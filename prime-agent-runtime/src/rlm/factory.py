@@ -717,3 +717,960 @@ __all__ = [
     "validate_factory_machine",
     "validate_factory_spec",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Executor: run a canonicalized DAG through the RLM supervisor.
+# ---------------------------------------------------------------------------
+
+ANSWER_CAPTURE_CAP = 200
+"""Local safety cap for captured answers.
+
+``rlm.collect`` already returns previews: the host caps them at 160
+characters (``compactRlmText``). Input binding and every rendered prompt
+therefore work on capped preview text; full child outputs stay in the
+child's own session and are never seen by the executor.
+"""
+
+EVENT_WINDOW = 50
+"""Number of trailing ledger events returned by ``status()``."""
+
+POLL_TIMEOUT_MS = 2000
+"""How long each control-loop ``rlm.collect`` waits for unsettled children."""
+
+BACKOFF_MAX_ATTEMPTS = 5
+"""Spawn admissions per node before a persistent rate limit fails the node."""
+
+BACKOFF_BASE_SECONDS = 1.0
+BACKOFF_CAP_SECONDS = 60.0
+_RATE_LIMIT_MARKERS = (
+    "rate limit",
+    "rate-limit",
+    "ratelimit",
+    "429",
+    "too many requests",
+    "throttled",
+    "quota",
+    "usage limit",
+)
+
+_FENCED_JSON_RE = re.compile(r"```json\s*(.*?)\s*```", re.DOTALL)
+TERMINAL_NODE_STATUSES = ("done", "error", "cancelled")
+
+
+def _is_rate_limit_error(message: str) -> bool:
+    """Heuristic: the host reports admission failures as error strings."""
+    lowered = message.lower()
+    return any(marker in lowered for marker in _RATE_LIMIT_MARKERS)
+
+
+def _effective_deps(node_spec: dict[str, Any]) -> set[str]:
+    """Dependencies that gate a node: depends_on plus every inputs[].from source."""
+    deps = set(node_spec.get("depends_on") or [])
+    for inp in node_spec.get("inputs") or []:
+        source = inp.get("from")
+        if isinstance(source, str) and "." in source:
+            deps.add(source.partition(".")[0])
+    return deps
+
+
+def _child_name(run_id: str, node_id: str, instance_index: int, attempt: int) -> str:
+    """Unique, readable sibling name for one spawned instance (host caps names at 64)."""
+    parts = ["sw", node_id[:20], run_id[:6]]
+    if instance_index >= 0:
+        parts.append(f"i{instance_index}")
+    if attempt > 1:
+        parts.append(f"a{attempt}")
+    return "-".join(parts)
+
+
+def _parse_json_output(answer: str, output_name: str) -> tuple[Any, str | None]:
+    """Extract one named JSON output from an upstream answer.
+
+    Prefers the trailing fenced `````json`` block whose object contains the
+    output name, then falls back to parsing the whole answer. Returns
+    ``(value, None)`` or ``(None, error_sentence)``.
+    """
+    candidates: list[str] = []
+    fenced = _FENCED_JSON_RE.findall(answer)
+    if fenced:
+        candidates.append(fenced[-1])
+    candidates.append(answer.strip())
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(parsed, dict) and output_name in parsed:
+            return parsed[output_name], None
+    return None, f"no JSON object containing output {output_name!r} in the upstream answer"
+
+
+def _render_prompt(template: str, values: dict[str, str]) -> str:
+    """Render bound input values into a prompt template.
+
+    Each ``{input_name}`` placeholder is replaced in a single pass (a value
+    that itself looks like a placeholder is never re-substituted). Inputs
+    without a placeholder are appended in a trailing ``## Inputs`` section,
+    so no bound value is dropped.
+    """
+    if not values:
+        return template
+    pattern = re.compile("|".join(re.escape("{" + name + "}") for name in values))
+    used: set[str] = set()
+
+    def _substitute(match: "re.Match[str]") -> str:
+        name = match.group(0)[1:-1]
+        used.add(name)
+        return values[name]
+
+    rendered = pattern.sub(_substitute, template)
+    unplaced = [(name, value) for name, value in values.items() if name not in used]
+    if unplaced:
+        rendered += "\n\n## Inputs\n" + "".join(f"- {name}: {value}\n" for name, value in unplaced)
+    return rendered
+
+
+@dataclass
+class _NodeInstance:
+    """One spawned child of one node (a foreach node has one per item)."""
+
+    index: int  # -1 for plain nodes, 0..K-1 for foreach items
+    prompt: str  # fully rendered; re-spawns reuse it verbatim
+    status: str = "pending"  # pending | running | done | error | cancelled
+    attempt: int = 0  # spawn admissions tried for this instance
+    child_id: str | None = None
+    spawned_at: float | None = None
+    duration_ms: int | None = None
+    answer: str | None = None  # capped collect preview (ANSWER_CAPTURE_CAP)
+    error: str | None = None
+    tool_uses: int = 0
+
+
+@dataclass
+class _NodeRun:
+    """Executor-side state for one node of one run."""
+
+    node_id: str
+    spec: dict[str, Any]  # canonical node spec
+    position: int  # stable topological position for deterministic ordering
+    prompt_template: str
+    model: str | None = None
+    thinking: str | None = None
+    status: str = "pending"  # pending | running | done | error | cancelled
+    instances: list[_NodeInstance] = field(default_factory=list)
+    error: str | None = None
+
+    @property
+    def lifecycle(self) -> str:
+        return self.spec.get("lifecycle", NODE_LIFECYCLE_DEFAULT)
+
+
+@dataclass
+class FactoryRun:
+    """Executor-side state for one run. Kernel memory only: it does not
+    survive a kernel restart; the children (supervisor-owned) keep running."""
+
+    run_id: str
+    spec_id: str
+    name: str | None
+    state: str = "running"  # running | paused | done | failed | stopped
+    started_at: float = 0.0
+    max_parallel: int = RUN_MAX_PARALLEL_DEFAULT
+    run_budget_ms: int | None = None
+    budget_reported: bool = False
+    pause_reason: str | None = None
+    nodes: dict[str, _NodeRun] = field(default_factory=dict)
+    order: list[str] = field(default_factory=list)
+    events: list[dict[str, Any]] = field(default_factory=list)
+    milestones: set[str] = field(default_factory=set)
+    spawn_count: int = 0
+    settle_count: int = 0
+    tool_use_total: int = 0
+    task: "asyncio.Task[None] | None" = None
+
+
+def _validate_spawn_settings(model: Any, thinking: Any) -> str | None:
+    for key, value in (("model", model), ("thinking", thinking)):
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            return f"subagent {key} must be a non-empty string when provided"
+    return None
+
+
+class FactoryExecutor:
+    """Runs canonicalized factory DAGs through the existing RLM supervisor.
+
+    Ownership split: the supervisor owns the children (admission via
+    ``rlm.spawn``, settlement via ``rlm.collect``, cancellation via
+    ``rlm.delete_subagent``); this executor owns the run state in kernel
+    memory. Every host call resolves through the module-level ``rlm``
+    functions and ``host_request`` at call time, so tests can patch
+    ``rlm.host_request``. ``now`` (default ``time.monotonic``) and ``sleep``
+    (default ``asyncio.sleep``) are injectable: budgets measure admission
+    to settlement, and rate-limit backoff is testable with fake sleeps.
+
+    Runs do not survive a kernel restart (the registry lives in kernel
+    memory); children are supervisor-owned and keep running, so
+    ``rlm.list_subagents`` can still see and stop them after a restart.
+    """
+
+    def __init__(
+        self,
+        *,
+        now: "Callable[[], float] | None" = None,
+        sleep: "Callable[[float], Any] | None" = None,
+        harness: Any = None,
+    ) -> None:
+        self._now_fn: Callable[[], float] = now or time.monotonic
+        self._sleep_fn: Callable[[float], Any] = sleep or asyncio.sleep
+        self._harness = harness
+        self._runs: dict[str, FactoryRun] = {}
+
+    # -- public API ---------------------------------------------------------
+
+    async def run(self, spec_id: str, *, name: str | None = None) -> dict[str, Any]:
+        """Validate a stored factory spec and start a run of it.
+
+        The dry run happens in two halves. Write time (``create_factory``)
+        validated the graph; here ``run`` re-validates and canonicalizes it,
+        then resolves every node's subagent reference, reporting ALL
+        failures in one ``ValueError`` and starting nothing on any failure.
+        The resolved node count and ``max_parallel`` are reported in the
+        result; actual admission limits (concurrency, tree depth, provider
+        rate limits) are enforced at spawn time through the backoff path.
+        Admission spawns every ready node up to ``max_parallel``, records
+        handles, and returns; a background asyncio task continues the run, so
+        the calling model turn ends immediately (nonblocking).
+        """
+        harness = self._resolve_harness()
+        entry = harness.get("factory", spec_id)
+        if entry is None:
+            raise ValueError(f"unknown factory spec {spec_id!r}")
+        dag = entry.arguments.get("dag") if isinstance(entry.arguments, dict) else None
+        canonical = canonicalize_factory_spec(dag)
+        resolved, reference_errors = self._resolve_subagents(harness, canonical)
+        if reference_errors:
+            raise ValueError("; ".join(reference_errors))
+        run = self._create_run(entry.id, canonical, resolved, name=name)
+        self._runs[run.run_id] = run
+        self._event(run, "run_started", detail=f"{len(run.nodes)} nodes, max_parallel {run.max_parallel}")
+        started = await self._spawn_ready(run, allow_backoff=False)
+        if self._run_complete(run):
+            await self._finalize(run)
+        else:
+            self._start_loop(run)
+        return {
+            "run_id": run.run_id,
+            "spec_id": entry.id,
+            "name": name,
+            "nodes": len(run.nodes),
+            "max_parallel": run.max_parallel,
+            "started": started,
+            "pending": self._pending_node_ids(run),
+        }
+
+    async def status(self, run_id: str) -> dict[str, Any]:
+        """Node states, the trailing event window, elapsed time, and usage.
+
+        Every call marks the whole ledger ``delivered`` (the parent read
+        it); the returned window is the last ``EVENT_WINDOW`` events.
+        Raises ``ValueError`` for an unknown run id.
+        """
+        run = self._require_run(run_id)
+        nodes: list[dict[str, Any]] = []
+        for node_id in run.order:
+            node = run.nodes[node_id]
+            entry: dict[str, Any] = {
+                "id": node.node_id,
+                "status": node.status,
+                "lifecycle": node.lifecycle,
+                "attempts": sum(instance.attempt for instance in node.instances),
+                "instances": [
+                    {
+                        "index": instance.index,
+                        "status": instance.status,
+                        "attempt": instance.attempt,
+                        "child": instance.child_id,
+                        "duration_ms": instance.duration_ms,
+                        "error": instance.error,
+                    }
+                    for instance in node.instances
+                ],
+            }
+            answer = self._node_answer(node)
+            if answer is not None:
+                entry["answer_preview"] = answer
+            if node.error is not None:
+                entry["error"] = node.error
+            nodes.append(entry)
+        for event in run.events:
+            event["stage"] = "delivered"
+        return {
+            "run_id": run.run_id,
+            "spec_id": run.spec_id,
+            "name": run.name,
+            "state": run.state,
+            "nodes": nodes,
+            "events": [dict(event) for event in run.events[-EVENT_WINDOW:]],
+            "elapsed_ms": int((self._now_fn() - run.started_at) * 1000),
+            "usage": {
+                "spawns": run.spawn_count,
+                "settled": run.settle_count,
+                "tool_uses": run.tool_use_total,
+                "max_parallel": run.max_parallel,
+                "running": self._running_instance_count(run),
+            },
+        }
+
+    async def stop(self, run_id: str) -> dict[str, Any]:
+        """Cancel every running child of the run and mark it stopped."""
+        run = self._require_run(run_id)
+        stopped = await self._halt_nonterminal(run, "run stopped")
+        run.state = "stopped"
+        self._event(run, "run_stopped", detail=f"stopped; {len(stopped)} node(s) cancelled")
+        return {"run_id": run.run_id, "state": "stopped", "cancelled": stopped}
+
+    async def resume(self, run_id: str) -> dict[str, Any]:
+        """Resume a paused run (escalate or budget pause) and restart the loop.
+
+        A budget pause is reported once per run: resuming after it is an
+        explicit operator decision and no further budget pauses fire.
+        Raises ``ValueError`` when the run is not paused.
+        """
+        run = self._require_run(run_id)
+        if run.state != "paused":
+            raise ValueError(f"factory run {run_id!r} is {run.state!r}, not paused")
+        run.state = "running"
+        run.pause_reason = None
+        self._event(run, "resumed", detail="resumed by caller")
+        started = await self._spawn_ready(run, allow_backoff=True)
+        if self._run_complete(run):
+            await self._finalize(run)
+        elif run.state == "running":
+            self._start_loop(run)
+        return {
+            "run_id": run.run_id,
+            "state": run.state,
+            "started": started,
+            "pending": self._pending_node_ids(run),
+        }
+
+    # -- setup --------------------------------------------------------------
+
+    def _resolve_harness(self) -> Any:
+        if self._harness is not None:
+            return self._harness
+        from . import rlm as rlm_namespace
+
+        return rlm_namespace.harness
+
+    def _require_run(self, run_id: str) -> FactoryRun:
+        run = self._runs.get(run_id)
+        if run is None:
+            raise ValueError(f"unknown factory run {run_id!r}")
+        return run
+
+    def _resolve_subagents(
+        self, harness: Any, canonical: dict[str, Any]
+    ) -> tuple[dict[str, tuple[str, str | None, str | None]], list[str]]:
+        """Resolve every node's subagent reference; collect ALL failures.
+
+        A string reference is a harness subagent entry id or title: its
+        content is the prompt template and ``metadata.model``/``metadata.thinking``
+        carry optional spawn settings. An inline object uses its own fields.
+        """
+        resolved: dict[str, tuple[str, str | None, str | None]] = {}
+        errors: list[str] = []
+        for node_spec in canonical["nodes"]:
+            node_id = node_spec["id"]
+            reference = node_spec["subagent"]
+            if isinstance(reference, dict):
+                prompt = reference.get("prompt")
+                model = reference.get("model")
+                thinking = reference.get("thinking")
+            else:
+                entry = harness.get("subagent", reference)
+                if entry is None:
+                    entry = next((row for row in harness.list("subagent") if row.title == reference), None)
+                if entry is None:
+                    errors.append(f"node {node_id!r} references unknown subagent {reference!r}")
+                    continue
+                prompt = entry.content
+                metadata = entry.metadata if isinstance(entry.metadata, dict) else {}
+                model = metadata.get("model")
+                thinking = metadata.get("thinking")
+            if not isinstance(prompt, str) or not prompt.strip():
+                errors.append(f"node {node_id!r} has an empty subagent prompt")
+                continue
+            settings_error = _validate_spawn_settings(model, thinking)
+            if settings_error is not None:
+                errors.append(f"node {node_id!r} {settings_error}")
+                continue
+            resolved[node_id] = (prompt, model, thinking)
+        return resolved, errors
+
+    def _create_run(
+        self,
+        spec_id: str,
+        canonical: dict[str, Any],
+        resolved: dict[str, tuple[str, str | None, str | None]],
+        *,
+        name: str | None,
+    ) -> FactoryRun:
+        run_spec = canonical["run"]
+        run = FactoryRun(
+            run_id=uuid4().hex,
+            spec_id=spec_id,
+            name=name,
+            started_at=self._now_fn(),
+            max_parallel=run_spec["max_parallel"],
+            run_budget_ms=run_spec.get("budget_ms"),
+        )
+        run.order = topological_order(canonical["nodes"])
+        position_of = {node_id: index for index, node_id in enumerate(run.order)}
+        for node_spec in canonical["nodes"]:
+            node_id = node_spec["id"]
+            prompt, model, thinking = resolved[node_id]
+            run.nodes[node_id] = _NodeRun(
+                node_id=node_id,
+                spec=node_spec,
+                position=position_of[node_id],
+                prompt_template=prompt,
+                model=model,
+                thinking=thinking,
+            )
+        return run
+
+    # -- event ledger -------------------------------------------------------
+
+    def _event(
+        self,
+        run: FactoryRun,
+        kind: str,
+        *,
+        node: str | None = None,
+        instance: int | None = None,
+        detail: str | None = None,
+        stage: str = "recorded",
+        **extra: Any,
+    ) -> dict[str, Any]:
+        """Append one ledger entry.
+
+        Stages follow the spec: ``arrived`` (a child answer settled and was
+        captured), ``recorded`` (everything else), ``shown`` (a milestone
+        notice was injected into the parent conversation), and ``delivered``
+        (the parent read the ledger via ``status()``).
+        """
+        event: dict[str, Any] = {"seq": len(run.events) + 1, "kind": kind, "stage": stage}
+        if node is not None:
+            event["node"] = node
+        if instance is not None:
+            event["instance"] = instance
+        if detail is not None:
+            event["detail"] = detail
+        event.update(extra)
+        run.events.append(event)
+        return event
+
+    async def _milestone(self, run: FactoryRun, kind: str, detail: str, *, node: str | None = None) -> None:
+        """Record a run milestone and inject one quiet notice (one per kind)."""
+        if kind in run.milestones:
+            return
+        run.milestones.add(kind)
+        event = self._event(run, "milestone", milestone=kind, detail=detail, node=node)
+        try:
+            from . import host_request
+
+            payload: dict[str, Any] = {"run_id": run.run_id, "kind": kind, "detail": detail}
+            if node is not None:
+                payload["node"] = node
+            await host_request("factory.progress", payload)
+            event["stage"] = "shown"
+        except Exception:
+            # A dead bridge cannot be told; the ledger keeps the milestone and
+            # status() still surfaces it to the parent.
+            pass
+
+    # -- readiness, binding, admission --------------------------------------
+
+    async def _spawn_ready(self, run: FactoryRun, *, allow_backoff: bool) -> list[str]:
+        """Initialize ready nodes and admit pending instances up to max_parallel.
+
+        Returns the node ids that had at least one instance admitted here.
+        """
+        started: list[str] = []
+        while run.state == "running":
+            await self._initialize_ready_nodes(run)
+            if run.state != "running":
+                break
+            if self._running_instance_count(run) >= run.max_parallel:
+                break
+            pair = self._next_pending_instance(run)
+            if pair is None:
+                break
+            node, instance = pair
+            outcome = await self._admit(run, node, instance, allow_backoff=allow_backoff)
+            if outcome == "admitted" and node.node_id not in started:
+                started.append(node.node_id)
+            if outcome == "deferred":
+                # A rate limit is usually global, so stop admitting in this
+                # phase; the control loop retries with exponential backoff.
+                break
+        return started
+
+    async def _initialize_ready_nodes(self, run: FactoryRun) -> None:
+        """Bind inputs and create instances for every node whose deps are terminal."""
+        for node_id in run.order:
+            node = run.nodes[node_id]
+            if node.status != "pending":
+                continue
+            deps = _effective_deps(node.spec)
+            if not all(run.nodes[dep].status in TERMINAL_NODE_STATUSES for dep in deps):
+                continue
+            instances, reason = self._prepare_instances(run, node)
+            if reason is not None:
+                await self._apply_node_failure_policy(run, node, reason)
+                if run.state != "running":
+                    return
+                continue
+            node.instances = instances
+            if instances:
+                node.status = "running"
+                self._event(run, "node_ready", node=node_id, detail=f"{len(instances)} instance(s) prepared")
+            else:
+                node.status = "done"
+                self._event(run, "node_ready", node=node_id, detail="foreach expanded to zero items; nothing to run")
+
+    def _prepare_instances(self, run: FactoryRun, node: _NodeRun) -> "tuple[list[_NodeInstance] | None, str | None]":
+        """Bind inputs, expand foreach, and render one prompt per instance.
+
+        Returns ``(instances, None)`` or ``(None, reason)`` on a binding
+        failure. Binding failures never retry: a deterministic binding
+        error would recur on every re-render, so the node fails and its
+        failure_policy applies directly.
+        """
+        values: dict[str, str] = {}
+        foreach = node.spec.get("foreach")
+        items: list[Any] | None = None
+        for inp in node.spec.get("inputs") or []:
+            name, port_type, source = inp["name"], inp["type"], inp["from"]
+            src_id, _, src_output = source.partition(".")
+            source_node = run.nodes.get(src_id)
+            if source_node is None or source_node.status != "done":
+                status = source_node.status if source_node is not None else "missing"
+                return None, f"input {name!r} from node {src_id!r} is unavailable (status {status!r})"
+            answer = self._node_answer(source_node)
+            if answer is None:
+                return None, f"input {name!r} from node {src_id!r} has no captured answer"
+            if port_type == "text":
+                values[name] = answer
+                continue
+            parsed, error = _parse_json_output(answer, src_output)
+            if error is not None:
+                return None, f"input {name!r}: {error}"
+            if foreach is not None and foreach.get("over") == name:
+                if not isinstance(parsed, list):
+                    return None, f"foreach.over input {name!r} is not a JSON list"
+                items = parsed
+                continue
+            values[name] = json.dumps(parsed)
+        if foreach is None:
+            return [_NodeInstance(index=-1, prompt=_render_prompt(node.prompt_template, values))], None
+        if items is None:
+            return None, "foreach node did not resolve its over input"
+        instances = [
+            _NodeInstance(
+                index=index,
+                prompt=_render_prompt(
+                    node.prompt_template,
+                    {**values, foreach["over"]: item if isinstance(item, str) else json.dumps(item)},
+                ),
+            )
+            for index, item in enumerate(items[: foreach["max"]])
+        ]
+        return instances, None
+
+    def _next_pending_instance(self, run: FactoryRun) -> "tuple[_NodeRun, _NodeInstance] | None":
+        for node_id in run.order:
+            for instance in run.nodes[node_id].instances:
+                if instance.status == "pending":
+                    return run.nodes[node_id], instance
+        return None
+
+    async def _admit(
+        self, run: FactoryRun, node: _NodeRun, instance: _NodeInstance, *, allow_backoff: bool
+    ) -> str:
+        """Spawn one instance. Returns "admitted", "deferred", or "failed".
+
+        Rate-limited admissions back off and retry: doubling delays capped
+        at 60s, at most ``BACKOFF_MAX_ATTEMPTS`` admissions per call, then
+        the node fails through its failure_policy. In the admission phase
+        (``allow_backoff=False``) a rate limit does not sleep inside
+        ``run()``: the instance stays pending ("deferred") and the control
+        loop retries it with backoff. Any other admission error fails the
+        node immediately.
+        """
+        from . import spawn
+
+        instance.attempt += 1
+        child_name = _child_name(run.run_id, node.node_id, instance.index, instance.attempt)
+        tries = BACKOFF_MAX_ATTEMPTS if allow_backoff else 1
+        delay = BACKOFF_BASE_SECONDS
+        last_error = "spawn admission failed"
+        for try_index in range(tries):
+            try:
+                handle = await spawn(instance.prompt, name=child_name, model=node.model, thinking=node.thinking)
+            except RuntimeError as exc:
+                last_error = str(exc)
+                if not _is_rate_limit_error(last_error):
+                    break
+                if try_index < tries - 1:
+                    self._event(
+                        run,
+                        "spawn_backoff",
+                        node=node.node_id,
+                        instance=instance.index,
+                        detail=f"rate limited; retrying in {delay:g}s",
+                    )
+                    await self._sleep_fn(delay)
+                    delay = min(delay * 2, BACKOFF_CAP_SECONDS)
+                continue
+            instance.child_id = handle.rlm_child_id
+            instance.spawned_at = self._now_fn()
+            instance.status = "running"
+            run.spawn_count += 1
+            self._event(
+                run,
+                "spawned",
+                node=node.node_id,
+                instance=instance.index,
+                attempt=instance.attempt,
+                child=handle.rlm_child_id,
+                name=child_name,
+            )
+            return "admitted"
+        if not allow_backoff and _is_rate_limit_error(last_error):
+            self._event(
+                run,
+                "spawn_deferred",
+                node=node.node_id,
+                instance=instance.index,
+                detail=f"rate limited at admission: {last_error}",
+            )
+            return "deferred"
+        await self._apply_instance_failure(run, node, instance, f"spawn admission failed: {last_error}", retry=False)
+        return "failed"
+
+    # -- settlement, retries, policies ---------------------------------------
+
+    async def _apply_settlement(self, run: FactoryRun, node: _NodeRun, instance: _NodeInstance, result: Any) -> None:
+        if instance.status != "running":
+            return  # cancelled (stop/fail_fast) while the collect was in flight
+        instance.duration_ms = result.duration_ms
+        instance.tool_uses = result.tool_use_count or 0
+        run.settle_count += 1
+        run.tool_use_total += instance.tool_uses
+        child_reason: str | None = None
+        if result.status == "error":
+            child_reason = result.error or f"child settled with status {result.status!r}"
+        elif result.status == "cancelled":
+            child_reason = "child was cancelled"
+        elif result.status != "done":
+            child_reason = f"child settled with unexpected status {result.status!r}"
+        if child_reason is not None:
+            # Child failures retry (same rendered prompt, attempts+1) while
+            # attempts remain; then the node failure_policy applies.
+            await self._apply_instance_failure(run, node, instance, child_reason, retry=True)
+            return
+        budget_ms = node.spec.get("budget_ms")
+        if budget_ms is not None and instance.spawned_at is not None:
+            elapsed_ms = (self._now_fn() - instance.spawned_at) * 1000
+            if elapsed_ms > budget_ms:
+                # Wall-clock budget (admission to settlement) exceeded: the
+                # budget is spent, so no retry; the failure_policy applies.
+                await self._apply_instance_failure(
+                    run,
+                    node,
+                    instance,
+                    f"node budget_ms {budget_ms} exceeded ({int(elapsed_ms)}ms from admission to settlement)",
+                    retry=False,
+                )
+                return
+        instance.status = "done"
+        instance.answer = (result.answer_preview or "")[:ANSWER_CAPTURE_CAP] or None
+        self._event(
+            run,
+            "settled",
+            node=node.node_id,
+            instance=instance.index,
+            status="done",
+            duration_ms=instance.duration_ms,
+        )
+        if instance.answer:
+            self._event(
+                run,
+                "answer_captured",
+                node=node.node_id,
+                instance=instance.index,
+                answer=instance.answer,
+                stage="arrived",
+            )
+        if node.status == "running" and node.instances and all(i.status == "done" for i in node.instances):
+            node.status = "done"
+
+    async def _apply_instance_failure(
+        self, run: FactoryRun, node: _NodeRun, instance: _NodeInstance, reason: str, *, retry: bool
+    ) -> None:
+        instance.status = "error"
+        instance.error = reason
+        self._event(
+            run,
+            "settled",
+            node=node.node_id,
+            instance=instance.index,
+            status="error",
+            error=reason,
+            duration_ms=instance.duration_ms,
+        )
+        retries = node.spec.get("retries", NODE_RETRIES_DEFAULT)
+        if retry and instance.attempt <= retries:
+            instance.status = "pending"
+            instance.error = None
+            self._event(
+                run,
+                "retry",
+                node=node.node_id,
+                instance=instance.index,
+                detail=f"attempt {instance.attempt} failed; re-spawning (retries {retries})",
+            )
+            return
+        if all(i.status in TERMINAL_NODE_STATUSES for i in node.instances):
+            await self._apply_node_failure_policy(run, node, reason)
+
+    async def _apply_node_failure_policy(self, run: FactoryRun, node: _NodeRun, reason: str) -> None:
+        if node.status in ("error", "done", "cancelled"):
+            return  # the policy already ran for this node
+        policy = node.spec.get("failure_policy", RUN_FAILURE_POLICY_DEFAULT)
+        node.status = "error"
+        node.error = reason
+        self._event(run, "node_error", node=node.node_id, error=reason, detail=f"failure_policy {policy}")
+        if policy == "fail_fast":
+            stopped = await self._halt_nonterminal(run, "run failed (fail_fast)")
+            run.state = "failed"
+            await self._milestone(
+                run,
+                "failed",
+                f"node {node.node_id} failed: {reason}; cancelled {len(stopped)} running node(s)",
+                node=node.node_id,
+            )
+        elif policy == "continue":
+            pass  # the node stays error; dependents see a terminal dep and fail at binding
+        else:  # escalate (default)
+            run.state = "paused"
+            run.pause_reason = reason
+            await self._milestone(
+                run,
+                "paused",
+                f"node {node.node_id} failed: {reason}; resume with await rlm.factory.resume('{run.run_id}')",
+                node=node.node_id,
+            )
+
+    async def _halt_nonterminal(self, run: FactoryRun, reason: str) -> list[str]:
+        """Delete every running child and cancel every non-terminal node."""
+        stopped = [node_id for node_id in run.order if run.nodes[node_id].status in ("pending", "running")]
+        await self._cancel_running(run)
+        for node_id in stopped:
+            node = run.nodes[node_id]
+            if node.status in ("pending", "running"):
+                node.status = "cancelled"
+                self._event(run, "node_cancelled", node=node_id, detail=reason)
+        return stopped
+
+    async def _cancel_running(self, run: FactoryRun) -> None:
+        from . import delete_subagent
+
+        for node_id in run.order:
+            node = run.nodes[node_id]
+            for instance in node.instances:
+                if instance.status != "running" or instance.child_id is None:
+                    continue
+                child_id = instance.child_id
+                try:
+                    await delete_subagent(child_id)
+                except Exception as exc:
+                    self._event(run, "cancel_failed", node=node_id, instance=instance.index, child=child_id, error=str(exc))
+                else:
+                    self._event(run, "cancelled", node=node_id, instance=instance.index, child=child_id)
+                # The child is supervisor-owned; a failed delete leaves it
+                # running there, but the executor treats its slot as released.
+                instance.status = "cancelled"
+
+    # -- completion ----------------------------------------------------------
+
+    def _run_complete(self, run: FactoryRun) -> bool:
+        for node in run.nodes.values():
+            if node.lifecycle == "resident":
+                # A resident node finishes the run's declarative work once it
+                # is admitted (or terminally failed); it then stays alive under
+                # the parent session until rlm.factory.stop() or session teardown.
+                if node.status == "pending":
+                    return False
+                if any(instance.status == "pending" for instance in node.instances):
+                    return False
+                continue
+            if node.status not in TERMINAL_NODE_STATUSES:
+                return False
+        return True
+
+    async def _finalize(self, run: FactoryRun) -> None:
+        errors = [node for node in run.nodes.values() if node.status == "error"]
+        if errors:
+            run.state = "failed"
+            await self._milestone(
+                run,
+                "failed",
+                "completed with node error(s): " + ", ".join(node.node_id for node in errors),
+            )
+            return
+        run.state = "done"
+        residents = [node for node in run.nodes.values() if node.lifecycle == "resident" and node.status == "running"]
+        detail = f"run complete: {len(run.nodes)} node(s)"
+        if residents:
+            detail += f"; {len(residents)} resident node(s) still running (stop with await rlm.factory.stop('{run.run_id}'))"
+        await self._milestone(run, "finished", detail)
+
+    # -- control loop --------------------------------------------------------
+
+    def _start_loop(self, run: FactoryRun) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            run.state = "failed"
+            self._event(run, "executor_error", error="no running asyncio loop; the factory control loop needs one")
+            return
+        run.task = loop.create_task(self._control_loop(run))
+
+    async def _control_loop(self, run: FactoryRun) -> None:
+        try:
+            await self._loop_body(run)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A dead bridge or host failure must not wedge the run silently;
+            # children stay alive under the supervisor either way.
+            run.state = "failed"
+            self._event(run, "executor_error", error=f"{type(exc).__name__}: {exc}")
+            try:
+                await self._milestone(run, "failed", f"executor error: {exc}")
+            except Exception:
+                pass
+
+    async def _loop_body(self, run: FactoryRun) -> None:
+        from . import collect
+
+        while run.state == "running":
+            in_flight = [
+                (run.nodes[node_id], instance)
+                for node_id in run.order
+                for instance in run.nodes[node_id].instances
+                if instance.status == "running" and instance.child_id is not None
+            ]
+            if in_flight:
+                results = await collect([instance.child_id for _, instance in in_flight], timeout_ms=POLL_TIMEOUT_MS)
+                settled = {entry.rlm_child_id: entry for entry in results if entry.settled}
+                for node, instance in in_flight:
+                    entry = settled.get(instance.child_id or "")
+                    if entry is not None:
+                        await self._apply_settlement(run, node, instance, entry)
+            if self._run_complete(run):
+                await self._finalize(run)
+                return
+            if run.state != "running":
+                return
+            if run.run_budget_ms is not None and not run.budget_reported:
+                elapsed_ms = (self._now_fn() - run.started_at) * 1000
+                if elapsed_ms > run.run_budget_ms:
+                    # Run budget: pause new spawns only; children already in
+                    # flight keep running and settle normally.
+                    run.state = "paused"
+                    run.pause_reason = "run budget exceeded"
+                    run.budget_reported = True
+                    await self._milestone(
+                        run,
+                        "budget_exceeded",
+                        f"run budget_ms {run.run_budget_ms} exceeded after {int(elapsed_ms)}ms; no new spawns; "
+                        f"resume with await rlm.factory.resume('{run.run_id}')",
+                    )
+                    return
+            started = await self._spawn_ready(run, allow_backoff=True)
+            if run.state != "running":
+                return
+            if not in_flight and not started and not self._has_pending_instance(run):
+                # Defensive: nothing in flight, nothing admitted, nothing
+                # pending. A validated DAG cannot reach this state; end the
+                # run instead of spinning.
+                self._event(run, "executor_error", error="control loop stalled: no in-flight or pending instances")
+                run.state = "failed"
+                try:
+                    await self._milestone(run, "failed", "control loop stalled")
+                except Exception:
+                    pass
+                return
+            # Yield once per iteration. A real collect already waits up to
+            # POLL_TIMEOUT_MS, but an instantly-settling host (tests, a fast
+            # supervisor) must not hot-spin the loop and starve other tasks.
+            await asyncio.sleep(0)
+
+    # -- small helpers --------------------------------------------------------
+
+    def _node_answer(self, node: _NodeRun) -> str | None:
+        """Captured answer for binding: one preview, or all instances joined."""
+        answers = [instance.answer for instance in node.instances if instance.status == "done" and instance.answer]
+        if not answers:
+            return None
+        return "\n\n".join(answers)
+
+    def _running_instance_count(self, run: FactoryRun) -> int:
+        return sum(1 for node in run.nodes.values() for instance in node.instances if instance.status == "running")
+
+    def _has_pending_instance(self, run: FactoryRun) -> bool:
+        return any(instance.status == "pending" for node in run.nodes.values() for instance in node.instances)
+
+    def _pending_node_ids(self, run: FactoryRun) -> list[str]:
+        return [node_id for node_id in run.order if run.nodes[node_id].status == "pending"]
+
+
+_DEFAULT_EXECUTOR: FactoryExecutor | None = None
+
+
+def default_factory_executor() -> FactoryExecutor:
+    """The process-wide executor behind the ``rlm.factory`` namespace.
+
+    Tests that need an injected clock or sleep assign their own
+    ``FactoryExecutor`` to ``factory._DEFAULT_EXECUTOR``; the namespace then
+    routes through it.
+    """
+    global _DEFAULT_EXECUTOR
+    if _DEFAULT_EXECUTOR is None:
+        _DEFAULT_EXECUTOR = FactoryExecutor()
+    return _DEFAULT_EXECUTOR
+
+
+async def run_factory(spec_id: str, *, name: str | None = None) -> dict[str, Any]:
+    """Validate a stored factory spec and start a nonblocking run of it."""
+    return await default_factory_executor().run(spec_id, name=name)
+
+
+async def status_factory(run_id: str) -> dict[str, Any]:
+    """Return node states, the event window, elapsed time, and usage."""
+    return await default_factory_executor().status(run_id)
+
+
+async def stop_factory(run_id: str) -> dict[str, Any]:
+    """Cancel every running child of the run and mark it stopped."""
+    return await default_factory_executor().stop(run_id)
+
+
+async def resume_factory(run_id: str) -> dict[str, Any]:
+    """Resume a paused run (escalate or budget pause)."""
+    return await default_factory_executor().resume(run_id)

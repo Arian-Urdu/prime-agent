@@ -718,7 +718,7 @@ export function formatHarnessStateForPrompt(
 			);
 		} else if (kind === "factory" && entries.length > 0 && includeIpythonExamples) {
 			lines.push(
-				`${kind}: ${entries.length} (state-machine workflow specs; run one with \`await rlm.factory.run('<id>')\`; execution lands in a follow-up PR)`,
+				`${kind}: ${entries.length} (state-machine workflow specs; run one with \`await rlm.factory.run('<id>')\`; watch with \`rlm.factory.status(run_id)\`, stop with \`rlm.factory.stop(run_id)\`)`,
 			);
 		} else {
 			lines.push(`${kind}: ${entries.length}`);

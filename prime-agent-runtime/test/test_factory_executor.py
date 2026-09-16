@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import rlm as rlm_module
 from rlm import factory as factory_module
@@ -49,13 +49,16 @@ class SleepRecorder:
 
 
 class FakeHost:
-    """Deterministic host_request fake that routes by request type.
+    """Deterministic async host_request fake that routes by request type.
 
     Child names carry the node id as their second dash-separated part, so
-    node ids in these tests never contain "-". A node's collect outcome is
-    scripted in ``outcomes``; ``running`` means the child never settles.
-    ``rate_limit_first``/``rate_limit_forever`` make spawn admissions for a
-    node fail with a 429-style RuntimeError.
+    node ids in these tests never contain "-". Collect outcomes are
+    scripted per child id first (``child_outcomes``), then per node id
+    (``outcomes``); a "running" outcome never settles. ``rate_limit_first``
+    / ``rate_limit_forever`` make spawn admissions for a node fail with a
+    429-style RuntimeError. ``gate("rlm.collect"|"rlm.delete_subagent", n)``
+    suspends the n-th call of that type on an asyncio.Event so tests can
+    reproduce races between the control loop and stop()/resume().
     """
 
     def __init__(self, clock: FakeClock | None = None) -> None:
@@ -66,8 +69,17 @@ class FakeHost:
         self.collects = 0
         self.clock = clock
         self.outcomes: dict[str, dict[str, Any]] = {}
+        self.child_outcomes: dict[str, dict[str, Any]] = {}
         self.rate_limit_first: dict[str, int] = {}
         self.rate_limit_forever: set[str] = set()
+        self.gates: dict[tuple[str, int], asyncio.Event] = {}
+        self._call_indices: dict[str, int] = {}
+
+    def gate(self, request_type: str, call_number: int) -> asyncio.Event:
+        """Suspend the call_number-th collect/delete on a returned event."""
+        event = asyncio.Event()
+        self.gates[(request_type, call_number)] = event
+        return event
 
     def calls_of(self, request_type: str) -> list[dict[str, Any]]:
         return [payload for kind, payload in self.calls if kind == request_type]
@@ -106,8 +118,15 @@ class FakeHost:
             entry["error"] = error
         return entry
 
-    def __call__(self, request_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def __call__(self, request_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = payload or {}
+        gate = None
+        if request_type in ("rlm.collect", "rlm.delete_subagent"):
+            index = self._call_indices.get(request_type, 0) + 1
+            self._call_indices[request_type] = index
+            gate = self.gates.pop((request_type, index), None)
+        if gate is not None:
+            await gate.wait()
         if request_type == "rlm.run":
             # Count this node's prior admission calls before recording the
             # current one, so rate_limit_first<n> fails exactly the first n.
@@ -120,8 +139,7 @@ class FakeHost:
                     if kind == "rlm.run" and p["kwargs"]["name"].split("-")[1] == node_id
                 ]
             )
-        self.calls.append((request_type, payload))
-        if request_type == "rlm.run":
+            self.calls.append((request_type, payload))
             limit = self.rate_limit_first.get(node_id, 0) + (999 if node_id in self.rate_limit_forever else 0)
             if attempted < limit:
                 raise RuntimeError("spawn admission failed: 429 rate limit exceeded")
@@ -134,6 +152,7 @@ class FakeHost:
                 "session_dir": f"/tmp/{child_id}",
                 "model": "fake-model",
             }
+        self.calls.append((request_type, payload))
         if request_type == "rlm.collect":
             self.collects += 1
             if self.clock is not None:
@@ -143,7 +162,11 @@ class FakeHost:
                 child = self.children.get(target)
                 if child is None:
                     continue  # deleted children vanish from collect results
-                outcome = self.outcomes.get(child["node"], {"status": "done", "answer": f"answer-{child['node']}"})
+                outcome = (
+                    self.child_outcomes.get(target)
+                    or self.outcomes.get(child["node"])
+                    or {"status": "done", "answer": f"answer-{child['node']}"}
+                )
                 if outcome["status"] == "running":
                     results.append(
                         self._entry(child_id=target, name=child["name"], status="running", settled=False)
@@ -191,7 +214,9 @@ class FactoryExecutorTest(unittest.TestCase):
         previous_executor = factory_module._DEFAULT_EXECUTOR
         factory_module._DEFAULT_EXECUTOR = self.executor
         self.addCleanup(lambda: setattr(factory_module, "_DEFAULT_EXECUTOR", previous_executor))
-        patcher = patch.object(rlm_module, "host_request", AsyncMock(side_effect=self.host))
+        # The fake is an async callable: patch it in directly (AsyncMock does
+        # not await async side effects), which preserves the patch seam.
+        patcher = patch.object(rlm_module, "host_request", self.host)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -460,7 +485,74 @@ class FactoryExecutorTest(unittest.TestCase):
             ["No placeholders here.\n\n## Inputs\n- draft: ANSWER-A\n"],
         )
 
+    @async_test
+    async def test_two_parent_fan_in_binds_both_answers(self) -> None:
+        # Both parents settle in one collect batch; the fan-in node must
+        # bind both captured answers into a single prompt.
+        self.host.outcomes["a"] = {"status": "done", "answer": "ANSWER-A"}
+        self.host.outcomes["b"] = {"status": "done", "answer": "ANSWER-B"}
+        self.store_factory(
+            {
+                "run": {"failure_policy": "continue"},
+                "nodes": [
+                    {"id": "a", "subagent": "worker", "outputs": [{"name": "out", "type": "text"}]},
+                    {"id": "b", "subagent": "worker", "outputs": [{"name": "out", "type": "text"}]},
+                    {
+                        "id": "c",
+                        "subagent": {"prompt": "Combine {left} and {right}."},
+                        "depends_on": ["a", "b"],
+                        "inputs": [
+                            {"name": "left", "type": "text", "from": "a.out"},
+                            {"name": "right", "type": "text", "from": "b.out"},
+                        ],
+                    },
+                ],
+            }
+        )
+        result = await self.start()
+        self.assertEqual(result["started"], ["a", "b"])
+        status = await self.settle(result)
+        self.assertEqual(status["state"], "done")
+        self.assertEqual(
+            [call["prompt"] for call in self.host.spawn_calls("c")],
+            ["Combine ANSWER-A and ANSWER-B."],
+        )
+
+    @async_test
+    async def test_answer_capture_cap_slices_previews(self) -> None:
+        long_answer = "x" * 300
+        self.host.outcomes["a"] = {"status": "done", "answer": long_answer}
+        self.store_factory(
+            {
+                "nodes": [{"id": "a", "subagent": "worker"}],
+            }
+        )
+        result = await self.start()
+        status = await self.settle(result)
+        self.assertEqual(status["state"], "done")
+        captured = self.node_status(status, "a")["answer_preview"]
+        self.assertEqual(len(captured), 200)
+        self.assertEqual(captured, long_answer[:200])
+
     # -- foreach ----------------------------------------------------------------
+
+    def store_fan_factory(self, *, policy: str) -> None:
+        self.host.outcomes["src"] = {"status": "done", "answer": '{"items": ["a", "b", "c", "d", "e"]}'}
+        self.store_factory(
+            {
+                "run": {"failure_policy": policy, "max_parallel": 8},
+                "nodes": [
+                    {"id": "src", "subagent": "worker", "outputs": [{"name": "items", "type": "json"}]},
+                    {
+                        "id": "fan",
+                        "subagent": "worker",
+                        "depends_on": ["src"],
+                        "inputs": [{"name": "items", "type": "json", "from": "src.items"}],
+                        "foreach": {"over": "items", "max": 5},
+                    },
+                ],
+            }
+        )
 
     @async_test
     async def test_foreach_expands_clamped_instances(self) -> None:
@@ -518,6 +610,60 @@ class FactoryExecutorTest(unittest.TestCase):
         self.assertEqual(status["state"], "done")
         self.assertEqual(self.node_status(status, "fan")["status"], "done")
         self.assertEqual(self.host.spawn_calls("fan"), [])
+
+    @async_test
+    async def test_foreach_mixed_instances_escalate_pauses(self) -> None:
+        self.store_fan_factory(policy="escalate")
+        result = await self.start()
+        # src is child-1; the five fan instances are child-2..child-6.
+        # Instances 0-1 fail permanently; 2-4 succeed in the same collect
+        # batch. The node must reach error and the policy must apply even
+        # though the failures did not settle last.
+        self.host.child_outcomes["child-2"] = {"status": "error", "error": "boom-1"}
+        self.host.child_outcomes["child-3"] = {"status": "error", "error": "boom-2"}
+        status = await self.settle(result)
+        self.assertEqual(status["state"], "paused")
+        self.assertEqual(self.host.notice_kinds(), ["paused"])
+        fan = self.node_status(status, "fan")
+        self.assertEqual(fan["status"], "error")
+        self.assertEqual([i["status"] for i in fan["instances"]], ["error", "error", "done", "done", "done"])
+
+    @async_test
+    async def test_foreach_mixed_instances_fail_fast_cancels_siblings(self) -> None:
+        self.store_fan_factory(policy="fail_fast")
+        result = await self.start()
+        # instance 0 (child-2) fails first while its siblings are still in
+        # flight: fail_fast must cancel those siblings now, not after they
+        # settle.
+        self.host.child_outcomes["child-2"] = {"status": "error", "error": "boom"}
+        for child_id in ("child-3", "child-4", "child-5", "child-6"):
+            self.host.child_outcomes[child_id] = {"status": "running"}
+        status = await self.settle(result)
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(self.host.notice_kinds(), ["failed"])
+        fan = self.node_status(status, "fan")
+        self.assertEqual(fan["status"], "error")
+        self.assertEqual(
+            [i["status"] for i in fan["instances"]],
+            ["error", "cancelled", "cancelled", "cancelled", "cancelled"],
+        )
+        self.assertEqual(len(self.host.deleted_targets()), 4)
+
+    @async_test
+    async def test_foreach_mixed_instances_continue_finishes_with_node_error(self) -> None:
+        self.store_fan_factory(policy="continue")
+        result = await self.start()
+        self.host.child_outcomes["child-2"] = {"status": "error", "error": "boom-1"}
+        self.host.child_outcomes["child-3"] = {"status": "error", "error": "boom-2"}
+        status = await self.settle(result)
+        # the node fails on the first permanent instance failure, the rest
+        # still settle, and the run finishes with the node error recorded
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(self.host.notice_kinds(), ["failed"])
+        fan = self.node_status(status, "fan")
+        self.assertEqual(fan["status"], "error")
+        self.assertEqual([i["status"] for i in fan["instances"]], ["error", "error", "done", "done", "done"])
+        self.assertEqual(self.host.deleted_targets(), [])
 
     # -- failure policies ---------------------------------------------------------
 
@@ -597,6 +743,34 @@ class FactoryExecutorTest(unittest.TestCase):
         # a second resume on the finished run must refuse
         with self.assertRaisesRegex(ValueError, "not paused"):
             await rlm_module.rlm.factory.resume(result["run_id"])
+
+    @async_test
+    async def test_resume_defers_rate_limited_admissions(self) -> None:
+        self.host.outcomes["a"] = {"status": "error", "error": "boom"}
+        self.host.rate_limit_first["b"] = 2
+        self.store_factory(
+            {
+                "nodes": [
+                    {"id": "a", "subagent": "worker"},
+                    {"id": "b", "subagent": "worker", "depends_on": ["a"]},
+                ],
+            }
+        )
+        result = await self.start()
+        paused = await self.settle(result)
+        self.assertEqual(paused["state"], "paused")
+        resumed = await rlm_module.rlm.factory.resume(result["run_id"])
+        # resume() must not sleep in the calling turn: the rate-limited
+        # admission defers to the control loop's backoff, exactly like run()
+        self.assertEqual(resumed["started"], [])
+        self.assertEqual(self.sleeps.sleeps, [])
+        final = await self.settle(result)
+        self.assertEqual(final["state"], "failed")  # a errored, b done
+        self.assertEqual(self.node_status(final, "b")["status"], "done")
+        # b needed 3 admissions total: one deferred at resume, then one
+        # rate-limited retry and one success inside the loop's backoff
+        self.assertEqual(len(self.host.spawn_calls("b")), 3)
+        self.assertEqual(self.sleeps.sleeps, [1.0])
 
     # -- retries --------------------------------------------------------------------
 
@@ -693,6 +867,51 @@ class FactoryExecutorTest(unittest.TestCase):
         self.assertEqual(status["state"], "stopped")
         self.assertEqual(self.node_status(status, "a")["status"], "cancelled")
         self.assertEqual(self.node_status(status, "b")["status"], "cancelled")
+        # repeated stop is idempotent: same result, no duplicate ledger event
+        again = await rlm_module.rlm.factory.stop(result["run_id"])
+        self.assertEqual(again, {"run_id": result["run_id"], "state": "stopped", "cancelled": []})
+        run_stopped_events = [e for e in self.executor._runs[result["run_id"]].events if e["kind"] == "run_stopped"]
+        self.assertEqual(len(run_stopped_events), 1)
+
+    @async_test
+    async def test_stop_window_admits_no_new_spawns_and_never_finalizes(self) -> None:
+        # max_parallel 2 with three ready nodes: c waits for a slot. The
+        # loop's first collect and stop()'s first delete are gated so the
+        # stop window opens mid-collect with free-able slots and a ready
+        # pending node: the loop must neither admit c nor finalize the run.
+        self.store_factory(
+            {
+                "run": {"max_parallel": 2},
+                "nodes": [
+                    {"id": "a", "subagent": "worker"},
+                    {"id": "b", "subagent": "worker"},
+                    {"id": "c", "subagent": "worker"},
+                ],
+            }
+        )
+        collect_gate = self.host.gate("rlm.collect", 1)
+        delete_gate = self.host.gate("rlm.delete_subagent", 1)
+        result = await self.start()
+        self.assertEqual(result["started"], ["a", "b"])  # c waits for a slot
+        run = self.executor._runs[result["run_id"]]
+        await asyncio.sleep(0)  # the loop reaches collect#1 and suspends
+        stop_task = asyncio.ensure_future(rlm_module.rlm.factory.stop(result["run_id"]))
+        for _ in range(1000):
+            if run.state == "stopping":
+                break
+            await asyncio.sleep(0)
+        self.assertEqual(run.state, "stopping")
+        # release the collect: the loop settles a and b inside the stop window
+        collect_gate.set()
+        await run.task  # the loop must exit on "stopping" without admitting c
+        delete_gate.set()
+        stopped = await stop_task
+        self.assertEqual(stopped["state"], "stopped")
+        status = await rlm_module.rlm.factory.status(result["run_id"])
+        self.assertEqual(status["state"], "stopped")
+        # never finalized: no finished notice, and c was never admitted
+        self.assertEqual(self.host.notice_kinds(), [])
+        self.assertEqual(len(self.host.calls_of("rlm.run")), 2)
 
     @async_test
     async def test_rate_limit_at_admission_defers_to_backoff(self) -> None:

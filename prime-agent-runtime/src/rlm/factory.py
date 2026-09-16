@@ -874,7 +874,7 @@ class FactoryRun:
     run_id: str
     spec_id: str
     name: str | None
-    state: str = "running"  # running | paused | done | failed | stopped
+    state: str = "running"  # running | stopping | paused | done | failed | stopped
     started_at: float = 0.0
     max_parallel: int = RUN_MAX_PARALLEL_DEFAULT
     run_budget_ms: int | None = None
@@ -1023,8 +1023,17 @@ class FactoryExecutor:
         }
 
     async def stop(self, run_id: str) -> dict[str, Any]:
-        """Cancel every running child of the run and mark it stopped."""
+        """Cancel every running child of the run and mark it stopped.
+
+        Sets the transitional ``stopping`` state before the first await so
+        the control loop cannot admit new children or finalize the run
+        while the cancellations are in flight. Idempotent: a second stop
+        returns the same result without another ledger event.
+        """
         run = self._require_run(run_id)
+        if run.state == "stopped":
+            return {"run_id": run.run_id, "state": "stopped", "cancelled": []}
+        run.state = "stopping"
         stopped = await self._halt_nonterminal(run, "run stopped")
         run.state = "stopped"
         self._event(run, "run_stopped", detail=f"stopped; {len(stopped)} node(s) cancelled")
@@ -1043,7 +1052,9 @@ class FactoryExecutor:
         run.state = "running"
         run.pause_reason = None
         self._event(run, "resumed", detail="resumed by caller")
-        started = await self._spawn_ready(run, allow_backoff=True)
+        # allow_backoff=False: like run(), resume() must never sleep inside
+        # the calling model turn; rate-limited admissions defer to the loop.
+        started = await self._spawn_ready(run, allow_backoff=False)
         if self._run_complete(run):
             await self._finalize(run)
         elif run.state == "running":
@@ -1444,8 +1455,13 @@ class FactoryExecutor:
                 detail=f"attempt {instance.attempt} failed; re-spawning (retries {retries})",
             )
             return
-        if all(i.status in TERMINAL_NODE_STATUSES for i in node.instances):
-            await self._apply_node_failure_policy(run, node, reason)
+        # The instance failed permanently, so the node fails NOW. A foreach
+        # node does not wait for its remaining instances: without this, a
+        # failure that settles before its siblings leaves the node stuck in
+        # running with every instance terminal, and fail_fast could never
+        # cancel in-flight siblings. The policy guard makes the second and
+        # later permanent failures no-ops.
+        await self._apply_node_failure_policy(run, node, reason)
 
     async def _apply_node_failure_policy(self, run: FactoryRun, node: _NodeRun, reason: str) -> None:
         if node.status in ("error", "done", "cancelled"):
@@ -1454,13 +1470,22 @@ class FactoryExecutor:
         node.status = "error"
         node.error = reason
         self._event(run, "node_error", node=node.node_id, error=reason, detail=f"failure_policy {policy}")
+        if run.state != "running":
+            # stop() (or another transition) owns the run state now; keep the
+            # node's error but do not overwrite the final state.
+            return
         if policy == "fail_fast":
-            stopped = await self._halt_nonterminal(run, "run failed (fail_fast)")
+            await self._halt_nonterminal(run, "run failed (fail_fast)")
+            if run.state != "running":
+                return  # stop() landed during the cancellations; it wins
+            cancelled_children = sum(
+                1 for other in run.nodes.values() for i in other.instances if i.status == "cancelled"
+            )
             run.state = "failed"
             await self._milestone(
                 run,
                 "failed",
-                f"node {node.node_id} failed: {reason}; cancelled {len(stopped)} running node(s)",
+                f"node {node.node_id} failed: {reason}; cancelled {cancelled_children} in-flight child(ren)",
                 node=node.node_id,
             )
         elif policy == "continue":
@@ -1523,6 +1548,8 @@ class FactoryExecutor:
         return True
 
     async def _finalize(self, run: FactoryRun) -> None:
+        if run.state != "running":
+            return  # stop() or a failure policy owns the final state
         errors = [node for node in run.nodes.values() if node.status == "error"]
         if errors:
             run.state = "failed"
@@ -1557,13 +1584,15 @@ class FactoryExecutor:
             raise
         except Exception as exc:
             # A dead bridge or host failure must not wedge the run silently;
-            # children stay alive under the supervisor either way.
-            run.state = "failed"
+            # children stay alive under the supervisor either way. A stop()
+            # that landed concurrently keeps ownership of the final state.
             self._event(run, "executor_error", error=f"{type(exc).__name__}: {exc}")
-            try:
-                await self._milestone(run, "failed", f"executor error: {exc}")
-            except Exception:
-                pass
+            if run.state == "running":
+                run.state = "failed"
+                try:
+                    await self._milestone(run, "failed", f"executor error: {exc}")
+                except Exception:
+                    pass
 
     async def _loop_body(self, run: FactoryRun) -> None:
         from . import collect
@@ -1582,10 +1611,13 @@ class FactoryExecutor:
                     entry = settled.get(instance.child_id or "")
                     if entry is not None:
                         await self._apply_settlement(run, node, instance, entry)
+            # Re-check state before completion: stop() (or a policy transition)
+            # can land while the collect above was in flight, and a run that
+            # was stopped must never finalize as done.
+            if run.state != "running":
+                return
             if self._run_complete(run):
                 await self._finalize(run)
-                return
-            if run.state != "running":
                 return
             if run.run_budget_ms is not None and not run.budget_reported:
                 elapsed_ms = (self._now_fn() - run.started_at) * 1000

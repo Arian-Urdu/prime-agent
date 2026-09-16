@@ -15,6 +15,7 @@ import {
 	buildReviewSweepFailDag,
 	checkReplayLedger,
 	checkTaskSuccess,
+	computeVerdicts,
 	type EvalConfig,
 	type FactoryDagEvalTrialResult,
 	type FactoryLedgerEvent,
@@ -160,6 +161,20 @@ describe("prompt invariants", () => {
 			expect(review.subagent.prompt).toContain(file.code);
 			expect(review.subagent.prompt).toContain(file.issueId);
 		}
+	});
+
+	it("the review-sweep baseline embeds the mini-repo exactly once (honest lower bound)", () => {
+		const uniqueSnippet = "Math.max(value, max)"; // unique to file fa's listing line
+		const baseline = buildBaselinePrompt(byKind("review-sweep"), "/tmp/ledger.json");
+		expect(baseline.split(uniqueSnippet).length - 1).toBe(1);
+		// The baseline composes reviewer prompts by substitution from the shared template.
+		expect(baseline).toContain('reviewer_template.replace("{files}", name)');
+		expect(baseline).not.toContain("STATE: done");
+		const factoryParent = buildFactoryParentPrompt(byKind("review-sweep"), "/tmp/ledger.json");
+		expect(factoryParent.split(uniqueSnippet).length - 1).toBe(0);
+		// The other baseline arms also dropped the baked-in STATE.
+		expect(buildBaselinePrompt(byKind("builder"), "/tmp/ledger.json")).not.toContain("STATE: done");
+		expect(buildBaselinePrompt(byKind("resident-watcher"), "/tmp/ledger.json")).not.toContain("STATE: done");
 	});
 
 	it("the resident watcher prompt replies once and holds its turn open", () => {
@@ -357,6 +372,85 @@ describe("answer parsing and task-success checks", () => {
 		expect(checkTaskSuccess(factory, bad, null).ok).toBe(false);
 		expect(checkTaskSuccess(factory, null, null).problems).toContain("no ANSWER line in the parent's final text");
 	});
+
+	it("baseline arms cross-check the collect ledger against the ANSWER ids", () => {
+		const factory = byKind("review-sweep");
+		const baselineLedger = Object.fromEntries(
+			REVIEW_FILES.map((file) => [`reviewer-${file.name}`, `FOUND ${file.issueId}`]),
+		);
+		const good = checkTaskSuccess(factory, answer({ issues: REVIEW_ISSUE_IDS }), null, {
+			arm: "baseline",
+			baselineLedger,
+		});
+		expect(good.ok).toBe(true);
+		// No STATE field is required for baselines (the template no longer bakes one in).
+		expect(good.problems).toEqual([]);
+
+		// A planted id the children never reported must fail.
+		const shortLedger = { "reviewer-fa": "FOUND AUDIT-A1" };
+		const missingId = checkTaskSuccess(factory, answer({ issues: REVIEW_ISSUE_IDS }), null, {
+			arm: "baseline",
+			baselineLedger: shortLedger,
+		});
+		expect(missingId.ok).toBe(false);
+		expect(
+			missingId.problems.some((problem) => problem.includes("AUDIT-B1 missing from the baseline collect ledger")),
+		).toBe(true);
+
+		// An ANSWER id absent from the ledger must fail (the parent cannot invent it).
+		const invented = checkTaskSuccess(factory, answer({ issues: [...REVIEW_ISSUE_IDS, "AUDIT-Z9"] }), null, {
+			arm: "baseline",
+			baselineLedger,
+		});
+		expect(invented.ok).toBe(false);
+		expect(
+			invented.problems.some((problem) =>
+				problem.includes("AUDIT-Z9 is not present in the baseline collect ledger"),
+			),
+		).toBe(true);
+
+		// A missing ledger fails completion instead of passing on the self-reported ANSWER.
+		const noLedger = checkTaskSuccess(factory, answer({ issues: REVIEW_ISSUE_IDS }), null, {
+			arm: "baseline",
+			baselineLedger: null,
+		});
+		expect(noLedger.ok).toBe(false);
+		expect(noLedger.problems.some((problem) => problem.includes("baseline collect ledger missing"))).toBe(true);
+	});
+
+	it("baseline arms check builder markers and the resident chain against the collect ledger", () => {
+		const builder = byKind("builder");
+		const markers = Array.from({ length: WIDTH }, (_, i) => BUILDER_MARKER(i + 1));
+		const builderLedger = Object.fromEntries(markers.map((marker) => [`builder-${marker}`, `BUILT ${marker}`]));
+		expect(
+			checkTaskSuccess(builder, answer({ markers }), null, { arm: "baseline", baselineLedger: builderLedger }).ok,
+		).toBe(true);
+		const missingMarker = checkTaskSuccess(builder, answer({ markers }), null, {
+			arm: "baseline",
+			baselineLedger: { "builder-1": "BUILT swb-marker-1" },
+		});
+		expect(missingMarker.ok).toBe(false);
+		expect(
+			missingMarker.problems.some((problem) =>
+				problem.includes("swb-marker-2 missing from the baseline collect ledger"),
+			),
+		).toBe(true);
+
+		const resident = byKind("resident-watcher");
+		const residentLedger = { "task-a": "STEP swt-1", "task-b": "STEP swt-2" };
+		expect(
+			checkTaskSuccess(resident, answer({ markers: ["swt-1", "swt-2"], stopped: ["watcher"] }), null, {
+				arm: "baseline",
+				baselineLedger: residentLedger,
+			}).ok,
+		).toBe(true);
+		const missingTask = checkTaskSuccess(resident, answer({ markers: ["swt-1"], stopped: ["watcher"] }), null, {
+			arm: "baseline",
+			baselineLedger: residentLedger,
+		});
+		expect(missingTask.ok).toBe(false);
+		expect(missingTask.problems.some((problem) => problem.includes("swt-2 missing from the ANSWER line"))).toBe(true);
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -543,6 +637,60 @@ describe("replay checker", () => {
 		expect(result.problems.some((problem) => problem.includes("non-increasing seq"))).toBe(true);
 	});
 
+	it("flags a dropped event as a seq gap within the window (1, 2, 4)", () => {
+		const ledger = reviewSweepLedger();
+		// Drop event 3 (a spawned) and renumber nothing: the gap 2 -> 4 must fail even
+		// though every remaining seq is strictly increasing and unique.
+		const dropped = ledger.events.filter((event) => event.seq !== 3);
+		expect(dropped.map((event) => event.seq).slice(0, 4)).toEqual([1, 2, 4, 5]);
+		const result = checkReplayLedger({ ...ledger, events: dropped });
+		expect(result.ok).toBe(false);
+		expect(result.problems.some((problem) => problem.includes("seq gap"))).toBe(true);
+		expect(result.problems.some((problem) => problem.includes("expected 3, got 4"))).toBe(true);
+	});
+
+	it("accepts a retry ledger: two settled events on one spawned key match usage.settled", () => {
+		// A retried builder node: first attempt fails (settled error with duration),
+		// the retry event re-spawns, the second attempt settles done. The executor's
+		// settle_count increments per settlement, so usage.settled is 2 — the checker
+		// must count settled EVENTS, not distinct keys.
+		const ledger = statusLedgerFixture({
+			spec_id: "factory-dag-eval-builder",
+			state: "done",
+			nodes: [
+				nodeFixture("builder-1", "done", {
+					attempts: 2,
+					instances: [instanceFixture(-1, "done", { attempt: 2, duration_ms: 9_000 })],
+				}),
+			],
+			events: [
+				eventFixture(1, "run_started"),
+				eventFixture(2, "node_ready", { node: "builder-1" }),
+				eventFixture(3, "spawned", { node: "builder-1", instance: -1 }),
+				eventFixture(4, "settled", {
+					node: "builder-1",
+					instance: -1,
+					status: "error",
+					error: "child error",
+					duration_ms: 8_000,
+				}),
+				eventFixture(5, "retry", { node: "builder-1", instance: -1 }),
+				eventFixture(6, "spawned", { node: "builder-1", instance: -1 }),
+				eventFixture(7, "settled", { node: "builder-1", instance: -1, status: "done", duration_ms: 9_000 }),
+				eventFixture(8, "answer_captured", { node: "builder-1", instance: -1 }),
+				eventFixture(9, "milestone", { milestone: "finished" }),
+			],
+			usage: { spawns: 2, settled: 2, tool_uses: 2, max_parallel: 8, running: 0 },
+		});
+		const result = checkReplayLedger(ledger);
+		expect(result.problems).toEqual([]);
+		expect(result.ok).toBe(true);
+		// The old distinct-key count would have reported settled 1 != usage.settled 2.
+		const distinctKeyLedger = { ...ledger, usage: { ...ledger.usage, settled: 1 } };
+		const mismatch = checkReplayLedger(distinctKeyLedger);
+		expect(mismatch.problems.some((problem) => problem.includes("usage.settled"))).toBe(true);
+	});
+
 	it("flags unknown event kinds and stages", () => {
 		const ledger = reviewSweepLedger();
 		ledger.events[0] = eventFixture(1, "teleported");
@@ -604,6 +752,99 @@ describe("replay checker", () => {
 	});
 });
 
+describe("computeVerdicts", () => {
+	const trial = (overrides: Partial<FactoryDagEvalTrialResult>): FactoryDagEvalTrialResult => ({
+		factory: "review-sweep",
+		arm: "factory",
+		trial: 1,
+		model: "internal/glm-5.2-fast",
+		taskSuccess: true,
+		problems: [],
+		state: "done",
+		wallMs: 1_000,
+		contextTokens: null,
+		totalTokens: 1,
+		declaredFanIn: 4,
+		queueLatencyMs: null,
+		teardownLatencyMs: null,
+		declaredBudgetMs: 900_000,
+		budgetOvershootMs: 0,
+		elapsedMs: null,
+		spawns: null,
+		settled: null,
+		replayOk: null,
+		replayProblems: [],
+		answer: null,
+		ledger: null,
+		verdict: "pass",
+		...overrides,
+	});
+
+	it("excludes the escalation and dry-run probes from the budget sum", () => {
+		const verdicts = computeVerdicts([
+			trial({ factory: "review-sweep", budgetOvershootMs: 1_000 }),
+			trial({ factory: "review-sweep-fail", budgetOvershootMs: 50_000, verdict: "pass" }),
+			trial({ factory: "dry-run-reject", budgetOvershootMs: 70_000, verdict: "pass" }),
+		]);
+		expect(verdicts.budgetOvershootMs).toBe(1_000);
+		expect(verdicts.budgetOvershootZero).toBe(false);
+		expect(verdicts.failurePolicyMatched).toBe(true);
+		expect(verdicts.dryRunRejected).toBe(true);
+		const clean = computeVerdicts([
+			trial({ factory: "review-sweep", budgetOvershootMs: 0 }),
+			trial({ factory: "review-sweep-fail", budgetOvershootMs: 123, verdict: "fail" }),
+			trial({ factory: "dry-run-reject", budgetOvershootMs: 456, verdict: "fail" }),
+		]);
+		expect(clean.budgetOvershootMs).toBe(0);
+		expect(clean.budgetOvershootZero).toBe(true);
+		expect(clean.failurePolicyMatched).toBe(false);
+		expect(clean.dryRunRejected).toBe(false);
+	});
+
+	it("reports null probe verdicts when the probes did not run", () => {
+		const verdicts = computeVerdicts([trial({ factory: "review-sweep" })]);
+		expect(verdicts.failurePolicyMatched).toBeNull();
+		expect(verdicts.dryRunRejected).toBeNull();
+	});
+
+	it("averages context tokens per pair and flags lower only when measured", () => {
+		const verdicts = computeVerdicts([
+			trial({ factory: "review-sweep", trial: 1, contextTokens: 100 }),
+			trial({ factory: "review-sweep", trial: 2, contextTokens: 200 }),
+			trial({ factory: "review-sweep", arm: "baseline", trial: 1, contextTokens: 300 }),
+			trial({ factory: "review-sweep", arm: "baseline", trial: 2, contextTokens: 500 }),
+		]);
+		expect(verdicts.contextPairs).toHaveLength(1);
+		const pair = verdicts.contextPairs[0]!;
+		expect(pair.factoryContextTokens).toBe(150);
+		expect(pair.baselineContextTokens).toBe(400);
+		expect(pair.lower).toBe(true);
+		expect(pair.bothCorrect).toBe(true);
+
+		const higher = computeVerdicts([
+			trial({ factory: "review-sweep", contextTokens: 900 }),
+			trial({ factory: "review-sweep", arm: "baseline", contextTokens: 800 }),
+		]);
+		expect(higher.contextPairs[0]!.lower).toBe(false);
+
+		const unknown = computeVerdicts([
+			trial({ factory: "review-sweep", contextTokens: null }),
+			trial({ factory: "review-sweep", arm: "baseline", contextTokens: 800 }),
+		]);
+		expect(unknown.contextPairs[0]!.lower).toBeNull();
+
+		const incorrect = computeVerdicts([
+			trial({ factory: "review-sweep", contextTokens: 100, taskSuccess: false, verdict: "fail" }),
+			trial({ factory: "review-sweep", arm: "baseline", contextTokens: 800 }),
+		]);
+		expect(incorrect.contextPairs[0]!.bothCorrect).toBe(false);
+	});
+
+	it("keeps the static no-orchestration verdict asserted", () => {
+		expect(computeVerdicts([trial({ factory: "review-sweep" })]).noOrchestrationCode).toBe(true);
+	});
+});
+
 describe("args and report rendering", () => {
 	it("parses args with defaults and clamps the width", () => {
 		const defaults = parseEvalArgs([]);
@@ -619,6 +860,12 @@ describe("args and report rendering", () => {
 		expect(clamped.factories).toEqual(["builder", "review-sweep"]);
 		expect(clamped.trials).toBe(3);
 		expect(parseEvalArgs(["--nope"])).toEqual({ error: "Unknown argument: --nope" });
+		// A typo in --factories must fail before any token is spent.
+		const typo = parseEvalArgs(["--factories", "review-swep"]);
+		expect("error" in typo).toBe(true);
+		if ("error" in typo) expect(typo.error).toContain("Unknown factory in --factories: review-swep");
+		const mixed = parseEvalArgs(["--factories", "builder,review-swep"]);
+		expect("error" in mixed).toBe(true);
 	});
 
 	it("renders the markdown table, pair comparison, and verdict rules", () => {
@@ -664,12 +911,16 @@ describe("args and report rendering", () => {
 			config,
 		);
 		expect(markdown).toContain("# Factory DAG capability eval report");
+		expect(markdown).toContain("over budget ms*");
+		expect(markdown).toContain("budget overshoot is measured per arm and is not directly comparable*");
 		expect(markdown).toContain("| review-sweep | factory | 1 | ok | done |");
 		expect(markdown).toContain("| review-sweep | baseline | 1 | failed | done |");
 		expect(markdown).toContain("| review-sweep | 10000 | 20000 | yes | no |");
-		expect(markdown).toContain("no task-specific orchestration code in factory prompts: PASS");
+		expect(markdown).toContain(
+			"no task-specific orchestration code in factory prompts (asserted statically, prompt invariant): PASS",
+		);
 		expect(markdown).toContain("declared failure policy matches observed behavior (escalation): (not run)");
-		expect(markdown).toContain("total budget overshoot: 0 ms (PASS)");
+		expect(markdown).toContain("total budget overshoot (factory arms only): 0 ms (PASS)");
 		expect(markdown).toContain("- review-sweep/baseline/trial 1: planted issue AUDIT-A1 missing");
 	});
 });

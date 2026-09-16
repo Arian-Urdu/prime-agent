@@ -204,11 +204,6 @@ export function buildReviewerPromptTemplate(): string {
 	].join("\n");
 }
 
-/** Concrete per-file reviewer prompt (baseline arms render the same template). */
-export function buildReviewerPromptFor(fileName: string): string {
-	return buildReviewerPromptTemplate().replaceAll("{files}", fileName);
-}
-
 export function buildReportNodePrompt(): string {
 	return [
 		"You are the aggregation node of a pull-request review sweep.",
@@ -660,11 +655,6 @@ export function buildFactoryParentPrompt(factory: ReferenceFactory, ledgerPath: 
 	}
 }
 
-function reviewerPromptBlock(fileName: string): string {
-	const prompt = buildReviewerPromptFor(fileName);
-	return `\t"${fileName}": """\n${prompt.replaceAll("\n", "\n\t")}""",`;
-}
-
 function budgetLine(factory: ReferenceFactory): string {
 	return `Declared budget: complete the whole run within ${Math.round(factory.declaredBudgetMs / 60000)} minutes; each child within ${Math.round(NODE_BUDGET_MS / 60000)} minutes.`;
 }
@@ -677,16 +667,13 @@ export function buildBaselinePrompt(factory: ReferenceFactory, ledgerPath: strin
 				"Capability eval: manual multi-agent orchestration (baseline). Do the identical pull-request review sweep by orchestrating the children yourself with rlm.spawn and rlm.collect. Do NOT use the factory executor.",
 				budgetLine(factory),
 				"",
-				"Mini-repo under review (four files, one planted defect each):",
-				"",
-				miniRepoListing(),
-				"",
-				"Step 1 — spawn one reviewer child per file in one ipython cell, using the exact child prompts below. Do not set a model on the spawn; children inherit yours.",
+				"Step 1 — spawn one reviewer child per file in one ipython cell. Each child's prompt is the reviewer template below with the placeholder {files} replaced by the file's name; compose the four prompts by substitution. Do not set a model on the spawn; children inherit yours.",
 				"",
 				"import asyncio, json",
-				"reviewer_prompts = {",
-				...REVIEW_FILES.map((file) => reviewerPromptBlock(file.name)),
-				"}",
+				'reviewer_template = """',
+				`\t${buildReviewerPromptTemplate().replaceAll("\n", "\n\t")}`,
+				'\t"""',
+				'reviewer_prompts = {name: reviewer_template.replace("{files}", name) for name in ["fa", "fb", "fc", "fd"]}',
 				'handles = {name: await rlm.spawn(prompt, name=f"reviewer-{name}") for name, prompt in reviewer_prompts.items()}',
 				'ids = [handle.rlm_child_id for handle in handles.values()]',
 				"",
@@ -703,9 +690,8 @@ export function buildBaselinePrompt(factory: ReferenceFactory, ledgerPath: strin
 				"",
 				"Step 3 — aggregate the found audit ids from the four answer previews yourself and output exactly one line and nothing else:",
 				"",
-				"ANSWER: ISSUES: <every audit id found, comma-separated, sorted>; STATE: done",
-			].join("\n");
-		case "builder": {
+				"ANSWER: ISSUES: <every audit id found, comma-separated, sorted>",
+			].join("\n");		case "builder": {
 			const width = factory.width ?? DEFAULT_WIDTH;
 			const prompts = Array.from({ length: width }, (_, i) => {
 				const prompt = buildBuilderNodePrompt(i + 1);
@@ -737,7 +723,7 @@ export function buildBaselinePrompt(factory: ReferenceFactory, ledgerPath: strin
 				"",
 				"Step 3 — merge the builder markers from the answer previews yourself and output exactly one line and nothing else:",
 				"",
-				"ANSWER: MARKERS: <every swb-marker found, comma-separated, in ascending node order>; STATE: done",
+				"ANSWER: MARKERS: <every swb-marker found, comma-separated, in ascending node order>",
 			].join("\n");
 		}
 		case "resident-watcher":
@@ -783,7 +769,7 @@ export function buildBaselinePrompt(factory: ReferenceFactory, ledgerPath: strin
 				"",
 				"Step 5 — output exactly one line and nothing else:",
 				"",
-				"ANSWER: MARKERS: <the two step markers from the answers, comma-separated>; STOPPED: watcher; STATE: done",
+				"ANSWER: MARKERS: <the two step markers from the answers, comma-separated>; STOPPED: watcher",
 			].join("\n");
 		default:
 			throw new Error(`no baseline exists for reference factory kind ${factory.kind}`);
@@ -1004,6 +990,9 @@ export function checkReplayLedger(ledger: unknown): LedgerCheckResult {
 			problems.push(`events[${index}] has a non-increasing seq: ${JSON.stringify(seq)}`);
 			continue;
 		}
+		if (seq !== lastSeq + 1) {
+			problems.push(`events[${index}] has a seq gap: expected ${lastSeq + 1}, got ${seq} (dropped event)`);
+		}
 		if (index === 0 && seq !== 1) truncated = true;
 		lastSeq = seq;
 		if (!KNOWN_FACTORY_EVENT_KINDS.includes(event.kind as (typeof KNOWN_FACTORY_EVENT_KINDS)[number])) {
@@ -1104,7 +1093,12 @@ export function checkReplayLedger(ledger: unknown): LedgerCheckResult {
 			}
 		}
 		const spawnEvents = [...spawned.values()].reduce((sum, count) => sum + count, 0);
-		const collectSettles = [...settled.entries()].filter(([key]) => (spawned.get(key) ?? 0) > 0).length;
+		// Count settled EVENTS on spawned keys, not distinct keys: a retried instance
+		// settles twice on the same key and the executor's settle_count increments per
+		// settlement (including retries), so the ledger must match event counts.
+		const collectSettles = [...settled.entries()]
+			.filter(([key]) => (spawned.get(key) ?? 0) > 0)
+			.reduce((sum, [, count]) => sum + count, 0);
 		if (ledger.usage.spawns !== spawnEvents) {
 			problems.push(`usage.spawns ${ledger.usage.spawns} does not match ${spawnEvents} spawned event(s)`);
 		}
@@ -1156,47 +1150,104 @@ export function runReplayChecks(data: unknown): { ok: boolean; ledgers: { id: st
 // Task-success checking (checkable answers + ledger cross-checks).
 // ---------------------------------------------------------------------------
 
+export interface TaskCheckOptions {
+	/** Which arm is being checked; defaults to the factory arm. */
+	arm?: "factory" | "baseline";
+	/** The baseline parent's collect dump ({ child name: answer preview }); factory arms ignore it. */
+	baselineLedger?: Record<string, unknown> | null;
+}
+
+/** Join the baseline collect dump's answer previews into one searchable text; null when absent. */
+function baselineLedgerText(baselineLedger: Record<string, unknown> | null | undefined): string | null {
+	if (!baselineLedger || typeof baselineLedger !== "object") return null;
+	return Object.values(baselineLedger)
+		.filter((value): value is string => typeof value === "string")
+		.join("\n");
+}
+
+/**
+ * Check the parent's ANSWER against the factory's checkable answer. The factory arm
+ * cross-checks the saved status ledger; the baseline arm instead cross-checks the
+ * parent's own collect dump against the ANSWER ids, so a baseline trial cannot pass
+ * on a self-reported ANSWER the children never produced.
+ */
 export function checkTaskSuccess(
 	factory: ReferenceFactory,
 	answer: ParsedAnswer | null,
 	ledger: FactoryStatusLedger | null,
+	options: TaskCheckOptions = {},
 ): { ok: boolean; problems: string[] } {
 	const problems: string[] = [];
 	if (answer === null) return { ok: false, problems: ["no ANSWER line in the parent's final text"] };
+	const baseline = options.arm === "baseline";
 	const width = factory.width ?? DEFAULT_WIDTH;
 	const nodeStatus = (id: string): FactoryLedgerNode | undefined => ledger?.nodes.find((node) => node.id === id);
+	const ledgerText = baseline ? baselineLedgerText(options.baselineLedger) : null;
 	switch (factory.kind) {
 		case "review-sweep": {
 			for (const issueId of REVIEW_ISSUE_IDS) {
 				if (!answer.issues.includes(issueId)) problems.push(`planted issue ${issueId} missing from the ANSWER line`);
 			}
-			if (answer.state !== "done") problems.push(`ANSWER state is ${answer.state ?? "unset"}, expected done`);
-			if (ledger !== null) {
-				if (ledger.state !== "done") problems.push(`ledger state is ${ledger.state}, expected done`);
-				const report = nodeStatus("report");
-				if (report?.status !== "done") problems.push("ledger report node is not done");
-				for (const issueId of REVIEW_ISSUE_IDS) {
-					if (!report?.answer_preview?.includes(issueId)) {
-						problems.push(`planted issue ${issueId} missing from the report node answer preview`);
+			if (baseline) {
+				if (ledgerText === null) {
+					problems.push("baseline collect ledger missing (cannot verify the ANSWER against the children)");
+				} else {
+					for (const issueId of REVIEW_ISSUE_IDS) {
+						if (!ledgerText.includes(issueId)) {
+							problems.push(`planted issue ${issueId} missing from the baseline collect ledger`);
+						}
+					}
+					for (const issueId of answer.issues) {
+						if (!ledgerText.includes(issueId)) {
+							problems.push(`ANSWER issue ${issueId} is not present in the baseline collect ledger`);
+						}
+					}
+				}
+			} else {
+				if (answer.state !== "done") problems.push(`ANSWER state is ${answer.state ?? "unset"}, expected done`);
+				if (ledger !== null) {
+					if (ledger.state !== "done") problems.push(`ledger state is ${ledger.state}, expected done`);
+					const report = nodeStatus("report");
+					if (report?.status !== "done") problems.push("ledger report node is not done");
+					for (const issueId of REVIEW_ISSUE_IDS) {
+						if (!report?.answer_preview?.includes(issueId)) {
+							problems.push(`planted issue ${issueId} missing from the report node answer preview`);
+						}
 					}
 				}
 			}
 			break;
 		}
 		case "builder": {
-			for (let index = 1; index <= width; index++) {
-				const marker = BUILDER_MARKER(index);
+			const markers = Array.from({ length: width }, (_, index) => BUILDER_MARKER(index + 1));
+			for (const marker of markers) {
 				if (!answer.markers.includes(marker)) problems.push(`${marker} missing from the ANSWER line`);
 			}
-			if (answer.state !== "done") problems.push(`ANSWER state is ${answer.state ?? "unset"}, expected done`);
-			if (ledger !== null) {
-				if (ledger.state !== "done") problems.push(`ledger state is ${ledger.state}, expected done`);
-				const collector = nodeStatus("collector");
-				if (collector?.status !== "done") problems.push("ledger collector node is not done");
-				for (let index = 1; index <= width; index++) {
-					const marker = BUILDER_MARKER(index);
-					if (!collector?.answer_preview?.includes(marker)) {
-						problems.push(`${marker} missing from the collector answer preview`);
+			if (baseline) {
+				if (ledgerText === null) {
+					problems.push("baseline collect ledger missing (cannot verify the ANSWER against the children)");
+				} else {
+					for (const marker of markers) {
+						if (!ledgerText.includes(marker)) {
+							problems.push(`${marker} missing from the baseline collect ledger`);
+						}
+					}
+					for (const marker of answer.markers) {
+						if (!ledgerText.includes(marker)) {
+							problems.push(`ANSWER marker ${marker} is not present in the baseline collect ledger`);
+						}
+					}
+				}
+			} else {
+				if (answer.state !== "done") problems.push(`ANSWER state is ${answer.state ?? "unset"}, expected done`);
+				if (ledger !== null) {
+					if (ledger.state !== "done") problems.push(`ledger state is ${ledger.state}, expected done`);
+					const collector = nodeStatus("collector");
+					if (collector?.status !== "done") problems.push("ledger collector node is not done");
+					for (const marker of markers) {
+						if (!collector?.answer_preview?.includes(marker)) {
+							problems.push(`${marker} missing from the collector answer preview`);
+						}
 					}
 				}
 			}
@@ -1207,7 +1258,22 @@ export function checkTaskSuccess(
 				if (!answer.markers.includes(marker)) problems.push(`${marker} missing from the ANSWER line`);
 			}
 			if (!answer.stopped.includes("watcher")) problems.push("ANSWER does not report the resident watcher as stopped");
-			if (ledger !== null) {
+			if (baseline) {
+				if (ledgerText === null) {
+					problems.push("baseline collect ledger missing (cannot verify the ANSWER against the children)");
+				} else {
+					for (const marker of [TASK_MARKER_A, TASK_MARKER_B]) {
+						if (!ledgerText.includes(marker)) {
+							problems.push(`${marker} missing from the baseline collect ledger`);
+						}
+					}
+					for (const marker of answer.markers) {
+						if (!ledgerText.includes(marker)) {
+							problems.push(`ANSWER marker ${marker} is not present in the baseline collect ledger`);
+						}
+					}
+				}
+			} else if (ledger !== null) {
 				if (ledger.state !== "stopped") problems.push(`ledger state is ${ledger.state}, expected stopped`);
 				for (const id of ["task-a", "task-b"]) {
 					if (nodeStatus(id)?.status !== "done") problems.push(`ledger ${id} node is not done`);
@@ -1322,7 +1388,7 @@ export function computeVerdicts(results: FactoryDagEvalTrialResult[]): EvalVerdi
 		});
 	}
 	return {
-		noOrchestrationCode: true, // Static: buildFactoryParentPrompt emits no spawn/collect calls (unit-tested).
+		noOrchestrationCode: true, // Asserted statically: buildFactoryParentPrompt emits no spawn/collect calls (prompt invariant, unit-tested).
 		failurePolicyMatched: escalation ? escalation.verdict === "pass" : null,
 		dryRunRejected: dryRun ? dryRun.verdict === "pass" : null,
 		budgetOvershootMs,
@@ -1346,8 +1412,9 @@ export function renderMarkdownReport(results: FactoryDagEvalTrialResult[], confi
 		`- declared budgets: run ${RUN_BUDGET_MS} ms, per task node ${NODE_BUDGET_MS} ms (same for each factory/baseline pair)`,
 		"- queue latency: omitted (the executor event ledger carries no timestamps)",
 		"- teardown latency: resident trial, finished-notice to final answer",
+		"- budget overshoot is measured per arm and is not directly comparable*: factory arms use the run ledger's elapsed_ms against the declared run budget; baseline arms use full wall clock (an upper bound) against the same budget",
 		"",
-		"| factory | arm | trial | task | state | wall s | ctx tokens | total tokens | fan-in | teardown ms | over budget ms | replay | verdict |",
+		"| factory | arm | trial | task | state | wall s | ctx tokens | total tokens | fan-in | teardown ms | over budget ms* | replay | verdict |",
 		"| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
 	];
 	const rows = results.map((row) =>
@@ -1387,10 +1454,12 @@ export function renderMarkdownReport(results: FactoryDagEvalTrialResult[], confi
 		"",
 		"## Verdict rules (Notion spec, Proposed evaluation)",
 		"",
-		`- no task-specific orchestration code in factory prompts: ${verdicts.noOrchestrationCode ? "PASS" : "FAIL"}`,
+		`- no task-specific orchestration code in factory prompts (asserted statically, prompt invariant): ${
+			verdicts.noOrchestrationCode ? "PASS" : "FAIL"
+		}`,
 		`- declared failure policy matches observed behavior (escalation): ${renderVerdict(verdicts.failurePolicyMatched)}`,
 		`- no node starts after a failed dry run: ${renderVerdict(verdicts.dryRunRejected)}`,
-		`- total budget overshoot: ${verdicts.budgetOvershootMs} ms ${renderVerdict(verdicts.budgetOvershootZero)}`,
+		`- total budget overshoot (factory arms only): ${verdicts.budgetOvershootMs} ms ${renderVerdict(verdicts.budgetOvershootZero)}`,
 		"- parent context lower than baseline: reported per pair above (informational, not asserted)",
 		"",
 		"## Problems",
@@ -1455,11 +1524,16 @@ export function parseEvalArgs(argv: string[], defaults = DEFAULT_EVAL_CONFIG): E
 				break;
 			case "--factories": {
 				const known: FactorySelection[] = ["review-sweep", "builder", "resident-watcher"];
-				const selected = value(arg)
+				const names = value(arg)
 					.split(",")
 					.map((raw) => raw.trim())
-					.filter((raw) => raw.length > 0)
-					.filter((raw): raw is FactorySelection => known.includes(raw as FactorySelection));
+					.filter((raw) => raw.length > 0);
+				// A typo must fail before any token is spent, not silently run the defaults.
+				const unknown = names.filter((raw) => !known.includes(raw as FactorySelection));
+				if (unknown.length > 0) {
+					return { error: `Unknown factory in --factories: ${unknown.join(", ")} (known: ${known.join(", ")})` };
+				}
+				const selected = names as FactorySelection[];
 				if (selected.length > 0) args.factories = selected;
 				break;
 			}
@@ -1674,10 +1748,9 @@ async function runBaselineTrial(
 			problems.push(`parent turn failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
 		const answer = parseAnswerLine(bundle.session.getLastAssistantText());
-		const check = checkTaskSuccess(factory, answer, null);
-		problems.push(...check.problems);
 		const baselineLedger = readBaselineLedger(ledgerPath);
-		if (baselineLedger === null) problems.push("baseline collect ledger missing (not fatal, recorded)");
+		const check = checkTaskSuccess(factory, answer, null, { arm: "baseline", baselineLedger });
+		problems.push(...check.problems);
 		const contextTokens = lastAssistantContextTokens(bundle.session);
 		const stats = bundle.session.getSessionStats();
 		const wallMs = Date.now() - startedAt;

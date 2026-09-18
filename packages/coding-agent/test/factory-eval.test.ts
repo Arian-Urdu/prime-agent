@@ -133,16 +133,22 @@ describe("reference factory shapes", () => {
 		expect(dag.nodes[0]?.subagent).toBe("no-such-subagent-entry");
 	});
 
-	it("builds the pr-manager machine with guarded transitions and a resident monitor", () => {
+	it("builds the pr-manager machine with a closed review/fix loop and a resident monitor", () => {
 		const machine = buildPrManagerMachine();
 		expect(machine.states.map((state) => state.id)).toEqual(["entry", "reviewing", "fixing", "monitoring"]);
 		expect(machine.states[0]?.entry).toBe(true);
 		expect(machine.states.slice(1).every((state) => !state.entry)).toBe(true);
 		expect(machine.states[1]?.max_entries).toBe(4);
 		expect(machine.states[2]?.max_entries).toBe(3);
-		expect(machine.states[1]?.inputs).toEqual([{ name: "pr_url", type: "text", from: "entry.pr_url" }]);
+		// the loop closes: reviewing reads the previous fix report (optional, so the
+		// first review binds null before the fixer ever runs)
+		expect(machine.states[1]?.inputs).toEqual([
+			{ name: "pr_url", type: "text", from: "entry.pr_url" },
+			{ name: "fix_report", type: "json", from: "fixing.fix_report", optional: true },
+		]);
 		expect(machine.states[1]?.outputs).toEqual([{ name: "verdict", type: "json" }]);
 		expect(machine.states[2]?.inputs).toEqual([{ name: "verdict", type: "json", from: "reviewing.verdict" }]);
+		expect(machine.states[2]?.outputs).toEqual([{ name: "fix_report", type: "json" }]);
 		const monitoring = machine.states[3];
 		expect(monitoring?.lifecycle).toBe("resident");
 		expect(monitoring?.outputs).toBeUndefined();
@@ -162,6 +168,11 @@ describe("reference factory shapes", () => {
 			},
 			{ from: "fixing", to: "reviewing" },
 		]);
+		// wait blocks are gated at the kernel until the rlm.watch.* handlers land
+		// (the TS shape types carry no wait field, so scan the serialized spec)
+		for (const factory of referenceFactories) {
+			if (factory.machine) expect(JSON.stringify(factory.machine)).not.toContain('"wait"');
+		}
 	});
 
 	it("seeds the pr-manager as a machine-form reference factory", () => {
@@ -241,7 +252,10 @@ describe("prompt invariants", () => {
 		const fixing = machine.states.find((state) => state.id === "fixing")?.subagent;
 		if (typeof reviewing !== "object" || typeof fixing !== "object") throw new Error("inline prompts");
 		expect(reviewing.prompt).toContain("{pr_url}");
+		expect(reviewing.prompt).toContain("{fix_report}");
+		expect(reviewing.prompt).toContain("null means no fixing round has run yet");
 		expect(fixing.prompt).toContain("{verdict}");
+		expect(fixing.prompt).toContain("fix_report");
 		for (const file of REVIEW_FILES) {
 			expect(reviewing.prompt).toContain(file.issueId);
 			expect(fixing.prompt).toContain(file.issueId);
@@ -303,12 +317,26 @@ describe("harness state seeding", () => {
 		}
 	});
 
-	it("seeds machine-form reference factories under arguments.machine", () => {
+	it("seeds machine-form reference factories under arguments.machine (full round-trip)", () => {
 		const prManager = byKind("pr-manager");
+		const tempDir = mkdtempSync(join(tmpdir(), "factory-dag-eval-seed-machine-"));
+		try {
+			const stateDir = join(tempDir, "harness");
+			mkdirSync(stateDir, { recursive: true });
+			writeFileSync(join(stateDir, "harness_state.json"), buildHarnessStateFile([prManager]));
+			const state = loadHarnessState(stateDir, "local");
+			const entry = state.entries.factory[prManager.id];
+			expect(entry).toBeDefined();
+			expect(entry?.kind).toBe("factory");
+			expect(entry?.scope).toBe("local");
+			expect(entry?.arguments.machine).toEqual(prManager.machine);
+			expect(entry?.arguments.dag).toBeUndefined();
+			expect(Object.keys(state.entries.factory)).toEqual([prManager.id]);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
 		const file = JSON.parse(buildHarnessStateFile([prManager]));
-		const entry = file.entries.factory[prManager.id];
-		expect(entry?.arguments.machine).toEqual(prManager.machine);
-		expect(entry?.arguments.dag).toBeUndefined();
+		expect(file.entries.factory[prManager.id]?.arguments.machine).toEqual(prManager.machine);
 		expect(factorySpecArguments(prManager)).toEqual({ machine: prManager.machine });
 		expect(factorySpecArguments(byKind("review-sweep"))).toEqual({ dag: byKind("review-sweep").dag });
 	});
@@ -712,45 +740,45 @@ function escalationLedger(): FactoryStatusLedger {
 }
 
 function prManagerLedger(): FactoryStatusLedger {
-	// The pr-manager's expected two-round shape: entry -> reviewing (verdict
-	// false) -> fixing -> reviewing (verdict false) -> fixing -> reviewing
-	// (verdict true) -> resident monitoring, then the caller stops the run.
+	// The pr-manager's closed two-round loop: entry -> reviewing (fix report
+	// null, verdict false, all four findings) -> fixing (fix_report with all
+	// four ids) -> reviewing (verdict approved true) -> resident monitoring,
+	// then the caller stops the run. rounds = reviewing entries_used = 2.
 	const events: FactoryLedgerEvent[] = [];
 	let seq = 0;
 	const push = (kind: string, extra: Partial<FactoryLedgerEvent> = {}) => {
 		seq += 1;
 		events.push(eventFixture(seq, kind, extra));
 	};
-	const settle = (node: string, index: number, answer: string) => {
-		push("node_ready", { node, entry: 0, instance: index });
-		push("spawned", { node, entry: 0, instance: index });
-		push("settled", { node, entry: 0, instance: index, status: "done", duration_ms: 6_000 });
-		push("answer_captured", { node, entry: 0, instance: index, answer });
+	const settle = (node: string, entry: number, instance: number, answer: string) => {
+		push("node_ready", { node, entry, instance });
+		push("spawned", { node, entry, instance });
+		push("settled", { node, entry, instance, status: "done", duration_ms: 6_000 });
+		push("answer_captured", { node, entry, instance, answer });
 	};
 	push("run_started", { detail: "4 states, max_parallel 8" });
 	push("state_entry", { node: "entry", entry: 0, detail: "entry state" });
-	settle("entry", 0, "PR swp://mini-repo: the snapshot under review carries four planted defects with audit notes");
+	settle("entry", 0, 0, "PR swp://mini-repo: the snapshot under review carries four planted defects with audit notes");
 	push("transition_fired", { from: "entry", to: "reviewing", detail: "'entry' -> 'reviewing'" });
 	push("state_entry", { node: "reviewing", entry: 0, detail: "entered from entry" });
-	settle("reviewing", 0, '```json\n{"verdict": {"approved": false, "findings": ["AUDIT-A1","AUDIT-B1"]}}\n```');
+	settle(
+		"reviewing",
+		0,
+		0,
+		'```json\n{"verdict": {"approved": false, "findings": ["AUDIT-A1","AUDIT-B1","AUDIT-C1","AUDIT-D1"]}}\n```',
+	);
 	push("transition_fired", { from: "reviewing", to: "fixing", detail: "'reviewing' -> 'fixing'" });
 	push("state_entry", { node: "fixing", entry: 0, detail: "entered from reviewing" });
-	settle("fixing", 0, "FIXED AUDIT-A1, AUDIT-B1");
+	settle("fixing", 0, 0, '```json\n{"fix_report": {"fixed": ["AUDIT-A1","AUDIT-B1","AUDIT-C1","AUDIT-D1"]}}\n```');
 	push("transition_fired", { from: "fixing", to: "reviewing", detail: "'fixing' -> 'reviewing'" });
 	push("state_entry", { node: "reviewing", entry: 1, detail: "entered from fixing" });
-	settle("reviewing", 1, '```json\n{"verdict": {"approved": false, "findings": ["AUDIT-C1","AUDIT-D1"]}}\n```');
-	push("transition_fired", { from: "reviewing", to: "fixing", detail: "'reviewing' -> 'fixing'" });
-	push("state_entry", { node: "fixing", entry: 1, detail: "entered from reviewing" });
-	settle("fixing", 1, "FIXED AUDIT-C1, AUDIT-D1");
-	push("transition_fired", { from: "fixing", to: "reviewing", detail: "'fixing' -> 'reviewing'" });
-	push("state_entry", { node: "reviewing", entry: 2, detail: "entered from fixing" });
-	settle("reviewing", 2, '```json\n{"verdict": {"approved": true, "findings": []}}\n```');
+	settle("reviewing", 1, 1, '```json\n{"verdict": {"approved": true, "findings": []}}\n```');
 	push("transition_fired", { from: "reviewing", to: "monitoring", detail: "'reviewing' -> 'monitoring'" });
 	push("state_entry", { node: "monitoring", entry: 0, detail: "entered from reviewing" });
 	push("node_ready", { node: "monitoring", entry: 0 });
 	push("spawned", { node: "monitoring", entry: 0, instance: 0 });
 	push("milestone", { milestone: "finished", detail: "resident still running" });
-	push("cancelled", { node: "monitoring", entry: 0, instance: 0, child: "child-7", detail: "watch cancelled" });
+	push("cancelled", { node: "monitoring", entry: 0, instance: 0, child: "child-5", detail: "resident torn down" });
 	push("run_stopped", { detail: "stopped; 1 state(s) cancelled" });
 	return statusLedgerFixture({
 		spec_id: "factory-dag-eval-pr-manager",
@@ -763,20 +791,19 @@ function prManagerLedger(): FactoryStatusLedger {
 				entries: [{ index: 0, status: "done" }],
 			}),
 			nodeFixture("reviewing", "done", {
-				attempts: 3,
-				instances: [0, 1, 2].map((index) => instanceFixture(index, "done", { entry: index, duration_ms: 6_000 })),
-				entries_used: 3,
-				max_entries: 4,
-				entries: [0, 1, 2].map((index) => ({ index, status: "done" })),
-				answer_preview: '```json\n{"verdict": {"approved": true, "findings": []}}\n```',
-			}),
-			nodeFixture("fixing", "done", {
 				attempts: 2,
 				instances: [0, 1].map((index) => instanceFixture(index, "done", { entry: index, duration_ms: 6_000 })),
 				entries_used: 2,
-				max_entries: 3,
+				max_entries: 4,
 				entries: [0, 1].map((index) => ({ index, status: "done" })),
-				answer_preview: "FIXED AUDIT-C1, AUDIT-D1",
+				answer_preview: '```json\n{"verdict": {"approved": true, "findings": []}}\n```',
+			}),
+			nodeFixture("fixing", "done", {
+				instances: [instanceFixture(0, "done", { duration_ms: 6_000 })],
+				entries_used: 1,
+				max_entries: 3,
+				entries: [{ index: 0, status: "done" }],
+				answer_preview: '```json\n{"fix_report": {"fixed": ["AUDIT-A1","AUDIT-B1","AUDIT-C1","AUDIT-D1"]}}\n```',
 			}),
 			nodeFixture("monitoring", "cancelled", {
 				lifecycle: "resident",
@@ -788,7 +815,7 @@ function prManagerLedger(): FactoryStatusLedger {
 			}),
 		],
 		events,
-		usage: { spawns: 7, settled: 6, tool_uses: 7, max_parallel: 8, running: 0, transitions_fired: 6 },
+		usage: { spawns: 5, settled: 4, tool_uses: 5, max_parallel: 8, running: 0, transitions_fired: 4 },
 	});
 }
 
@@ -873,47 +900,85 @@ describe("pr-manager task checks", () => {
 		);
 	});
 
-	it("cross-checks the machine ledger: fixing rounds, the fix ledger, and the resident teardown", () => {
+	it("cross-checks the machine ledger: review rounds, the fix ledger, and the resident teardown", () => {
 		const ledger = prManagerLedger();
 		const reviewing = ledger.nodes.find((node) => node.id === "reviewing");
 		const fixing = ledger.nodes.find((node) => node.id === "fixing");
-		expect(reviewing?.entries_used).toBe(3);
+		// the closed loop: two reviewing rounds (rounds), one fixing round
+		expect(reviewing?.entries_used).toBe(2);
 		expect(reviewing?.max_entries).toBe(4);
-		expect(fixing?.entries_used).toBe(2);
+		expect(fixing?.entries_used).toBe(1);
 		const ok = checkReplayLedger(ledger);
 		expect(ok.problems).toEqual([]);
 		// mutating the ledger breaks the task check
 		const broken = structuredClone(ledger);
-		const brokenFixing = broken.nodes.find((node) => node.id === "fixing");
-		brokenFixing!.entries_used = 3;
+		const brokenReviewing = broken.nodes.find((node) => node.id === "reviewing");
+		brokenReviewing!.entries_used = 3;
 		const check = checkTaskSuccess(prManager, prAnswer(), broken);
-		expect(check.problems.some((problem) => problem.includes("fixing entries_used"))).toBe(true);
+		expect(check.problems.some((problem) => problem.includes("reviewing entries_used"))).toBe(true);
+		// a forged approved verdict (loose "true" substring, not the parsed field) fails
+		const forged = structuredClone(ledger);
+		const forgedReviewing = forged.nodes.find((node) => node.id === "reviewing");
+		forgedReviewing!.answer_preview = "verdict said false but this preview contains the word true somewhere";
+		const forgedCheck = checkTaskSuccess(prManager, prAnswer(), forged);
+		expect(forgedCheck.problems.some((problem) => problem.includes("not approved true"))).toBe(true);
 		// a missing planted defect in the fix ledger breaks the check
 		const holed = structuredClone(ledger);
 		for (const event of holed.events) {
-			if (event.kind === "answer_captured" && event.node === "fixing") event.answer = "FIXED AUDIT-C1, AUDIT-D1";
+			if (event.kind === "answer_captured" && event.node === "fixing") {
+				event.answer = '```json\n{"fix_report": {"fixed": ["AUDIT-A1","AUDIT-B1"]}}\n```';
+			}
 		}
 		const holedFixing = holed.nodes.find((node) => node.id === "fixing");
-		holedFixing!.answer_preview = undefined;
+		holedFixing!.answer_preview = '```json\n{"fix_report": {"fixed": ["AUDIT-A1","AUDIT-B1"]}}\n```';
 		const holedCheck = checkTaskSuccess(prManager, prAnswer(), holed);
 		expect(holedCheck.problems.some((problem) => problem.includes("missing from the fixing ledger"))).toBe(true);
 	});
 
-	it("accepts the baseline arm against the collect dump", () => {
+	it("accepts the baseline arm against the collect dump (ids, rounds, no inventions)", () => {
 		const baselineLedger = {
-			"pr-fixing-1": "FIXED AUDIT-A1, AUDIT-B1",
-			"pr-fixing-2": "FIXED AUDIT-C1, AUDIT-D1",
+			"pr-fixing-1": '```json\n{"fix_report": {"fixed": ["AUDIT-A1","AUDIT-B1","AUDIT-C1","AUDIT-D1"]}}\n```',
+			rounds: 2,
 		};
 		const check = checkTaskSuccess(prManager, prAnswer({ state: "done" }), null, {
 			arm: "baseline",
 			baselineLedger,
 		});
 		expect(check.problems).toEqual([]);
+		// a planted id the children never reported fails the baseline arm
 		const missing = checkTaskSuccess(prManager, prAnswer({ state: "done" }), null, {
 			arm: "baseline",
-			baselineLedger: { "pr-fixing-1": "FIXED AUDIT-A1, AUDIT-B1" },
+			baselineLedger: {
+				"pr-fixing-1": '```json\n{"fix_report": {"fixed": ["AUDIT-A1","AUDIT-B1"]}}\n```',
+				rounds: 2,
+			},
 		});
 		expect(missing.problems.some((problem) => problem.includes("baseline collect ledger"))).toBe(true);
+		// an invented ANSWER defect id (absent from the dump) is rejected
+		const invented = checkTaskSuccess(
+			prManager,
+			prAnswer({ state: "done", defects: [...REVIEW_ISSUE_IDS, "AUDIT-Z9"] }),
+			null,
+			{
+				arm: "baseline",
+				baselineLedger,
+			},
+		);
+		expect(
+			invented.problems.some((problem) =>
+				problem.includes("AUDIT-Z9 is not present in the baseline collect ledger"),
+			),
+		).toBe(true);
+		// a self-reported ROUNDS the dump does not carry is rejected
+		const wrongRounds = checkTaskSuccess(prManager, prAnswer({ state: "done", rounds: 3 }), null, {
+			arm: "baseline",
+			baselineLedger,
+		});
+		expect(
+			wrongRounds.problems.some((problem) =>
+				problem.includes("rounds 3 is not present in the baseline collect ledger"),
+			),
+		).toBe(true);
 	});
 });
 
@@ -935,6 +1000,56 @@ describe("replay checker", () => {
 		const wait = waitMachineLedger();
 		expect(wait.events.some((event) => event.kind === "wait_settled")).toBe(true);
 		expect(wait.events.some((event) => event.kind === "transition_blocked")).toBe(true);
+	});
+
+	it("flags a state_entry index gap (dropped or forged entry events)", () => {
+		const ledger = prManagerLedger();
+		const reviewingEntries = ledger.events.filter(
+			(event) => event.kind === "state_entry" && event.node === "reviewing",
+		);
+		expect(reviewingEntries.map((event) => event.entry)).toEqual([0, 1]);
+		reviewingEntries[1]!.entry = 2;
+		const result = checkReplayLedger(ledger);
+		expect(result.ok).toBe(false);
+		expect(result.problems.some((problem) => problem.includes("state_entry indices are not contiguous"))).toBe(true);
+		// the nodes[].entries report must match the state_entry events too
+		const mismatched = prManagerLedger();
+		const reported = mismatched.nodes.find((node) => node.id === "reviewing");
+		reported!.entries = [{ index: 0, status: "done" }];
+		const mismatchResult = checkReplayLedger(mismatched);
+		expect(mismatchResult.ok).toBe(false);
+		expect(mismatchResult.problems.some((problem) => problem.includes("do not match its state_entry events"))).toBe(
+			true,
+		);
+	});
+
+	it("flags a wait_settled node that spawned instances", () => {
+		const ledger = waitMachineLedger();
+		const result = checkReplayLedger(ledger);
+		expect(result.problems).toEqual([]);
+		// the same shape but the "watch" node spawned: impossible, must fail
+		const broken = waitMachineLedger();
+		broken.nodes[0]!.instances = [instanceFixture(0, "done", { duration_ms: 1_000 })];
+		broken.events.splice(3, 0, eventFixture(4, "spawned", { node: "watch", entry: 0, instance: 0 }));
+		for (const [position, event] of broken.events.slice(4).entries()) {
+			event.seq = 5 + position;
+		}
+		broken.usage = { spawns: 2, settled: 2, tool_uses: 2, max_parallel: 8, running: 0, transitions_fired: 1 };
+		const brokenResult = checkReplayLedger(broken);
+		expect(brokenResult.ok).toBe(false);
+		expect(brokenResult.problems.some((problem) => problem.includes("settled a wait but spawned"))).toBe(true);
+	});
+
+	it("flags transition events missing their from/to endpoints", () => {
+		const ledger = prManagerLedger();
+		const fired = ledger.events.find((event) => event.kind === "transition_fired");
+		if (!fired) throw new Error("fixture lost its transition event");
+		const from = fired.from;
+		fired.from = undefined;
+		const result = checkReplayLedger(ledger);
+		expect(result.ok).toBe(false);
+		expect(result.problems.some((problem) => problem.includes("requires from and to"))).toBe(true);
+		fired.from = from;
 	});
 
 	it("cross-checks usage.transitions_fired against the transition_fired events", () => {

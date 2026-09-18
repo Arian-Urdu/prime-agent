@@ -50,6 +50,9 @@ export interface FactoryDagPort {
 	name: string;
 	type: PortType;
 	from?: string;
+	/** Machine form only: an optional input binds a null sentinel instead of
+	 * waiting when its source state never settled (compiled dags never set it). */
+	optional?: boolean;
 }
 
 export interface FactoryDagOutputPort {
@@ -117,12 +120,6 @@ export interface FactoryTransitionSpec {
 	when?: FactoryGuard;
 }
 
-export interface FactoryWaitSpec {
-	kind: "path" | "agent";
-	target: string;
-	timeout_ms: number;
-}
-
 export interface FactoryStateSpec {
 	id: string;
 	entry?: boolean;
@@ -135,7 +132,6 @@ export interface FactoryStateSpec {
 	retries?: number;
 	failure_policy?: FailurePolicy;
 	foreach?: FactoryDagForeach;
-	wait?: FactoryWaitSpec;
 }
 
 export interface FactoryMachineSpec {
@@ -452,18 +448,20 @@ export function buildPrEntryPrompt(): string {
 	].join("\n");
 }
 
-/** Reviewing prompt; `{pr_url}` is the entry state's captured output. */
+/** Reviewing prompt; `{pr_url}` is the entry state's captured output and `{fix_report}` the previous fixing round's report (null on the first review). */
 export function buildPrReviewingPromptTemplate(): string {
 	return [
 		"You are the reviewing state of a pull-request manager loop.",
 		"",
 		"Pull request under review: {pr_url}",
 		"",
+		"Fix report from the previous fixing round (json; null means no fixing round has run yet): {fix_report}",
+		"",
 		"Mini-repo under review (four files, one planted defect each, audit note included):",
 		"",
 		miniRepoListing(),
 		"",
-		"Decide whether the pull request is merge-ready, then reply with exactly one fenced json block and nothing else:",
+		"Decide whether the pull request is merge-ready: when the fix report lists every finding you previously reported as fixed, approve it. Then reply with exactly one fenced json block and nothing else:",
 		"",
 		'```json\n{"verdict": {"approved": <true when the pull request is merge-ready, otherwise false>, "findings": [<every audit id that still needs a fix> ]}}\n```',
 		"",
@@ -482,10 +480,11 @@ export function buildPrFixingPromptTemplate(): string {
 		"",
 		miniRepoListing(),
 		"",
-		"Reply with exactly one line listing every audit id you fixed, comma-separated:",
-		"FIXED <every audit id from the findings, comma-separated>",
+		"Fix every finding, then reply with exactly one fenced json block and nothing else:",
 		"",
-		"Output that single line and nothing else, then end your turn.",
+		'```json\n{"fix_report": {"fixed": [<every audit id you fixed>]}}\n```',
+		"",
+		"Output that single block and nothing else, then end your turn.",
 	].join("\n");
 }
 
@@ -505,9 +504,12 @@ export function buildPrMonitoringPrompt(): string {
 
 /**
  * The pr-manager reference machine: entry -> reviewing -> (fixing -> reviewing)*
- * -> monitoring, driven by the approved verdict guard. The loop re-enters
- * reviewing after every fixing round until the verdict approves the pull
- * request; monitoring stays resident until the caller stops the run.
+ * -> monitoring, driven by the approved verdict guard. The fixing state
+ * reports the ids it fixed through a json `fix_report` output; reviewing's
+ * optional fix_report input re-binds that report on every re-entry (it binds
+ * null on the first review, before the fixer ever runs), so a consistent
+ * reviewer rejects round 1 and approves once the report covers its findings.
+ * Monitoring stays resident until the caller stops the run.
  */
 export function buildPrManagerMachine(): FactoryMachineSpec {
 	return {
@@ -523,7 +525,10 @@ export function buildPrManagerMachine(): FactoryMachineSpec {
 			{
 				id: "reviewing",
 				subagent: { prompt: buildPrReviewingPromptTemplate(), name: "pr-reviewing" },
-				inputs: [{ name: "pr_url", type: "text", from: "entry.pr_url" }],
+				inputs: [
+					{ name: "pr_url", type: "text", from: "entry.pr_url" },
+					{ name: "fix_report", type: "json", from: "fixing.fix_report", optional: true },
+				],
 				outputs: [{ name: "verdict", type: "json" }],
 				max_entries: 4,
 				budget_ms: NODE_BUDGET_MS,
@@ -532,6 +537,7 @@ export function buildPrManagerMachine(): FactoryMachineSpec {
 				id: "fixing",
 				subagent: { prompt: buildPrFixingPromptTemplate(), name: "pr-fixing" },
 				inputs: [{ name: "verdict", type: "json", from: "reviewing.verdict" }],
+				outputs: [{ name: "fix_report", type: "json" }],
 				max_entries: 3,
 				budget_ms: NODE_BUDGET_MS,
 			},
@@ -814,9 +820,9 @@ export function buildFactoryParentPrompt(factory: ReferenceFactory, ledgerPath: 
 					'\tjson.dump(status, open(r"<LEDGER>", "w"))',
 					"\tstopped",
 					"",
-					'Step 3 — from the saved status: APPROVED is yes when the reviewing state\'s answer_preview contains "approved": true, DEFECTS is every audit id that appears in the fixing state\'s captured answers (its answer_preview plus the fixing answer_captured ledger events), ROUNDS is the fixing state\'s entries_used, and STOPPED lists the cancelled state ids. Output exactly one line and nothing else:',
+					'Step 3 — from the saved status: APPROVED is yes when the fenced json block in the reviewing state\'s answer_preview has verdict.approved true, DEFECTS is every audit id that appears in the fixing state\'s captured answers (its answer_preview plus the fixing answer_captured ledger events), ROUNDS is the reviewing state\'s entries_used, and STOPPED lists the cancelled state ids. Output exactly one line and nothing else:',
 					"",
-					'ANSWER: APPROVED: <yes|no>; DEFECTS: <every audit id from the fixing answers, comma-separated>; ROUNDS: <the fixing state\'s entries_used>; STOPPED: <the cancelled state ids from stopped["cancelled"], comma-separated>; STATE: <status["state"]>',
+					'ANSWER: APPROVED: <yes|no>; DEFECTS: <every audit id from the fixing answers, comma-separated>; ROUNDS: <the reviewing state\'s entries_used>; STOPPED: <the cancelled state ids from stopped["cancelled"], comma-separated>; STATE: <status["state"]>',
 				].join("\n"),
 				factory,
 				ledgerPath,
@@ -996,54 +1002,60 @@ export function buildBaselinePrompt(factory: ReferenceFactory, ledgerPath: strin
 				"Capability eval: manual multi-agent orchestration (baseline). Run the identical pull-request manager loop by orchestrating the children yourself with rlm.spawn and rlm.collect. Do NOT use the factory executor.",
 				budgetLine(factory),
 				"",
-				"Step 1 — spawn the entry child in one ipython cell, using the exact prompt below. Do not set a model on the spawn; children inherit yours.",
+				"Step 1 — spawn the entry child and collect its answer as pr_url, using the exact prompt below. Do not set a model on the spawn; children inherit yours.",
 				"",
 				"import asyncio, json",
+				"async def settle_one(handle):",
+				'    """Poll one child until it settles, then return its collect entry."""',
+				"    while True:",
+				"        result = (await rlm.collect([handle.rlm_child_id], timeout_ms=2000))[0]",
+				"        if result.settled:",
+				"            return result",
+				"        await asyncio.sleep(2)",
+				"",
 				'entry = await rlm.spawn("""',
 				`\t${buildPrEntryPrompt().replaceAll("\n", "\n\t")}`,
 				'\t""", name="pr-entry")',
-				'entry_result = (await rlm.collect([entry.rlm_child_id], timeout_ms=2000))[0]',
-				"while not entry_result.settled:",
-				"\tawait asyncio.sleep(2)",
-				"\tentry_result = (await rlm.collect([entry.rlm_child_id], timeout_ms=2000))[0]",
-				"pr_url = entry_result.answer_preview",
+				"pr_url = settle_one(entry).answer_preview",
 				"",
-				"Step 2 — spawn the reviewing child with the prompt below, replacing the line that reads `Pull request under review: {pr_url}` with pr_url:",
+				"Step 2 — compose the reviewing and fixing prompts once by substitution (the reviewing prompt uses {pr_url} and {fix_report}; the fixing prompt uses {verdict}):",
 				"",
-				'reviewing = await rlm.spawn("""',
+				'reviewing_template = """',
 				`\t${buildPrReviewingPromptTemplate().replaceAll("\n", "\n\t")}`,
-				'\t""".replace("{pr_url}", pr_url), name="pr-reviewing")',
+				'\t"""',
+				'fixing_template = """',
+				`\t${buildPrFixingPromptTemplate().replaceAll("\n", "\n\t")}`,
+				'\t"""',
 				"",
-				"Step 3 — poll the reviewing child until it settles, then run the loop by hand: while its answer says approved false and fewer than two fix rounds have run, spawn the fixing child with the prompt below (replacing `Review verdict to act on (json): {verdict}` with the verdict json from the reviewing answer), wait for it to settle, then spawn a fresh reviewing child with the same reviewing prompt and wait for its new verdict. The loop runs at most two fix rounds.",
+				"Step 3 — run the loop by hand: review the pull request, and while the verdict json says approved false and fewer than two review rounds have run, spawn the fixing child with the verdict, settle it, then re-review with the fix report substituted. Parse the verdict json from each reviewing answer with json.loads (strip the ``` fences first):",
 				"",
-				"rounds = 0",
-				"verdict_line = reviewing_answer",
-				"handles = [reviewing]",
+				"def parse_verdict(answer):",
+				"    block = answer[answer.find('{'):answer.rfind('}') + 1]",
+				"    return json.loads(block)['verdict']",
+				"",
+				"rounds = 1",
 				'fix_answers = []',
-				"while '\"approved\": false' in verdict_line and rounds < 2:",
+				'reviewing = await rlm.spawn(reviewing_template.replace("{pr_url}", pr_url).replace("{fix_report}", "null"), name="pr-reviewing-1")',
+				"verdict = parse_verdict(settle_one(reviewing).answer_preview)",
+				"while verdict['approved'] is False and rounds < 3:",
+				'\tfixing = await rlm.spawn(fixing_template.replace("{verdict}", json.dumps(verdict)), name=f"pr-fixing-{rounds}")',
+				"\tfix_answer = settle_one(fixing).answer_preview",
+				"\tfix_answers.append(fix_answer)",
 				"\trounds += 1",
-				"\tfixing = await rlm.spawn(fixing_prompt, name=f\"pr-fixing-{rounds}\")",
-				"\tfix_result = (await rlm.collect([fixing.rlm_child_id], timeout_ms=2000))[0]",
-				"\twhile not fix_result.settled:",
-				"\t\tawait asyncio.sleep(2)",
-				"\t\tfix_result = (await rlm.collect([fixing.rlm_child_id], timeout_ms=2000))[0]",
-				"\tfix_answers.append(fix_result.answer_preview)",
-				"\treviewing = await rlm.spawn(reviewing_prompt, name=f\"pr-reviewing-{rounds}\")",
-				"\tverdict_line = (await rlm.collect([reviewing.rlm_child_id], timeout_ms=2000))[0].answer_preview",
-				'\thandles.append(fixing); handles.append(reviewing)',
+				'\treviewing = await rlm.spawn(reviewing_template.replace("{pr_url}", pr_url).replace("{fix_report}", fix_answer), name=f"pr-reviewing-{rounds}")',
+				"\tverdict = parse_verdict(settle_one(reviewing).answer_preview)",
 				"",
-				"Step 4 — save the fix answers and spawn the resident monitoring child with the exact prompt below:",
+				"Step 4 — save the loop ledger, spawn the resident monitoring child with the exact prompt below, and tear it down:",
 				"",
 				'json.dump({"fix_answers": fix_answers, "rounds": rounds}, open(r"' + ledgerPath + '", "w"))',
 				'monitoring = await rlm.spawn("""',
 				`\t${buildPrMonitoringPrompt().replaceAll("\n", "\n\t")}`,
 				'\t""", name="pr-monitoring")',
-				"",
-				"Step 5 — tear the monitoring child down, then output exactly one line and nothing else:",
-				"",
 				"await rlm.delete_subagent(monitoring.rlm_child_id)",
 				"",
-				"ANSWER: APPROVED: <yes if the last reviewing verdict says approved true, otherwise no>; DEFECTS: <every audit id from the fix answers, comma-separated>; ROUNDS: <the fix rounds run>; STOPPED: monitoring; STATE: done",
+				"Step 5 — output exactly one line and nothing else:",
+				"",
+				"ANSWER: APPROVED: <yes if the final verdict says approved true, otherwise no>; DEFECTS: <every audit id from the fix answers, comma-separated>; ROUNDS: <the review rounds run>; STOPPED: monitoring",
 			].join("\n");
 		default:
 			throw new Error(`no baseline exists for reference factory kind ${factory.kind}`);
@@ -1286,8 +1298,11 @@ export function checkReplayLedger(ledger: unknown): LedgerCheckResult {
 	let truncated = false;
 	let lastSeq = 0;
 	const spawned = new Map<string, number>();
+	const spawnedPerNode = new Map<string, number>();
 	const settled = new Map<string, number>();
 	const cancelled = new Set<string>();
+	const stateEntries = new Map<string, number[]>();
+	const waitSettledNodes = new Set<string>();
 	const milestones: string[] = [];
 	let runStopped = false;
 	let transitionsFired = 0;
@@ -1315,16 +1330,32 @@ export function checkReplayLedger(ledger: unknown): LedgerCheckResult {
 		if (event.node !== undefined && !nodeIds.has(event.node)) {
 			problems.push(`events[${index}] references unknown node ${JSON.stringify(event.node)}`);
 		}
-		if (
-			(event.kind === "transition_fired" || event.kind === "transition_blocked") &&
-			(event.from !== undefined || event.to !== undefined)
-		) {
-			if (event.from !== undefined && !nodeIds.has(event.from)) {
-				problems.push(`events[${index}] transitions from unknown state ${JSON.stringify(event.from)}`);
+		if (event.kind === "transition_fired" || event.kind === "transition_blocked") {
+			// The executor always emits both endpoints; absence is drift.
+			if (event.from === undefined || event.to === undefined) {
+				problems.push(`events[${index}] ${event.kind} requires from and to states`);
+			} else {
+				if (!nodeIds.has(event.from)) {
+					problems.push(`events[${index}] transitions from unknown state ${JSON.stringify(event.from)}`);
+				}
+				if (!nodeIds.has(event.to)) {
+					problems.push(`events[${index}] transitions to unknown state ${JSON.stringify(event.to)}`);
+				}
 			}
-			if (event.to !== undefined && !nodeIds.has(event.to)) {
-				problems.push(`events[${index}] transitions to unknown state ${JSON.stringify(event.to)}`);
+		}
+		if (event.kind === "state_entry") {
+			if (event.node === undefined || !nodeIds.has(event.node)) {
+				problems.push(`events[${index}] state_entry references unknown node ${JSON.stringify(event.node)}`);
+			} else if (typeof event.entry !== "number" || !Number.isInteger(event.entry) || event.entry < 0) {
+				problems.push(`events[${index}] state_entry requires a non-negative integer entry index`);
+			} else {
+				const indices = stateEntries.get(event.node) ?? [];
+				indices.push(event.entry);
+				stateEntries.set(event.node, indices);
 			}
+		}
+		if (event.kind === "wait_settled" && event.node !== undefined) {
+			waitSettledNodes.add(event.node);
 		}
 		const key = event.node !== undefined ? `${event.node}#${event.instance ?? -1}` : "";
 		switch (event.kind) {
@@ -1333,6 +1364,9 @@ export function checkReplayLedger(ledger: unknown): LedgerCheckResult {
 				break;
 			case "spawned":
 				if (key) spawned.set(key, (spawned.get(key) ?? 0) + 1);
+				if (event.node !== undefined) {
+					spawnedPerNode.set(event.node, (spawnedPerNode.get(event.node) ?? 0) + 1);
+				}
 				break;
 			case "settled":
 				if (key) settled.set(key, (settled.get(key) ?? 0) + 1);
@@ -1359,6 +1393,33 @@ export function checkReplayLedger(ledger: unknown): LedgerCheckResult {
 	}
 	if (truncated) {
 		problems.push("event window is truncated (first seq is not 1); count assertions skipped");
+	}
+
+	if (!truncated) {
+		// A wait state never spawns: a node with wait_settled events must have
+		// zero spawned instances in the whole ledger.
+		for (const nodeId of waitSettledNodes) {
+			if ((spawnedPerNode.get(nodeId) ?? 0) > 0) {
+				problems.push(`node ${nodeId} settled a wait but spawned ${spawnedPerNode.get(nodeId)} instance(s)`);
+			}
+		}
+		// state_entry indices are contiguous 0..n-1 per state and match the
+		// node's entries report (a gap means a dropped or forged event).
+		for (const node of nodes) {
+			const indices = [...(stateEntries.get(node.id) ?? [])].sort((a, b) => a - b);
+			const contiguous = indices.every((entryIndex, position) => entryIndex === position);
+			if (!contiguous) {
+				problems.push(`node ${node.id} state_entry indices are not contiguous 0..n-1: ${JSON.stringify(indices)}`);
+			}
+			if (node.entries !== undefined) {
+				const reported = node.entries.map((entry) => entry.index).sort((a, b) => a - b);
+				if (JSON.stringify(reported) !== JSON.stringify(indices)) {
+					problems.push(
+						`node ${node.id} entries ${JSON.stringify(reported)} do not match its state_entry events ${JSON.stringify(indices)}`,
+					);
+				}
+			}
+		}
 	}
 
 	if (!truncated) {
@@ -1447,9 +1508,12 @@ export function checkReplayLedger(ledger: unknown): LedgerCheckResult {
 		}
 		if (
 			ledger.state === "paused" &&
-			!milestones.some((milestone) => milestone === "paused" || milestone === "budget_exceeded")
+			!milestones.some(
+				(milestone) =>
+					milestone === "paused" || milestone === "budget_exceeded" || milestone === "max_transitions_exceeded",
+			)
 		) {
-			problems.push("run state paused without a paused or budget_exceeded milestone");
+			problems.push("run state paused without a paused, budget_exceeded, or max_transitions_exceeded milestone");
 		}
 		if (ledger.state === "stopped" && !runStopped) {
 			problems.push("run state stopped without a run_stopped event");
@@ -1487,12 +1551,33 @@ export interface TaskCheckOptions {
 	baselineLedger?: Record<string, unknown> | null;
 }
 
-/** Join the baseline collect dump's answer previews into one searchable text; null when absent. */
+/** Join the baseline collect dump's values into one searchable text; null when absent.
+ * Strings and numbers join (the pr-manager dump carries a numeric "rounds"), so
+ * a numeric ANSWER field like ROUNDS can be cross-checked against the dump. */
 function baselineLedgerText(baselineLedger: Record<string, unknown> | null | undefined): string | null {
 	if (!baselineLedger || typeof baselineLedger !== "object") return null;
 	return Object.values(baselineLedger)
-		.filter((value): value is string => typeof value === "string")
+		.filter((value) => typeof value === "string" || typeof value === "number")
+		.map((value) => String(value))
 		.join("\n");
+}
+
+/** Parse the last fenced ```json block in a captured answer preview; null when absent or malformed. */
+export function parseFencedJson(text: string): Record<string, unknown> | null {
+	const match = /```json\s*(.*?)\s*```/g;
+	let last: string | null = null;
+	for (const found of text.matchAll(match)) {
+		last = found[1] ?? last;
+	}
+	if (last === null) return null;
+	try {
+		const parsed = JSON.parse(last);
+		return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+			? (parsed as Record<string, unknown>)
+			: null;
+	} catch {
+		return null;
+	}
 }
 
 /**
@@ -1633,17 +1718,36 @@ export function checkTaskSuccess(
 							problems.push(`planted issue ${issueId} missing from the baseline collect ledger`);
 						}
 					}
+					for (const issueId of answer.defects) {
+						if (!ledgerText.includes(issueId)) {
+							problems.push(`ANSWER defect ${issueId} is not present in the baseline collect ledger`);
+						}
+					}
+					if (answer.rounds !== null && !ledgerText.includes(String(answer.rounds))) {
+						problems.push(`ANSWER rounds ${answer.rounds} is not present in the baseline collect ledger`);
+					}
 				}
 			} else if (ledger !== null) {
 				if (ledger.state !== "stopped") problems.push(`ledger state is ${ledger.state}, expected stopped`);
 				const reviewing = nodeStatus("reviewing");
 				const fixing = nodeStatus("fixing");
 				const monitoring = nodeStatus("monitoring");
-				if (fixing?.entries_used !== 2) {
-					problems.push(`ledger fixing entries_used is ${fixing?.entries_used ?? "unset"}, expected 2`);
+				// rounds is the review-loop length: the reviewing state's entries_used
+				if (reviewing?.entries_used !== 2) {
+					problems.push(`ledger reviewing entries_used is ${reviewing?.entries_used ?? "unset"}, expected 2`);
+				}
+				if (fixing?.entries_used !== 1) {
+					problems.push(`ledger fixing entries_used is ${fixing?.entries_used ?? "unset"}, expected 1`);
 				}
 				if (reviewing?.status !== "done") problems.push("ledger reviewing state is not done");
-				if (!reviewing?.answer_preview?.includes('"approved"') || !reviewing.answer_preview.includes("true")) {
+				// The final verdict must be a fenced json block with approved === true.
+				const parsedVerdict = parseFencedJson(reviewing?.answer_preview ?? "");
+				const verdictBody = parsedVerdict?.verdict;
+				const approved =
+					typeof verdictBody === "object" && verdictBody !== null
+						? (verdictBody as { approved?: unknown }).approved
+						: undefined;
+				if (approved !== true) {
 					problems.push("final reviewing verdict is not approved true");
 				}
 				if (reviewing?.max_entries !== 4) {

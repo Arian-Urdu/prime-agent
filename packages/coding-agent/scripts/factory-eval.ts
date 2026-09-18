@@ -22,7 +22,7 @@
  *
  * Usage:
  *   npx tsx scripts/factory-eval.ts \
- *     --model internal/glm-5.2-fast --factories review-sweep,builder,resident-watcher \
+ *     --model internal/glm-5.2-fast --factories review-sweep,builder,resident-watcher,pr-manager \
  *     --width 6 --trials 1 --out ./factory-dag-eval-reports
  *   npx tsx scripts/factory-eval.ts --replay ./factory-dag-eval-reports/report.json
  */
@@ -95,10 +95,60 @@ export interface FactoryDagSpec {
 	nodes: FactoryDagNodeSpec[];
 }
 
+// ---------------------------------------------------------------------------
+// Machine-form spec types (mirror the kernel-side factory machine schema; the
+// kernel validates on write at run time, so the TS side only builds and
+// shape-checks them).
+// ---------------------------------------------------------------------------
+
+export type FactoryGuardOp = "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "exists" | "contains";
+
+export interface FactoryGuard {
+	output: string;
+	path?: string;
+	op: FactoryGuardOp;
+	value?: unknown;
+}
+
+export interface FactoryTransitionSpec {
+	from: string;
+	to: string;
+	on?: "settled";
+	when?: FactoryGuard;
+}
+
+export interface FactoryWaitSpec {
+	kind: "path" | "agent";
+	target: string;
+	timeout_ms: number;
+}
+
+export interface FactoryStateSpec {
+	id: string;
+	entry?: boolean;
+	max_entries?: number;
+	subagent?: string | InlineSubagent;
+	lifecycle?: "task" | "resident";
+	inputs?: FactoryDagPort[];
+	outputs?: FactoryDagOutputPort[];
+	budget_ms?: number;
+	retries?: number;
+	failure_policy?: FailurePolicy;
+	foreach?: FactoryDagForeach;
+	wait?: FactoryWaitSpec;
+}
+
+export interface FactoryMachineSpec {
+	run?: FactoryDagRunSpec & { max_transitions?: number };
+	states: FactoryStateSpec[];
+	transitions?: FactoryTransitionSpec[];
+}
+
 export type ReferenceFactoryKind =
 	| "review-sweep"
 	| "builder"
 	| "resident-watcher"
+	| "pr-manager"
 	| "review-sweep-fail"
 	| "dry-run-reject";
 
@@ -107,7 +157,9 @@ export interface ReferenceFactory {
 	kind: ReferenceFactoryKind;
 	title: string;
 	description: string;
-	dag: FactoryDagSpec;
+	/** Dag sugar: exactly one of dag/machine is present on a reference factory. */
+	dag?: FactoryDagSpec;
+	machine?: FactoryMachineSpec;
 	declaredBudgetMs: number;
 	declaredFanIn: number;
 	width?: number;
@@ -383,11 +435,135 @@ export function buildBrokenDag(): FactoryDagSpec {
 	};
 }
 
+// ---------------------------------------------------------------------------
+// Reference machine: the pr-manager review/fix loop (state-machine form).
+// ---------------------------------------------------------------------------
+
+/** Marker the monitoring resident sends before idling. */
+export const MERGE_READY_MARKER = "MERGE-READY";
+
+export function buildPrEntryPrompt(): string {
+	return [
+		"You are the entry state of a pull-request manager loop. Reply with exactly one line describing the pull request under management:",
+		"",
+		"PR swp://mini-repo: the snapshot under review carries four planted defects with audit notes",
+		"",
+		"Output that single line and nothing else, then end your turn.",
+	].join("\n");
+}
+
+/** Reviewing prompt; `{pr_url}` is the entry state's captured output. */
+export function buildPrReviewingPromptTemplate(): string {
+	return [
+		"You are the reviewing state of a pull-request manager loop.",
+		"",
+		"Pull request under review: {pr_url}",
+		"",
+		"Mini-repo under review (four files, one planted defect each, audit note included):",
+		"",
+		miniRepoListing(),
+		"",
+		"Decide whether the pull request is merge-ready, then reply with exactly one fenced json block and nothing else:",
+		"",
+		'```json\n{"verdict": {"approved": <true when the pull request is merge-ready, otherwise false>, "findings": [<every audit id that still needs a fix> ]}}\n```',
+		"",
+		"Output that single block and nothing else, then end your turn.",
+	].join("\n");
+}
+
+/** Fixing prompt; `{verdict}` is the reviewing state's captured json output. */
+export function buildPrFixingPromptTemplate(): string {
+	return [
+		"You are the fixing state of a pull-request manager loop.",
+		"",
+		"Review verdict to act on (json): {verdict}",
+		"",
+		"Mini-repo under repair (four files, one planted defect each, audit note included):",
+		"",
+		miniRepoListing(),
+		"",
+		"Reply with exactly one line listing every audit id you fixed, comma-separated:",
+		"FIXED <every audit id from the findings, comma-separated>",
+		"",
+		"Output that single line and nothing else, then end your turn.",
+	].join("\n");
+}
+
+/** Resident monitoring prompt: replies once, then idles like the resident-watcher. */
+export function buildPrMonitoringPrompt(): string {
+	return [
+		"You are the monitoring state of a pull-request manager loop: a resident watcher attached to the merge-ready pull request. Do exactly this, in order:",
+		"",
+		'1. In the ipython tool, send your parent one message with exactly this text:',
+		`   await agent_message.send("${MERGE_READY_MARKER} ${WATCHER_MARKER}", receiver_role="parent")`,
+		"2. Then, still in the ipython tool, run:",
+		"   import asyncio",
+		`   await asyncio.sleep(${RESIDENT_WATCHER_SLEEP_SECONDS})`,
+		"   and stay idle. Do not end your turn before the sleep finishes. Do not send more messages. Do nothing else.",
+	].join("\n");
+}
+
+/**
+ * The pr-manager reference machine: entry -> reviewing -> (fixing -> reviewing)*
+ * -> monitoring, driven by the approved verdict guard. The loop re-enters
+ * reviewing after every fixing round until the verdict approves the pull
+ * request; monitoring stays resident until the caller stops the run.
+ */
+export function buildPrManagerMachine(): FactoryMachineSpec {
+	return {
+		run: { budget_ms: RUN_BUDGET_MS, failure_policy: "escalate", max_parallel: 8, max_transitions: 24 },
+		states: [
+			{
+				id: "entry",
+				entry: true,
+				subagent: { prompt: buildPrEntryPrompt(), name: "pr-entry" },
+				outputs: [{ name: "pr_url", type: "text" }],
+				budget_ms: NODE_BUDGET_MS,
+			},
+			{
+				id: "reviewing",
+				subagent: { prompt: buildPrReviewingPromptTemplate(), name: "pr-reviewing" },
+				inputs: [{ name: "pr_url", type: "text", from: "entry.pr_url" }],
+				outputs: [{ name: "verdict", type: "json" }],
+				max_entries: 4,
+				budget_ms: NODE_BUDGET_MS,
+			},
+			{
+				id: "fixing",
+				subagent: { prompt: buildPrFixingPromptTemplate(), name: "pr-fixing" },
+				inputs: [{ name: "verdict", type: "json", from: "reviewing.verdict" }],
+				max_entries: 3,
+				budget_ms: NODE_BUDGET_MS,
+			},
+			{
+				id: "monitoring",
+				subagent: { prompt: buildPrMonitoringPrompt(), name: "pr-monitoring" },
+				lifecycle: "resident",
+			},
+		],
+		transitions: [
+			{ from: "entry", to: "reviewing" },
+			{
+				from: "reviewing",
+				to: "fixing",
+				when: { output: "verdict", path: "approved", op: "eq", value: false },
+			},
+			{
+				from: "reviewing",
+				to: "monitoring",
+				when: { output: "verdict", path: "approved", op: "eq", value: true },
+			},
+			{ from: "fixing", to: "reviewing" },
+		],
+	};
+}
+
 export const FACTORY_ENTRY_IDS = {
 	reviewSweep: "factory-dag-eval-review-sweep",
 	reviewSweepFail: "factory-dag-eval-review-fail",
 	builder: "factory-dag-eval-builder",
 	residentWatcher: "factory-dag-eval-resident-watcher",
+	prManager: "factory-dag-eval-pr-manager",
 	broken: "factory-dag-eval-broken",
 } as const;
 
@@ -421,6 +597,16 @@ export function buildReferenceFactories(width: number): ReferenceFactory[] {
 			dag: buildResidentWatcherDag(),
 			declaredBudgetMs: RUN_BUDGET_MS,
 			declaredFanIn: 1,
+		},
+		{
+			id: FACTORY_ENTRY_IDS.prManager,
+			kind: "pr-manager",
+			title: "pr-manager",
+			description:
+				"Reference machine: guarded review/fix loop that re-enters reviewing until the verdict approves, then parks a resident monitoring state (capability eval).",
+			machine: buildPrManagerMachine(),
+			declaredBudgetMs: RUN_BUDGET_MS,
+			declaredFanIn: 2,
 		},
 		{
 			id: FACTORY_ENTRY_IDS.reviewSweepFail,
@@ -463,12 +649,17 @@ export interface HarnessEntryJson {
 	path: string;
 	scope: "local";
 	reference: Record<string, unknown>;
-	arguments: { dag: FactoryDagSpec };
+	arguments: { dag?: FactoryDagSpec; machine?: FactoryMachineSpec };
 	metadata: Record<string, unknown>;
 	source: string;
 	created_at: string;
 	updated_at: string;
 	version: number;
+}
+
+/** The stored arguments payload for a reference factory: machine form wins when present. */
+export function factorySpecArguments(spec: ReferenceFactory): HarnessEntryJson["arguments"] {
+	return spec.machine ? { machine: spec.machine } : { dag: spec.dag };
 }
 
 /** Full harness_state.json file body seeding the given factory entries. */
@@ -483,7 +674,7 @@ export function buildHarnessStateFile(specs: ReferenceFactory[], now = new Date(
 			path: "factory-dag-eval",
 			scope: "local",
 			reference: {},
-			arguments: { dag: spec.dag },
+			arguments: factorySpecArguments(spec),
 			metadata: { evalKind: spec.kind, source: "factory-dag-eval" },
 			source: "agent",
 			created_at: now.toISOString(),
@@ -603,6 +794,35 @@ export function buildFactoryParentPrompt(factory: ReferenceFactory, ledgerPath: 
 				ledgerPath,
 				pollCode('"done", "failed", "paused"'),
 			);
+		case "pr-manager": {
+			const machineHead =
+				`Capability eval: factory state-machine orchestration. The local harness state for this session seeds exactly one factory specification: "${factory.id}". Run it with the executor and report the outcome. Do not spawn subagents yourself; the factory executor owns the children.`;
+			return fill(
+				[
+					machineHead,
+					"",
+					"The machine loops reviewing and fixing until the reviewing verdict approves the pull request, then parks a resident monitoring state: the run reaches done while the monitoring child stays alive; you must then stop the run to tear it down.",
+					"",
+					"Step 1 — start the run and poll until the declarative work is done (state done) in one ipython cell:",
+					"",
+					"<POLL>",
+					"",
+					"Step 2 — stop the run to tear the resident monitoring state down, save the final status, and report. In the same or a new ipython cell:",
+					"",
+					"\tstopped = await rlm.factory.stop(run_id)",
+					"\tstatus = await rlm.factory.status(run_id)",
+					'\tjson.dump(status, open(r"<LEDGER>", "w"))',
+					"\tstopped",
+					"",
+					'Step 3 — from the saved status: APPROVED is yes when the reviewing state\'s answer_preview contains "approved": true, DEFECTS is every audit id that appears in the fixing state\'s captured answers (its answer_preview plus the fixing answer_captured ledger events), ROUNDS is the fixing state\'s entries_used, and STOPPED lists the cancelled state ids. Output exactly one line and nothing else:',
+					"",
+					'ANSWER: APPROVED: <yes|no>; DEFECTS: <every audit id from the fixing answers, comma-separated>; ROUNDS: <the fixing state\'s entries_used>; STOPPED: <the cancelled state ids from stopped["cancelled"], comma-separated>; STATE: <status["state"]>',
+				].join("\n"),
+				factory,
+				ledgerPath,
+				pollCode('"done", "failed", "paused"'),
+			);
+		}
 		case "review-sweep-fail":
 			return fill(
 				[
@@ -771,6 +991,60 @@ export function buildBaselinePrompt(factory: ReferenceFactory, ledgerPath: strin
 				"",
 				"ANSWER: MARKERS: <the two step markers from the answers, comma-separated>; STOPPED: watcher",
 			].join("\n");
+		case "pr-manager":
+			return [
+				"Capability eval: manual multi-agent orchestration (baseline). Run the identical pull-request manager loop by orchestrating the children yourself with rlm.spawn and rlm.collect. Do NOT use the factory executor.",
+				budgetLine(factory),
+				"",
+				"Step 1 — spawn the entry child in one ipython cell, using the exact prompt below. Do not set a model on the spawn; children inherit yours.",
+				"",
+				"import asyncio, json",
+				'entry = await rlm.spawn("""',
+				`\t${buildPrEntryPrompt().replaceAll("\n", "\n\t")}`,
+				'\t""", name="pr-entry")',
+				'entry_result = (await rlm.collect([entry.rlm_child_id], timeout_ms=2000))[0]',
+				"while not entry_result.settled:",
+				"\tawait asyncio.sleep(2)",
+				"\tentry_result = (await rlm.collect([entry.rlm_child_id], timeout_ms=2000))[0]",
+				"pr_url = entry_result.answer_preview",
+				"",
+				"Step 2 — spawn the reviewing child with the prompt below, replacing the line that reads `Pull request under review: {pr_url}` with pr_url:",
+				"",
+				'reviewing = await rlm.spawn("""',
+				`\t${buildPrReviewingPromptTemplate().replaceAll("\n", "\n\t")}`,
+				'\t""".replace("{pr_url}", pr_url), name="pr-reviewing")',
+				"",
+				"Step 3 — poll the reviewing child until it settles, then run the loop by hand: while its answer says approved false and fewer than two fix rounds have run, spawn the fixing child with the prompt below (replacing `Review verdict to act on (json): {verdict}` with the verdict json from the reviewing answer), wait for it to settle, then spawn a fresh reviewing child with the same reviewing prompt and wait for its new verdict. The loop runs at most two fix rounds.",
+				"",
+				"rounds = 0",
+				"verdict_line = reviewing_answer",
+				"handles = [reviewing]",
+				'fix_answers = []',
+				"while '\"approved\": false' in verdict_line and rounds < 2:",
+				"\trounds += 1",
+				"\tfixing = await rlm.spawn(fixing_prompt, name=f\"pr-fixing-{rounds}\")",
+				"\tfix_result = (await rlm.collect([fixing.rlm_child_id], timeout_ms=2000))[0]",
+				"\twhile not fix_result.settled:",
+				"\t\tawait asyncio.sleep(2)",
+				"\t\tfix_result = (await rlm.collect([fixing.rlm_child_id], timeout_ms=2000))[0]",
+				"\tfix_answers.append(fix_result.answer_preview)",
+				"\treviewing = await rlm.spawn(reviewing_prompt, name=f\"pr-reviewing-{rounds}\")",
+				"\tverdict_line = (await rlm.collect([reviewing.rlm_child_id], timeout_ms=2000))[0].answer_preview",
+				'\thandles.append(fixing); handles.append(reviewing)',
+				"",
+				"Step 4 — save the fix answers and spawn the resident monitoring child with the exact prompt below:",
+				"",
+				'json.dump({"fix_answers": fix_answers, "rounds": rounds}, open(r"' + ledgerPath + '", "w"))',
+				'monitoring = await rlm.spawn("""',
+				`\t${buildPrMonitoringPrompt().replaceAll("\n", "\n\t")}`,
+				'\t""", name="pr-monitoring")',
+				"",
+				"Step 5 — tear the monitoring child down, then output exactly one line and nothing else:",
+				"",
+				"await rlm.delete_subagent(monitoring.rlm_child_id)",
+				"",
+				"ANSWER: APPROVED: <yes if the last reviewing verdict says approved true, otherwise no>; DEFECTS: <every audit id from the fix answers, comma-separated>; ROUNDS: <the fix rounds run>; STOPPED: monitoring; STATE: done",
+			].join("\n");
 		default:
 			throw new Error(`no baseline exists for reference factory kind ${factory.kind}`);
 	}
@@ -790,6 +1064,9 @@ export interface ParsedAnswer {
 	rejected: boolean | null;
 	children: number | null;
 	message: string | null;
+	approved: boolean | null;
+	defects: string[];
+	rounds: number | null;
 }
 
 /** Parse the single ANSWER line from the parent's final assistant text. */
@@ -806,6 +1083,9 @@ export function parseAnswerLine(text: string | undefined): ParsedAnswer | null {
 		rejected: null,
 		children: null,
 		message: null,
+		approved: null,
+		defects: [],
+		rounds: null,
 	};
 	const list = (value: string): string[] =>
 		value
@@ -846,6 +1126,15 @@ export function parseAnswerLine(text: string | undefined): ParsedAnswer | null {
 			case "MESSAGE":
 				parsed.message = value;
 				break;
+			case "APPROVED":
+				parsed.approved = value.toLowerCase() === "yes";
+				break;
+			case "DEFECTS":
+				parsed.defects = list(value);
+				break;
+			case "ROUNDS":
+				parsed.rounds = Number(value);
+				break;
 		}
 	}
 	return parsed;
@@ -857,10 +1146,17 @@ export function parseAnswerLine(text: string | undefined): ParsedAnswer | null {
 
 export interface FactoryLedgerInstance {
 	index: number;
+	entry?: number;
 	status: string;
 	attempt: number;
 	child?: string | null;
 	duration_ms?: number | null;
+	error?: string | null;
+}
+
+export interface FactoryLedgerEntry {
+	index: number;
+	status: string;
 	error?: string | null;
 }
 
@@ -870,6 +1166,9 @@ export interface FactoryLedgerNode {
 	lifecycle: string;
 	attempts: number;
 	instances: FactoryLedgerInstance[];
+	entries_used?: number;
+	max_entries?: number;
+	entries?: FactoryLedgerEntry[];
 	answer_preview?: string;
 	error?: string;
 }
@@ -879,12 +1178,18 @@ export interface FactoryLedgerEvent {
 	kind: string;
 	stage?: string;
 	node?: string;
+	entry?: number;
 	instance?: number;
+	child?: string | null;
 	detail?: string;
 	duration_ms?: number | null;
 	status?: string;
 	error?: string;
 	milestone?: string;
+	answer?: string;
+	from?: string;
+	to?: string;
+	timed_out?: boolean;
 }
 
 export interface FactoryLedgerUsage {
@@ -893,6 +1198,7 @@ export interface FactoryLedgerUsage {
 	tool_uses: number;
 	max_parallel: number;
 	running: number;
+	transitions_fired?: number;
 }
 
 export interface FactoryStatusLedger {
@@ -909,6 +1215,10 @@ export interface FactoryStatusLedger {
 export const KNOWN_FACTORY_EVENT_KINDS = [
 	"run_started",
 	"node_ready",
+	"state_entry",
+	"transition_fired",
+	"transition_blocked",
+	"wait_settled",
 	"spawned",
 	"spawn_backoff",
 	"spawn_deferred",
@@ -980,6 +1290,7 @@ export function checkReplayLedger(ledger: unknown): LedgerCheckResult {
 	const cancelled = new Set<string>();
 	const milestones: string[] = [];
 	let runStopped = false;
+	let transitionsFired = 0;
 	for (const [index, event] of ledger.events.entries()) {
 		if (!isRecord(event)) {
 			problems.push(`events[${index}] is not an object`);
@@ -1004,8 +1315,22 @@ export function checkReplayLedger(ledger: unknown): LedgerCheckResult {
 		if (event.node !== undefined && !nodeIds.has(event.node)) {
 			problems.push(`events[${index}] references unknown node ${JSON.stringify(event.node)}`);
 		}
+		if (
+			(event.kind === "transition_fired" || event.kind === "transition_blocked") &&
+			(event.from !== undefined || event.to !== undefined)
+		) {
+			if (event.from !== undefined && !nodeIds.has(event.from)) {
+				problems.push(`events[${index}] transitions from unknown state ${JSON.stringify(event.from)}`);
+			}
+			if (event.to !== undefined && !nodeIds.has(event.to)) {
+				problems.push(`events[${index}] transitions to unknown state ${JSON.stringify(event.to)}`);
+			}
+		}
 		const key = event.node !== undefined ? `${event.node}#${event.instance ?? -1}` : "";
 		switch (event.kind) {
+			case "transition_fired":
+				transitionsFired += 1;
+				break;
 			case "spawned":
 				if (key) spawned.set(key, (spawned.get(key) ?? 0) + 1);
 				break;
@@ -1104,6 +1429,11 @@ export function checkReplayLedger(ledger: unknown): LedgerCheckResult {
 		}
 		if (ledger.usage.settled !== collectSettles) {
 			problems.push(`usage.settled ${ledger.usage.settled} does not match ${collectSettles} collect settlement(s)`);
+		}
+		if (ledger.usage.transitions_fired !== undefined && ledger.usage.transitions_fired !== transitionsFired) {
+			problems.push(
+				`usage.transitions_fired ${ledger.usage.transitions_fired} does not match ${transitionsFired} transition_fired event(s)`,
+			);
 		}
 	}
 
@@ -1285,6 +1615,58 @@ export function checkTaskSuccess(
 			}
 			break;
 		}
+		case "pr-manager": {
+			if (answer.approved !== true) problems.push(`ANSWER approved is ${answer.approved === null ? "unset" : answer.approved}, expected yes`);
+			if (answer.rounds !== 2) problems.push(`ANSWER rounds is ${answer.rounds ?? "unset"}, expected 2`);
+			for (const issueId of REVIEW_ISSUE_IDS) {
+				if (!answer.defects.includes(issueId)) problems.push(`planted issue ${issueId} missing from the ANSWER line`);
+			}
+			if (!answer.stopped.includes("monitoring")) {
+				problems.push("ANSWER does not report the resident monitoring state as stopped");
+			}
+			if (baseline) {
+				if (ledgerText === null) {
+					problems.push("baseline collect ledger missing (cannot verify the ANSWER against the children)");
+				} else {
+					for (const issueId of REVIEW_ISSUE_IDS) {
+						if (!ledgerText.includes(issueId)) {
+							problems.push(`planted issue ${issueId} missing from the baseline collect ledger`);
+						}
+					}
+				}
+			} else if (ledger !== null) {
+				if (ledger.state !== "stopped") problems.push(`ledger state is ${ledger.state}, expected stopped`);
+				const reviewing = nodeStatus("reviewing");
+				const fixing = nodeStatus("fixing");
+				const monitoring = nodeStatus("monitoring");
+				if (fixing?.entries_used !== 2) {
+					problems.push(`ledger fixing entries_used is ${fixing?.entries_used ?? "unset"}, expected 2`);
+				}
+				if (reviewing?.status !== "done") problems.push("ledger reviewing state is not done");
+				if (!reviewing?.answer_preview?.includes('"approved"') || !reviewing.answer_preview.includes("true")) {
+					problems.push("final reviewing verdict is not approved true");
+				}
+				if (reviewing?.max_entries !== 4) {
+					problems.push(`ledger reviewing max_entries is ${reviewing?.max_entries ?? "unset"}, expected 4`);
+				}
+				// The fix ledger: the fixing node's captured previews plus every
+				// fixing answer_captured event must carry all planted defect ids.
+				const fixTexts = [
+					fixing?.answer_preview ?? "",
+					...ledger.events
+						.filter((event) => event.kind === "answer_captured" && event.node === "fixing")
+						.map((event) => event.answer ?? ""),
+				].join("\n");
+				for (const issueId of REVIEW_ISSUE_IDS) {
+					if (!fixTexts.includes(issueId)) {
+						problems.push(`planted issue ${issueId} missing from the fixing ledger`);
+					}
+				}
+				if (monitoring?.lifecycle !== "resident") problems.push("ledger monitoring state is not resident");
+				if (monitoring?.status !== "cancelled") problems.push("ledger monitoring state is not cancelled");
+			}
+			break;
+		}
 		case "review-sweep-fail": {
 			if (answer.state !== "paused") problems.push(`ANSWER state is ${answer.state ?? "unset"}, expected paused`);
 			if (answer.failedNode !== "review-broken") {
@@ -1371,7 +1753,7 @@ export function computeVerdicts(results: FactoryDagEvalTrialResult[]): EvalVerdi
 	const dryRun = results.find((row) => row.factory === "dry-run-reject" && row.arm === "factory");
 	const budgetOvershootMs = factoryArms.reduce((sum, row) => sum + row.budgetOvershootMs, 0);
 	const contextPairs: EvalVerdicts["contextPairs"] = [];
-	for (const factory of ["review-sweep", "builder", "resident-watcher"]) {
+	for (const factory of ["review-sweep", "builder", "resident-watcher", "pr-manager"]) {
 		const factoryRows = factoryArms.filter((row) => row.factory === factory);
 		const baselineRows = results.filter((row) => row.arm === "baseline" && row.factory === factory);
 		if (factoryRows.length === 0 && baselineRows.length === 0) continue;
@@ -1483,7 +1865,7 @@ function renderVerdict(value: boolean | null): string {
 // Driver.
 // ---------------------------------------------------------------------------
 
-export type FactorySelection = "review-sweep" | "builder" | "resident-watcher";
+export type FactorySelection = "review-sweep" | "builder" | "resident-watcher" | "pr-manager";
 
 export interface EvalConfig {
 	model: string;
@@ -1523,7 +1905,7 @@ export function parseEvalArgs(argv: string[], defaults = DEFAULT_EVAL_CONFIG): E
 				args.model = value(arg);
 				break;
 			case "--factories": {
-				const known: FactorySelection[] = ["review-sweep", "builder", "resident-watcher"];
+				const known: FactorySelection[] = ["review-sweep", "builder", "resident-watcher", "pr-manager"];
 				const names = value(arg)
 					.split(",")
 					.map((raw) => raw.trim())

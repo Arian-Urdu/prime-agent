@@ -126,7 +126,7 @@ interface AsyncBashConsumedRequest {
 
 type AsyncBashConsumedHandler = (request: AsyncBashConsumedRequest) => void | Promise<void>;
 
-export type FactoryProgressKind = "finished" | "failed" | "paused" | "budget_exceeded";
+export type FactoryProgressKind = "finished" | "failed" | "paused" | "budget_exceeded" | "max_transitions_exceeded";
 
 export interface FactoryProgressRequest {
 	runId: string;
@@ -137,7 +137,13 @@ export interface FactoryProgressRequest {
 
 export type FactoryProgressHandler = (request: FactoryProgressRequest) => void | Promise<void>;
 
-const FACTORY_PROGRESS_KINDS: readonly FactoryProgressKind[] = ["finished", "failed", "paused", "budget_exceeded"];
+const FACTORY_PROGRESS_KINDS: readonly FactoryProgressKind[] = [
+	"finished",
+	"failed",
+	"paused",
+	"budget_exceeded",
+	"max_transitions_exceeded",
+];
 
 function isFactoryProgressKind(value: unknown): value is FactoryProgressKind {
 	return typeof value === "string" && (FACTORY_PROGRESS_KINDS as readonly string[]).includes(value);

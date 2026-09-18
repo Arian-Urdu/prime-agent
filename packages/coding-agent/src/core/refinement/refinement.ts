@@ -1067,10 +1067,15 @@ function validateEdit(edit: RefinementEdit, computedId?: string): string | undef
 	}
 	if (edit.action !== "delete" && edit.kind === "factory") {
 		// Structural check only: the kernel validator (rlm.factory) enforces the full
-		// DAG semantics at write time; do not reimplement it here.
+		// machine semantics at write time; do not reimplement it here.
 		const dag = edit.arguments?.dag;
-		if (typeof dag !== "object" || dag === null || Array.isArray(dag)) {
-			return "factory entry requires a dag object in arguments";
+		const machine = edit.arguments?.machine;
+		if (dag !== undefined && machine !== undefined) {
+			return "pass either dag or machine form, not both";
+		}
+		const spec = machine ?? dag;
+		if (typeof spec !== "object" || spec === null || Array.isArray(spec)) {
+			return "factory entry requires a dag or machine object in arguments";
 		}
 	}
 	return undefined;

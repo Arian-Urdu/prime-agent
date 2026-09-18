@@ -172,7 +172,7 @@ def _validate_state_fields(
 ) -> None:
     """Field rules shared by dag nodes (noun="node") and machine states
     (noun="state"): subagent forms, lifecycle, budgets, retries, failure
-    policies, port lists, foreach, and the wait/resident exclusions."""
+    policies, port lists, foreach, and the resident exclusions."""
     ref = state["id"]
     lifecycle = state.get("lifecycle", NODE_LIFECYCLE_DEFAULT)
     if lifecycle not in LIFECYCLES:
@@ -246,6 +246,9 @@ def _validate_state_fields(
             errors.append(f"{noun} {ref} inputs[{index}] must be an object")
             continue
         name, port_type, source = inp.get("name"), inp.get("type"), inp.get("from")
+        optional = inp.get("optional")
+        if optional is not None and not isinstance(optional, bool):
+            errors.append(f"{noun} {ref} input {name!r} optional must be a boolean when provided")
         if not _is_nonempty_str(name):
             errors.append(f"{noun} {ref} inputs[{index}] requires a non-empty name")
         elif _port_names(state, "inputs").count(name) > 1 and name not in reported_duplicate_inputs:
@@ -346,8 +349,8 @@ def _validate_guard(
         if not _is_number(value):
             errors.append(f"transitions[{index}] when.op {op!r} requires a numeric value")
     elif op == "contains":
-        if not isinstance(value, list):
-            errors.append(f"transitions[{index}] when.op 'contains' requires a list value")
+        if not isinstance(value, list) or not value:
+            errors.append(f"transitions[{index}] when.op 'contains' requires a non-empty list value")
     elif op in ("eq", "ne") and not _is_scalar(value):
         errors.append(f"transitions[{index}] when.op {op!r} requires a scalar value")
 
@@ -749,14 +752,17 @@ therefore work on capped preview text; full child outputs stay in the
 child's own session and are never seen by the executor.
 """
 
-EVENT_WINDOW = 50
-"""Number of trailing ledger events returned by ``status()``."""
+EVENT_WINDOW = 200
+"""Number of trailing ledger events returned by ``status()``.
+
+200 (not 50): a state-machine run's ledger grows fast — the pr-manager
+happy path alone is ~43 events, and retries or rate-limit backoff would
+otherwise push early evidence (a round-1 fix answer) out of the window a
+parent or replay checker reads.
+"""
 
 POLL_TIMEOUT_MS = 2000
 """How long each control-loop ``rlm.collect`` waits for unsettled children."""
-
-IDLE_LOOP_SLEEP_SECONDS = 0.02
-"""Loop yield while only wait-state timeouts are pending (no children)."""
 
 BACKOFF_MAX_ATTEMPTS = 5
 """Spawn admissions per node before a persistent rate limit fails the node."""
@@ -841,11 +847,28 @@ def _render_prompt(template: str, values: dict[str, str]) -> str:
     return rendered
 
 
+def _json_equal(actual: Any, expected: Any) -> bool:
+    """JSON-strict equality for eq/ne guards: a boolean never equals a
+    number (true != 1, false != 0), numbers compare numerically (1 == 1.0),
+    and everything else compares within its own type."""
+    if isinstance(actual, bool) or isinstance(expected, bool):
+        return isinstance(actual, bool) and isinstance(expected, bool) and actual is expected
+    if actual is None or expected is None:
+        return actual is None and expected is None
+    if _is_number(actual) and _is_number(expected):
+        return float(actual) == float(expected)
+    if isinstance(actual, str) and isinstance(expected, str):
+        return actual == expected
+    return False
+
+
 def _guard_passes(when: dict[str, Any], outputs: dict[str, Any]) -> bool:
     """Evaluate one transition guard over a settle's captured outputs.
 
     A missing or unparseable port fails every op except ``exists`` (which is
     explicitly false then); ``ne`` needs a found value to compare against.
+    ``eq``/``ne`` compare JSON-strictly (bools never equal numbers); an
+    empty ``contains`` needle is defensively false.
     """
     port = when.get("output")
     value: Any = None
@@ -871,9 +894,9 @@ def _guard_passes(when: dict[str, Any], outputs: dict[str, Any]) -> bool:
     if not found:
         return False
     if op == "eq":
-        return value == when.get("value")
+        return _json_equal(value, when.get("value"))
     if op == "ne":
-        return value != when.get("value")
+        return not _json_equal(value, when.get("value"))
     if op in ("gt", "gte", "lt", "lte"):
         bound = when.get("value")
         if not _is_number(value) or not _is_number(bound):
@@ -887,7 +910,7 @@ def _guard_passes(when: dict[str, Any], outputs: dict[str, Any]) -> bool:
         return value <= bound
     if op == "contains":
         needle = when.get("value")
-        if not isinstance(needle, list):
+        if not isinstance(needle, list) or not needle:
             return False
         if isinstance(value, list):
             return all(item in value for item in needle)
@@ -921,23 +944,11 @@ class _NodeInstance:
 
 
 @dataclass
-class _WaitHandle:
-    """Executor-side state for one active wait-state watch."""
-
-    kind: str = "path"  # "path" | "agent"
-    target: str = ""
-    timeout_ms: int = 0
-    watch_id: str | None = None
-    entered_at: float | None = None
-    timeout_task: "Any | None" = None
-
-
-@dataclass
 class _StateEntry:
     """One entry (activation) of a state; re-entry creates a fresh entry.
 
-    An entry settles when all of its instances settle done (or when a wait
-    watch settles); the settle captures the state's declared outputs, and
+    An entry settles when all of its instances settle done; the settle
+    captures the state's declared outputs, and
     the control loop then evaluates the outgoing transitions once
     (``consumed`` marks that evaluation done).
     """
@@ -951,7 +962,6 @@ class _StateEntry:
     output_errors: dict[str, str] | None = None  # ports whose json capture failed
     is_settle: bool = False  # True once the entry settled (done or error)
     consumed: bool = False  # True once the settle's transitions were evaluated
-    wait: _WaitHandle | None = None
 
 
 @dataclass
@@ -961,7 +971,7 @@ class _StateRun:
     state_id: str
     spec: dict[str, Any]  # canonical state spec
     position: int  # stable list position for deterministic ordering
-    prompt_template: str | None = None  # None for wait states
+    prompt_template: str | None = None
     model: str | None = None
     thinking: str | None = None
     max_entries: int = STATE_MAX_ENTRIES_DEFAULT
@@ -974,10 +984,6 @@ class _StateRun:
     @property
     def lifecycle(self) -> str:
         return self.spec.get("lifecycle", NODE_LIFECYCLE_DEFAULT)
-
-    @property
-    def is_wait(self) -> bool:
-        return isinstance(self.spec.get("wait"), dict)
 
     @property
     def status(self) -> str:
@@ -1011,7 +1017,7 @@ class FactoryRun:
     states: dict[str, _StateRun] = field(default_factory=dict)
     order: list[str] = field(default_factory=list)
     transitions_from: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-    pending_evaluations: list[tuple[str, int]] = field(default_factory=list)
+    pending_evaluations: list[tuple[str, int, int]] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
     milestones: set[str] = field(default_factory=set)
     spawn_count: int = 0
@@ -1031,8 +1037,7 @@ class FactoryExecutor:
     functions and ``host_request`` at call time, so tests can patch
     ``rlm.host_request``. ``now`` (default ``time.monotonic``) and ``sleep``
     (default ``asyncio.sleep``) are injectable: budgets measure admission
-    to settlement, wait-state timeouts and rate-limit backoff are testable
-    with fake sleeps.
+    to settlement and rate-limit backoff is testable with fake sleeps.
 
     Machine semantics: admission enters every entry state; each settle is
     queued and its outgoing transitions evaluated once -- every guard that
@@ -1183,8 +1188,7 @@ class FactoryExecutor:
 
         Sets the transitional ``stopping`` state before the first await so
         the control loop cannot admit new children or finalize the run while
-        the cancellations are in flight. Active wait-state watches are
-        cancelled through the host too. Idempotent: a second stop returns
+        the cancellations are in flight. Idempotent: a second stop returns
         the same result without another ledger event.
         """
         run = self._require_run(run_id)
@@ -1244,19 +1248,16 @@ class FactoryExecutor:
     def _resolve_subagents(
         self, harness: Any, canonical: dict[str, Any]
     ) -> tuple[dict[str, tuple[str, str | None, str | None]], list[str]]:
-        """Resolve every non-wait state's subagent reference; collect ALL failures.
+        """Resolve every state's subagent reference; collect ALL failures.
 
         A string reference is a harness subagent entry id or title: its
         content is the prompt template and ``metadata.model``/``metadata.thinking``
         carry optional spawn settings. An inline object uses its own fields.
-        Wait states have no subagent and are skipped.
         """
         resolved: dict[str, tuple[str, str | None, str | None]] = {}
         errors: list[str] = []
         for state_spec in canonical["states"]:
             state_id = state_spec["id"]
-            if isinstance(state_spec.get("wait"), dict):
-                continue
             reference = state_spec["subagent"]
             if isinstance(reference, dict):
                 prompt = reference.get("prompt")
@@ -1386,7 +1387,9 @@ class FactoryExecutor:
 
     def _queue_settle(self, run: FactoryRun, state: _StateRun, entry: _StateEntry) -> None:
         entry.is_settle = True
-        run.pending_evaluations.append((state.state_id, entry.index))
+        # The third element is the transition index to resume from: 0 for a
+        # fresh settle, or the paused index after a max_transitions pause.
+        run.pending_evaluations.append((state.state_id, entry.index, 0))
 
     async def _evaluate_settles(self, run: FactoryRun) -> None:
         """Evaluate every queued settle's outgoing transitions once.
@@ -1394,18 +1397,22 @@ class FactoryExecutor:
         ALL transitions whose guards pass fire (fan-out is legal); a fire
         enters the target unless it is out of max_entries (recorded as
         transition_blocked). Exceeding max_transitions pauses the run once
-        (budget_exceeded milestone, resume-able) with the settle left
-        unconsumed so resume re-evaluates it.
+        (max_transitions_exceeded milestone, resume-able) with the settle
+        left unconsumed AND the transition index where the pause landed, so
+        a resume continues after the transitions that already fired instead
+        of re-firing them.
         """
         while run.pending_evaluations and run.state == "running":
-            state_id, entry_index = run.pending_evaluations.pop(0)
+            state_id, entry_index, resume_from = run.pending_evaluations.pop(0)
             state = run.states[state_id]
             entry = state.entries[entry_index]
             if entry.consumed or not entry.is_settle:
                 continue
             entry.consumed = True
             outputs = entry.outputs or {}
-            for transition in run.transitions_from.get(state_id, []):
+            for transition_index, transition in enumerate(run.transitions_from.get(state_id, [])):
+                if transition_index < resume_from:
+                    continue  # already fired before the pause; do not re-fire
                 when = transition.get("when")
                 if when is not None and not _guard_passes(when, outputs):
                     continue
@@ -1424,12 +1431,12 @@ class FactoryExecutor:
                 if run.transitions_fired >= run.max_transitions and not run.max_transitions_reported:
                     run.max_transitions_reported = True
                     entry.consumed = False
-                    run.pending_evaluations.insert(0, (state_id, entry_index))
+                    run.pending_evaluations.insert(0, (state_id, entry_index, transition_index))
                     run.state = "paused"
                     run.pause_reason = "max_transitions exceeded"
                     await self._milestone(
                         run,
-                        "budget_exceeded",
+                        "max_transitions_exceeded",
                         f"max_transitions {run.max_transitions} exceeded; no new entries; "
                         f"resume with await rlm.factory.resume('{run.run_id}')",
                     )
@@ -1478,11 +1485,6 @@ class FactoryExecutor:
             for entry in state.entries:
                 if entry.status != "pending":
                     continue
-                if state.is_wait:
-                    await self._prepare_wait_entry(run, state, entry)
-                    if run.state != "running":
-                        return
-                    continue
                 instances, reason = self._prepare_entry(run, state, entry)
                 if reason is not None:
                     await self._apply_entry_failure_policy(run, state, entry, reason)
@@ -1526,6 +1528,14 @@ class FactoryExecutor:
             source_state = run.states.get(src_id)
             latest = source_state.latest_settle() if source_state is not None else None
             if latest is None:
+                if inp.get("optional"):
+                    # Optional inputs bind a null sentinel when their source
+                    # never settled, so loop states can re-enter before their
+                    # upstream partner has run (a compiled dag never sets
+                    # optional: its input edges are transitions, so the
+                    # wait-for-the-source semantics stay V1-exact).
+                    values[name] = "null" if port_type == "json" else "None"
+                    continue
                 return None, None  # wait for the source's first settle
             if latest.status == "error":
                 return None, f"input {name!r} from state {src_id!r} is unavailable (latest settle status 'error')"
@@ -1563,100 +1573,6 @@ class FactoryExecutor:
             )
         state.instance_counter += len(instances)
         return instances, None
-
-    async def _prepare_wait_entry(self, run: FactoryRun, state: _StateRun, entry: _StateEntry) -> None:
-        """Register one wait entry's watch and arm its timeout.
-
-        The host watch request resolves the outcome: a terminal response
-        settles the entry immediately with ``{"detail", "timed_out": false}``;
-        an "active" watch arms the injectable-clock timeout task, which
-        settles with ``timed_out: true`` when it fires.
-        """
-        wait = state.spec["wait"]
-        kind, target, timeout_ms = wait["kind"], wait["target"], wait["timeout_ms"]
-        entry.status = "waiting"
-        handle = _WaitHandle(kind=kind, target=target, timeout_ms=timeout_ms, entered_at=self._now_fn())
-        entry.wait = handle
-        self._event(
-            run, "node_ready", node=state.state_id, entry=entry.index,
-            detail=f"waiting on {kind} {target!r} (timeout {timeout_ms}ms)",
-        )
-        from . import host_request
-
-        try:
-            payload = await host_request(
-                f"rlm.watch.{kind}",
-                {"kind": kind, "target": target, "timeout_ms": timeout_ms, "run_id": run.run_id},
-            )
-        except Exception as exc:
-            self._settle_wait(run, state, entry, detail=f"watch registration failed: {exc}", timed_out=False)
-            return
-        if not isinstance(payload, dict):
-            payload = {}
-        handle.watch_id = payload.get("watch_id")
-        status = payload.get("status")
-        if status == "active":
-            if run.state != "running":
-                # stop() (or a policy) landed while the registration was in
-                # flight; the watch belongs to a run that is no longer ours.
-                await self._cancel_watch(run, state, entry, handle)
-                entry.status = "cancelled"
-                return
-            import asyncio
-
-            loop = asyncio.get_running_loop()
-            handle.timeout_task = loop.create_task(self._wait_timeout(run, state, entry, handle))
-            return
-        detail = payload.get("detail")
-        detail = str(detail) if detail else f"watch {status}"
-        self._settle_wait(run, state, entry, detail=detail, timed_out=False)
-
-    async def _wait_timeout(self, run: FactoryRun, state: _StateRun, entry: _StateEntry, handle: _WaitHandle) -> None:
-        try:
-            await self._sleep_fn(handle.timeout_ms / 1000.0)
-        except Exception:
-            return
-        if entry.status != "waiting" or entry.is_settle:
-            return
-        self._settle_wait(
-            run,
-            state,
-            entry,
-            detail=f"{handle.kind} watch on {handle.target!r} timed out after {handle.timeout_ms}ms",
-            timed_out=True,
-        )
-
-    def _settle_wait(self, run: FactoryRun, state: _StateRun, entry: _StateEntry, *, detail: str, timed_out: bool) -> None:
-        """Settle one wait entry with the implicit ``event`` output."""
-        entry.status = "done"
-        entry.outputs = {"event": {"detail": detail, "timed_out": timed_out}}
-        handle = entry.wait
-        if handle is not None and handle.timeout_task is not None:
-            handle.timeout_task.cancel()
-            handle.timeout_task = None
-        self._event(
-            run, "wait_settled", node=state.state_id, entry=entry.index, detail=detail, timed_out=timed_out
-        )
-        self._queue_settle(run, state, entry)
-
-    async def _cancel_watch(self, run: FactoryRun, state: _StateRun, entry: _StateEntry, handle: _WaitHandle) -> None:
-        """Stop one active watch through the host; idempotent per handle."""
-        if handle.timeout_task is not None:
-            handle.timeout_task.cancel()
-            handle.timeout_task = None
-        if handle.watch_id is None:
-            return
-        from . import host_request
-
-        try:
-            await host_request("rlm.watch.cancel", {"watch_id": handle.watch_id})
-        except Exception as exc:
-            self._event(
-                run, "cancel_failed", node=state.state_id, entry=entry.index,
-                detail=f"watch cancel failed: {exc}",
-            )
-            return
-        self._event(run, "cancelled", node=state.state_id, entry=entry.index, detail="watch cancelled")
 
     def _next_pending_instance(self, run: FactoryRun) -> "tuple[_StateRun, _StateEntry, _NodeInstance] | None":
         for state_id in run.order:
@@ -1928,7 +1844,6 @@ class FactoryExecutor:
             if run.states[state_id].status in ("pending", "running", "waiting")
         ]
         await self._cancel_running(run)
-        await self._cancel_watches(run)
         for state_id in stopped:
             state = run.states[state_id]
             if state.status in ("pending", "running", "waiting"):
@@ -1958,16 +1873,6 @@ class FactoryExecutor:
                     # The child is supervisor-owned; a failed delete leaves it
                     # running there, but the executor treats its slot as released.
                     instance.status = "cancelled"
-
-    async def _cancel_watches(self, run: FactoryRun) -> None:
-        for state_id in run.order:
-            state = run.states[state_id]
-            for entry in state.entries:
-                handle = entry.wait
-                if handle is None or entry.status != "waiting":
-                    continue
-                await self._cancel_watch(run, state, entry, handle)
-                entry.status = "cancelled"
 
     # -- completion ----------------------------------------------------------
 
@@ -2101,28 +2006,36 @@ class FactoryExecutor:
                 not in_flight
                 and not started
                 and not self._has_pending_instance(run)
-                and not self._has_active_wait(run)
                 and not run.pending_evaluations
             ):
                 # Defensive: nothing in flight, nothing admitted, nothing
-                # pending, no watch to settle it. A pending entry whose input
-                # source never settles is the only reachable shape; end the
-                # run instead of spinning.
-                self._event(run, "executor_error", error="control loop stalled: no in-flight or pending work")
+                # pending. The one reachable shape is a pending entry whose
+                # input source never settled; end the run instead of spinning.
+                stuck = [
+                    state_id
+                    for state_id in run.order
+                    for entry in run.states[state_id].entries
+                    if entry.status == "pending" and not entry.instances
+                ]
+                if stuck:
+                    reason = (
+                        "control loop stalled: pending entry of state "
+                        + ", ".join(repr(state_id) for state_id in stuck)
+                        + " is waiting for an input source that never settled"
+                    )
+                else:
+                    reason = "control loop stalled: no in-flight or pending work"
+                self._event(run, "executor_error", error=reason)
                 run.state = "failed"
                 try:
-                    await self._milestone(run, "failed", "control loop stalled")
+                    await self._milestone(run, "failed", reason)
                 except Exception:
                     pass
                 return
             # Yield once per iteration. A real collect already waits up to
             # POLL_TIMEOUT_MS, but an instantly-settling host (tests, a fast
-            # supervisor) must not hot-spin the loop and starve other tasks;
-            # when only wait-state timeouts remain, yield in small slices.
-            if not in_flight and self._has_active_wait(run):
-                await self._sleep_fn(IDLE_LOOP_SLEEP_SECONDS)
-            else:
-                await asyncio.sleep(0)
+            # supervisor) must not hot-spin the loop and starve other tasks.
+            await asyncio.sleep(0)
 
     # -- small helpers --------------------------------------------------------
 
@@ -2141,13 +2054,6 @@ class FactoryExecutor:
             for state in run.states.values()
             for entry in state.entries
             for instance in entry.instances
-        )
-
-    def _has_active_wait(self, run: FactoryRun) -> bool:
-        return any(
-            entry.status == "waiting" and entry.wait is not None
-            for state in run.states.values()
-            for entry in state.entries
         )
 
     def _pending_state_ids(self, run: FactoryRun) -> list[str]:

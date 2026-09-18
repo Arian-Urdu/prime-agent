@@ -10,19 +10,30 @@ Wait states are specified for the communication series but gated here:
 the watch host handlers (``rlm.watch.*``) do not exist yet, so a state
 carrying a ``wait`` block is rejected at write time.
 
-This module implements the write-time dry run for both forms: the machine
+This module implements the write-time dry run for both forms -- the machine
 validator, the dag-to-machine compiler, the unified entry point
 (``validate_factory_spec`` detects the form), and a canonicalizer that
-applies defaults and returns the canonical MACHINE form. Execution
-(run/status/stop) lands in a follow-up PR; nothing here spawns states.
+applies defaults and returns the canonical MACHINE form -- plus the
+executor (``FactoryExecutor`` and the ``rlm.factory`` namespace:
+run/status/stop/resume) that runs canonicalized machines through the
+existing RLM supervisor: states are admitted with ``rlm.spawn``, settled
+through ``rlm.collect``, and cancelled with ``rlm.delete_subagent``. The
+supervisor owns the children; the executor owns the run state in kernel
+memory. Runs do not survive a kernel restart (the registry lives in this
+module's state); children are supervisor-owned and keep running, so
+``rlm.list_subagents`` can still see them after a restart.
 """
 
 from __future__ import annotations
 
 import copy
 import heapq
+import json
 import re
-from typing import Any
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable
+from uuid import uuid4
 
 FAILURE_POLICIES: tuple[str, ...] = ("fail_fast", "continue", "escalate")
 PORT_TYPES: tuple[str, ...] = ("text", "json")
@@ -711,16 +722,22 @@ def topological_order(nodes: list[dict[str, Any]]) -> list[str]:
 
 
 __all__ = [
+    "FactoryExecutor",
+    "FactoryRun",
     "canonicalize_factory_spec",
     "compile_factory_dag",
+    "default_factory_executor",
+    "resume_factory",
+    "run_factory",
+    "status_factory",
+    "stop_factory",
     "topological_order",
     "validate_factory_machine",
     "validate_factory_spec",
 ]
 
 
-# ---------------------------------------------------------------------------
-# Executor: run a canonicalized DAG through the RLM supervisor.
+# Executor: run a canonicalized machine through the RLM supervisor.
 # ---------------------------------------------------------------------------
 
 ANSWER_CAPTURE_CAP = 200
@@ -737,6 +754,9 @@ EVENT_WINDOW = 50
 
 POLL_TIMEOUT_MS = 2000
 """How long each control-loop ``rlm.collect`` waits for unsettled children."""
+
+IDLE_LOOP_SLEEP_SECONDS = 0.02
+"""Loop yield while only wait-state timeouts are pending (no children)."""
 
 BACKOFF_MAX_ATTEMPTS = 5
 """Spawn admissions per node before a persistent rate limit fails the node."""
@@ -755,7 +775,7 @@ _RATE_LIMIT_MARKERS = (
 )
 
 _FENCED_JSON_RE = re.compile(r"```json\s*(.*?)\s*```", re.DOTALL)
-TERMINAL_NODE_STATUSES = ("done", "error", "cancelled")
+TERMINAL_ENTRY_STATUSES = ("done", "error", "cancelled")
 
 
 def _is_rate_limit_error(message: str) -> bool:
@@ -764,19 +784,9 @@ def _is_rate_limit_error(message: str) -> bool:
     return any(marker in lowered for marker in _RATE_LIMIT_MARKERS)
 
 
-def _effective_deps(node_spec: dict[str, Any]) -> set[str]:
-    """Dependencies that gate a node: depends_on plus every inputs[].from source."""
-    deps = set(node_spec.get("depends_on") or [])
-    for inp in node_spec.get("inputs") or []:
-        source = inp.get("from")
-        if isinstance(source, str) and "." in source:
-            deps.add(source.partition(".")[0])
-    return deps
-
-
-def _child_name(run_id: str, node_id: str, instance_index: int, attempt: int) -> str:
+def _child_name(run_id: str, state_id: str, instance_index: int, attempt: int) -> str:
     """Unique, readable sibling name for one spawned instance (host caps names at 64)."""
-    parts = ["sw", node_id[:20], run_id[:6]]
+    parts = ["sw", state_id[:20], run_id[:6]]
     if instance_index >= 0:
         parts.append(f"i{instance_index}")
     if attempt > 1:
@@ -831,11 +841,74 @@ def _render_prompt(template: str, values: dict[str, str]) -> str:
     return rendered
 
 
+def _guard_passes(when: dict[str, Any], outputs: dict[str, Any]) -> bool:
+    """Evaluate one transition guard over a settle's captured outputs.
+
+    A missing or unparseable port fails every op except ``exists`` (which is
+    explicitly false then); ``ne`` needs a found value to compare against.
+    """
+    port = when.get("output")
+    value: Any = None
+    found = False
+    path = when.get("path")
+    if path:
+        current = outputs.get(port)
+        if isinstance(current, dict):
+            found = True
+            for part in path.split("."):
+                if isinstance(current, dict) and part in current:
+                    current = current[part]
+                else:
+                    found = False
+                    break
+            value = current
+    elif port in outputs:
+        found = True
+        value = outputs[port]
+    op = when.get("op")
+    if op == "exists":
+        return found
+    if not found:
+        return False
+    if op == "eq":
+        return value == when.get("value")
+    if op == "ne":
+        return value != when.get("value")
+    if op in ("gt", "gte", "lt", "lte"):
+        bound = when.get("value")
+        if not _is_number(value) or not _is_number(bound):
+            return False
+        if op == "gt":
+            return value > bound
+        if op == "gte":
+            return value >= bound
+        if op == "lt":
+            return value < bound
+        return value <= bound
+    if op == "contains":
+        needle = when.get("value")
+        if not isinstance(needle, list):
+            return False
+        if isinstance(value, list):
+            return all(item in value for item in needle)
+        if isinstance(value, str):
+            return all(isinstance(item, str) and item in value for item in needle)
+        return False
+    return False
+
+
+def _validate_spawn_settings(model: Any, thinking: Any) -> str | None:
+    for key, value in (("model", model), ("thinking", thinking)):
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            return f"subagent {key} must be a non-empty string when provided"
+    return None
+
+
 @dataclass
 class _NodeInstance:
-    """One spawned child of one node (a foreach node has one per item)."""
+    """One spawned child of one state entry (a foreach entry has one per item)."""
 
-    index: int  # -1 for plain nodes, 0..K-1 for foreach items
+    index: int  # per-state running counter; unique within the state
     prompt: str  # fully rendered; re-spawns reuse it verbatim
     status: str = "pending"  # pending | running | done | error | cancelled
     attempt: int = 0  # spawn admissions tried for this instance
@@ -848,22 +921,75 @@ class _NodeInstance:
 
 
 @dataclass
-class _NodeRun:
-    """Executor-side state for one node of one run."""
+class _WaitHandle:
+    """Executor-side state for one active wait-state watch."""
 
-    node_id: str
-    spec: dict[str, Any]  # canonical node spec
-    position: int  # stable topological position for deterministic ordering
-    prompt_template: str
-    model: str | None = None
-    thinking: str | None = None
-    status: str = "pending"  # pending | running | done | error | cancelled
+    kind: str = "path"  # "path" | "agent"
+    target: str = ""
+    timeout_ms: int = 0
+    watch_id: str | None = None
+    entered_at: float | None = None
+    timeout_task: "Any | None" = None
+
+
+@dataclass
+class _StateEntry:
+    """One entry (activation) of a state; re-entry creates a fresh entry.
+
+    An entry settles when all of its instances settle done (or when a wait
+    watch settles); the settle captures the state's declared outputs, and
+    the control loop then evaluates the outgoing transitions once
+    (``consumed`` marks that evaluation done).
+    """
+
+    index: int  # per-state entry index, 0-based
+    status: str = "pending"  # pending | running | waiting | done | error | cancelled
     instances: list[_NodeInstance] = field(default_factory=list)
     error: str | None = None
+    answer: str | None = None  # joined captured answers of this entry
+    outputs: dict[str, Any] | None = None  # captured settle outputs (port name -> value)
+    output_errors: dict[str, str] | None = None  # ports whose json capture failed
+    is_settle: bool = False  # True once the entry settled (done or error)
+    consumed: bool = False  # True once the settle's transitions were evaluated
+    wait: _WaitHandle | None = None
+
+
+@dataclass
+class _StateRun:
+    """Executor-side state for one machine state of one run."""
+
+    state_id: str
+    spec: dict[str, Any]  # canonical state spec
+    position: int  # stable list position for deterministic ordering
+    prompt_template: str | None = None  # None for wait states
+    model: str | None = None
+    thinking: str | None = None
+    max_entries: int = STATE_MAX_ENTRIES_DEFAULT
+    entries_used: int = 0
+    entries: list[_StateEntry] = field(default_factory=list)
+    instance_counter: int = 0
+    error: str | None = None
+    cancelled: bool = False  # set by stop()/fail_fast for never-entered states
 
     @property
     def lifecycle(self) -> str:
         return self.spec.get("lifecycle", NODE_LIFECYCLE_DEFAULT)
+
+    @property
+    def is_wait(self) -> bool:
+        return isinstance(self.spec.get("wait"), dict)
+
+    @property
+    def status(self) -> str:
+        if self.entries:
+            return self.entries[-1].status
+        return "cancelled" if self.cancelled else "pending"
+
+    def latest_settle(self) -> _StateEntry | None:
+        for entry in reversed(self.entries):
+            if entry.is_settle:
+                return entry
+        return None
 
 
 @dataclass
@@ -877,28 +1003,26 @@ class FactoryRun:
     state: str = "running"  # running | stopping | paused | done | failed | stopped
     started_at: float = 0.0
     max_parallel: int = RUN_MAX_PARALLEL_DEFAULT
+    max_transitions: int = MAX_TRANSITIONS_CAP
+    max_transitions_reported: bool = False
     run_budget_ms: int | None = None
     budget_reported: bool = False
     pause_reason: str | None = None
-    nodes: dict[str, _NodeRun] = field(default_factory=dict)
+    states: dict[str, _StateRun] = field(default_factory=dict)
     order: list[str] = field(default_factory=list)
+    transitions_from: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    pending_evaluations: list[tuple[str, int]] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
     milestones: set[str] = field(default_factory=set)
     spawn_count: int = 0
     settle_count: int = 0
+    transitions_fired: int = 0
     tool_use_total: int = 0
-    task: "asyncio.Task[None] | None" = None
-
-
-def _validate_spawn_settings(model: Any, thinking: Any) -> str | None:
-    for key, value in (("model", model), ("thinking", thinking)):
-        if value is not None and (not isinstance(value, str) or not value.strip()):
-            return f"subagent {key} must be a non-empty string when provided"
-    return None
+    task: "Any | None" = None
 
 
 class FactoryExecutor:
-    """Runs canonicalized factory DAGs through the existing RLM supervisor.
+    """Runs canonicalized state-machine factories through the existing RLM supervisor.
 
     Ownership split: the supervisor owns the children (admission via
     ``rlm.spawn``, settlement via ``rlm.collect``, cancellation via
@@ -907,7 +1031,16 @@ class FactoryExecutor:
     functions and ``host_request`` at call time, so tests can patch
     ``rlm.host_request``. ``now`` (default ``time.monotonic``) and ``sleep``
     (default ``asyncio.sleep``) are injectable: budgets measure admission
-    to settlement, and rate-limit backoff is testable with fake sleeps.
+    to settlement, wait-state timeouts and rate-limit backoff are testable
+    with fake sleeps.
+
+    Machine semantics: admission enters every entry state; each settle is
+    queued and its outgoing transitions evaluated once -- every guard that
+    passes fires (fan-out is legal), a fire enters the target unless it is
+    out of ``max_entries`` (recorded as ``transition_blocked``), and a
+    self-loop or back-edge re-enters its target with freshly re-bound
+    inputs. A run completes at quiescence: no state entry in flight
+    (pending/running/waiting) and no unevaluated settle.
 
     Runs do not survive a kernel restart (the registry lives in kernel
     memory); children are supervisor-owned and keep running, so
@@ -934,28 +1067,38 @@ class FactoryExecutor:
         """Validate a stored factory spec and start a run of it.
 
         The dry run happens in two halves. Write time (``create_factory``)
-        validated the graph; here ``run`` re-validates and canonicalizes it,
-        then resolves every node's subagent reference, reporting ALL
-        failures in one ``ValueError`` and starting nothing on any failure.
-        The resolved node count and ``max_parallel`` are reported in the
-        result; actual admission limits (concurrency, tree depth, provider
-        rate limits) are enforced at spawn time through the backoff path.
-        Admission spawns every ready node up to ``max_parallel``, records
-        handles, and returns; a background asyncio task continues the run, so
-        the calling model turn ends immediately (nonblocking).
+        validated the machine; here ``run`` re-validates and canonicalizes
+        it (dag sugar compiles to machine form), then resolves every state's
+        subagent reference, reporting ALL failures in one ``ValueError`` and
+        starting nothing on any failure. The resolved state count and
+        ``max_parallel`` are reported in the result; actual admission limits
+        (concurrency, tree depth, provider rate limits) are enforced at
+        spawn time through the backoff path. Admission enters every entry
+        state up to ``max_parallel``, records handles, and returns; a
+        background asyncio task continues the run, so the calling model turn
+        ends immediately (nonblocking).
         """
         harness = self._resolve_harness()
         entry = harness.get("factory", spec_id)
         if entry is None:
             raise ValueError(f"unknown factory spec {spec_id!r}")
-        dag = entry.arguments.get("dag") if isinstance(entry.arguments, dict) else None
-        canonical = canonicalize_factory_spec(dag)
+        arguments = entry.arguments if isinstance(entry.arguments, dict) else {}
+        spec = arguments.get("machine")
+        if spec is None:
+            spec = arguments.get("dag")
+        canonical = canonicalize_factory_spec(spec)
         resolved, reference_errors = self._resolve_subagents(harness, canonical)
         if reference_errors:
             raise ValueError("; ".join(reference_errors))
         run = self._create_run(entry.id, canonical, resolved, name=name)
         self._runs[run.run_id] = run
-        self._event(run, "run_started", detail=f"{len(run.nodes)} nodes, max_parallel {run.max_parallel}")
+        self._event(
+            run, "run_started", detail=f"{len(run.states)} states, max_parallel {run.max_parallel}"
+        )
+        for state_id in run.order:
+            state = run.states[state_id]
+            if state.spec.get("entry"):
+                self._enter_state(run, state, from_state=None)
         started = await self._spawn_ready(run, allow_backoff=False)
         if self._run_complete(run):
             await self._finalize(run)
@@ -965,14 +1108,14 @@ class FactoryExecutor:
             "run_id": run.run_id,
             "spec_id": entry.id,
             "name": name,
-            "nodes": len(run.nodes),
+            "nodes": len(run.states),
             "max_parallel": run.max_parallel,
             "started": started,
-            "pending": self._pending_node_ids(run),
+            "pending": self._pending_state_ids(run),
         }
 
     async def status(self, run_id: str) -> dict[str, Any]:
-        """Node states, the trailing event window, elapsed time, and usage.
+        """State states, the trailing event window, elapsed time, and usage.
 
         Every call marks the whole ledger ``delivered`` (the parent read
         it); the returned window is the last ``EVENT_WINDOW`` events.
@@ -980,31 +1123,41 @@ class FactoryExecutor:
         """
         run = self._require_run(run_id)
         nodes: list[dict[str, Any]] = []
-        for node_id in run.order:
-            node = run.nodes[node_id]
-            entry: dict[str, Any] = {
-                "id": node.node_id,
-                "status": node.status,
-                "lifecycle": node.lifecycle,
-                "attempts": sum(instance.attempt for instance in node.instances),
+        for state_id in run.order:
+            state = run.states[state_id]
+            entry_report: dict[str, Any] = {
+                "id": state.state_id,
+                "status": state.status,
+                "lifecycle": state.lifecycle,
+                "attempts": sum(
+                    instance.attempt for entry in state.entries for instance in entry.instances
+                ),
+                "entries_used": state.entries_used,
+                "max_entries": state.max_entries,
+                "entries": [
+                    {"index": entry.index, "status": entry.status, "error": entry.error}
+                    for entry in state.entries
+                ],
                 "instances": [
                     {
                         "index": instance.index,
+                        "entry": entry.index,
                         "status": instance.status,
                         "attempt": instance.attempt,
                         "child": instance.child_id,
                         "duration_ms": instance.duration_ms,
                         "error": instance.error,
                     }
-                    for instance in node.instances
+                    for entry in state.entries
+                    for instance in entry.instances
                 ],
             }
-            answer = self._node_answer(node)
-            if answer is not None:
-                entry["answer_preview"] = answer
-            if node.error is not None:
-                entry["error"] = node.error
-            nodes.append(entry)
+            latest = state.latest_settle()
+            if latest is not None and latest.answer:
+                entry_report["answer_preview"] = latest.answer
+            if state.error is not None:
+                entry_report["error"] = state.error
+            nodes.append(entry_report)
         for event in run.events:
             event["stage"] = "delivered"
         return {
@@ -1021,6 +1174,7 @@ class FactoryExecutor:
                 "tool_uses": run.tool_use_total,
                 "max_parallel": run.max_parallel,
                 "running": self._running_instance_count(run),
+                "transitions_fired": run.transitions_fired,
             },
         }
 
@@ -1028,9 +1182,10 @@ class FactoryExecutor:
         """Cancel every running child of the run and mark it stopped.
 
         Sets the transitional ``stopping`` state before the first await so
-        the control loop cannot admit new children or finalize the run
-        while the cancellations are in flight. Idempotent: a second stop
-        returns the same result without another ledger event.
+        the control loop cannot admit new children or finalize the run while
+        the cancellations are in flight. Active wait-state watches are
+        cancelled through the host too. Idempotent: a second stop returns
+        the same result without another ledger event.
         """
         run = self._require_run(run_id)
         if run.state == "stopped":
@@ -1038,15 +1193,15 @@ class FactoryExecutor:
         run.state = "stopping"
         stopped = await self._halt_nonterminal(run, "run stopped")
         run.state = "stopped"
-        self._event(run, "run_stopped", detail=f"stopped; {len(stopped)} node(s) cancelled")
+        self._event(run, "run_stopped", detail=f"stopped; {len(stopped)} state(s) cancelled")
         return {"run_id": run.run_id, "state": "stopped", "cancelled": stopped}
 
     async def resume(self, run_id: str) -> dict[str, Any]:
-        """Resume a paused run (escalate or budget pause) and restart the loop.
+        """Resume a paused run (escalate, budget, or max_transitions pause).
 
-        A budget pause is reported once per run: resuming after it is an
-        explicit operator decision and no further budget pauses fire.
-        Raises ``ValueError`` when the run is not paused.
+        A budget or max_transitions pause is reported once per run:
+        resuming after it is an explicit operator decision and no further
+        budget pauses fire. Raises ``ValueError`` when the run is not paused.
         """
         run = self._require_run(run_id)
         if run.state != "paused":
@@ -1054,6 +1209,9 @@ class FactoryExecutor:
         run.state = "running"
         run.pause_reason = None
         self._event(run, "resumed", detail="resumed by caller")
+        # Evaluate settles first: paused runs may still carry transitions to
+        # fire (escalate) before anything can be admitted.
+        await self._evaluate_settles(run)
         # allow_backoff=False: like run(), resume() must never sleep inside
         # the calling model turn; rate-limited admissions defer to the loop.
         started = await self._spawn_ready(run, allow_backoff=False)
@@ -1065,7 +1223,7 @@ class FactoryExecutor:
             "run_id": run.run_id,
             "state": run.state,
             "started": started,
-            "pending": self._pending_node_ids(run),
+            "pending": self._pending_state_ids(run),
         }
 
     # -- setup --------------------------------------------------------------
@@ -1086,17 +1244,20 @@ class FactoryExecutor:
     def _resolve_subagents(
         self, harness: Any, canonical: dict[str, Any]
     ) -> tuple[dict[str, tuple[str, str | None, str | None]], list[str]]:
-        """Resolve every node's subagent reference; collect ALL failures.
+        """Resolve every non-wait state's subagent reference; collect ALL failures.
 
         A string reference is a harness subagent entry id or title: its
         content is the prompt template and ``metadata.model``/``metadata.thinking``
         carry optional spawn settings. An inline object uses its own fields.
+        Wait states have no subagent and are skipped.
         """
         resolved: dict[str, tuple[str, str | None, str | None]] = {}
         errors: list[str] = []
-        for node_spec in canonical["nodes"]:
-            node_id = node_spec["id"]
-            reference = node_spec["subagent"]
+        for state_spec in canonical["states"]:
+            state_id = state_spec["id"]
+            if isinstance(state_spec.get("wait"), dict):
+                continue
+            reference = state_spec["subagent"]
             if isinstance(reference, dict):
                 prompt = reference.get("prompt")
                 model = reference.get("model")
@@ -1106,20 +1267,20 @@ class FactoryExecutor:
                 if entry is None:
                     entry = next((row for row in harness.list("subagent") if row.title == reference), None)
                 if entry is None:
-                    errors.append(f"node {node_id!r} references unknown subagent {reference!r}")
+                    errors.append(f"state {state_id!r} references unknown subagent {reference!r}")
                     continue
                 prompt = entry.content
                 metadata = entry.metadata if isinstance(entry.metadata, dict) else {}
                 model = metadata.get("model")
                 thinking = metadata.get("thinking")
             if not isinstance(prompt, str) or not prompt.strip():
-                errors.append(f"node {node_id!r} has an empty subagent prompt")
+                errors.append(f"state {state_id!r} has an empty subagent prompt")
                 continue
             settings_error = _validate_spawn_settings(model, thinking)
             if settings_error is not None:
-                errors.append(f"node {node_id!r} {settings_error}")
+                errors.append(f"state {state_id!r} {settings_error}")
                 continue
-            resolved[node_id] = (prompt, model, thinking)
+            resolved[state_id] = (prompt, model, thinking)
         return resolved, errors
 
     def _create_run(
@@ -1137,21 +1298,26 @@ class FactoryExecutor:
             name=name,
             started_at=self._now_fn(),
             max_parallel=run_spec["max_parallel"],
+            max_transitions=run_spec["max_transitions"],
             run_budget_ms=run_spec.get("budget_ms"),
         )
-        run.order = topological_order(canonical["nodes"])
-        position_of = {node_id: index for index, node_id in enumerate(run.order)}
-        for node_spec in canonical["nodes"]:
-            node_id = node_spec["id"]
-            prompt, model, thinking = resolved[node_id]
-            run.nodes[node_id] = _NodeRun(
-                node_id=node_id,
-                spec=node_spec,
-                position=position_of[node_id],
+        position_of: dict[str, int] = {}
+        for position, state_spec in enumerate(canonical["states"]):
+            position_of[state_spec["id"]] = position
+            state_id = state_spec["id"]
+            prompt, model, thinking = resolved.get(state_id, (None, None, None))
+            run.states[state_id] = _StateRun(
+                state_id=state_id,
+                spec=state_spec,
+                position=position,
                 prompt_template=prompt,
                 model=model,
                 thinking=thinking,
+                max_entries=state_spec.get("max_entries", STATE_MAX_ENTRIES_DEFAULT),
             )
+            run.order.append(state_id)
+        for transition in canonical.get("transitions") or []:
+            run.transitions_from.setdefault(transition["from"], []).append(transition)
         return run
 
     # -- event ledger -------------------------------------------------------
@@ -1162,6 +1328,7 @@ class FactoryExecutor:
         kind: str,
         *,
         node: str | None = None,
+        entry: int | None = None,
         instance: int | None = None,
         detail: str | None = None,
         stage: str = "recorded",
@@ -1177,6 +1344,8 @@ class FactoryExecutor:
         event: dict[str, Any] = {"seq": len(run.events) + 1, "kind": kind, "stage": stage}
         if node is not None:
             event["node"] = node
+        if entry is not None:
+            event["entry"] = entry
         if instance is not None:
             event["instance"] = instance
         if detail is not None:
@@ -1204,16 +1373,85 @@ class FactoryExecutor:
             # status() still surfaces it to the parent.
             pass
 
+    # -- entries, transitions -------------------------------------------------
+
+    def _enter_state(self, run: FactoryRun, state: _StateRun, *, from_state: str | None) -> _StateEntry:
+        """Create one new entry of a state (bounded by max_entries upstream)."""
+        entry = _StateEntry(index=len(state.entries))
+        state.entries.append(entry)
+        state.entries_used += 1
+        detail = "entry state" if from_state is None else f"entered from {from_state}"
+        self._event(run, "state_entry", node=state.state_id, entry=entry.index, detail=detail)
+        return entry
+
+    def _queue_settle(self, run: FactoryRun, state: _StateRun, entry: _StateEntry) -> None:
+        entry.is_settle = True
+        run.pending_evaluations.append((state.state_id, entry.index))
+
+    async def _evaluate_settles(self, run: FactoryRun) -> None:
+        """Evaluate every queued settle's outgoing transitions once.
+
+        ALL transitions whose guards pass fire (fan-out is legal); a fire
+        enters the target unless it is out of max_entries (recorded as
+        transition_blocked). Exceeding max_transitions pauses the run once
+        (budget_exceeded milestone, resume-able) with the settle left
+        unconsumed so resume re-evaluates it.
+        """
+        while run.pending_evaluations and run.state == "running":
+            state_id, entry_index = run.pending_evaluations.pop(0)
+            state = run.states[state_id]
+            entry = state.entries[entry_index]
+            if entry.consumed or not entry.is_settle:
+                continue
+            entry.consumed = True
+            outputs = entry.outputs or {}
+            for transition in run.transitions_from.get(state_id, []):
+                when = transition.get("when")
+                if when is not None and not _guard_passes(when, outputs):
+                    continue
+                target = run.states[transition["to"]]
+                if target.entries_used >= target.max_entries:
+                    self._event(
+                        run,
+                        "transition_blocked",
+                        detail=(
+                            f"state {target.state_id!r} is at max_entries "
+                            f"{target.max_entries}; transition {state_id!r} -> {target.state_id!r} blocked"
+                        ),
+                    )
+                    continue
+                if run.transitions_fired >= run.max_transitions and not run.max_transitions_reported:
+                    run.max_transitions_reported = True
+                    entry.consumed = False
+                    run.pending_evaluations.insert(0, (state_id, entry_index))
+                    run.state = "paused"
+                    run.pause_reason = "max_transitions exceeded"
+                    await self._milestone(
+                        run,
+                        "budget_exceeded",
+                        f"max_transitions {run.max_transitions} exceeded; no new entries; "
+                        f"resume with await rlm.factory.resume('{run.run_id}')",
+                    )
+                    return
+                run.transitions_fired += 1
+                self._event(
+                    run,
+                    "transition_fired",
+                    detail=f"{state_id!r} -> {target.state_id!r}",
+                    **{"from": state_id, "to": target.state_id},
+                )
+                self._enter_state(run, target, from_state=state_id)
+
     # -- readiness, binding, admission --------------------------------------
 
     async def _spawn_ready(self, run: FactoryRun, *, allow_backoff: bool) -> list[str]:
-        """Initialize ready nodes and admit pending instances up to max_parallel.
+        """Prepare ready entries and admit pending instances up to max_parallel.
 
-        Returns the node ids that had at least one instance admitted here.
+        Returns the state ids that had at least one instance admitted here.
         """
         started: list[str] = []
         while run.state == "running":
-            await self._initialize_ready_nodes(run)
+            await self._prepare_ready_entries(run)
             if run.state != "running":
                 break
             if self._running_instance_count(run) >= run.max_parallel:
@@ -1221,118 +1459,238 @@ class FactoryExecutor:
             pair = self._next_pending_instance(run)
             if pair is None:
                 break
-            node, instance = pair
-            outcome = await self._admit(run, node, instance, allow_backoff=allow_backoff)
-            if outcome == "admitted" and node.node_id not in started:
-                started.append(node.node_id)
+            state, entry, instance = pair
+            outcome = await self._admit(run, state, entry, instance, allow_backoff=allow_backoff)
+            if outcome == "admitted" and state.state_id not in started:
+                started.append(state.state_id)
             if outcome == "deferred":
                 # A rate limit is usually global, so stop admitting in this
                 # phase; the control loop retries with exponential backoff.
                 break
         return started
 
-    async def _initialize_ready_nodes(self, run: FactoryRun) -> None:
-        """Bind inputs and create instances for every node whose deps are terminal."""
-        for node_id in run.order:
-            node = run.nodes[node_id]
-            if node.status != "pending":
-                continue
-            deps = _effective_deps(node.spec)
-            if not all(run.nodes[dep].status in TERMINAL_NODE_STATUSES for dep in deps):
-                continue
-            instances, reason = self._prepare_instances(run, node)
-            if reason is not None:
-                await self._apply_node_failure_policy(run, node, reason)
-                if run.state != "running":
-                    return
-                continue
-            node.instances = instances
-            if instances:
-                node.status = "running"
-                self._event(run, "node_ready", node=node_id, detail=f"{len(instances)} instance(s) prepared")
-            else:
-                node.status = "done"
-                self._event(run, "node_ready", node=node_id, detail="foreach expanded to zero items; nothing to run")
+    async def _prepare_ready_entries(self, run: FactoryRun) -> None:
+        """Bind inputs and create instances for every entry whose input
+        sources have settles; wait entries register their watch instead."""
+        for state_id in run.order:
+            state = run.states[state_id]
+            for entry in state.entries:
+                if entry.status != "pending":
+                    continue
+                if state.is_wait:
+                    await self._prepare_wait_entry(run, state, entry)
+                    if run.state != "running":
+                        return
+                    continue
+                instances, reason = self._prepare_entry(run, state, entry)
+                if reason is not None:
+                    await self._apply_entry_failure_policy(run, state, entry, reason)
+                    if run.state != "running":
+                        return
+                    continue
+                if instances is None:
+                    continue  # an input source has not settled yet; stay pending
+                entry.instances = instances
+                if instances:
+                    entry.status = "running"
+                    self._event(
+                        run, "node_ready", node=state_id, entry=entry.index,
+                        detail=f"{len(instances)} instance(s) prepared",
+                    )
+                else:
+                    entry.status = "done"
+                    self._event(
+                        run, "node_ready", node=state_id, entry=entry.index,
+                        detail="foreach expanded to zero items; nothing to run",
+                    )
+                    self._queue_settle(run, state, entry)
 
-    def _prepare_instances(self, run: FactoryRun, node: _NodeRun) -> "tuple[list[_NodeInstance] | None, str | None]":
+    def _prepare_entry(
+        self, run: FactoryRun, state: _StateRun, entry: _StateEntry
+    ) -> "tuple[list[_NodeInstance] | None, str | None]":
         """Bind inputs, expand foreach, and render one prompt per instance.
 
-        Returns ``(instances, None)`` or ``(None, reason)`` on a binding
-        failure. Binding failures never retry: a deterministic binding
-        error would recur on every re-render, so the node fails and its
-        failure_policy applies directly.
+        Returns ``(instances, None)`` on success, ``(None, None)`` while an
+        input source has not settled yet (the entry stays pending), or
+        ``(None, reason)`` on a binding failure. Binding failures never
+        retry: a deterministic binding error would recur on every re-render,
+        so the entry fails and its failure_policy applies directly.
         """
         values: dict[str, str] = {}
-        foreach = node.spec.get("foreach")
+        foreach = state.spec.get("foreach")
         items: list[Any] | None = None
-        for inp in node.spec.get("inputs") or []:
+        for inp in state.spec.get("inputs") or []:
             name, port_type, source = inp["name"], inp["type"], inp["from"]
             src_id, _, src_output = source.partition(".")
-            source_node = run.nodes.get(src_id)
-            if source_node is None or source_node.status != "done":
-                status = source_node.status if source_node is not None else "missing"
-                return None, f"input {name!r} from node {src_id!r} is unavailable (status {status!r})"
-            answer = self._node_answer(source_node)
-            if answer is None:
-                return None, f"input {name!r} from node {src_id!r} has no captured answer"
+            source_state = run.states.get(src_id)
+            latest = source_state.latest_settle() if source_state is not None else None
+            if latest is None:
+                return None, None  # wait for the source's first settle
+            if latest.status == "error":
+                return None, f"input {name!r} from state {src_id!r} is unavailable (latest settle status 'error')"
+            outputs = latest.outputs or {}
+            output_errors = latest.output_errors or {}
+            if src_output in output_errors:
+                return None, f"input {name!r}: {output_errors[src_output]}"
+            if src_output not in outputs:
+                return None, f"input {name!r} from state {src_id!r} has no captured output {src_output!r}"
+            value = outputs[src_output]
             if port_type == "text":
-                values[name] = answer
+                values[name] = value if isinstance(value, str) else json.dumps(value)
                 continue
-            parsed, error = _parse_json_output(answer, src_output)
-            if error is not None:
-                return None, f"input {name!r}: {error}"
             if foreach is not None and foreach.get("over") == name:
-                if not isinstance(parsed, list):
+                if not isinstance(value, list):
                     return None, f"foreach.over input {name!r} is not a JSON list"
-                items = parsed
+                items = value
                 continue
-            values[name] = json.dumps(parsed)
+            values[name] = json.dumps(value)
         if foreach is None:
-            return [_NodeInstance(index=-1, prompt=_render_prompt(node.prompt_template, values))], None
+            assert state.prompt_template is not None
+            instance = _NodeInstance(index=state.instance_counter, prompt=_render_prompt(state.prompt_template, values))
+            state.instance_counter += 1
+            return [instance], None
         if items is None:
-            return None, "foreach node did not resolve its over input"
-        instances = [
-            _NodeInstance(
-                index=index,
-                prompt=_render_prompt(
-                    node.prompt_template,
-                    {**values, foreach["over"]: item if isinstance(item, str) else json.dumps(item)},
-                ),
+            return None, "foreach entry did not resolve its over input"
+        instances = []
+        for item in items[: foreach["max"]]:
+            instance_value = item if isinstance(item, str) else json.dumps(item)
+            instances.append(
+                _NodeInstance(
+                    index=state.instance_counter + len(instances),
+                    prompt=_render_prompt(state.prompt_template, {**values, foreach["over"]: instance_value}),
+                )
             )
-            for index, item in enumerate(items[: foreach["max"]])
-        ]
+        state.instance_counter += len(instances)
         return instances, None
 
-    def _next_pending_instance(self, run: FactoryRun) -> "tuple[_NodeRun, _NodeInstance] | None":
-        for node_id in run.order:
-            for instance in run.nodes[node_id].instances:
-                if instance.status == "pending":
-                    return run.nodes[node_id], instance
+    async def _prepare_wait_entry(self, run: FactoryRun, state: _StateRun, entry: _StateEntry) -> None:
+        """Register one wait entry's watch and arm its timeout.
+
+        The host watch request resolves the outcome: a terminal response
+        settles the entry immediately with ``{"detail", "timed_out": false}``;
+        an "active" watch arms the injectable-clock timeout task, which
+        settles with ``timed_out: true`` when it fires.
+        """
+        wait = state.spec["wait"]
+        kind, target, timeout_ms = wait["kind"], wait["target"], wait["timeout_ms"]
+        entry.status = "waiting"
+        handle = _WaitHandle(kind=kind, target=target, timeout_ms=timeout_ms, entered_at=self._now_fn())
+        entry.wait = handle
+        self._event(
+            run, "node_ready", node=state.state_id, entry=entry.index,
+            detail=f"waiting on {kind} {target!r} (timeout {timeout_ms}ms)",
+        )
+        from . import host_request
+
+        try:
+            payload = await host_request(
+                f"rlm.watch.{kind}",
+                {"kind": kind, "target": target, "timeout_ms": timeout_ms, "run_id": run.run_id},
+            )
+        except Exception as exc:
+            self._settle_wait(run, state, entry, detail=f"watch registration failed: {exc}", timed_out=False)
+            return
+        if not isinstance(payload, dict):
+            payload = {}
+        handle.watch_id = payload.get("watch_id")
+        status = payload.get("status")
+        if status == "active":
+            if run.state != "running":
+                # stop() (or a policy) landed while the registration was in
+                # flight; the watch belongs to a run that is no longer ours.
+                await self._cancel_watch(run, state, entry, handle)
+                entry.status = "cancelled"
+                return
+            import asyncio
+
+            loop = asyncio.get_running_loop()
+            handle.timeout_task = loop.create_task(self._wait_timeout(run, state, entry, handle))
+            return
+        detail = payload.get("detail")
+        detail = str(detail) if detail else f"watch {status}"
+        self._settle_wait(run, state, entry, detail=detail, timed_out=False)
+
+    async def _wait_timeout(self, run: FactoryRun, state: _StateRun, entry: _StateEntry, handle: _WaitHandle) -> None:
+        try:
+            await self._sleep_fn(handle.timeout_ms / 1000.0)
+        except Exception:
+            return
+        if entry.status != "waiting" or entry.is_settle:
+            return
+        self._settle_wait(
+            run,
+            state,
+            entry,
+            detail=f"{handle.kind} watch on {handle.target!r} timed out after {handle.timeout_ms}ms",
+            timed_out=True,
+        )
+
+    def _settle_wait(self, run: FactoryRun, state: _StateRun, entry: _StateEntry, *, detail: str, timed_out: bool) -> None:
+        """Settle one wait entry with the implicit ``event`` output."""
+        entry.status = "done"
+        entry.outputs = {"event": {"detail": detail, "timed_out": timed_out}}
+        handle = entry.wait
+        if handle is not None and handle.timeout_task is not None:
+            handle.timeout_task.cancel()
+            handle.timeout_task = None
+        self._event(
+            run, "wait_settled", node=state.state_id, entry=entry.index, detail=detail, timed_out=timed_out
+        )
+        self._queue_settle(run, state, entry)
+
+    async def _cancel_watch(self, run: FactoryRun, state: _StateRun, entry: _StateEntry, handle: _WaitHandle) -> None:
+        """Stop one active watch through the host; idempotent per handle."""
+        if handle.timeout_task is not None:
+            handle.timeout_task.cancel()
+            handle.timeout_task = None
+        if handle.watch_id is None:
+            return
+        from . import host_request
+
+        try:
+            await host_request("rlm.watch.cancel", {"watch_id": handle.watch_id})
+        except Exception as exc:
+            self._event(
+                run, "cancel_failed", node=state.state_id, entry=entry.index,
+                detail=f"watch cancel failed: {exc}",
+            )
+            return
+        self._event(run, "cancelled", node=state.state_id, entry=entry.index, detail="watch cancelled")
+
+    def _next_pending_instance(self, run: FactoryRun) -> "tuple[_StateRun, _StateEntry, _NodeInstance] | None":
+        for state_id in run.order:
+            state = run.states[state_id]
+            for entry in state.entries:
+                for instance in entry.instances:
+                    if instance.status == "pending":
+                        return state, entry, instance
         return None
 
     async def _admit(
-        self, run: FactoryRun, node: _NodeRun, instance: _NodeInstance, *, allow_backoff: bool
+        self, run: FactoryRun, state: _StateRun, entry: _StateEntry, instance: _NodeInstance, *, allow_backoff: bool
     ) -> str:
         """Spawn one instance. Returns "admitted", "deferred", or "failed".
 
         Rate-limited admissions back off and retry: doubling delays capped
         at 60s, at most ``BACKOFF_MAX_ATTEMPTS`` admissions per call, then
-        the node fails through its failure_policy. In the admission phase
+        the entry fails through its failure_policy. In the admission phase
         (``allow_backoff=False``) a rate limit does not sleep inside
-        ``run()``: the instance stays pending ("deferred") and the control
-        loop retries it with backoff. Any other admission error fails the
-        node immediately.
+        ``run()``/``resume()``: the instance stays pending ("deferred") and
+        the control loop retries it with backoff. Any other admission error
+        fails the entry immediately.
         """
         from . import spawn
 
         instance.attempt += 1
-        child_name = _child_name(run.run_id, node.node_id, instance.index, instance.attempt)
+        child_name = _child_name(run.run_id, state.state_id, instance.index, instance.attempt)
         tries = BACKOFF_MAX_ATTEMPTS if allow_backoff else 1
         delay = BACKOFF_BASE_SECONDS
         last_error = "spawn admission failed"
         for try_index in range(tries):
             try:
-                handle = await spawn(instance.prompt, name=child_name, model=node.model, thinking=node.thinking)
+                handle = await spawn(
+                    instance.prompt, name=child_name, model=state.model, thinking=state.thinking
+                )
             except RuntimeError as exc:
                 last_error = str(exc)
                 if not _is_rate_limit_error(last_error):
@@ -1341,7 +1699,8 @@ class FactoryExecutor:
                     self._event(
                         run,
                         "spawn_backoff",
-                        node=node.node_id,
+                        node=state.state_id,
+                        entry=entry.index,
                         instance=instance.index,
                         detail=f"rate limited; retrying in {delay:g}s",
                     )
@@ -1355,7 +1714,8 @@ class FactoryExecutor:
             self._event(
                 run,
                 "spawned",
-                node=node.node_id,
+                node=state.state_id,
+                entry=entry.index,
                 instance=instance.index,
                 attempt=instance.attempt,
                 child=handle.rlm_child_id,
@@ -1366,17 +1726,22 @@ class FactoryExecutor:
             self._event(
                 run,
                 "spawn_deferred",
-                node=node.node_id,
+                node=state.state_id,
+                entry=entry.index,
                 instance=instance.index,
                 detail=f"rate limited at admission: {last_error}",
             )
             return "deferred"
-        await self._apply_instance_failure(run, node, instance, f"spawn admission failed: {last_error}", retry=False)
+        await self._apply_instance_failure(
+            run, state, entry, instance, f"spawn admission failed: {last_error}", retry=False
+        )
         return "failed"
 
     # -- settlement, retries, policies ---------------------------------------
 
-    async def _apply_settlement(self, run: FactoryRun, node: _NodeRun, instance: _NodeInstance, result: Any) -> None:
+    async def _apply_settlement(
+        self, run: FactoryRun, state: _StateRun, entry: _StateEntry, instance: _NodeInstance, result: Any
+    ) -> None:
         if instance.status != "running":
             return  # cancelled (stop/fail_fast) while the collect was in flight
         instance.duration_ms = result.duration_ms
@@ -1392,10 +1757,10 @@ class FactoryExecutor:
             child_reason = f"child settled with unexpected status {result.status!r}"
         if child_reason is not None:
             # Child failures retry (same rendered prompt, attempts+1) while
-            # attempts remain; then the node failure_policy applies.
-            await self._apply_instance_failure(run, node, instance, child_reason, retry=True)
+            # attempts remain; then the entry failure_policy applies.
+            await self._apply_instance_failure(run, state, entry, instance, child_reason, retry=True)
             return
-        budget_ms = node.spec.get("budget_ms")
+        budget_ms = state.spec.get("budget_ms")
         if budget_ms is not None and instance.spawned_at is not None:
             elapsed_ms = (self._now_fn() - instance.spawned_at) * 1000
             if elapsed_ms > budget_ms:
@@ -1403,9 +1768,10 @@ class FactoryExecutor:
                 # budget is spent, so no retry; the failure_policy applies.
                 await self._apply_instance_failure(
                     run,
-                    node,
+                    state,
+                    entry,
                     instance,
-                    f"node budget_ms {budget_ms} exceeded ({int(elapsed_ms)}ms from admission to settlement)",
+                    f"state budget_ms {budget_ms} exceeded ({int(elapsed_ms)}ms from admission to settlement)",
                     retry=False,
                 )
                 return
@@ -1414,7 +1780,8 @@ class FactoryExecutor:
         self._event(
             run,
             "settled",
-            node=node.node_id,
+            node=state.state_id,
+            entry=entry.index,
             instance=instance.index,
             status="done",
             duration_ms=instance.duration_ms,
@@ -1423,149 +1790,227 @@ class FactoryExecutor:
             self._event(
                 run,
                 "answer_captured",
-                node=node.node_id,
+                node=state.state_id,
+                entry=entry.index,
                 instance=instance.index,
                 answer=instance.answer,
                 stage="arrived",
             )
-        if node.status == "running" and node.instances and all(i.status == "done" for i in node.instances):
-            node.status = "done"
+        if entry.status == "running" and entry.instances and all(i.status == "done" for i in entry.instances):
+            entry.status = "done"
+            entry.answer = self._entry_answer(entry)
+            self._capture_outputs(state, entry)
+            self._queue_settle(run, state, entry)
+
+    def _entry_answer(self, entry: _StateEntry) -> str | None:
+        """Captured answer for binding: one preview, or all instances joined."""
+        answers = [instance.answer for instance in entry.instances if instance.status == "done" and instance.answer]
+        if not answers:
+            return None
+        return "\n\n".join(answers)
+
+    def _capture_outputs(self, state: _StateRun, entry: _StateEntry) -> None:
+        """Capture the state's declared output ports from the entry's answer.
+
+        Text ports keep the captured string; json ports parse as in V1
+        binding, with the parse error recorded on the settle so a reader
+        (guard or input binding) fails deterministically instead of
+        re-parsing.
+        """
+        outputs: dict[str, Any] = {}
+        errors: dict[str, str] = {}
+        for out in state.spec.get("outputs") or []:
+            name, port_type = out.get("name"), out.get("type")
+            if port_type == "text":
+                if entry.answer is not None:
+                    outputs[name] = entry.answer
+                continue
+            if entry.answer is None:
+                continue
+            parsed, error = _parse_json_output(entry.answer, name)
+            if error is None:
+                outputs[name] = parsed
+            else:
+                errors[name] = error
+        entry.outputs = outputs
+        entry.output_errors = errors
 
     async def _apply_instance_failure(
-        self, run: FactoryRun, node: _NodeRun, instance: _NodeInstance, reason: str, *, retry: bool
+        self, run: FactoryRun, state: _StateRun, entry: _StateEntry, instance: _NodeInstance, reason: str, *, retry: bool
     ) -> None:
         instance.status = "error"
         instance.error = reason
         self._event(
             run,
             "settled",
-            node=node.node_id,
+            node=state.state_id,
+            entry=entry.index,
             instance=instance.index,
             status="error",
             error=reason,
             duration_ms=instance.duration_ms,
         )
-        retries = node.spec.get("retries", NODE_RETRIES_DEFAULT)
+        retries = state.spec.get("retries", NODE_RETRIES_DEFAULT)
         if retry and instance.attempt <= retries:
             instance.status = "pending"
             instance.error = None
             self._event(
                 run,
                 "retry",
-                node=node.node_id,
+                node=state.state_id,
+                entry=entry.index,
                 instance=instance.index,
                 detail=f"attempt {instance.attempt} failed; re-spawning (retries {retries})",
             )
             return
-        # The instance failed permanently, so the node fails NOW. A foreach
-        # node does not wait for its remaining instances: without this, a
-        # failure that settles before its siblings leaves the node stuck in
+        # The instance failed permanently, so the entry fails NOW. A foreach
+        # entry does not wait for its remaining instances: without this, a
+        # failure that settles before its siblings leaves the entry stuck in
         # running with every instance terminal, and fail_fast could never
         # cancel in-flight siblings. The policy guard makes the second and
         # later permanent failures no-ops.
-        await self._apply_node_failure_policy(run, node, reason)
+        await self._apply_entry_failure_policy(run, state, entry, reason)
 
-    async def _apply_node_failure_policy(self, run: FactoryRun, node: _NodeRun, reason: str) -> None:
-        if node.status in ("error", "done", "cancelled"):
-            return  # the policy already ran for this node
-        policy = node.spec.get("failure_policy", RUN_FAILURE_POLICY_DEFAULT)
-        node.status = "error"
-        node.error = reason
-        self._event(run, "node_error", node=node.node_id, error=reason, detail=f"failure_policy {policy}")
+    async def _apply_entry_failure_policy(
+        self, run: FactoryRun, state: _StateRun, entry: _StateEntry, reason: str
+    ) -> None:
+        if entry.status in TERMINAL_ENTRY_STATUSES:
+            return  # the policy already ran for this entry
+        policy = state.spec.get("failure_policy", RUN_FAILURE_POLICY_DEFAULT)
+        entry.status = "error"
+        entry.error = reason
+        state.error = reason
+        self._event(run, "node_error", node=state.state_id, entry=entry.index, error=reason, detail=f"failure_policy {policy}")
+        # The failed entry settles too: guard-less transitions (the compiled
+        # dag's depends_on edges) fire from error settles so dependents run.
+        self._queue_settle(run, state, entry)
         if run.state != "running":
             # stop() (or another transition) owns the run state now; keep the
-            # node's error but do not overwrite the final state.
+            # entry's error but do not overwrite the final state.
             return
         if policy == "fail_fast":
             await self._halt_nonterminal(run, "run failed (fail_fast)")
             if run.state != "running":
                 return  # stop() landed during the cancellations; it wins
             cancelled_children = sum(
-                1 for other in run.nodes.values() for i in other.instances if i.status == "cancelled"
+                1
+                for other in run.states.values()
+                for other_entry in other.entries
+                for i in other_entry.instances
+                if i.status == "cancelled"
             )
             run.state = "failed"
             await self._milestone(
                 run,
                 "failed",
-                f"node {node.node_id} failed: {reason}; cancelled {cancelled_children} in-flight child(ren)",
-                node=node.node_id,
+                f"state {state.state_id} failed: {reason}; cancelled {cancelled_children} in-flight child(ren)",
+                node=state.state_id,
             )
         elif policy == "continue":
-            pass  # the node stays error; dependents see a terminal dep and fail at binding
+            pass  # the entry stays error; dependents see the error settle at binding
         else:  # escalate (default)
             run.state = "paused"
             run.pause_reason = reason
             await self._milestone(
                 run,
                 "paused",
-                f"node {node.node_id} failed: {reason}; resume with await rlm.factory.resume('{run.run_id}')",
-                node=node.node_id,
+                f"state {state.state_id} failed: {reason}; resume with await rlm.factory.resume('{run.run_id}')",
+                node=state.state_id,
             )
 
     async def _halt_nonterminal(self, run: FactoryRun, reason: str) -> list[str]:
-        """Delete every running child and cancel every non-terminal node."""
-        stopped = [node_id for node_id in run.order if run.nodes[node_id].status in ("pending", "running")]
+        """Delete every running child, cancel every active watch, and cancel
+        every non-terminal entry; never-entered states are marked cancelled."""
+        stopped = [
+            state_id
+            for state_id in run.order
+            if run.states[state_id].status in ("pending", "running", "waiting")
+        ]
         await self._cancel_running(run)
-        for node_id in stopped:
-            node = run.nodes[node_id]
-            if node.status in ("pending", "running"):
-                node.status = "cancelled"
-                self._event(run, "node_cancelled", node=node_id, detail=reason)
+        await self._cancel_watches(run)
+        for state_id in stopped:
+            state = run.states[state_id]
+            if state.status in ("pending", "running", "waiting"):
+                state.cancelled = True
+                for entry in state.entries:
+                    if entry.status in ("pending", "running", "waiting"):
+                        entry.status = "cancelled"
+                        self._event(run, "node_cancelled", node=state_id, entry=entry.index, detail=reason)
         return stopped
 
     async def _cancel_running(self, run: FactoryRun) -> None:
         from . import delete_subagent
 
-        for node_id in run.order:
-            node = run.nodes[node_id]
-            for instance in node.instances:
-                if instance.status != "running" or instance.child_id is None:
+        for state_id in run.order:
+            state = run.states[state_id]
+            for entry in state.entries:
+                for instance in entry.instances:
+                    if instance.status != "running" or instance.child_id is None:
+                        continue
+                    child_id = instance.child_id
+                    try:
+                        await delete_subagent(child_id)
+                    except Exception as exc:
+                        self._event(run, "cancel_failed", node=state_id, entry=entry.index, instance=instance.index, child=child_id, error=str(exc))
+                    else:
+                        self._event(run, "cancelled", node=state_id, entry=entry.index, instance=instance.index, child=child_id)
+                    # The child is supervisor-owned; a failed delete leaves it
+                    # running there, but the executor treats its slot as released.
+                    instance.status = "cancelled"
+
+    async def _cancel_watches(self, run: FactoryRun) -> None:
+        for state_id in run.order:
+            state = run.states[state_id]
+            for entry in state.entries:
+                handle = entry.wait
+                if handle is None or entry.status != "waiting":
                     continue
-                child_id = instance.child_id
-                try:
-                    await delete_subagent(child_id)
-                except Exception as exc:
-                    self._event(run, "cancel_failed", node=node_id, instance=instance.index, child=child_id, error=str(exc))
-                else:
-                    self._event(run, "cancelled", node=node_id, instance=instance.index, child=child_id)
-                # The child is supervisor-owned; a failed delete leaves it
-                # running there, but the executor treats its slot as released.
-                instance.status = "cancelled"
+                await self._cancel_watch(run, state, entry, handle)
+                entry.status = "cancelled"
 
     # -- completion ----------------------------------------------------------
 
     def _run_complete(self, run: FactoryRun) -> bool:
-        for node in run.nodes.values():
-            if node.lifecycle == "resident":
-                # A resident node finishes the run's declarative work once it
-                # is admitted (or terminally failed); it then stays alive under
-                # the parent session until rlm.factory.stop() or session teardown.
-                if node.status == "pending":
+        """Quiescence: nothing in flight (no pending/running/waiting entry,
+        and no unevaluated settle). Admitted resident entries are not in
+        flight: they stay alive under the parent session until
+        rlm.factory.stop() or session teardown."""
+        if run.pending_evaluations:
+            return False
+        for state in run.states.values():
+            for entry in state.entries:
+                if entry.status in ("pending", "running", "waiting"):
+                    if state.lifecycle == "resident" and entry.status == "running":
+                        continue
                     return False
-                if any(instance.status == "pending" for instance in node.instances):
-                    return False
-                continue
-            if node.status not in TERMINAL_NODE_STATUSES:
-                return False
         return True
 
     async def _finalize(self, run: FactoryRun) -> None:
         if run.state != "running":
             return  # stop() or a failure policy owns the final state
-        errors = [node for node in run.nodes.values() if node.status == "error"]
+        errors = [
+            state
+            for state in run.states.values()
+            if any(entry.status == "error" for entry in state.entries)
+        ]
         if errors:
             run.state = "failed"
             await self._milestone(
                 run,
                 "failed",
-                "completed with node error(s): " + ", ".join(node.node_id for node in errors),
+                "completed with state error(s): " + ", ".join(state.state_id for state in errors),
             )
             return
         run.state = "done"
-        residents = [node for node in run.nodes.values() if node.lifecycle == "resident" and node.status == "running"]
-        detail = f"run complete: {len(run.nodes)} node(s)"
+        residents = [
+            state
+            for state in run.states.values()
+            if state.lifecycle == "resident"
+            and any(entry.status == "running" for entry in state.entries)
+        ]
+        detail = f"run complete: {len(run.states)} state(s), {run.transitions_fired} transition(s) fired"
         if residents:
-            detail += f"; {len(residents)} resident node(s) still running (stop with await rlm.factory.stop('{run.run_id}'))"
+            detail += f"; {len(residents)} resident state(s) still running (stop with await rlm.factory.stop('{run.run_id}'))"
         await self._milestone(run, "finished", detail)
 
     # -- control loop --------------------------------------------------------
@@ -1607,21 +2052,27 @@ class FactoryExecutor:
 
         while run.state == "running":
             in_flight = [
-                (run.nodes[node_id], instance)
-                for node_id in run.order
-                for instance in run.nodes[node_id].instances
+                (run.states[state_id], entry, instance)
+                for state_id in run.order
+                for entry in run.states[state_id].entries
+                for instance in entry.instances
                 if instance.status == "running" and instance.child_id is not None
             ]
             if in_flight:
-                results = await collect([instance.child_id for _, instance in in_flight], timeout_ms=POLL_TIMEOUT_MS)
+                results = await collect(
+                    [instance.child_id for _, _, instance in in_flight], timeout_ms=POLL_TIMEOUT_MS
+                )
                 settled = {entry.rlm_child_id: entry for entry in results if entry.settled}
-                for node, instance in in_flight:
-                    entry = settled.get(instance.child_id or "")
-                    if entry is not None:
-                        await self._apply_settlement(run, node, instance, entry)
+                for state, entry, instance in in_flight:
+                    result = settled.get(instance.child_id or "")
+                    if result is not None:
+                        await self._apply_settlement(run, state, entry, instance, result)
             # Re-check state before completion: stop() (or a policy transition)
             # can land while the collect above was in flight, and a run that
             # was stopped must never finalize as done.
+            if run.state != "running":
+                return
+            await self._evaluate_settles(run)
             if run.state != "running":
                 return
             if self._run_complete(run):
@@ -1645,11 +2096,18 @@ class FactoryExecutor:
             started = await self._spawn_ready(run, allow_backoff=True)
             if run.state != "running":
                 return
-            if not in_flight and not started and not self._has_pending_instance(run):
+            if (
+                not in_flight
+                and not started
+                and not self._has_pending_instance(run)
+                and not self._has_active_wait(run)
+                and not run.pending_evaluations
+            ):
                 # Defensive: nothing in flight, nothing admitted, nothing
-                # pending. A validated DAG cannot reach this state; end the
+                # pending, no watch to settle it. A pending entry whose input
+                # source never settles is the only reachable shape; end the
                 # run instead of spinning.
-                self._event(run, "executor_error", error="control loop stalled: no in-flight or pending instances")
+                self._event(run, "executor_error", error="control loop stalled: no in-flight or pending work")
                 run.state = "failed"
                 try:
                     await self._milestone(run, "failed", "control loop stalled")
@@ -1658,26 +2116,41 @@ class FactoryExecutor:
                 return
             # Yield once per iteration. A real collect already waits up to
             # POLL_TIMEOUT_MS, but an instantly-settling host (tests, a fast
-            # supervisor) must not hot-spin the loop and starve other tasks.
-            await asyncio.sleep(0)
+            # supervisor) must not hot-spin the loop and starve other tasks;
+            # when only wait-state timeouts remain, yield in small slices.
+            if not in_flight and self._has_active_wait(run):
+                await self._sleep_fn(IDLE_LOOP_SLEEP_SECONDS)
+            else:
+                await asyncio.sleep(0)
 
     # -- small helpers --------------------------------------------------------
 
-    def _node_answer(self, node: _NodeRun) -> str | None:
-        """Captured answer for binding: one preview, or all instances joined."""
-        answers = [instance.answer for instance in node.instances if instance.status == "done" and instance.answer]
-        if not answers:
-            return None
-        return "\n\n".join(answers)
-
     def _running_instance_count(self, run: FactoryRun) -> int:
-        return sum(1 for node in run.nodes.values() for instance in node.instances if instance.status == "running")
+        return sum(
+            1
+            for state in run.states.values()
+            for entry in state.entries
+            for instance in entry.instances
+            if instance.status == "running"
+        )
 
     def _has_pending_instance(self, run: FactoryRun) -> bool:
-        return any(instance.status == "pending" for node in run.nodes.values() for instance in node.instances)
+        return any(
+            instance.status == "pending"
+            for state in run.states.values()
+            for entry in state.entries
+            for instance in entry.instances
+        )
 
-    def _pending_node_ids(self, run: FactoryRun) -> list[str]:
-        return [node_id for node_id in run.order if run.nodes[node_id].status == "pending"]
+    def _has_active_wait(self, run: FactoryRun) -> bool:
+        return any(
+            entry.status == "waiting" and entry.wait is not None
+            for state in run.states.values()
+            for entry in state.entries
+        )
+
+    def _pending_state_ids(self, run: FactoryRun) -> list[str]:
+        return [state_id for state_id in run.order if run.states[state_id].status == "pending"]
 
 
 _DEFAULT_EXECUTOR: FactoryExecutor | None = None
@@ -1702,7 +2175,7 @@ async def run_factory(spec_id: str, *, name: str | None = None) -> dict[str, Any
 
 
 async def status_factory(run_id: str) -> dict[str, Any]:
-    """Return node states, the event window, elapsed time, and usage."""
+    """Return state states, the event window, elapsed time, and usage."""
     return await default_factory_executor().status(run_id)
 
 
@@ -1712,5 +2185,5 @@ async def stop_factory(run_id: str) -> dict[str, Any]:
 
 
 async def resume_factory(run_id: str) -> dict[str, Any]:
-    """Resume a paused run (escalate or budget pause)."""
+    """Resume a paused run (escalate, budget, or max_transitions pause)."""
     return await default_factory_executor().resume(run_id)

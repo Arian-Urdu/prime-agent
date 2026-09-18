@@ -529,12 +529,13 @@ _harness_state = _HarnessProxy()
 
 
 class _RLMFactoryNamespace:
-    """Run stored factory DAGs: rlm.factory.run/status/stop/resume.
+    """Run stored state-machine factories: rlm.factory.run/status/stop/resume.
 
-    ``run('<spec_id>')`` validates a stored factory entry, starts every
-    ready node up to the spec's max_parallel, and returns immediately; a
-    kernel asyncio task continues the run (nonblocking control loop).
-    Runs live in kernel memory only; children stay supervisor-owned.
+    ``run('<spec_id>')`` validates a stored factory entry (machine form, or
+    dag sugar that compiles to one), enters the entry states up to the
+    spec's max_parallel, and returns immediately; a kernel asyncio task
+    continues the run (nonblocking control loop). Runs live in kernel
+    memory only; children stay supervisor-owned.
     """
 
     async def run(self, spec_id: str, *, name: str | None = None) -> dict[str, Any]:

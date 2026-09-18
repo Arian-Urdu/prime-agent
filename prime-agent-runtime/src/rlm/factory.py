@@ -921,6 +921,8 @@ class FactoryExecutor:
         sleep: "Callable[[float], Any] | None" = None,
         harness: Any = None,
     ) -> None:
+        import asyncio
+
         self._now_fn: Callable[[], float] = now or time.monotonic
         self._sleep_fn: Callable[[float], Any] = sleep or asyncio.sleep
         self._harness = harness
@@ -1569,6 +1571,8 @@ class FactoryExecutor:
     # -- control loop --------------------------------------------------------
 
     def _start_loop(self, run: FactoryRun) -> None:
+        import asyncio
+
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -1578,6 +1582,8 @@ class FactoryExecutor:
         run.task = loop.create_task(self._control_loop(run))
 
     async def _control_loop(self, run: FactoryRun) -> None:
+        import asyncio
+
         try:
             await self._loop_body(run)
         except asyncio.CancelledError:
@@ -1595,6 +1601,8 @@ class FactoryExecutor:
                     pass
 
     async def _loop_body(self, run: FactoryRun) -> None:
+        import asyncio
+
         from . import collect
 
         while run.state == "running":

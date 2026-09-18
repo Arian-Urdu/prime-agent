@@ -1418,6 +1418,7 @@ class FactoryExecutor:
                             f"state {target.state_id!r} is at max_entries "
                             f"{target.max_entries}; transition {state_id!r} -> {target.state_id!r} blocked"
                         ),
+                        **{"from": state_id, "to": target.state_id},
                     )
                     continue
                 if run.transitions_fired >= run.max_transitions and not run.max_transitions_reported:

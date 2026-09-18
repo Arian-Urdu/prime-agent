@@ -74,6 +74,10 @@ class FakeHost:
         self.rate_limit_forever: set[str] = set()
         self.gates: dict[tuple[str, int], asyncio.Event] = {}
         self._call_indices: dict[str, int] = {}
+        # Wait-state watches: scripted registration responses keyed by kind
+        # ("path"/"agent"), plus a record of cancel calls.
+        self.watch_outcomes: dict[str, dict[str, Any]] = {}
+        self.watch_cancels: list[str | None] = []
 
     def gate(self, request_type: str, call_number: int) -> asyncio.Event:
         """Suspend the call_number-th collect/delete on a returned event."""
@@ -153,6 +157,15 @@ class FakeHost:
                 "model": "fake-model",
             }
         self.calls.append((request_type, payload))
+        if request_type in ("rlm.watch.path", "rlm.watch.agent"):
+            outcome = self.watch_outcomes.get(payload["kind"]) or {
+                "watch_id": f"watch-{len(self.calls)}",
+                "status": "active",
+            }
+            return dict(outcome)
+        if request_type == "rlm.watch.cancel":
+            self.watch_cancels.append(payload.get("watch_id"))
+            return {"watch_id": payload.get("watch_id"), "status": "cancelled"}
         if request_type == "rlm.collect":
             self.collects += 1
             if self.clock is not None:
@@ -224,6 +237,19 @@ class FactoryExecutorTest(unittest.TestCase):
 
     def store_factory(self, dag: dict[str, Any], spec_id: str = "sw") -> None:
         self.harness.create_factory("Factory", "Factory content", id=spec_id, dag=dag)
+
+    def store_machine(self, machine: dict[str, Any], spec_id: str = "sw") -> None:
+        self.harness.create_factory("Factory", "Factory content", id=spec_id, machine=machine)
+
+    def state_report(self, status: dict[str, Any], state_id: str) -> dict[str, Any]:
+        return next(entry for entry in status["nodes"] if entry["id"] == state_id)
+
+    def events_of(self, status: dict[str, Any], kind: str) -> list[dict[str, Any]]:
+        return [event for event in status["events"] if event["kind"] == kind]
+
+    def all_events_of(self, run_result: dict[str, Any], kind: str) -> list[dict[str, Any]]:
+        run = self.executor._runs[run_result["run_id"]]
+        return [event for event in run.events if event["kind"] == kind]
 
     def node(self, node_id: str, **overrides: Any) -> dict[str, Any]:
         base: dict[str, Any] = {"id": node_id, "subagent": "worker"}
@@ -1004,6 +1030,350 @@ class FactoryExecutorTest(unittest.TestCase):
         for call in ("status", "stop", "resume"):
             with self.assertRaisesRegex(ValueError, "unknown factory run"):
                 await getattr(rlm_module.rlm.factory, call)("no-such-run")
+
+
+    # -- machine form: transitions, guards, re-entry, waits ---------------------
+
+    @async_test
+    async def test_machine_three_round_review_loop(self) -> None:
+        # review verdict approved=false twice, then true: the guarded switch
+        # alternates reviewing/fixing until approved, then quiesces as done.
+        self.host.child_outcomes["child-1"] = {"status": "done", "answer": "DRAFT-1"}
+        self.host.child_outcomes["child-2"] = {
+            "status": "done",
+            "answer": '```json\n{"verdict": {"approved": false, "findings": ["AUDIT-A1"]}}\n```',
+        }
+        self.host.child_outcomes["child-3"] = {"status": "done", "answer": "fixed round 1"}
+        self.host.child_outcomes["child-4"] = {
+            "status": "done",
+            "answer": '```json\n{"verdict": {"approved": false, "findings": ["AUDIT-B1"]}}\n```',
+        }
+        self.host.child_outcomes["child-5"] = {"status": "done", "answer": "fixed round 2"}
+        self.host.child_outcomes["child-6"] = {
+            "status": "done",
+            "answer": '```json\n{"verdict": {"approved": true, "findings": []}}\n```',
+        }
+        self.store_machine(
+            {
+                "run": {"failure_policy": "continue", "max_parallel": 4},
+                "states": [
+                    {
+                        "id": "draft",
+                        "entry": True,
+                        "subagent": "worker",
+                        "outputs": [{"name": "draft", "type": "text"}],
+                    },
+                    {
+                        "id": "reviewing",
+                        "subagent": "worker",
+                        "inputs": [{"name": "draft", "type": "text", "from": "draft.draft"}],
+                        "outputs": [{"name": "verdict", "type": "json"}],
+                        "max_entries": 4,
+                    },
+                    {"id": "fixing", "subagent": "worker", "max_entries": 3},
+                ],
+                "transitions": [
+                    {"from": "draft", "to": "reviewing"},
+                    {
+                        "from": "reviewing",
+                        "to": "fixing",
+                        "when": {"output": "verdict", "path": "approved", "op": "eq", "value": False},
+                    },
+                    {"from": "fixing", "to": "reviewing"},
+                ],
+            }
+        )
+        result = await self.start()
+        self.assertEqual(result["started"], ["draft"])
+        status = await self.settle(result)
+        self.assertEqual(status["state"], "done")
+        reviewing = self.state_report(status, "reviewing")
+        fixing = self.state_report(status, "fixing")
+        self.assertEqual(reviewing["status"], "done")
+        self.assertEqual(reviewing["entries_used"], 3)
+        self.assertEqual(len(reviewing["entries"]), 3)
+        self.assertEqual(len(reviewing["instances"]), 3)
+        self.assertEqual(fixing["status"], "done")
+        self.assertEqual(fixing["entries_used"], 2)
+        self.assertEqual(len(self.host.spawn_calls("reviewing")), 3)
+        self.assertEqual(len(self.host.spawn_calls("fixing")), 2)
+        self.assertEqual(status["usage"]["transitions_fired"], 5)
+        # the final approved verdict never fires the guarded transition
+        fired = self.all_events_of(result, "transition_fired")
+        self.assertEqual(len(fired), 5)
+        self.assertEqual(self.all_events_of(result, "transition_blocked"), [])
+
+    @async_test
+    async def test_machine_guard_switch_fires_only_the_matching_branch(self) -> None:
+        self.host.outcomes["pick"] = {
+            "status": "done",
+            "answer": '```json\n{"pick": {"choice": "left"}}\n```',
+        }
+        self.store_machine(
+            {
+                "run": {"failure_policy": "continue"},
+                "states": [
+                    {
+                        "id": "pick",
+                        "entry": True,
+                        "subagent": "worker",
+                        "outputs": [{"name": "pick", "type": "json"}],
+                    },
+                    {"id": "left", "subagent": "worker"},
+                    {"id": "right", "subagent": "worker"},
+                ],
+                "transitions": [
+                    {"from": "pick", "to": "left", "when": {"output": "pick", "path": "choice", "op": "eq", "value": "left"}},
+                    {"from": "pick", "to": "right", "when": {"output": "pick", "path": "choice", "op": "eq", "value": "right"}},
+                ],
+            }
+        )
+        result = await self.start()
+        status = await self.settle(result)
+        self.assertEqual(status["state"], "done")
+        left = self.state_report(status, "left")
+        right = self.state_report(status, "right")
+        self.assertEqual(left["status"], "done")
+        self.assertEqual(left["entries_used"], 1)
+        # the exclusive guard never entered "right": quiescence ignores it
+        self.assertEqual(right["entries_used"], 0)
+        self.assertEqual(right["status"], "pending")
+        self.assertEqual(self.host.spawn_calls("right"), [])
+        self.assertEqual(status["usage"]["transitions_fired"], 1)
+
+    @async_test
+    async def test_machine_fan_out_from_one_settle_fires_all(self) -> None:
+        self.host.outcomes["fan"] = {"status": "done", "answer": "go"}
+        self.store_machine(
+            {
+                "run": {"failure_policy": "continue"},
+                "states": [
+                    {"id": "fan", "entry": True, "subagent": "worker", "outputs": [{"name": "go", "type": "text"}]},
+                    {"id": "left", "subagent": "worker"},
+                    {"id": "right", "subagent": "worker"},
+                ],
+                "transitions": [
+                    {"from": "fan", "to": "left"},
+                    {"from": "fan", "to": "right"},
+                ],
+            }
+        )
+        result = await self.start()
+        status = await self.settle(result)
+        self.assertEqual(status["state"], "done")
+        self.assertEqual(self.state_report(status, "left")["status"], "done")
+        self.assertEqual(self.state_report(status, "right")["status"], "done")
+        self.assertEqual(status["usage"]["transitions_fired"], 2)
+        fired = self.all_events_of(result, "transition_fired")
+        self.assertEqual([event["to"] for event in fired], ["left", "right"])
+
+    @async_test
+    async def test_machine_max_entries_blocked_transition_quiesces_done(self) -> None:
+        self.store_machine(
+            {
+                "states": [
+                    {"id": "once", "entry": True, "subagent": "worker", "max_entries": 1},
+                    {"id": "sink", "subagent": "worker", "max_entries": 1},
+                ],
+                "transitions": [
+                    {"from": "once", "to": "sink"},
+                    {"from": "once", "to": "sink"},
+                    {"from": "once", "to": "once"},
+                ],
+            }
+        )
+        result = await self.start()
+        status = await self.settle(result)
+        # once settles once: sink is entered (one fire), the duplicate edge and
+        # the self-loop are blocked by max_entries, and the run quiesces done.
+        self.assertEqual(status["state"], "done")
+        once = self.state_report(status, "once")
+        self.assertEqual(once["entries_used"], 1)
+        self.assertEqual(once["max_entries"], 1)
+        sink = self.state_report(status, "sink")
+        self.assertEqual(sink["entries_used"], 1)
+        self.assertEqual(status["usage"]["transitions_fired"], 1)
+        blocked = self.all_events_of(result, "transition_blocked")
+        self.assertEqual(len(blocked), 2)
+        self.assertTrue(all(event["to"] in ("once", "sink") for event in blocked))
+
+    @async_test
+    async def test_machine_self_loop_reenters_until_guard_fails(self) -> None:
+        self.host.child_outcomes["child-1"] = {
+            "status": "done",
+            "answer": '```json\n{"count": {"value": 1}}\n```',
+        }
+        self.host.child_outcomes["child-2"] = {
+            "status": "done",
+            "answer": '```json\n{"count": {"value": 2}}\n```',
+        }
+        self.host.child_outcomes["child-3"] = {
+            "status": "done",
+            "answer": '```json\n{"count": {"value": 3}}\n```',
+        }
+        self.store_machine(
+            {
+                "states": [
+                    {
+                        "id": "tick",
+                        "entry": True,
+                        "subagent": "worker",
+                        "max_entries": 4,
+                        "outputs": [{"name": "count", "type": "json"}],
+                    }
+                ],
+                "transitions": [
+                    {"from": "tick", "to": "tick", "when": {"output": "count", "path": "value", "op": "lt", "value": 3}},
+                ],
+            }
+        )
+        result = await self.start()
+        status = await self.settle(result)
+        self.assertEqual(status["state"], "done")
+        tick = self.state_report(status, "tick")
+        self.assertEqual(tick["entries_used"], 3)
+        self.assertEqual(len(self.host.spawn_calls("tick")), 3)
+        self.assertEqual(status["usage"]["transitions_fired"], 2)
+
+    @async_test
+    async def test_machine_wait_state_settles_on_path_event(self) -> None:
+        self.host.watch_outcomes["path"] = {
+            "watch_id": "w-1",
+            "status": "completed",
+            "detail": "path changed: /tmp/x",
+        }
+        self.store_machine(
+            {
+                "run": {"failure_policy": "continue"},
+                "states": [
+                    {
+                        "id": "watch",
+                        "entry": True,
+                        "wait": {"kind": "path", "target": "/tmp/x", "timeout_ms": 5000},
+                    },
+                    {
+                        "id": "act",
+                        "subagent": "worker",
+                        "inputs": [{"name": "event", "type": "json", "from": "watch.event"}],
+                    },
+                ],
+                "transitions": [
+                    {"from": "watch", "to": "act", "when": {"output": "event", "path": "timed_out", "op": "eq", "value": False}},
+                ],
+            }
+        )
+        result = await self.start()
+        status = await self.settle(result)
+        self.assertEqual(status["state"], "done")
+        watch_calls = self.host.calls_of("rlm.watch.path")
+        self.assertEqual(len(watch_calls), 1)
+        self.assertEqual(watch_calls[0]["target"], "/tmp/x")
+        self.assertEqual(self.host.watch_cancels, [])
+        waits = self.all_events_of(result, "wait_settled")
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(waits[0]["timed_out"], False)
+        self.assertEqual(waits[0]["node"], "watch")
+        act = self.state_report(status, "act")
+        self.assertEqual(act["status"], "done")
+        self.assertEqual(act["entries_used"], 1)
+        # the wait entry bound the event object into the act prompt
+        prompts = [call["prompt"] for call in self.host.spawn_calls("act")]
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("path changed: /tmp/x", prompts[0])
+        self.assertIn('"timed_out": false', prompts[0])
+        # completed at registration: no timeout was armed
+        self.assertEqual(self.sleeps.sleeps, [])
+
+    @async_test
+    async def test_machine_wait_state_times_out_through_the_clock(self) -> None:
+        self.host.watch_outcomes["path"] = {"watch_id": "w-1", "status": "active"}
+        self.store_machine(
+            {
+                "run": {"failure_policy": "continue"},
+                "states": [
+                    {
+                        "id": "watch",
+                        "entry": True,
+                        "wait": {"kind": "path", "target": "/tmp/y", "timeout_ms": 5000},
+                    },
+                    {"id": "act", "subagent": "worker"},
+                ],
+                "transitions": [
+                    {"from": "watch", "to": "act", "when": {"output": "event", "path": "timed_out", "op": "eq", "value": True}},
+                ],
+            }
+        )
+        result = await self.start()
+        status = await self.settle(result)
+        self.assertEqual(status["state"], "done")
+        # the injectable clock slept the declared timeout (SleepRecorder)
+        self.assertIn(5.0, self.sleeps.sleeps)
+        waits = self.all_events_of(result, "wait_settled")
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(waits[0]["timed_out"], True)
+        self.assertIn("timed out", waits[0]["detail"])
+        # only the timeout branch fired; the act entry ran
+        act = self.state_report(status, "act")
+        self.assertEqual(act["status"], "done")
+        self.assertEqual(status["usage"]["transitions_fired"], 1)
+
+    @async_test
+    async def test_machine_max_transitions_pauses_once_then_resumes(self) -> None:
+        self.store_machine(
+            {
+                "run": {"max_transitions": 1, "failure_policy": "continue"},
+                "states": [
+                    {"id": "a", "entry": True, "subagent": "worker"},
+                    {"id": "b", "subagent": "worker"},
+                    {"id": "c", "subagent": "worker"},
+                ],
+                "transitions": [
+                    {"from": "a", "to": "b"},
+                    {"from": "b", "to": "c"},
+                ],
+            }
+        )
+        result = await self.start()
+        paused = await self.settle(result)
+        # a->b fired (cap 1); b's settle pauses the run before b->c
+        self.assertEqual(paused["state"], "paused")
+        self.assertIn("budget_exceeded", self.host.notice_kinds())
+        self.assertEqual(paused["usage"]["transitions_fired"], 1)
+        self.assertEqual(self.state_report(paused, "b")["status"], "done")
+        self.assertEqual(self.state_report(paused, "c")["entries_used"], 0)
+        resumed = await rlm_module.rlm.factory.resume(result["run_id"])
+        self.assertEqual(resumed["state"], "running")
+        final = await self.settle(result)
+        # resume is the explicit operator override: the remaining transition fires
+        self.assertEqual(final["state"], "done")
+        self.assertEqual(final["usage"]["transitions_fired"], 2)
+        self.assertEqual(self.state_report(final, "c")["status"], "done")
+
+    @async_test
+    async def test_machine_stop_cancels_active_wait_watch(self) -> None:
+        self.host.watch_outcomes["path"] = {"watch_id": "w-1", "status": "active"}
+        self.store_machine(
+            {
+                "states": [
+                    {
+                        "id": "watch",
+                        "entry": True,
+                        "wait": {"kind": "path", "target": "/tmp/z", "timeout_ms": 60_000},
+                    },
+                ],
+                "transitions": [],
+            }
+        )
+        result = await self.start()
+        await self.wait_until(
+            lambda: any(e.status == "waiting" for s in self.executor._runs[result["run_id"]].states.values() for e in s.entries)
+        )
+        stopped = await rlm_module.rlm.factory.stop(result["run_id"])
+        self.assertEqual(stopped["state"], "stopped")
+        self.assertEqual(stopped["cancelled"], ["watch"])
+        self.assertEqual(self.host.watch_cancels, ["w-1"])
+        status = await rlm_module.rlm.factory.status(result["run_id"])
+        self.assertEqual(self.state_report(status, "watch")["status"], "cancelled")
 
     @async_test
     async def test_resident_node_spawns_stays_alive_and_stops(self) -> None:

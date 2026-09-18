@@ -221,6 +221,57 @@ class HarnessStateTest(unittest.TestCase):
             reloaded = HarnessState(state.file_path)
             self.assertEqual(reloaded.get("swarm", "pr_sweep").arguments["dag"], SWARM_DAG)
 
+    def test_create_swarm_with_machine_stores_arguments_machine(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            machine = {
+                "states": [
+                    {"id": "collect", "entry": True, "subagent": "researcher", "outputs": [{"name": "findings", "type": "text"}]},
+                    {
+                        "id": "fix",
+                        "subagent": {"prompt": "Fix the findings."},
+                        "max_entries": 3,
+                        "inputs": [{"name": "draft", "type": "text", "from": "collect.findings"}],
+                    },
+                ],
+                "transitions": [
+                    {"from": "collect", "to": "fix", "when": {"output": "findings", "op": "exists"}},
+                ],
+            }
+
+            entry = state.create_swarm("Loop", "Fix-and-review loop.", id="loop", machine=machine)
+
+            self.assertEqual(entry.arguments, {"machine": machine})
+            self.assertEqual(state.get("swarm", "loop").arguments["machine"], machine)
+
+            # An invalid machine is rejected exactly like an invalid dag.
+            with self.assertRaises(ValueError):
+                state.create_swarm("Broken", "Never stores.", id="broken", machine={"states": [{}]})
+            self.assertIsNone(state.get("swarm", "broken"))
+
+            # Supplying both forms at once is a usage error, not a validation one.
+            with self.assertRaisesRegex(ValueError, "not both"):
+                state.create_swarm("Both", "Never stores.", id="both", dag=SWARM_DAG, machine=machine)
+            self.assertIsNone(state.get("swarm", "both"))
+
+    def test_update_swarm_with_machine_replaces_the_spec(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            state.create_swarm("PR review sweep", "Sweep.", id="pr_sweep", dag=SWARM_DAG)
+
+            machine = {"states": [{"id": "solo", "entry": True, "subagent": "worker"}], "transitions": []}
+            updated = state.update_swarm("pr_sweep", "PR review sweep", "Sweep v2.", machine=machine)
+            self.assertEqual(updated.version, 2)
+            self.assertEqual(state.get("swarm", "pr_sweep").arguments, {"machine": machine})
+
+            # Omitting both forms still preserves the stored spec.
+            state.update_swarm("pr_sweep", "PR review sweep", "Sweep v3.")
+            self.assertEqual(state.get("swarm", "pr_sweep").arguments, {"machine": machine})
+
+            with self.assertRaises(ValueError):
+                state.update_swarm("pr_sweep", "PR review sweep", "Bad machine.", machine={"states": "nope"})
+            self.assertEqual(state.get("swarm", "pr_sweep").content, "Sweep v3.")
+
     def test_update_swarm_without_dag_preserves_stored_dag(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             state = HarnessState(Path(temp_dir) / "harness_state.json")

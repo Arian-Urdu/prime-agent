@@ -42,6 +42,22 @@ def _slug(raw: str, fallback: str) -> str:
     return (normalized or fallback)[:80]
 
 
+def _swarm_spec_argument(
+    dag: Any, machine: Any
+) -> "tuple[Any, Literal['dag', 'machine']]":
+    """Pick the swarm spec payload and its arguments key from the call.
+
+    Supplying both forms at once is an error. A bare ``dag=None,
+    machine=None`` passes ``None`` through in the dag slot so the write-time
+    validation rejects it with the standard wording.
+    """
+    if dag is not None and machine is not None:
+        raise ValueError("pass either dag or machine, not both")
+    if machine is not None:
+        return machine, "machine"
+    return dag, "dag"
+
+
 _CJK_TERM_CHARS = re.compile(
     r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af"
     r"\U00020000-\U0002a6df\U0002a700-\U0002b73f\U0002b740-\U0002b81f"
@@ -907,12 +923,14 @@ class HarnessState:
         id: str | None = None,
         path: str = "general",
         dag: dict[str, Any] | None = None,
+        machine: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         global_: bool = False,
         **kwargs: Any,
     ) -> HarnessEntry:
-        # Write-time dry run: an invalid DAG never reaches the store.
-        errors = validate_swarm_spec(dag)
+        # Write-time dry run: an invalid spec (either form) never reaches the store.
+        spec, key = _swarm_spec_argument(dag, machine)
+        errors = validate_swarm_spec(spec)
         if errors:
             raise ValueError("; ".join(errors))
         return self.create(
@@ -921,7 +939,7 @@ class HarnessState:
             content,
             id=id,
             path=path,
-            arguments={"dag": dag},
+            arguments={key: spec},
             metadata=metadata,
             global_=global_,
             **kwargs,
@@ -935,24 +953,29 @@ class HarnessState:
         *,
         path: str | None = None,
         dag: dict[str, Any] | None = None,
+        machine: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         global_: bool = False,
         **kwargs: Any,
     ) -> HarnessEntry:
-        # Only validate a DAG when one is supplied; omitting it preserves the
+        # Only validate a spec when one is supplied; omitting both preserves the
         # stored arguments (see _upsert) rather than forcing every title/content
-        # update to re-send the full DAG, exactly like update_skill treats reference.
-        if dag is not None:
-            errors = validate_swarm_spec(dag)
+        # update to re-send the full spec, exactly like update_skill treats reference.
+        if dag is not None or machine is not None:
+            spec, key = _swarm_spec_argument(dag, machine)
+            errors = validate_swarm_spec(spec)
             if errors:
                 raise ValueError("; ".join(errors))
+            arguments = {key: spec}
+        else:
+            arguments = None
         return self.update(
             "swarm",
             id,
             title,
             content,
             path=path,
-            arguments={"dag": dag} if dag is not None else None,
+            arguments=arguments,
             metadata=metadata,
             global_=global_,
             **kwargs,
@@ -1025,9 +1048,10 @@ class HarnessState:
             "files; children reply with await agent_message.send(message, receiver_role='parent'). Use "
             "await rlm.list_subagents() to recover direct child handles and await agent_message.send(..., "
             "receiver_role='child', receiver_name=handle.name) for follow-ups.",
-            "Swarm entries declare a validated DAG of subagent nodes in arguments['dag']: manage them with "
-            "create_swarm/update_swarm/delete_swarm (create_swarm validates the DAG at write time); run them "
-            "with rlm.swarm.run(\"<id>\") once the executor lands in a follow-up PR.",
+            "Swarm entries declare validated state-machine workflows of subagent states in arguments['machine'] "
+            "(the original DAG sugar in arguments['dag'] compiles to machine form): manage them with "
+            "create_swarm/update_swarm/delete_swarm (create_swarm validates either form at write time); run "
+            "them with rlm.swarm.run(\"<id>\") once the executor lands in a follow-up PR.",
         ]
         for kind in _KINDS:
             records = self.list(kind)[:max_entries_per_kind]

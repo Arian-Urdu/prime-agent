@@ -1,0 +1,1 @@
+- Added the state-machine swarm specification form (`arguments["machine"]` via `create_swarm`/`update_swarm`): entry states, guarded transitions, bounded re-entry (`max_entries`), wait states with a path/agent watch, and `max_transitions` run bounds, all validated at write time. The DAG form stays as sugar and compiles to machine form at canonicalization.

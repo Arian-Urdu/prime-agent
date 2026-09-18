@@ -1,12 +1,14 @@
 """Validation and compilation for swarm specifications.
 
 A continual-harness ``swarm`` entry stores a declarative state machine of
-subagent states in ``arguments["machine"]``: entry states, guarded
-transitions between states, bounded re-entry (``max_entries``), and wait
-states that settle on a watched path/agent event. The original DAG form in
-``arguments["dag"]`` stays as sugar: it compiles to machine form (each node
-becomes a state entered once; each effective dependency edge becomes a
-guard-less transition).
+subagent states in ``arguments["machine"]``: entry states (which declare
+no inputs), guarded transitions between states, and bounded re-entry
+(``max_entries``). The original DAG form in ``arguments["dag"]`` stays as
+sugar: it compiles to machine form (each node becomes a state entered
+once; each effective dependency edge becomes a guard-less transition).
+Wait states are specified for the communication series but gated here:
+the watch host handlers (``rlm.watch.*``) do not exist yet, so a state
+carrying a ``wait`` block is rejected at write time.
 
 This module implements the write-time dry run for both forms: the machine
 validator, the dag-to-machine compiler, the unified entry point
@@ -25,7 +27,6 @@ from typing import Any
 FAILURE_POLICIES: tuple[str, ...] = ("fail_fast", "continue", "escalate")
 PORT_TYPES: tuple[str, ...] = ("text", "json")
 LIFECYCLES: tuple[str, ...] = ("task", "resident")
-WAIT_KINDS: tuple[str, ...] = ("path", "agent")
 TRANSITION_ON_KINDS: tuple[str, ...] = ("settled",)
 GUARD_OPS: tuple[str, ...] = ("eq", "ne", "gt", "gte", "lt", "lte", "exists", "contains")
 MAX_NODES = 1024
@@ -43,7 +44,6 @@ NODE_LIFECYCLE_DEFAULT = "task"
 NODE_RETRIES_DEFAULT = 0
 STATE_ENTRY_DEFAULT = False
 STATE_MAX_ENTRIES_DEFAULT = 1
-WAIT_EVENT_OUTPUT = "event"
 
 _NODE_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 
@@ -96,16 +96,8 @@ def _declared_port_types(node: dict[str, Any], key: str) -> dict[str, str]:
     return ports
 
 
-def _is_wait_state(state: dict[str, Any]) -> bool:
-    """True when a wait block is present (even malformed: shape errors follow)."""
-    return state.get("wait") is not None
-
-
 def _effective_output_types(state: dict[str, Any]) -> dict[str, str]:
-    """Output ports readable from a state: declared outputs, plus the implicit
-    json ``event`` port for wait states."""
-    if _is_wait_state(state):
-        return {WAIT_EVENT_OUTPUT: "json"}
+    """Output ports readable from a state: its declared outputs."""
     return _declared_port_types(state, "outputs")
 
 
@@ -175,30 +167,17 @@ def _validate_state_fields(
     if lifecycle not in LIFECYCLES:
         errors.append(f"{noun} {ref} lifecycle must be 'task' or 'resident', got {lifecycle!r}")
     is_resident = lifecycle == "resident"
-    is_wait = _is_wait_state(state)
-    if is_wait and is_resident:
-        errors.append(f"wait {noun} {ref} cannot be resident")
+
+    if state.get("wait") is not None:
+        # Gated: the watch host handlers (rlm.watch.*) arrive with the
+        # communication series; a wait block would silently no-op until then.
+        errors.append(
+            f"{noun} {ref}: wait states require the watch host handlers (rlm.watch.*); "
+            "they arrive with the communication series - remove the wait block until then"
+        )
 
     subagent = state.get("subagent")
-    if is_wait:
-        if subagent is not None:
-            errors.append(f"wait {noun} {ref} cannot declare a subagent")
-        wait = state.get("wait")
-        if not isinstance(wait, dict):
-            errors.append(f"{noun} {ref} wait must be an object")
-        else:
-            kind = wait.get("kind")
-            if kind not in WAIT_KINDS:
-                errors.append(f"{noun} {ref} wait.kind must be one of {list(WAIT_KINDS)}, got {kind!r}")
-            target = wait.get("target")
-            if not _is_nonempty_str(target):
-                errors.append(f"{noun} {ref} wait.target must be a non-empty string")
-            if not _is_positive_int(wait.get("timeout_ms")):
-                errors.append(f"{noun} {ref} wait.timeout_ms must be a positive integer")
-        retries = state.get("retries")
-        if retries is not None and not (_is_int(retries) and retries == 0):
-            errors.append(f"wait {noun} {ref} cannot declare retries")
-    elif _is_nonempty_str(subagent):
+    if _is_nonempty_str(subagent):
         pass  # Harness subagent entry id or title; resolved at run time.
     elif isinstance(subagent, dict):
         if not _is_nonempty_str(subagent.get("prompt")):
@@ -220,10 +199,9 @@ def _validate_state_fields(
         elif run_budget is not None and budget > run_budget:
             errors.append(f"{noun} {ref} budget_ms {budget} exceeds the run budget_ms {run_budget}")
 
-    if not is_wait:
-        retries = state.get("retries")
-        if retries is not None and not (_is_int(retries) and 0 <= retries <= MAX_RETRIES):
-            errors.append(f"{noun} {ref} retries must be an integer between 0 and {MAX_RETRIES}")
+    retries = state.get("retries")
+    if retries is not None and not (_is_int(retries) and 0 <= retries <= MAX_RETRIES):
+        errors.append(f"{noun} {ref} retries must be an integer between 0 and {MAX_RETRIES}")
 
     policy = state.get("failure_policy")
     if policy is not None and policy not in FAILURE_POLICIES:
@@ -232,8 +210,6 @@ def _validate_state_fields(
     outputs = state.get("outputs")
     if outputs is not None and not isinstance(outputs, list):
         errors.append(f"{noun} {ref} outputs must be a list")
-    elif is_wait and isinstance(outputs, list) and outputs:
-        errors.append(f"wait {noun} {ref} cannot declare outputs")
     elif is_resident and isinstance(outputs, list) and outputs:
         errors.append(f"resident {noun} {ref} cannot declare outputs")
     reported_duplicate_outputs: set[str] = set()
@@ -295,8 +271,6 @@ def _validate_state_fields(
     if foreach is not None:
         if is_resident:
             errors.append(f"resident {noun} {ref} cannot use foreach")
-        if is_wait:
-            errors.append(f"wait {noun} {ref} cannot use foreach")
         if not isinstance(foreach, dict):
             errors.append(f"{noun} {ref} foreach must be an object")
         else:
@@ -372,13 +346,13 @@ def validate_swarm_machine(machine: Any) -> list[str]:
 
     Returns a list of human-readable error sentences; an empty list means
     the machine is valid. Rules: states are 1..1024 with unique slug ids and
-    at least one entry state; non-wait states require a subagent (wait
-    states require a well-formed ``wait`` block and declare nothing);
-    resident states declare no outputs, foreach, or outgoing transitions;
-    transitions reference existing states (self-loops are legal re-entry)
-    and may carry one guard over the from-state's latest settle output.
-    There is no acyclicity requirement: arbitrary state machines, including
-    cycles, validate.
+    at least one entry state; every state requires a subagent and entry
+    states declare no inputs; resident states declare no outputs, foreach,
+    or outgoing transitions; wait blocks are rejected (the watch host
+    handlers arrive with the communication series); transitions reference
+    existing states (self-loops are legal re-entry) and may carry one guard
+    over the from-state's latest settle output. There is no acyclicity
+    requirement: arbitrary state machines, including cycles, validate.
     """
     if not isinstance(machine, dict):
         return ["swarm machine must be a JSON object"]
@@ -424,6 +398,8 @@ def validate_swarm_machine(machine: Any) -> list[str]:
         max_entries = state.get("max_entries")
         if max_entries is not None and not (_is_int(max_entries) and max_entries >= STATE_MAX_ENTRIES_DEFAULT):
             errors.append(f"state {state_id} max_entries must be an integer >= {STATE_MAX_ENTRIES_DEFAULT}")
+        if entry is True and _port_list(state, "inputs"):
+            errors.append(f"entry state {state_id} cannot declare inputs")
 
     # The entry check needs at least one well-formed state: a machine whose
     # only state failed its id check reports that problem alone, and a flag
@@ -491,6 +467,8 @@ def compile_swarm_dag(dag: Any) -> "tuple[dict[str, Any] | None, list[str]]":
     the errors carry the V1 dag wording. Each node becomes a state with
     ``entry`` set when it has no effective dependencies and ``max_entries``
     1; each effective dependency edge becomes one guard-less transition.
+    Wait blocks are rejected by the shared field check (they are gated until
+    the communication series); the compiler itself has no wait support.
     """
     if not isinstance(dag, dict):
         return None, ["swarm dag must be a JSON object"]
@@ -570,12 +548,15 @@ def validate_swarm_spec(spec: Any) -> list[str]:
 
     Detects the form first: a spec carrying "states" or "transitions" is
     machine form; anything else is dag form and compiles to machine form
-    first. Returns a list of human-readable error sentences; an empty list
-    means the specification is valid. Every rule is enforced before a swarm
-    entry is stored, so an invalid spec never reaches the store.
+    first. A spec carrying both dag and machine keys is rejected outright.
+    Returns a list of human-readable error sentences; an empty list means
+    the specification is valid. Every rule is enforced before a swarm entry
+    is stored, so an invalid spec never reaches the store.
     """
     if not isinstance(spec, dict):
         return ["swarm dag must be a JSON object"]
+    if _is_machine_form(spec) and "nodes" in spec:
+        return ["pass either dag or machine form, not both"]
     if _is_machine_form(spec):
         return validate_swarm_machine(spec)
     machine, errors = compile_swarm_dag(spec)
@@ -590,9 +571,8 @@ def _canonicalize_machine(machine: dict[str, Any]) -> dict[str, Any]:
 
     Defaults: run failure_policy 'escalate', run max_parallel 8, run
     max_transitions 10 per state capped at 10000, state entry False, state
-    max_entries 1, state lifecycle 'task', state retries 0 (wait states
-    carry none), state failure_policy copied from the run policy, and
-    transition on 'settled'.
+    max_entries 1, state lifecycle 'task', state retries 0, state
+    failure_policy copied from the run policy, and transition on 'settled'.
     """
     run_in = machine.get("run") if isinstance(machine.get("run"), dict) else {}
     run_policy = run_in.get("failure_policy", RUN_FAILURE_POLICY_DEFAULT)
@@ -609,18 +589,16 @@ def _canonicalize_machine(machine: dict[str, Any]) -> dict[str, Any]:
         run["budget_ms"] = run_in["budget_ms"]
     states_out: list[dict[str, Any]] = []
     for state in machine["states"]:
-        is_wait = _is_wait_state(state)
         state_out: dict[str, Any] = {
             "id": state["id"],
             "entry": bool(state.get("entry", STATE_ENTRY_DEFAULT)),
             "max_entries": state.get("max_entries", STATE_MAX_ENTRIES_DEFAULT),
             "lifecycle": state.get("lifecycle", NODE_LIFECYCLE_DEFAULT),
-            "retries": NODE_RETRIES_DEFAULT if is_wait else state.get("retries", NODE_RETRIES_DEFAULT),
+            "retries": state.get("retries", NODE_RETRIES_DEFAULT),
             "failure_policy": state.get("failure_policy", run_policy),
+            "subagent": copy.deepcopy(state["subagent"]),
         }
-        if not is_wait:
-            state_out["subagent"] = copy.deepcopy(state["subagent"])
-        for key in ("budget_ms", "inputs", "outputs", "foreach", "wait"):
+        for key in ("budget_ms", "inputs", "outputs", "foreach"):
             if key in state:
                 state_out[key] = copy.deepcopy(state[key])
         states_out.append(state_out)
@@ -641,20 +619,19 @@ def canonicalize_swarm_spec(spec: Any) -> dict[str, Any]:
     """Validate a spec in either form and return the canonical MACHINE form.
 
     Raises ``ValueError`` with the joined error list when the spec is
-    invalid. Dag specs compile to machine form first, so the executor sees
-    one shape: ``{"run": ..., "states": [...], "transitions": [...]}``.
+    invalid (including the both-forms rejection). Dag specs compile to
+    machine form first, so the executor sees one shape:
+    ``{"run": ..., "states": [...], "transitions": [...]}``.
     """
-    if not isinstance(spec, dict):
-        raise ValueError("swarm dag must be a JSON object")
-    if _is_machine_form(spec):
-        machine = spec
-        errors = validate_swarm_machine(machine)
-    else:
-        machine, errors = compile_swarm_dag(spec)
-        if not errors:
-            errors = validate_swarm_machine(machine)
+    errors = validate_swarm_spec(spec)
     if errors:
         raise ValueError("; ".join(errors))
+    assert isinstance(spec, dict)  # validated above
+    if _is_machine_form(spec):
+        machine = spec
+    else:
+        machine, compile_errors = compile_swarm_dag(spec)
+        assert machine is not None and not compile_errors  # validated above
     return _canonicalize_machine(machine)
 
 

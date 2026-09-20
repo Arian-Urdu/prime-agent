@@ -26,14 +26,17 @@
  *   uv pip install --python .venv/bin/python -e . dill requests httpx pyyaml \
  *     tomli python-dotenv pandas numpy scipy beautifulsoup4 lxml pydantic tyro
  *
- * Without that venv the suite boots through the standard kernel bootstrap: CI
- * pre-warms it via `npx tsx src/core/kernel/bootstrap-cli.ts` (test:ci), so
- * the kernel never pays a venv build inside a test there.
+ * Without a usable pinned python the suite refuses to boot while a live shared
+ * kernel venv exists (a dev checkout's runtime hash can only mismatch that
+ * venv's bootstrap marker, so the standard bootstrap would rebuild it under
+ * live sessions) and fails with the recipe above. With no pre-existing shared
+ * venv (CI), the standard bootstrap builds it; CI pre-warms that via `npx tsx
+ * src/core/kernel/bootstrap-cli.ts` (test:ci), so no test pays a venv build.
  */
 
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Agent, type AgentMessage, type StreamFn } from "@earendil-works/pi-agent-core";
 import {
@@ -84,10 +87,10 @@ const KERNEL_REQUIRED_IMPORTS = [
 function resolveKernelPython(): string | undefined {
 	// PRIME_AGENT_KERNEL_PYTHON first, then the checkout-local runtime venv: a
 	// dev checkout's runtime hash mismatches the shared ~/.prime/agent/kernel-venv
-	// bootstrap marker, and letting a session boot the default path here would
-	// rebuild that venv under live user sessions. CI never has the isolated venv;
-	// it pre-warms the shared one through bootstrap-cli (test:ci), so the default
-	// path there is a warm no-op.
+	// bootstrap marker, and the standard bootstrap would rebuild that venv under
+	// live user sessions (beforeAll refuses that case). CI never has the isolated
+	// venv and no pre-existing shared one either, so the standard bootstrap there
+	// is a safe build that bootstrap-cli (test:ci) pre-warms.
 	const candidates = [
 		process.env.PRIME_AGENT_KERNEL_PYTHON,
 		join(REPO_ROOT, "prime-agent-runtime", ".venv", "bin", "python"),
@@ -432,7 +435,7 @@ function resumeCell(runId: string): string {
 // The bridge suite.
 // ---------------------------------------------------------------------------
 
-describe("factory workflows over the real kernel bridge", () => {
+describe("factory workflows over the real kernel bridge", { tags: ["kernel-heavy"] }, () => {
 	let tempDir: string;
 	let session: AgentSession;
 	const driveCells: string[] = [];
@@ -679,6 +682,20 @@ describe("factory workflows over the real kernel bridge", () => {
 		const hadOwnOverride = Boolean(process.env.PRIME_AGENT_KERNEL_PYTHON);
 		if (pinnedKernelPython) process.env.PRIME_AGENT_KERNEL_PYTHON = pinnedKernelPython;
 		appliedKernelPythonOverride = !hadOwnOverride;
+		// A dev checkout's runtime hash can only mismatch the shared kernel
+		// venv's bootstrap marker, so the standard bootstrap would REBUILD that
+		// venv under live user sessions. Refuse instead; CI never has a
+		// pre-existing shared venv, so the bootstrap there is a safe build.
+		if (!pinnedKernelPython && existsSync(join(homedir(), ".prime", "agent", "kernel-venv"))) {
+			throw new Error(
+				"No usable isolated kernel python: point PRIME_AGENT_KERNEL_PYTHON at a factory-capable kernel " +
+					"python, or create the checkout-local venv (cd prime-agent-runtime && uv venv .venv && " +
+					"uv pip install --python .venv/bin/python -e . dill requests httpx pyyaml tomli python-dotenv " +
+					"pandas numpy scipy beautifulsoup4 lxml pydantic tyro). Refusing the standard kernel " +
+					"bootstrap because it would rebuild the shared ~/.prime/agent/kernel-venv that live " +
+					"sessions run on.",
+			);
+		}
 		tempDir = join(tmpdir(), `pi-factory-e2e-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(tempDir, { recursive: true });
 
@@ -853,6 +870,8 @@ describe("factory workflows over the real kernel bridge", () => {
 		expect(stopped.state).toBe("stopped");
 		expect(stopped.cancelled).toEqual(["hold", "after"]);
 
+		// Best-effort cleanup only: stop() already deleted the held child through
+		// the real delete path, so this push lands on an abandoned stream.
 		releaseGates("E2E-STATE:HOLD");
 		const status = await driveCell(statusCell(runId));
 		expect(status.state).toBe("stopped");

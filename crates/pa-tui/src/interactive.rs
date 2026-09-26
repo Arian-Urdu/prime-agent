@@ -3579,6 +3579,16 @@ impl Renderer {
                 write_flush_rows(&mut buffer, &rows);
             }
         }
+        // PROBE-ONLY (tui-scroll-retain): dump the composed exit-flush
+        // byte stream for the ANSI byte-parity oracle (never ships).
+        if let Ok(dump) = std::env::var("PA_TUI_FLUSH_DUMP") {
+            use std::io::Write as _;
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&dump)
+                .and_then(|mut f| f.write_all(buffer.as_bytes()));
+        }
         out.write_all(buffer.as_bytes())?;
         out.flush()?;
         Ok(())

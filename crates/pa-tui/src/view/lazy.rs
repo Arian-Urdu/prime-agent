@@ -1,6 +1,6 @@
 //! Sparse fullscreen windows. Unknown global row totals are resolved only
 //! for callers that require absolute coordinates (selection and scroll info).
-use super::{layout::EntryLayout, layout::EntryRows, AgentView};
+use super::{layout::EntryLayout, layout::EntryRows, layout::RowPack, AgentView};
 use crate::chat::Detail;
 use crate::chrome::render_splash;
 use crate::Line;
@@ -516,7 +516,7 @@ impl AgentView {
             // retention is the per-span chunk overhead, not the text.
             self.entry_layout[index][detail] = Some(EntryLayout {
                 spacing,
-                rows: std::sync::Arc::new(layout::RowPack::pack(&rows)),
+                rows: std::sync::Arc::new(RowPack::pack(&rows)),
             });
         }
         EntryRows::Fresh(rows)

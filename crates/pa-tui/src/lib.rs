@@ -4,6 +4,7 @@
 //! from `coding-agent/src/modes/interactive`. Components render styled lines;
 //! the terminal layer paints them with crossterm + ratatui diffing.
 
+#![recursion_limit = "256"] // PROBE-ONLY (tui-scroll-retain census): the census json! nests deeper than the default limit; never ships
 pub mod agents_view;
 pub mod agents_view_forest;
 pub mod agents_view_search;

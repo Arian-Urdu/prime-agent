@@ -156,6 +156,13 @@ pub fn render_markdown_tagged(
 #[derive(Default)]
 pub struct MarkdownBlockCache(std::collections::HashMap<String, Vec<Line>>);
 
+impl MarkdownBlockCache {
+    /// PROBE-ONLY (tui-scroll-retain lane): iterate the retained blocks.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Vec<Line>)> {
+        self.0.iter()
+    }
+}
+
 /// The cache key (TS: `${width}|${token.type}|${nextTokenType}|${token.raw}`):
 /// the style discriminator (the dim thinking block), width, this block's
 /// kind, the following kind (a block's trailing blank row depends on it),

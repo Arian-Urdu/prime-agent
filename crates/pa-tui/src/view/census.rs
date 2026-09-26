@@ -203,17 +203,88 @@ impl AgentView {
     }
 }
 
+/// The TUI process's own memory map summary (probe): total RSS, the
+/// [heap] mapping, and every anonymous mapping >= 128KB (glibc mmaps
+/// large Vec/String allocations directly; they never live in [heap]).
+fn self_smaps_summary() -> serde_json::Value {
+    let mut rss_kb = 0usize;
+    let mut heap_kb = 0usize;
+    let mut small_anon_kb = 0usize;
+    let mut big_anon: Vec<serde_json::Value> = Vec::new();
+    let Ok(text) = std::fs::read_to_string("/proc/self/smaps") else {
+        return serde_json::Value::Null;
+    };
+    let mut in_heap = false;
+    let mut is_anon = false;
+    let mut map_kb = 0usize;
+    let mut map_label = String::new();
+    for line in text.lines() {
+        let head = line.split_whitespace().collect::<Vec<_>>();
+        if head.len() >= 5 && head[0].contains('-') && !head[0].contains(':') {
+            if is_anon && map_kb > 0 {
+                if map_kb >= 128 {
+                    big_anon.push(serde_json::json!({"kb": map_kb, "label": map_label}));
+                } else {
+                    small_anon_kb += map_kb;
+                }
+            }
+            let path_part = if head.len() > 5 { head[5..].join(" ") } else { String::new() };
+            in_heap = path_part.contains("[heap]");
+            is_anon = path_part.is_empty() && head[1].contains('p');
+            map_kb = 0;
+            map_label = head[0].to_string();
+        } else if line.starts_with("Rss:") {
+            let kb: usize = head[1].parse().unwrap_or(0);
+            rss_kb += kb;
+            map_kb += kb;
+            if in_heap {
+                heap_kb += kb;
+            }
+        }
+    }
+    if is_anon && map_kb > 0 {
+        if map_kb >= 128 {
+            big_anon.push(serde_json::json!({"kb": map_kb, "label": map_label}));
+        } else {
+            small_anon_kb += map_kb;
+        }
+    }
+    serde_json::json!({
+        "self_rss_kb": rss_kb,
+        "self_heap_kb": heap_kb,
+        "self_small_anon_kb": small_anon_kb,
+        "self_big_anon_kb": big_anon.iter().map(|m| m["kb"].as_u64().unwrap_or(0)).sum::<u64>(),
+        "self_big_anon": big_anon,
+    })
+}
+
 /// Run the census if a probe request is pending (draw-path, main thread).
+/// `<PA_TUI_CENSUS_FILE>.kick` = plain census;
+/// `<PA_TUI_CENSUS_FILE>.kick.trim` = trim freed heap first (slack probe).
 pub fn maybe_census(view: &AgentView) {
     let Ok(path) = std::env::var("PA_TUI_CENSUS_FILE") else {
         return;
     };
-    let kick = format!("{path}.kick");
-    if !std::path::Path::new(&kick).exists() {
+    let plain = format!("{path}.kick");
+    let trim = format!("{path}.kick.trim");
+    let mode = if std::path::Path::new(&trim).exists() {
+        let _ = std::fs::remove_file(&trim);
+        pa_types::memory_release::trim_freed_heap();
+        Some(true)
+    } else if std::path::Path::new(&plain).exists() {
+        let _ = std::fs::remove_file(&plain);
+        Some(false)
+    } else {
+        None
+    };
+    let Some(trimmed) = mode else {
         return;
+    };
+    let mut census = view.census();
+    if let serde_json::Value::Object(map) = &mut census {
+        map.insert("trimmed".into(), serde_json::json!(trimmed));
+        map.insert("smaps".into(), self_smaps_summary());
     }
-    let _ = std::fs::remove_file(&kick);
-    let census = view.census();
     let line = format!("{census}\n");
     let _ = std::fs::OpenOptions::new()
         .create(true)

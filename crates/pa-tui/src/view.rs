@@ -23,6 +23,7 @@ use pa_types::slash_commands::SlashCommandRegistry;
 use ratatui::style::{Modifier, Style};
 
 pub(crate) mod click;
+pub(crate) mod census;
 mod geometry;
 mod layout;
 pub(crate) mod lazy;

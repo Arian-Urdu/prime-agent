@@ -97,6 +97,19 @@ impl RowPack {
         self.first.len().saturating_sub(1)
     }
 
+    /// PROBE-ONLY (tui-scroll-retain, probe-cand build): the retained
+    /// packed structure's census stats — rows, span records, and the
+    /// packed bytes (index + records + blob capacity). Never ships.
+    pub(super) fn census_parts(&self) -> (usize, usize, usize, usize, usize) {
+        (
+            self.len(),
+            self.spans.len(),
+            self.first.capacity() * 4,
+            self.spans.capacity() * std::mem::size_of::<PackedSpan>(),
+            self.blob.capacity(),
+        )
+    }
+
     /// Rebuild rows `[from, to)` in the expanded `Vec<Line>` form
     /// (byte-exact to the rows that were packed).
     pub(super) fn range(&self, from: usize, to: usize) -> Vec<Line> {

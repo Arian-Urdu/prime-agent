@@ -254,6 +254,7 @@ pub(crate) fn draw(
     terminal: &mut Terminal<crate::hyperlinks::LinkBackend>,
     view: &mut AgentView,
 ) -> Result<()> {
+    crate::view::census::maybe_census(view);
     // The interactive surface's mount sequences (the alt-screen
     // adopt/enter for a fresh process, the queued clear, the cursor
     // hide) ride THIS draw's single flush: the first paint is the mount

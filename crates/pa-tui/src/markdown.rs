@@ -156,6 +156,29 @@ pub fn render_markdown_tagged(
 #[derive(Default)]
 pub struct MarkdownBlockCache(std::collections::HashMap<String, Vec<Line>>);
 
+impl MarkdownBlockCache {
+    /// PROBE-ONLY (tui-memory lane): retained-byte stats of this cache.
+    pub fn stats(&self) -> (usize, usize, usize, usize, usize) {
+        let mut blocks = 0usize;
+        let mut key_bytes = 0usize;
+        let mut lines = 0usize;
+        let mut spans = 0usize;
+        let mut content_bytes = 0usize;
+        for (key, key_lines) in &self.0 {
+            blocks += 1;
+            key_bytes += key.len();
+            lines += key_lines.len();
+            for line in key_lines {
+                spans += line.len();
+                for span in line {
+                    content_bytes += span.content.len();
+                }
+            }
+        }
+        (blocks, key_bytes, lines, spans, content_bytes)
+    }
+}
+
 /// The cache key (TS: `${width}|${token.type}|${nextTokenType}|${token.raw}`):
 /// the style discriminator (the dim thinking block), width, this block's
 /// kind, the following kind (a block's trailing blank row depends on it),

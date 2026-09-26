@@ -22,7 +22,7 @@ use crate::{Line, Span};
 use pa_types::slash_commands::SlashCommandRegistry;
 use ratatui::style::{Modifier, Style};
 
-mod census;
+pub(crate) mod census;
 mod geometry;
 mod layout;
 pub(crate) mod lazy;

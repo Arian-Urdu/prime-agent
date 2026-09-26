@@ -1507,7 +1507,6 @@ async fn run_interactive_surface(
     ui: UiMode,
     surface_mounted: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<InteractiveOutcome> {
-    crate::view::census::install_probe();
     // The TS theme emits raw ANSI color codes regardless of NO_COLOR; match
     // that so the same terminal renders the same frames either way.
     crossterm::style::force_color_output(true);

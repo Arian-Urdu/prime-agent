@@ -1,30 +1,15 @@
 //! PROBE-ONLY (tui-memory lane, branch lane/hillclimb-tui-memory-probe): a
-//! SIGUSR1-triggered census of the transcript state the TUI retains.
+//! trigger-file-driven census of the transcript state the TUI retains.
 //! Never ships: this file exists to attribute RSS bytes to concrete
 //! structures (chat entries, entry row caches, markdown block caches).
+//! Trigger: create/remove `<PA_TUI_CENSUS_FILE>.kick` (one stat per draw;
+//! the walk itself runs on the draw path and appends a JSON line).
 #![allow(dead_code)]
 
 use super::AgentView;
 use crate::chat::ChatEntry;
 use serde_json::json;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-pub static CENSUS_REQUESTED: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn census_signal_handler(_sig: i32) {
-    CENSUS_REQUESTED.store(true, Ordering::Relaxed);
-}
-
-/// Install the SIGUSR1 census trigger when PA_TUI_CENSUS_FILE is set.
-/// The handler only flips an atomic; the walk runs on the draw path.
-pub fn install_probe() {
-    if std::env::var("PA_TUI_CENSUS_FILE").is_ok() {
-        unsafe {
-            libc::signal(libc::SIGUSR1, census_signal_handler as usize);
-        }
-    }
-}
 
 /// (lines, spans, content_bytes) of a rendered row set.
 fn line_stats(lines: &[crate::Line]) -> (usize, usize, usize) {
@@ -69,9 +54,6 @@ fn entry_kind(entry: &ChatEntry) -> &'static str {
         ChatEntry::ShellCompletion(_) => "shell_completion",
         ChatEntry::RefinementOutcome(_) => "refinement_outcome",
         ChatEntry::CustomPanel(_) => "custom_panel",
-        ChatEntry::ClientMarkdown { .. } => "client_markdown",
-        ChatEntry::ClientText { .. } => "client_text",
-        ChatEntry::ChangelogPanel { .. } => "changelog_panel",
     }
 }
 
@@ -223,12 +205,14 @@ impl AgentView {
 
 /// Run the census if a probe request is pending (draw-path, main thread).
 pub fn maybe_census(view: &AgentView) {
-    if !CENSUS_REQUESTED.swap(false, Ordering::Relaxed) {
-        return;
-    }
     let Ok(path) = std::env::var("PA_TUI_CENSUS_FILE") else {
         return;
     };
+    let kick = format!("{path}.kick");
+    if !std::path::Path::new(&kick).exists() {
+        return;
+    }
+    let _ = std::fs::remove_file(&kick);
     let census = view.census();
     let line = format!("{census}\n");
     let _ = std::fs::OpenOptions::new()

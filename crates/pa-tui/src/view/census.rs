@@ -49,7 +49,7 @@ fn is_default_styled(span: &crate::Span) -> bool {
         && span.style.add_modifier.is_empty()
 }
 
-fn line_stats(rows: &[crate::Line]) -> SpanStats {
+fn line_stats(rows: &Vec<crate::Line>) -> SpanStats {
     let mut s = SpanStats::default();
     s.lines = rows.len();
     s.rows_cap = rows.capacity();

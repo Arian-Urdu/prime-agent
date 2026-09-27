@@ -11,6 +11,7 @@ packages/*/dist-firefox/
 
 # Environment
 .env
+.prime/
 
 # Editor files
 .vscode/
@@ -22,6 +23,8 @@ packages/*/dist-firefox/
 *~
 
 # Package specific
+packages/coding-agent/catalog/*.bundled.json
+prime-agent-catalog/
 .npm/
 coverage/
 .nyc_output/

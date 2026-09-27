@@ -101,6 +101,8 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 			"serve --port <n>    expose localhost:<n> on your tailnet (wraps `tailscale serve --bg`)",
 			"--funnel            with serve: expose publicly via tailscale funnel",
 		],
+	},
+	{
 		path: ["incident"],
 		usage: "incident [--since <time>] [--until <time>] [--session <id>]",
 		summary: "Reconstruct a daemon incident from its logs",

@@ -2958,11 +2958,17 @@ export class DaemonSupervisor {
 				// fails closed); otherwise a tailnet sibling that shares a name
 				// would intercept a message that resumes the saved local session.
 				// Session names are unique per daemon, not per tailnet: two remote
-				// daemons can each own a "worker", but two remote matches only turn
-				// ambiguous once the saved-local lookup has missed as well.
+				// daemons can each own a "worker", but two reachable remote matches
+				// only turn ambiguous once the saved-local lookup has missed as well.
 				await this.refreshRemoteMesh(REMOTE_MESH_MESSAGE_REFRESH_WAIT_MS);
 				const remoteMatches = this.remoteAgentMeshState?.findMessageTargets(command.targetActiveSessionId) ?? [];
-				const remoteTarget = remoteMatches[0];
+				// A peer that drops from a scan keeps its rows, marked offline, until the
+				// offline TTL forgets it, and it can receive nothing meanwhile. A retained
+				// ghost must not veto a reachable sibling that owns the same name or the
+				// same copied id, so only deliverable rows make a selector ambiguous; an
+				// all-offline set still fails loudly in deliverRemoteAgentMessage.
+				const reachableRemoteMatches = remoteMatches.filter((target) => !target.offline);
+				const remoteTarget = reachableRemoteMatches[0] ?? remoteMatches[0];
 				const cwd = source?.summary.cwd ?? this.defaultSessionConfig.cwd ?? process.cwd();
 				let sessionPath: string;
 				try {
@@ -2985,9 +2991,9 @@ export class DaemonSupervisor {
 					// hand message contents to a same-named remote agent.
 					if (!isDaemonCatalogSessionMiss(catalogError)) throw catalogError;
 					// The catalog missed as well: only now may remote siblings claim
-					// the message — a single one delivers, two stay ambiguous exactly
-					// like the local path.
-					if (remoteMatches.length > 1) {
+					// the message — a single reachable one delivers, two reachable stay
+					// ambiguous exactly like the local path.
+					if (reachableRemoteMatches.length > 1) {
 						throw new Error(`Ambiguous active session: ${command.targetActiveSessionId}`);
 					}
 					if (remoteTarget) {

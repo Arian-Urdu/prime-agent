@@ -857,6 +857,7 @@ describe("daemon supervisor remote mesh routing", () => {
 		const targets = [
 			{
 				host: { tailnetHost: "peer.tailnet.ts.net", online: true, daemon: true, sessions: [] },
+				offline: false,
 				sessionId: "r-s",
 				activeSessionId: "r-a",
 				summary: { rlmDepth: 0, rosterStatus: "idle" },
@@ -955,5 +956,18 @@ describe("daemon supervisor remote mesh routing", () => {
 		mesh.targets[0]!.sessionId = "l-s";
 		await supervisor.handleCommand(client, send("hi same session", true));
 		expect(deliveries.at(-1)).toMatchObject({ message: "hi same session", fromRelationship: "sibling" });
+
+		// A peer that dropped from the scan keeps its rows until the offline TTL, but it
+		// can receive nothing: an offline row must not veto the reachable sibling that
+		// owns the same name, and it must not shadow it either, so the send lands on the
+		// reachable row in both orders.
+		mesh.targets.push({ ...mesh.targets[0]!, sessionId: "g-s", activeSessionId: "g-a", offline: true });
+		await supervisor.handleCommand(client, send("hi live ghost"));
+		expect(deliveries.at(-1)).toMatchObject({ message: "hi live ghost", target: { sessionId: "l-s" } });
+
+		mesh.targets[0]!.offline = true;
+		mesh.targets[1]!.offline = false;
+		await supervisor.handleCommand(client, send("hi live peer"));
+		expect(deliveries.at(-1)).toMatchObject({ message: "hi live peer", target: { sessionId: "g-s" } });
 	});
 });

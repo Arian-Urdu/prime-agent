@@ -3275,7 +3275,7 @@ describe("DaemonAgentConnection", () => {
 		async (refresh) => {
 			const fakeClient = new FakeDaemonClient();
 			if (refresh === "catalog") fakeClient.serverCapabilities.add("model_catalog");
-			const model = getModel("xai", "grok-4.5");
+			const model = getCodingAgentFixtureModel("xai", "grok-code-fast-1");
 			const initialState = { ...createConnectionState("active-1", "session-current"), model };
 			fakeClient.attachResultFactory = (command) =>
 				createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12, {

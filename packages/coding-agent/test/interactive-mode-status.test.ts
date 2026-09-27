@@ -1395,6 +1395,7 @@ describe("InteractiveMode.setToolsExpanded", () => {
 			customHeader: undefined,
 			builtInHeader: { setExpanded: vi.fn() },
 			chatContainer: { children: chatChildren },
+			uiServices: { settingsManager: { setChatDetail: vi.fn() } },
 			ui: {
 				requestRender: vi.fn(),
 				requestRenderPreservingViewport: vi.fn(),

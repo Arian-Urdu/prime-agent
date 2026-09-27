@@ -42,7 +42,6 @@ import { Agent, type AgentMessage, type StreamFn } from "@earendil-works/pi-agen
 import {
 	type AssistantMessage,
 	createAssistantMessageEventStream,
-	getModel,
 	type TextContent,
 	type Usage,
 } from "@earendil-works/pi-ai";
@@ -54,9 +53,10 @@ import { ModelRegistry } from "../src/core/model-registry.js";
 import { getSessionArtifactPath, SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import { waitForHeadlessCompletion } from "../src/modes/headless-completion.js";
+import { getCodingAgentFixtureModel } from "./fixture-models.js";
 import { createTestResourceLoader } from "./utilities.js";
 
-const model = getModel("anthropic", "claude-sonnet-4-5")!;
+const model = getCodingAgentFixtureModel("anthropic", "claude-sonnet-4-5");
 
 // ---------------------------------------------------------------------------
 // Kernel python: PRIME_AGENT_KERNEL_PYTHON, else the repo-local runtime venv.

@@ -94,14 +94,20 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 	},
 	{
 		path: ["tailscale"],
-		usage: "tailscale [status] | tailscale serve --port <n> [--funnel]",
+		usage: "tailscale <status|serve>",
 		summary: "Tailscale tailnet support: status, and expose a local port via serve/funnel",
-		options: [
-			"status              (default) show tailnet state, MagicDNS name, and served endpoints",
-			"serve --port <n>    expose localhost:<n> on your tailnet (wraps `tailscale serve --bg`)",
-			"--funnel            with serve: expose publicly via tailscale funnel",
-			"--json              with status: print machine-readable output",
-		],
+	},
+	{
+		path: ["tailscale", "status"],
+		usage: "tailscale status [--json]",
+		summary: "Show tailnet state, MagicDNS name, and served endpoints (the default)",
+		options: ["--json  Print machine-readable output"],
+	},
+	{
+		path: ["tailscale", "serve"],
+		usage: "tailscale serve --port <n> [--funnel]",
+		summary: "Expose localhost:<n> on your tailnet (wraps `tailscale serve --bg`)",
+		options: ["--port <n>  The local port to expose", "--funnel    Expose publicly via Tailscale Funnel"],
 	},
 	{
 		path: ["incident"],

@@ -4444,6 +4444,10 @@ export class InteractiveMode {
 					this.hideExtensionEditor();
 					resolve(undefined);
 				},
+				undefined,
+				() => {
+					if (this.fullscreenEnabled) this.applyFullscreen(true);
+				},
 			);
 
 			this.editorContainer.clear();

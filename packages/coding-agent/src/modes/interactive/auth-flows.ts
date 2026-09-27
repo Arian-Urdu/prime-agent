@@ -810,7 +810,9 @@ export class ProviderAuthFlows {
 
 			if (result.source === "manual") {
 				browserAbort.abort();
-				dialog.showProgress("Checking Prime Agent trace access...");
+				if (!this.isOnboarding()) {
+					dialog.showProgress("Checking Prime Agent trace access...");
+				}
 				const access = await checkPrimeAgentTracesAccess(result.apiKey, resolvePrimeAgentTracesBaseUrl(), {
 					signal: dialog.signal,
 				});

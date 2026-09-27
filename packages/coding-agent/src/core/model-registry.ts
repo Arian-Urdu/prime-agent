@@ -110,6 +110,8 @@ const ThinkingLevelMapSchema = Type.Object({
 });
 
 const OpenAICompletionsCompatSchema = Type.Object({
+	zaiToolStream: Type.Optional(Type.Boolean()),
+	sendSessionAffinityHeaders: Type.Optional(Type.Boolean()),
 	supportsStore: Type.Optional(Type.Boolean()),
 	supportsDeveloperRole: Type.Optional(Type.Boolean()),
 	supportsReasoningEffort: Type.Optional(Type.Boolean()),

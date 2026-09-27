@@ -1461,7 +1461,10 @@ function waitForPromiseOrAbort<T>(
 	abortMessage: string,
 ): Promise<T> {
 	if (!signal) return promise;
-	if (signal.aborted) return Promise.reject(new Error(abortMessage));
+	if (signal.aborted) {
+		void promise.catch(() => {});
+		return Promise.reject(new Error(abortMessage));
+	}
 	return new Promise<T>((resolve, reject) => {
 		const onAbort = () => {
 			cleanup();

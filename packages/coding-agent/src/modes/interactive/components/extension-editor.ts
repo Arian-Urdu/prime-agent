@@ -23,6 +23,7 @@ export class ExtensionEditorComponent extends Container implements Focusable {
 	private onCancelCallback: () => void;
 	private tui: TUI;
 	private keybindings: KeybindingsManager;
+	private restoreFullscreen: (() => void) | undefined;
 
 	private _focused = false;
 	get focused(): boolean {
@@ -41,11 +42,13 @@ export class ExtensionEditorComponent extends Container implements Focusable {
 		onSubmit: (value: string) => void,
 		onCancel: () => void,
 		options?: EditorOptions,
+		restoreFullscreen?: () => void,
 	) {
 		super();
 
 		this.tui = tui;
 		this.keybindings = keybindings;
+		this.restoreFullscreen = restoreFullscreen;
 		this.onSubmitCallback = onSubmit;
 		this.onCancelCallback = onCancel;
 
@@ -126,6 +129,7 @@ export class ExtensionEditorComponent extends Container implements Focusable {
 				// Ignore cleanup errors
 			}
 			this.tui.start();
+			this.restoreFullscreen?.();
 			// Force full re-render since external editor uses alternate screen
 			this.tui.requestRender(true);
 		}

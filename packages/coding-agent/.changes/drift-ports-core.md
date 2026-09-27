@@ -1,0 +1,1 @@
+- Fixed fullscreen mode turning off after you edit an extension's text prompt in your external editor (`$VISUAL`/`$EDITOR`).

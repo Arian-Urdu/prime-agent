@@ -1,1 +1,0 @@
-- Added the `swarm` continual-harness entry kind: a versioned, validated DAG of subagent nodes (typed ports, task/resident lifecycles, budgets, retries, failure policies, bounded foreach fan-out) stored via `rlm.harness.create_swarm/update_swarm/delete_swarm`; invalid specifications are rejected at write time.

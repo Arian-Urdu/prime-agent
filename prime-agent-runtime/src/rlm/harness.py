@@ -21,14 +21,14 @@ from pathlib import Path
 from uuid import uuid4
 from typing import Any, Literal
 
-from .swarm import validate_swarm_spec
+from .factory import validate_factory_spec
 
-HarnessKind = Literal["prompt", "memory", "skill", "subagent", "swarm"]
+HarnessKind = Literal["prompt", "memory", "skill", "subagent", "factory"]
 HarnessScope = Literal["local", "global"]
 
 _DEFAULT_FILE_NAME = "harness_state.json"
 _DEFAULT_HARNESS_DIR_NAME = "harness"
-_KINDS: tuple[HarnessKind, ...] = ("prompt", "memory", "skill", "subagent", "swarm")
+_KINDS: tuple[HarnessKind, ...] = ("prompt", "memory", "skill", "subagent", "factory")
 _state_cache: dict[tuple[Path, HarnessScope], "HarnessState"] = {}
 
 
@@ -42,10 +42,10 @@ def _slug(raw: str, fallback: str) -> str:
     return (normalized or fallback)[:80]
 
 
-def _swarm_spec_argument(
+def _factory_spec_argument(
     dag: Any, machine: Any
 ) -> "tuple[Any, Literal['dag', 'machine']]":
-    """Pick the swarm spec payload and its arguments key from the call.
+    """Pick the factory spec payload and its arguments key from the call.
 
     Supplying both forms at once is an error. A bare ``dag=None,
     machine=None`` passes ``None`` through in the dag slot so the write-time
@@ -915,7 +915,7 @@ class HarnessState:
     def delete_subagent(self, id: str, *, global_: bool = False, **kwargs: Any) -> bool:
         return self.delete("subagent", id, global_=global_, **kwargs)
 
-    def create_swarm(
+    def create_factory(
         self,
         title: str,
         content: str,
@@ -929,12 +929,12 @@ class HarnessState:
         **kwargs: Any,
     ) -> HarnessEntry:
         # Write-time dry run: an invalid spec (either form) never reaches the store.
-        spec, key = _swarm_spec_argument(dag, machine)
-        errors = validate_swarm_spec(spec)
+        spec, key = _factory_spec_argument(dag, machine)
+        errors = validate_factory_spec(spec)
         if errors:
             raise ValueError("; ".join(errors))
         return self.create(
-            "swarm",
+            "factory",
             title,
             content,
             id=id,
@@ -945,7 +945,7 @@ class HarnessState:
             **kwargs,
         )
 
-    def update_swarm(
+    def update_factory(
         self,
         id: str,
         title: str,
@@ -962,15 +962,15 @@ class HarnessState:
         # stored arguments (see _upsert) rather than forcing every title/content
         # update to re-send the full spec, exactly like update_skill treats reference.
         if dag is not None or machine is not None:
-            spec, key = _swarm_spec_argument(dag, machine)
-            errors = validate_swarm_spec(spec)
+            spec, key = _factory_spec_argument(dag, machine)
+            errors = validate_factory_spec(spec)
             if errors:
                 raise ValueError("; ".join(errors))
             arguments = {key: spec}
         else:
             arguments = None
         return self.update(
-            "swarm",
+            "factory",
             id,
             title,
             content,
@@ -981,8 +981,8 @@ class HarnessState:
             **kwargs,
         )
 
-    def delete_swarm(self, id: str, *, global_: bool = False, **kwargs: Any) -> bool:
-        return self.delete("swarm", id, global_=global_, **kwargs)
+    def delete_factory(self, id: str, *, global_: bool = False, **kwargs: Any) -> bool:
+        return self.delete("factory", id, global_=global_, **kwargs)
 
     def record_refinement(
         self,
@@ -1048,10 +1048,10 @@ class HarnessState:
             "files; children reply with await agent_message.send(message, receiver_role='parent'). Use "
             "await rlm.list_subagents() to recover direct child handles and await agent_message.send(..., "
             "receiver_role='child', receiver_name=handle.name) for follow-ups.",
-            "Swarm entries declare validated state-machine workflows of subagent states in arguments['machine'] "
+            "Factory entries declare validated state-machine workflows of subagent states in arguments['machine'] "
             "(the original DAG sugar in arguments['dag'] compiles to machine form): manage them with "
-            "create_swarm/update_swarm/delete_swarm (create_swarm validates either form at write time); run "
-            "them with rlm.swarm.run(\"<id>\") once the executor lands in a follow-up PR.",
+            "create_factory/update_factory/delete_factory (create_factory validates either form at write time); run "
+            "them with rlm.factory.run(\"<id>\") once the executor lands in a follow-up PR.",
         ]
         for kind in _KINDS:
             records = self.list(kind)[:max_entries_per_kind]

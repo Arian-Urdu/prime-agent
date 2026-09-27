@@ -1,6 +1,6 @@
-"""Validation and compilation for swarm specifications.
+"""Validation and compilation for factory specifications.
 
-A continual-harness ``swarm`` entry stores a declarative state machine of
+A continual-harness ``factory`` entry stores a declarative state machine of
 subagent states in ``arguments["machine"]``: entry states (which declare
 no inputs), guarded transitions between states, and bounded re-entry
 (``max_entries``). The original DAG form in ``arguments["dag"]`` stays as
@@ -12,7 +12,7 @@ carrying a ``wait`` block is rejected at write time.
 
 This module implements the write-time dry run for both forms: the machine
 validator, the dag-to-machine compiler, the unified entry point
-(``validate_swarm_spec`` detects the form), and a canonicalizer that
+(``validate_factory_spec`` detects the form), and a canonicalizer that
 applies defaults and returns the canonical MACHINE form. Execution
 (run/status/stop) lands in a follow-up PR; nothing here spawns states.
 """
@@ -341,8 +341,8 @@ def _validate_guard(
         errors.append(f"transitions[{index}] when.op {op!r} requires a scalar value")
 
 
-def validate_swarm_machine(machine: Any) -> list[str]:
-    """Dry-run validation for a machine-form swarm spec.
+def validate_factory_machine(machine: Any) -> list[str]:
+    """Dry-run validation for a machine-form factory spec.
 
     Returns a list of human-readable error sentences; an empty list means
     the machine is valid. Rules: states are 1..1024 with unique slug ids and
@@ -355,7 +355,7 @@ def validate_swarm_machine(machine: Any) -> list[str]:
     requirement: arbitrary state machines, including cycles, validate.
     """
     if not isinstance(machine, dict):
-        return ["swarm machine must be a JSON object"]
+        return ["factory machine must be a JSON object"]
     errors: list[str] = []
     run = machine.get("run")
     if run is not None and not isinstance(run, dict):
@@ -365,10 +365,10 @@ def validate_swarm_machine(machine: Any) -> list[str]:
 
     states = machine.get("states")
     if not isinstance(states, list):
-        errors.append("swarm machine requires a states list")
+        errors.append("factory machine requires a states list")
         return errors
     if not 1 <= len(states) <= MAX_STATES:
-        errors.append(f"swarm machine must declare between 1 and {MAX_STATES} states, got {len(states)}")
+        errors.append(f"factory machine must declare between 1 and {MAX_STATES} states, got {len(states)}")
         return errors
 
     seen_ids: set[str] = set()
@@ -405,13 +405,13 @@ def validate_swarm_machine(machine: Any) -> list[str]:
     # only state failed its id check reports that problem alone, and a flag
     # that is not a boolean never counts as declaring an entry.
     if states_by_id and not any(state.get("entry") is True for state in states_by_id.values()):
-        errors.append("swarm machine requires at least one entry state")
+        errors.append("factory machine requires at least one entry state")
 
     transitions = machine.get("transitions")
     if transitions is None:
         transitions = []
     if not isinstance(transitions, list):
-        errors.append("swarm machine transitions must be a list")
+        errors.append("factory machine transitions must be a list")
         return errors
     for index, transition in enumerate(transitions):
         if not isinstance(transition, dict):
@@ -458,11 +458,11 @@ def _effective_dag_edges(node: dict[str, Any]) -> list[str]:
     return edges
 
 
-def compile_swarm_dag(dag: Any) -> "tuple[dict[str, Any] | None, list[str]]":
+def compile_factory_dag(dag: Any) -> "tuple[dict[str, Any] | None, list[str]]":
     """Compile a dag-form spec into machine form.
 
     Returns ``(machine, errors)``: on success the machine is a spec-shaped
-    dict (defaults are applied later by ``canonicalize_swarm_spec``) and the
+    dict (defaults are applied later by ``canonicalize_factory_spec``) and the
     error list is empty; on any dag-level error the machine is ``None`` and
     the errors carry the V1 dag wording. Each node becomes a state with
     ``entry`` set when it has no effective dependencies and ``max_entries``
@@ -471,7 +471,7 @@ def compile_swarm_dag(dag: Any) -> "tuple[dict[str, Any] | None, list[str]]":
     the communication series); the compiler itself has no wait support.
     """
     if not isinstance(dag, dict):
-        return None, ["swarm dag must be a JSON object"]
+        return None, ["factory dag must be a JSON object"]
     errors: list[str] = []
     run = dag.get("run")
     if run is not None and not isinstance(run, dict):
@@ -481,9 +481,9 @@ def compile_swarm_dag(dag: Any) -> "tuple[dict[str, Any] | None, list[str]]":
 
     nodes = dag.get("nodes")
     if not isinstance(nodes, list):
-        return None, errors + ["swarm dag requires a nodes list"]
+        return None, errors + ["factory dag requires a nodes list"]
     if not 1 <= len(nodes) <= MAX_NODES:
-        return None, errors + [f"swarm dag must declare between 1 and {MAX_NODES} nodes, got {len(nodes)}"]
+        return None, errors + [f"factory dag must declare between 1 and {MAX_NODES} nodes, got {len(nodes)}"]
 
     seen_ids: set[str] = set()
     nodes_by_id: dict[str, dict[str, Any]] = {}
@@ -543,27 +543,27 @@ def compile_swarm_dag(dag: Any) -> "tuple[dict[str, Any] | None, list[str]]":
 # ---------------------------------------------------------------------------
 
 
-def validate_swarm_spec(spec: Any) -> list[str]:
-    """Dry-run validation for a swarm spec in either form.
+def validate_factory_spec(spec: Any) -> list[str]:
+    """Dry-run validation for a factory spec in either form.
 
     Detects the form first: a spec carrying "states" or "transitions" is
     machine form; anything else is dag form and compiles to machine form
     first. A spec carrying both dag and machine keys is rejected outright.
     Returns a list of human-readable error sentences; an empty list means
-    the specification is valid. Every rule is enforced before a swarm entry
+    the specification is valid. Every rule is enforced before a factory entry
     is stored, so an invalid spec never reaches the store.
     """
     if not isinstance(spec, dict):
-        return ["swarm dag must be a JSON object"]
+        return ["factory dag must be a JSON object"]
     if _is_machine_form(spec) and "nodes" in spec:
         return ["pass either dag or machine form, not both"]
     if _is_machine_form(spec):
-        return validate_swarm_machine(spec)
-    machine, errors = compile_swarm_dag(spec)
+        return validate_factory_machine(spec)
+    machine, errors = compile_factory_dag(spec)
     if errors:
         return errors
     # Defense in depth: a compiled dag must produce a valid machine.
-    return validate_swarm_machine(machine)
+    return validate_factory_machine(machine)
 
 
 def _canonicalize_machine(machine: dict[str, Any]) -> dict[str, Any]:
@@ -615,7 +615,7 @@ def _canonicalize_machine(machine: dict[str, Any]) -> dict[str, Any]:
     return {"run": run, "states": states_out, "transitions": transitions_out}
 
 
-def canonicalize_swarm_spec(spec: Any) -> dict[str, Any]:
+def canonicalize_factory_spec(spec: Any) -> dict[str, Any]:
     """Validate a spec in either form and return the canonical MACHINE form.
 
     Raises ``ValueError`` with the joined error list when the spec is
@@ -623,14 +623,14 @@ def canonicalize_swarm_spec(spec: Any) -> dict[str, Any]:
     machine form first, so the executor sees one shape:
     ``{"run": ..., "states": [...], "transitions": [...]}``.
     """
-    errors = validate_swarm_spec(spec)
+    errors = validate_factory_spec(spec)
     if errors:
         raise ValueError("; ".join(errors))
     assert isinstance(spec, dict)  # validated above
     if _is_machine_form(spec):
         machine = spec
     else:
-        machine, compile_errors = compile_swarm_dag(spec)
+        machine, compile_errors = compile_factory_dag(spec)
         assert machine is not None and not compile_errors  # validated above
     return _canonicalize_machine(machine)
 
@@ -706,14 +706,14 @@ def topological_order(nodes: list[dict[str, Any]]) -> list[str]:
                 heapq.heappush(ready, (index_of[dependent], dependent))
     if len(order) != len(index_of):
         stuck = sorted(node_id for node_id, count in remaining.items() if count > 0)
-        raise ValueError(f"the swarm graph contains a cycle involving nodes: {', '.join(stuck)}")
+        raise ValueError(f"the factory graph contains a cycle involving nodes: {', '.join(stuck)}")
     return order
 
 
 __all__ = [
-    "canonicalize_swarm_spec",
-    "compile_swarm_dag",
+    "canonicalize_factory_spec",
+    "compile_factory_dag",
     "topological_order",
-    "validate_swarm_machine",
-    "validate_swarm_spec",
+    "validate_factory_machine",
+    "validate_factory_spec",
 ]

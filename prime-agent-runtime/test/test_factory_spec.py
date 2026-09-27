@@ -3,12 +3,12 @@ from __future__ import annotations
 import unittest
 from typing import Any
 
-from rlm.swarm import (
-    canonicalize_swarm_spec,
-    compile_swarm_dag,
+from rlm.factory import (
+    canonicalize_factory_spec,
+    compile_factory_dag,
     topological_order,
-    validate_swarm_machine,
-    validate_swarm_spec,
+    validate_factory_machine,
+    validate_factory_spec,
 )
 
 
@@ -87,91 +87,91 @@ def valid_dag() -> dict[str, Any]:
     }
 
 
-class ValidateSwarmSpecTest(unittest.TestCase):
+class ValidateFactorySpecTest(unittest.TestCase):
     def test_valid_spec_has_no_errors(self) -> None:
-        self.assertEqual(validate_swarm_spec(valid_dag()), [])
+        self.assertEqual(validate_factory_spec(valid_dag()), [])
 
     def test_dag_must_be_an_object(self) -> None:
         for bad in (None, [], "nodes", 42):
-            errors = validate_swarm_spec(bad)
+            errors = validate_factory_spec(bad)
             self.assertEqual(len(errors), 1)
-            self.assertIn("swarm dag must be a JSON object", errors[0])
+            self.assertIn("factory dag must be a JSON object", errors[0])
 
     def test_nodes_required_and_must_be_a_list(self) -> None:
         self.assertEqual(
-            validate_swarm_spec({"nodes": "nope"}),
-            ["swarm dag requires a nodes list"],
+            validate_factory_spec({"nodes": "nope"}),
+            ["factory dag requires a nodes list"],
         )
         self.assertEqual(
-            validate_swarm_spec({"run": "bad", "nodes": "nope"}),
-            ["run must be an object", "swarm dag requires a nodes list"],
+            validate_factory_spec({"run": "bad", "nodes": "nope"}),
+            ["run must be an object", "factory dag requires a nodes list"],
         )
 
     def test_node_cap(self) -> None:
         at_cap = {"nodes": [node(f"n{i}") for i in range(1024)]}
-        self.assertEqual(validate_swarm_spec(at_cap), [])
+        self.assertEqual(validate_factory_spec(at_cap), [])
         over_cap = {"nodes": [node(f"n{i}") for i in range(1025)]}
-        errors = validate_swarm_spec(over_cap)
+        errors = validate_factory_spec(over_cap)
         self.assertEqual(len(errors), 1)
         self.assertIn("between 1 and 1024 nodes", errors[0])
 
     def test_node_ids(self) -> None:
         for good in ("a", "node-1", "1st-node", "a" * 64):
-            self.assertEqual(validate_swarm_spec({"nodes": [node(good)]}), [], good)
+            self.assertEqual(validate_factory_spec({"nodes": [node(good)]}), [], good)
         for bad in ("-abc", "ABC", "a_b", "a.b", "a" * 65):
-            errors = validate_swarm_spec({"nodes": [{"id": bad, "subagent": "w"}]})
+            errors = validate_factory_spec({"nodes": [{"id": bad, "subagent": "w"}]})
             self.assertEqual(len(errors), 1, bad)
             self.assertIn("id must match", errors[0])
         for bad in ("", None, 5):
-            errors = validate_swarm_spec({"nodes": [{"id": bad, "subagent": "w"}]})
+            errors = validate_factory_spec({"nodes": [{"id": bad, "subagent": "w"}]})
             self.assertEqual(errors, ["nodes[0] requires a non-empty id"], repr(bad))
 
     def test_duplicate_node_ids(self) -> None:
-        errors = validate_swarm_spec({"nodes": [node("dup"), node("dup")]})
+        errors = validate_factory_spec({"nodes": [node("dup"), node("dup")]})
         self.assertEqual(len(errors), 1)
         self.assertIn("duplicates node id 'dup'", errors[0])
 
     def test_subagent_forms(self) -> None:
         by_ref = {"nodes": [node("a", subagent="reviewer")]}
-        self.assertEqual(validate_swarm_spec(by_ref), [])
+        self.assertEqual(validate_factory_spec(by_ref), [])
         inline = {"nodes": [node("a", subagent={"prompt": "Do work."})]}
-        self.assertEqual(validate_swarm_spec(inline), [])
+        self.assertEqual(validate_factory_spec(inline), [])
         inline_full = {
             "nodes": [
                 node("a", subagent={"prompt": "Do work.", "name": "w", "model": "m", "thinking": "high"})
             ]
         }
-        self.assertEqual(validate_swarm_spec(inline_full), [])
+        self.assertEqual(validate_factory_spec(inline_full), [])
 
         missing = {"nodes": [{"id": "a"}]}
-        errors = validate_swarm_spec(missing)
+        errors = validate_factory_spec(missing)
         self.assertEqual(len(errors), 1)
         self.assertIn("requires a subagent", errors[0])
 
         empty_ref = {"nodes": [node("a", subagent="")]}
-        errors = validate_swarm_spec(empty_ref)
+        errors = validate_factory_spec(empty_ref)
         self.assertEqual(len(errors), 1)
         self.assertIn("requires a subagent", errors[0])
 
         empty_prompt = {"nodes": [node("a", subagent={"prompt": ""})]}
-        errors = validate_swarm_spec(empty_prompt)
+        errors = validate_factory_spec(empty_prompt)
         self.assertEqual(len(errors), 1)
         self.assertIn("requires a non-empty prompt", errors[0])
 
         bad_name = {"nodes": [node("a", subagent={"prompt": "p", "model": 5})]}
-        errors = validate_swarm_spec(bad_name)
+        errors = validate_factory_spec(bad_name)
         self.assertEqual(len(errors), 1)
         self.assertIn("model must be a non-empty string", errors[0])
 
         bad_thinking = {"nodes": [node("a", subagent={"prompt": "p", "thinking": ""})]}
-        errors = validate_swarm_spec(bad_thinking)
+        errors = validate_factory_spec(bad_thinking)
         self.assertEqual(len(errors), 1)
         self.assertIn("thinking must be a non-empty string", errors[0])
 
     def test_lifecycle(self) -> None:
         for good in ("task", "resident"):
-            self.assertEqual(validate_swarm_spec({"nodes": [node("a", lifecycle=good)]}), [])
-        errors = validate_swarm_spec({"nodes": [node("a", lifecycle="daemon")]})
+            self.assertEqual(validate_factory_spec({"nodes": [node("a", lifecycle=good)]}), [])
+        errors = validate_factory_spec({"nodes": [node("a", lifecycle="daemon")]})
         self.assertEqual(len(errors), 1)
         self.assertIn("lifecycle must be 'task' or 'resident'", errors[0])
 
@@ -180,75 +180,75 @@ class ValidateSwarmSpecTest(unittest.TestCase):
             "run": {"budget_ms": 1000},
             "nodes": [node("a", budget_ms=1000)],
         }
-        self.assertEqual(validate_swarm_spec(ok), [])
+        self.assertEqual(validate_factory_spec(ok), [])
 
         over = {
             "run": {"budget_ms": 1000},
             "nodes": [node("a", budget_ms=1001)],
         }
-        errors = validate_swarm_spec(over)
+        errors = validate_factory_spec(over)
         self.assertEqual(len(errors), 1)
         self.assertIn("exceeds the run budget_ms", errors[0])
 
         for bad in (0, -5, 1.5, "10", True):
-            errors = validate_swarm_spec({"run": {"budget_ms": bad}, "nodes": [node("a")]})
+            errors = validate_factory_spec({"run": {"budget_ms": bad}, "nodes": [node("a")]})
             self.assertEqual(errors, ["run budget_ms must be a positive integer"], bad)
-            errors = validate_swarm_spec({"nodes": [node("a", budget_ms=bad)]})
+            errors = validate_factory_spec({"nodes": [node("a", budget_ms=bad)]})
             self.assertEqual(errors, ["node a budget_ms must be a positive integer"], bad)
 
         # No run budget set: any positive node budget is fine.
-        self.assertEqual(validate_swarm_spec({"nodes": [node("a", budget_ms=999_999)]}), [])
+        self.assertEqual(validate_factory_spec({"nodes": [node("a", budget_ms=999_999)]}), [])
 
     def test_run_budget_invalid(self) -> None:
-        errors = validate_swarm_spec({"run": "bad", "nodes": [node("a")]})
+        errors = validate_factory_spec({"run": "bad", "nodes": [node("a")]})
         self.assertEqual(errors, ["run must be an object"])
 
     def test_run_failure_policy(self) -> None:
         for good in ("fail_fast", "continue", "escalate"):
-            self.assertEqual(validate_swarm_spec({"run": {"failure_policy": good}, "nodes": [node("a")]}), [])
-        errors = validate_swarm_spec({"run": {"failure_policy": "stop"}, "nodes": [node("a")]})
+            self.assertEqual(validate_factory_spec({"run": {"failure_policy": good}, "nodes": [node("a")]}), [])
+        errors = validate_factory_spec({"run": {"failure_policy": "stop"}, "nodes": [node("a")]})
         self.assertEqual(len(errors), 1)
         self.assertIn("run failure_policy must be one of", errors[0])
 
     def test_run_max_parallel(self) -> None:
         for good in (1, 8, 64):
-            self.assertEqual(validate_swarm_spec({"run": {"max_parallel": good}, "nodes": [node("a")]}), [])
+            self.assertEqual(validate_factory_spec({"run": {"max_parallel": good}, "nodes": [node("a")]}), [])
         for bad in (0, 65, -1, 1.5, "8", True):
-            errors = validate_swarm_spec({"run": {"max_parallel": bad}, "nodes": [node("a")]})
+            errors = validate_factory_spec({"run": {"max_parallel": bad}, "nodes": [node("a")]})
             self.assertEqual(errors, ["run max_parallel must be an integer between 1 and 64"], bad)
 
     def test_node_failure_policy(self) -> None:
         for good in ("fail_fast", "continue", "escalate"):
-            self.assertEqual(validate_swarm_spec({"nodes": [node("a", failure_policy=good)]}), [])
-        errors = validate_swarm_spec({"nodes": [node("a", failure_policy="retry")]})
+            self.assertEqual(validate_factory_spec({"nodes": [node("a", failure_policy=good)]}), [])
+        errors = validate_factory_spec({"nodes": [node("a", failure_policy="retry")]})
         self.assertEqual(len(errors), 1)
         self.assertIn("node a failure_policy must be one of", errors[0])
 
     def test_retries(self) -> None:
         for good in (0, 5, 10):
-            self.assertEqual(validate_swarm_spec({"nodes": [node("a", retries=good)]}), [])
+            self.assertEqual(validate_factory_spec({"nodes": [node("a", retries=good)]}), [])
         for bad in (-1, 11, 1.5, "2", True):
-            errors = validate_swarm_spec({"nodes": [node("a", retries=bad)]})
+            errors = validate_factory_spec({"nodes": [node("a", retries=bad)]})
             self.assertEqual(errors, ["node a retries must be an integer between 0 and 10"], bad)
 
     def test_depends_on(self) -> None:
         ok = {"nodes": [node("a"), node("b", depends_on=["a"])]}
-        self.assertEqual(validate_swarm_spec(ok), [])
+        self.assertEqual(validate_factory_spec(ok), [])
 
         self_dep = {"nodes": [node("a", depends_on=["a"])]}
-        errors = validate_swarm_spec(self_dep)
+        errors = validate_factory_spec(self_dep)
         self.assertEqual(errors, ["node a cannot depend on itself"])
 
         unknown = {"nodes": [node("a", depends_on=["ghost"])]}
-        errors = validate_swarm_spec(unknown)
+        errors = validate_factory_spec(unknown)
         self.assertEqual(errors, ["node a depends on unknown node 'ghost'"])
 
         not_list = {"nodes": [node("a", depends_on="b")]}
-        errors = validate_swarm_spec(not_list)
+        errors = validate_factory_spec(not_list)
         self.assertEqual(errors, ["node a depends_on must be a list of node ids"])
 
         bad_entry = {"nodes": [node("a", depends_on=[5])]}
-        errors = validate_swarm_spec(bad_entry)
+        errors = validate_factory_spec(bad_entry)
         self.assertEqual(errors, ["node a depends_on entries must be non-empty node id strings"])
 
     def test_data_edges(self) -> None:
@@ -258,7 +258,7 @@ class ValidateSwarmSpecTest(unittest.TestCase):
                 node("b", inputs=[{"name": "in", "type": "text", "from": "a.out"}]),
             ]
         }
-        self.assertEqual(validate_swarm_spec(ok), [])
+        self.assertEqual(validate_factory_spec(ok), [])
 
         # A data edge implies ordering even without depends_on.
         no_declared_dep = {
@@ -267,12 +267,12 @@ class ValidateSwarmSpecTest(unittest.TestCase):
                 node("b", inputs=[{"name": "in", "type": "json", "from": "a.out"}]),
             ]
         }
-        self.assertEqual(validate_swarm_spec(no_declared_dep), [])
+        self.assertEqual(validate_factory_spec(no_declared_dep), [])
 
         unknown_source = {
             "nodes": [node("b", inputs=[{"name": "in", "type": "text", "from": "ghost.out"}])]
         }
-        errors = validate_swarm_spec(unknown_source)
+        errors = validate_factory_spec(unknown_source)
         self.assertEqual(len(errors), 1)
         self.assertIn("references unknown node 'ghost'", errors[0])
 
@@ -282,7 +282,7 @@ class ValidateSwarmSpecTest(unittest.TestCase):
                 node("b", inputs=[{"name": "in", "type": "text", "from": "a.missing"}]),
             ]
         }
-        errors = validate_swarm_spec(undeclared_output)
+        errors = validate_factory_spec(undeclared_output)
         self.assertEqual(len(errors), 1)
         self.assertIn("does not declare", errors[0])
 
@@ -292,7 +292,7 @@ class ValidateSwarmSpecTest(unittest.TestCase):
                 node("b", inputs=[{"name": "in", "type": "json", "from": "a.out"}]),
             ]
         }
-        errors = validate_swarm_spec(type_mismatch)
+        errors = validate_factory_spec(type_mismatch)
         self.assertEqual(len(errors), 1)
         self.assertIn("cannot read from output", errors[0])
         self.assertIn("of type 'text'", errors[0])
@@ -303,7 +303,7 @@ class ValidateSwarmSpecTest(unittest.TestCase):
                 node("b", inputs=[{"name": "in", "type": "text", "from": "no-dot"}]),
             ]
         }
-        errors = validate_swarm_spec(malformed_from)
+        errors = validate_factory_spec(malformed_from)
         self.assertEqual(len(errors), 1)
         self.assertIn("requires a 'from' reference", errors[0])
 
@@ -316,17 +316,17 @@ class ValidateSwarmSpecTest(unittest.TestCase):
                 )
             ]
         }
-        self.assertEqual(validate_swarm_spec(ok), [])
+        self.assertEqual(validate_factory_spec(ok), [])
 
         bad_output_type = {"nodes": [node("a", outputs=[{"name": "o", "type": "yaml"}])]}
-        errors = validate_swarm_spec(bad_output_type)
+        errors = validate_factory_spec(bad_output_type)
         self.assertEqual(len(errors), 1)
         self.assertIn("output 'o' type must be 'text' or 'json'", errors[0])
 
         dup_output = {
             "nodes": [node("a", outputs=[{"name": "o", "type": "text"}, {"name": "o", "type": "json"}])]
         }
-        errors = validate_swarm_spec(dup_output)
+        errors = validate_factory_spec(dup_output)
         self.assertEqual(errors, ["node a declares duplicate output name 'o'"])
 
         bad_input_type = {
@@ -335,7 +335,7 @@ class ValidateSwarmSpecTest(unittest.TestCase):
                 node("a", inputs=[{"name": "i", "type": "yaml", "from": "b.o"}]),
             ]
         }
-        errors = validate_swarm_spec(bad_input_type)
+        errors = validate_factory_spec(bad_input_type)
         self.assertEqual(errors, ["node a input 'i' type must be 'text' or 'json'"])
 
         dup_input = {
@@ -350,28 +350,28 @@ class ValidateSwarmSpecTest(unittest.TestCase):
                 node("b", outputs=[{"name": "o1", "type": "text"}, {"name": "o2", "type": "text"}]),
             ]
         }
-        errors = validate_swarm_spec(dup_input)
+        errors = validate_factory_spec(dup_input)
         self.assertEqual(errors, ["node a declares duplicate input name 'i'"])
 
         missing_name = {"nodes": [node("a", outputs=[{"type": "text"}])]}
-        errors = validate_swarm_spec(missing_name)
+        errors = validate_factory_spec(missing_name)
         self.assertEqual(errors, ["node a outputs[0] requires a non-empty name"])
 
         not_a_list = {"nodes": [node("a", outputs="nope")]}
-        errors = validate_swarm_spec(not_a_list)
+        errors = validate_factory_spec(not_a_list)
         self.assertEqual(errors, ["node a outputs must be a list"])
         not_a_list = {"nodes": [node("a", inputs="nope")]}
-        errors = validate_swarm_spec(not_a_list)
+        errors = validate_factory_spec(not_a_list)
         self.assertEqual(errors, ["node a inputs must be a list"])
 
     def test_resident_rules(self) -> None:
         resident_ok = {"nodes": [node("watcher", lifecycle="resident")]}
-        self.assertEqual(validate_swarm_spec(resident_ok), [])
+        self.assertEqual(validate_factory_spec(resident_ok), [])
 
         depended_on = {
             "nodes": [node("watcher", lifecycle="resident"), node("task", depends_on=["watcher"])]
         }
-        errors = validate_swarm_spec(depended_on)
+        errors = validate_factory_spec(depended_on)
         self.assertEqual(errors, ["node task cannot depend on resident node 'watcher'"])
 
         read_from = {
@@ -380,11 +380,11 @@ class ValidateSwarmSpecTest(unittest.TestCase):
                 node("task", inputs=[{"name": "i", "type": "text", "from": "watcher.o"}]),
             ]
         }
-        errors = validate_swarm_spec(read_from)
+        errors = validate_factory_spec(read_from)
         self.assertEqual(errors, ["node task input 'i' cannot read from resident node 'watcher'"])
 
         declares_outputs = {"nodes": [node("watcher", lifecycle="resident", outputs=[{"name": "o", "type": "text"}])]}
-        errors = validate_swarm_spec(declares_outputs)
+        errors = validate_factory_spec(declares_outputs)
         self.assertEqual(errors, ["resident node watcher cannot declare outputs"])
 
         uses_foreach = {
@@ -398,12 +398,12 @@ class ValidateSwarmSpecTest(unittest.TestCase):
                 ),
             ]
         }
-        errors = validate_swarm_spec(uses_foreach)
+        errors = validate_factory_spec(uses_foreach)
         self.assertEqual(errors, ["resident node watcher cannot use foreach"])
 
         # Empty outputs list on a resident node is fine: nothing is declared.
         empty_outputs = {"nodes": [node("watcher", lifecycle="resident", outputs=[])]}
-        self.assertEqual(validate_swarm_spec(empty_outputs), [])
+        self.assertEqual(validate_factory_spec(empty_outputs), [])
 
     def test_foreach(self) -> None:
         ok = {
@@ -416,7 +416,7 @@ class ValidateSwarmSpecTest(unittest.TestCase):
                 ),
             ]
         }
-        self.assertEqual(validate_swarm_spec(ok), [])
+        self.assertEqual(validate_factory_spec(ok), [])
 
         for good_max in (1, 256):
             ok_max = {
@@ -429,7 +429,7 @@ class ValidateSwarmSpecTest(unittest.TestCase):
                     ),
                 ]
             }
-            self.assertEqual(validate_swarm_spec(ok_max), [])
+            self.assertEqual(validate_factory_spec(ok_max), [])
 
         for bad_max in (0, 257, -1, 1.5, "8", True):
             bad = {
@@ -442,7 +442,7 @@ class ValidateSwarmSpecTest(unittest.TestCase):
                     ),
                 ]
             }
-            errors = validate_swarm_spec(bad)
+            errors = validate_factory_spec(bad)
             self.assertEqual(errors, ["node b foreach.max must be an integer between 1 and 256"], bad_max)
 
         wrong_port = {
@@ -455,7 +455,7 @@ class ValidateSwarmSpecTest(unittest.TestCase):
                 ),
             ]
         }
-        errors = validate_swarm_spec(wrong_port)
+        errors = validate_factory_spec(wrong_port)
         self.assertEqual(
             errors, ["node b foreach.over must name one of this node's inputs, got 'not-an-input'"]
         )
@@ -470,11 +470,11 @@ class ValidateSwarmSpecTest(unittest.TestCase):
                 ),
             ]
         }
-        errors = validate_swarm_spec(text_port)
+        errors = validate_factory_spec(text_port)
         self.assertEqual(errors, ["node b foreach.over input 'draft' must have type 'json'"])
 
         not_object = {"nodes": [node("a", foreach=["bad"])]}
-        errors = validate_swarm_spec(not_object)
+        errors = validate_factory_spec(not_object)
         self.assertEqual(errors, ["node a foreach must be an object"])
 
     def test_cycles_are_legal_when_an_entry_state_exists(self) -> None:
@@ -487,7 +487,7 @@ class ValidateSwarmSpecTest(unittest.TestCase):
                 node("c", depends_on=["b"]),
             ]
         }
-        self.assertEqual(validate_swarm_spec(cycle_with_entry), [])
+        self.assertEqual(validate_factory_spec(cycle_with_entry), [])
 
         data_cycle_with_entry = {
             "nodes": [
@@ -496,7 +496,7 @@ class ValidateSwarmSpecTest(unittest.TestCase):
                 node("c", inputs=[{"name": "i", "type": "json", "from": "b.o"}]),
             ]
         }
-        self.assertEqual(validate_swarm_spec(data_cycle_with_entry), [])
+        self.assertEqual(validate_factory_spec(data_cycle_with_entry), [])
 
     def test_fully_cyclic_dag_compiles_to_a_machine_without_entry_states(self) -> None:
         depends_cycle = {
@@ -506,8 +506,8 @@ class ValidateSwarmSpecTest(unittest.TestCase):
             ]
         }
         self.assertEqual(
-            validate_swarm_spec(depends_cycle),
-            ["swarm machine requires at least one entry state"],
+            validate_factory_spec(depends_cycle),
+            ["factory machine requires at least one entry state"],
         )
 
         data_cycle = {
@@ -521,8 +521,8 @@ class ValidateSwarmSpecTest(unittest.TestCase):
             ]
         }
         self.assertEqual(
-            validate_swarm_spec(data_cycle),
-            ["swarm machine requires at least one entry state"],
+            validate_factory_spec(data_cycle),
+            ["factory machine requires at least one entry state"],
         )
 
         three_cycle = {
@@ -533,8 +533,8 @@ class ValidateSwarmSpecTest(unittest.TestCase):
             ]
         }
         self.assertEqual(
-            validate_swarm_spec(three_cycle),
-            ["swarm machine requires at least one entry state"],
+            validate_factory_spec(three_cycle),
+            ["factory machine requires at least one entry state"],
         )
 
     def test_collects_multiple_errors(self) -> None:
@@ -546,7 +546,7 @@ class ValidateSwarmSpecTest(unittest.TestCase):
                 node("c", failure_policy="retry"),
             ],
         }
-        errors = validate_swarm_spec(dag)
+        errors = validate_factory_spec(dag)
         self.assertEqual(
             errors,
             [
@@ -559,11 +559,11 @@ class ValidateSwarmSpecTest(unittest.TestCase):
         )
 
 
-class CanonicalizeSwarmSpecTest(unittest.TestCase):
+class CanonicalizeFactorySpecTest(unittest.TestCase):
     def test_applies_defaults(self) -> None:
         dag = {"nodes": [{"id": "a", "subagent": "worker"}]}
         self.assertEqual(
-            canonicalize_swarm_spec(dag),
+            canonicalize_factory_spec(dag),
             {
                 "run": {"failure_policy": "escalate", "max_parallel": 8, "max_transitions": 10},
                 "states": [
@@ -598,7 +598,7 @@ class CanonicalizeSwarmSpecTest(unittest.TestCase):
             ],
         }
         self.assertEqual(
-            canonicalize_swarm_spec(dag),
+            canonicalize_factory_spec(dag),
             {
                 "run": {"failure_policy": "continue", "max_parallel": 2, "max_transitions": 7, "budget_ms": 5000},
                 "states": [
@@ -623,7 +623,7 @@ class CanonicalizeSwarmSpecTest(unittest.TestCase):
             "run": {"failure_policy": "continue"},
             "nodes": [{"id": "a", "subagent": "w"}, {"id": "b", "subagent": "w", "failure_policy": "escalate"}],
         }
-        result = canonicalize_swarm_spec(dag)
+        result = canonicalize_factory_spec(dag)
         self.assertEqual(result["states"][0]["failure_policy"], "continue")
         self.assertEqual(result["states"][1]["failure_policy"], "escalate")
 
@@ -634,7 +634,7 @@ class CanonicalizeSwarmSpecTest(unittest.TestCase):
                 {"id": "b", "subagent": "w", "depends_on": ["a", "a", "a"]},
             ]
         }
-        result = canonicalize_swarm_spec(dag)
+        result = canonicalize_factory_spec(dag)
         self.assertEqual(result["transitions"], [{"from": "a", "to": "b", "on": "settled"}])
 
     def test_machine_form_canonicalization(self) -> None:
@@ -654,7 +654,7 @@ class CanonicalizeSwarmSpecTest(unittest.TestCase):
             ],
         }
         self.assertEqual(
-            canonicalize_swarm_spec(machine),
+            canonicalize_factory_spec(machine),
             {
                 "run": {"failure_policy": "continue", "max_parallel": 2, "max_transitions": 20, "budget_ms": 5000},
                 "states": [
@@ -692,22 +692,22 @@ class CanonicalizeSwarmSpecTest(unittest.TestCase):
 
     def test_raises_with_joined_errors_on_invalid_input(self) -> None:
         with self.assertRaises(ValueError) as ctx:
-            canonicalize_swarm_spec({"nodes": [node("a", depends_on=["ghost"])]})
+            canonicalize_factory_spec({"nodes": [node("a", depends_on=["ghost"])]})
         message = str(ctx.exception)
         self.assertIn("depends on unknown node", message)
 
         with self.assertRaises(ValueError) as ctx:
-            canonicalize_swarm_spec("not a dag")
-        self.assertIn("swarm dag must be a JSON object", str(ctx.exception))
+            canonicalize_factory_spec("not a dag")
+        self.assertIn("factory dag must be a JSON object", str(ctx.exception))
 
         with self.assertRaises(ValueError) as ctx:
-            canonicalize_swarm_spec({"states": [state("a")], "transitions": [{"from": "a", "to": "ghost"}]})
+            canonicalize_factory_spec({"states": [state("a")], "transitions": [{"from": "a", "to": "ghost"}]})
         self.assertIn("references unknown to-state", str(ctx.exception))
 
     def test_does_not_mutate_input(self) -> None:
         dag = {"nodes": [{"id": "a", "subagent": {"prompt": "p"}, "outputs": [{"name": "o", "type": "json"}]}]}
         snapshot = {"nodes": [dict(dag["nodes"][0])]}
-        result = canonicalize_swarm_spec(dag)
+        result = canonicalize_factory_spec(dag)
         result["states"][0]["subagent"]["prompt"] = "mutated"
         result["states"][0]["outputs"][0]["type"] = "text"
         self.assertEqual(dag["nodes"][0]["subagent"]["prompt"], "p")
@@ -721,7 +721,7 @@ class CanonicalizeSwarmSpecTest(unittest.TestCase):
             ],
             "transitions": [{"from": "a", "to": "b", "when": {"output": "o", "op": "exists"}}],
         }
-        result = canonicalize_swarm_spec(machine)
+        result = canonicalize_factory_spec(machine)
         result["states"][0]["outputs"][0]["type"] = "mutated"
         result["transitions"][0]["when"]["output"] = "mutated"
         self.assertEqual(machine["states"][0]["outputs"][0]["type"], "json")
@@ -729,62 +729,62 @@ class CanonicalizeSwarmSpecTest(unittest.TestCase):
 
 
 
-class ValidateSwarmMachineTest(unittest.TestCase):
+class ValidateFactoryMachineTest(unittest.TestCase):
     """Every machine-form validator rule, valid and invalid."""
 
     def test_valid_machine_has_no_errors(self) -> None:
         # Includes an entry state, a guard switch, a self-loop, re-entry
         # bounds, and a reviewing<->fixing cycle: all legal in machine form.
-        self.assertEqual(validate_swarm_spec(valid_machine()), [])
-        self.assertEqual(validate_swarm_machine(valid_machine()), [])
+        self.assertEqual(validate_factory_spec(valid_machine()), [])
+        self.assertEqual(validate_factory_machine(valid_machine()), [])
 
     def test_machine_must_be_an_object(self) -> None:
         for bad in (None, [], "states", 42):
-            self.assertEqual(validate_swarm_machine(bad), ["swarm machine must be a JSON object"], repr(bad))
+            self.assertEqual(validate_factory_machine(bad), ["factory machine must be a JSON object"], repr(bad))
 
     def test_states_required_and_must_be_a_list(self) -> None:
         self.assertEqual(
-            validate_swarm_machine({"transitions": []}),
-            ["swarm machine requires a states list"],
+            validate_factory_machine({"transitions": []}),
+            ["factory machine requires a states list"],
         )
         self.assertEqual(
-            validate_swarm_machine({"states": "nope"}),
-            ["swarm machine requires a states list"],
+            validate_factory_machine({"states": "nope"}),
+            ["factory machine requires a states list"],
         )
         self.assertEqual(
-            validate_swarm_machine({"run": "bad", "states": "nope"}),
-            ["run must be an object", "swarm machine requires a states list"],
+            validate_factory_machine({"run": "bad", "states": "nope"}),
+            ["run must be an object", "factory machine requires a states list"],
         )
 
     def test_state_cap(self) -> None:
         at_cap = {"states": [state(f"s{i}") for i in range(1024)], "transitions": []}
         at_cap["states"][0]["entry"] = True
-        self.assertEqual(validate_swarm_machine(at_cap), [])
+        self.assertEqual(validate_factory_machine(at_cap), [])
         over_cap = {"states": [state(f"s{i}") for i in range(1025)], "transitions": []}
         over_cap["states"][0]["entry"] = True
         self.assertEqual(
-            validate_swarm_machine(over_cap),
-            [f"swarm machine must declare between 1 and 1024 states, got 1025"],
+            validate_factory_machine(over_cap),
+            [f"factory machine must declare between 1 and 1024 states, got 1025"],
         )
         empty = {"states": [], "transitions": []}
         self.assertEqual(
-            validate_swarm_machine(empty),
-            ["swarm machine must declare between 1 and 1024 states, got 0"],
+            validate_factory_machine(empty),
+            ["factory machine must declare between 1 and 1024 states, got 0"],
         )
 
     def test_state_ids(self) -> None:
         for good in ("a", "state-1", "1st-state", "a" * 64):
             machine = {"states": [{"id": good, "entry": True, "subagent": "w"}], "transitions": []}
-            self.assertEqual(validate_swarm_machine(machine), [], good)
+            self.assertEqual(validate_factory_machine(machine), [], good)
         for bad in ("-abc", "ABC", "a_b", "a.b", "a" * 65):
             machine = {"states": [{"id": bad, "entry": True, "subagent": "w"}], "transitions": []}
-            errors = validate_swarm_machine(machine)
+            errors = validate_factory_machine(machine)
             self.assertEqual(len(errors), 1, bad)
             self.assertIn("id must match", errors[0])
         for bad in ("", None, 5):
             machine = {"states": [{"id": bad, "subagent": "w"}], "transitions": []}
             self.assertEqual(
-                validate_swarm_machine(machine),
+                validate_factory_machine(machine),
                 ["states[0] requires a non-empty id"],
                 repr(bad),
             )
@@ -792,25 +792,25 @@ class ValidateSwarmMachineTest(unittest.TestCase):
     def test_duplicate_state_ids(self) -> None:
         machine = {"states": [state("dup"), state("dup")], "transitions": []}
         machine["states"][0]["entry"] = True
-        errors = validate_swarm_machine(machine)
+        errors = validate_factory_machine(machine)
         self.assertEqual(len(errors), 1)
         self.assertIn("duplicates state id 'dup'", errors[0])
 
     def test_entry_state_required(self) -> None:
         no_entry = {"states": [state("a"), state("b")], "transitions": [{"from": "a", "to": "b"}]}
         self.assertEqual(
-            validate_swarm_machine(no_entry),
-            ["swarm machine requires at least one entry state"],
+            validate_factory_machine(no_entry),
+            ["factory machine requires at least one entry state"],
         )
         explicit_false = {"states": [state("a", entry=False)], "transitions": []}
         self.assertEqual(
-            validate_swarm_machine(explicit_false),
-            ["swarm machine requires at least one entry state"],
+            validate_factory_machine(explicit_false),
+            ["factory machine requires at least one entry state"],
         )
         bad_flag = {"states": [state("a", entry="yes")], "transitions": []}
         self.assertEqual(
-            validate_swarm_machine(bad_flag),
-            ["state a entry must be a boolean", "swarm machine requires at least one entry state"],
+            validate_factory_machine(bad_flag),
+            ["state a entry must be a boolean", "factory machine requires at least one entry state"],
         )
 
     def test_entry_states_cannot_declare_inputs(self) -> None:
@@ -822,11 +822,11 @@ class ValidateSwarmMachineTest(unittest.TestCase):
             "transitions": [{"from": "peer", "to": "src"}],
         }
         self.assertEqual(
-            validate_swarm_machine(with_inputs),
+            validate_factory_machine(with_inputs),
             ["entry state src cannot declare inputs"],
         )
         entry_without_inputs = {"states": [state("a", entry=True)], "transitions": []}
-        self.assertEqual(validate_swarm_machine(entry_without_inputs), [])
+        self.assertEqual(validate_factory_machine(entry_without_inputs), [])
         # Compiled dags only mark dep-free nodes as entry states, so the rule
         # never fires on the dag path.
         dag = {
@@ -835,39 +835,39 @@ class ValidateSwarmMachineTest(unittest.TestCase):
                 node("b", depends_on=["a"], inputs=[{"name": "i", "type": "text", "from": "a.o"}]),
             ]
         }
-        self.assertEqual(validate_swarm_spec(dag), [])
+        self.assertEqual(validate_factory_spec(dag), [])
 
     def test_max_entries(self) -> None:
         for good in (1, 2, 99):
             machine = {"states": [state("a", entry=True, max_entries=good)], "transitions": []}
-            self.assertEqual(validate_swarm_machine(machine), [], good)
+            self.assertEqual(validate_factory_machine(machine), [], good)
         for bad in (0, -1, 1.5, "2", True):
             machine = {"states": [state("a", entry=True, max_entries=bad)], "transitions": []}
             self.assertEqual(
-                validate_swarm_machine(machine),
+                validate_factory_machine(machine),
                 ["state a max_entries must be an integer >= 1"],
                 repr(bad),
             )
 
     def test_subagent_required(self) -> None:
         missing = {"states": [{"id": "a", "entry": True}], "transitions": []}
-        errors = validate_swarm_machine(missing)
+        errors = validate_factory_machine(missing)
         self.assertEqual(len(errors), 1)
         self.assertIn("requires a subagent", errors[0])
         self.assertIn("state a", errors[0])
 
         empty_ref = {"states": [state("a", entry=True, subagent="")], "transitions": []}
-        errors = validate_swarm_machine(empty_ref)
+        errors = validate_factory_machine(empty_ref)
         self.assertEqual(len(errors), 1)
         self.assertIn("requires a subagent", errors[0])
 
         empty_prompt = {"states": [state("a", entry=True, subagent={"prompt": ""})], "transitions": []}
-        errors = validate_swarm_machine(empty_prompt)
+        errors = validate_factory_machine(empty_prompt)
         self.assertEqual(len(errors), 1)
         self.assertIn("requires a non-empty prompt", errors[0])
 
         bad_model = {"states": [state("a", entry=True, subagent={"prompt": "p", "model": 5})], "transitions": []}
-        errors = validate_swarm_machine(bad_model)
+        errors = validate_factory_machine(bad_model)
         self.assertEqual(len(errors), 1)
         self.assertIn("model must be a non-empty string", errors[0])
 
@@ -875,7 +875,7 @@ class ValidateSwarmMachineTest(unittest.TestCase):
             "states": [state("a", entry=True, subagent={"prompt": "Do work.", "name": "w", "thinking": "high"})],
             "transitions": [],
         }
-        self.assertEqual(validate_swarm_machine(inline_ok), [])
+        self.assertEqual(validate_factory_machine(inline_ok), [])
 
     def test_wait_states_are_gated_until_the_communication_series(self) -> None:
         # The rlm.watch.* host handlers do not exist on this stack, so wait
@@ -887,7 +887,7 @@ class ValidateSwarmMachineTest(unittest.TestCase):
             ],
             "transitions": [{"from": "watch", "to": "act"}],
         }
-        errors = validate_swarm_machine(machine)
+        errors = validate_factory_machine(machine)
         self.assertEqual(
             errors,
             [
@@ -895,10 +895,10 @@ class ValidateSwarmMachineTest(unittest.TestCase):
                 "they arrive with the communication series - remove the wait block until then"
             ],
         )
-        self.assertEqual(validate_swarm_spec(machine), errors)
+        self.assertEqual(validate_factory_spec(machine), errors)
 
         dag_wait = {"nodes": [node("a", wait={"kind": "path", "target": "t", "timeout_ms": 5})]}
-        errors = validate_swarm_spec(dag_wait)
+        errors = validate_factory_spec(dag_wait)
         self.assertEqual(
             errors,
             [
@@ -915,14 +915,14 @@ class ValidateSwarmMachineTest(unittest.TestCase):
             ],
             "transitions": [{"from": "entry", "to": "watcher"}],
         }
-        self.assertEqual(validate_swarm_machine(resident_ok), [])
+        self.assertEqual(validate_factory_machine(resident_ok), [])
 
         declares_outputs = {
             "states": [state("watcher", entry=True, lifecycle="resident", outputs=[{"name": "o", "type": "text"}])],
             "transitions": [],
         }
         self.assertEqual(
-            validate_swarm_machine(declares_outputs),
+            validate_factory_machine(declares_outputs),
             ["resident state watcher cannot declare outputs"],
         )
         uses_foreach = {
@@ -938,7 +938,7 @@ class ValidateSwarmMachineTest(unittest.TestCase):
             ],
             "transitions": [{"from": "src", "to": "watcher"}],
         }
-        self.assertEqual(validate_swarm_machine(uses_foreach), ["resident state watcher cannot use foreach"])
+        self.assertEqual(validate_factory_machine(uses_foreach), ["resident state watcher cannot use foreach"])
         leaves_resident = {
             "states": [
                 {"id": "entry", "entry": True, "subagent": "w"},
@@ -947,7 +947,7 @@ class ValidateSwarmMachineTest(unittest.TestCase):
             "transitions": [{"from": "watcher", "to": "entry"}],
         }
         self.assertEqual(
-            validate_swarm_machine(leaves_resident),
+            validate_factory_machine(leaves_resident),
             ["transitions[0] cannot leave resident state 'watcher'"],
         )
 
@@ -961,21 +961,21 @@ class ValidateSwarmMachineTest(unittest.TestCase):
             "transitions": [],
         }
         self.assertEqual(
-            validate_swarm_machine(machine),
+            validate_factory_machine(machine),
             ["state task input 'i' cannot read from resident state 'watcher'"],
         )
 
     def test_port_rules(self) -> None:
         dup_output = {"states": [state("a", entry=True, outputs=[{"name": "o", "type": "text"}, {"name": "o", "type": "json"}])], "transitions": []}
-        self.assertEqual(validate_swarm_machine(dup_output), ["state a declares duplicate output name 'o'"])
+        self.assertEqual(validate_factory_machine(dup_output), ["state a declares duplicate output name 'o'"])
         bad_type = {"states": [state("a", entry=True, outputs=[{"name": "o", "type": "yaml"}])], "transitions": []}
-        self.assertEqual(validate_swarm_machine(bad_type), ["state a output 'o' type must be 'text' or 'json'"])
+        self.assertEqual(validate_factory_machine(bad_type), ["state a output 'o' type must be 'text' or 'json'"])
         unknown_source = {
             "states": [state("a", entry=True), state("b", inputs=[{"name": "i", "type": "text", "from": "ghost.o"}])],
             "transitions": [],
         }
         self.assertEqual(
-            validate_swarm_machine(unknown_source),
+            validate_factory_machine(unknown_source),
             ["state b input 'i' references unknown state 'ghost'"],
         )
         undeclared_output = {
@@ -986,7 +986,7 @@ class ValidateSwarmMachineTest(unittest.TestCase):
             "transitions": [],
         }
         self.assertEqual(
-            validate_swarm_machine(undeclared_output),
+            validate_factory_machine(undeclared_output),
             ["state b input 'i' references output 'missing' that state 'a' does not declare"],
         )
         type_mismatch = {
@@ -996,7 +996,7 @@ class ValidateSwarmMachineTest(unittest.TestCase):
             ],
             "transitions": [],
         }
-        errors = validate_swarm_machine(type_mismatch)
+        errors = validate_factory_machine(type_mismatch)
         self.assertEqual(len(errors), 1)
         self.assertIn("cannot read from output", errors[0])
         malformed = {
@@ -1006,7 +1006,7 @@ class ValidateSwarmMachineTest(unittest.TestCase):
             ],
             "transitions": [],
         }
-        errors = validate_swarm_machine(malformed)
+        errors = validate_factory_machine(malformed)
         self.assertEqual(len(errors), 1)
         self.assertIn("requires a 'from' reference", errors[0])
 
@@ -1017,40 +1017,40 @@ class ValidateSwarmMachineTest(unittest.TestCase):
             "transitions": [],
         }
         self.assertEqual(
-            validate_swarm_machine(over),
+            validate_factory_machine(over),
             ["state a budget_ms 1001 exceeds the run budget_ms 1000"],
         )
         for bad in (0, -5, 1.5, "10", True):
             machine = {"run": {"budget_ms": bad}, "states": [state("a", entry=True)], "transitions": []}
-            self.assertEqual(validate_swarm_machine(machine), ["run budget_ms must be a positive integer"], bad)
+            self.assertEqual(validate_factory_machine(machine), ["run budget_ms must be a positive integer"], bad)
             machine = {"states": [state("a", entry=True, budget_ms=bad)], "transitions": []}
-            self.assertEqual(validate_swarm_machine(machine), ["state a budget_ms must be a positive integer"], bad)
+            self.assertEqual(validate_factory_machine(machine), ["state a budget_ms must be a positive integer"], bad)
         for bad in (-1, 11, 1.5, "2", True):
             machine = {"states": [state("a", entry=True, retries=bad)], "transitions": []}
             self.assertEqual(
-                validate_swarm_machine(machine),
+                validate_factory_machine(machine),
                 ["state a retries must be an integer between 0 and 10"],
                 bad,
             )
         bad_policy = {"states": [state("a", entry=True, failure_policy="retry")], "transitions": []}
         self.assertEqual(
-            validate_swarm_machine(bad_policy),
+            validate_factory_machine(bad_policy),
             ["state a failure_policy must be one of ['fail_fast', 'continue', 'escalate'], got 'retry'"],
         )
         bad_lifecycle = {"states": [state("a", entry=True, lifecycle="daemon")], "transitions": []}
         self.assertEqual(
-            validate_swarm_machine(bad_lifecycle),
+            validate_factory_machine(bad_lifecycle),
             ["state a lifecycle must be 'task' or 'resident', got 'daemon'"],
         )
 
     def test_run_max_transitions(self) -> None:
         for good in (1, 40, 10_000):
             machine = {"run": {"max_transitions": good}, "states": [state("a", entry=True)], "transitions": []}
-            self.assertEqual(validate_swarm_machine(machine), [], good)
+            self.assertEqual(validate_factory_machine(machine), [], good)
         for bad in (0, -1, 10_001, 1.5, "5", True):
             machine = {"run": {"max_transitions": bad}, "states": [state("a", entry=True)], "transitions": []}
             self.assertEqual(
-                validate_swarm_machine(machine),
+                validate_factory_machine(machine),
                 ["run max_transitions must be a positive integer no greater than 10000"],
                 bad,
             )
@@ -1067,7 +1067,7 @@ class ValidateSwarmMachineTest(unittest.TestCase):
             ],
             "transitions": [{"from": "a", "to": "b"}],
         }
-        self.assertEqual(validate_swarm_machine(ok), [])
+        self.assertEqual(validate_factory_machine(ok), [])
         wrong_port = {
             "states": [
                 state("a", entry=True, outputs=[{"name": "items", "type": "json"}]),
@@ -1080,7 +1080,7 @@ class ValidateSwarmMachineTest(unittest.TestCase):
             "transitions": [{"from": "a", "to": "b"}],
         }
         self.assertEqual(
-            validate_swarm_machine(wrong_port),
+            validate_factory_machine(wrong_port),
             ["state b foreach.over must name one of this state's inputs, got 'not-an-input'"],
         )
         text_port = {
@@ -1094,7 +1094,7 @@ class ValidateSwarmMachineTest(unittest.TestCase):
             ],
             "transitions": [{"from": "a", "to": "b"}],
         }
-        self.assertEqual(validate_swarm_machine(text_port), ["state b foreach.over input 'draft' must have type 'json'"])
+        self.assertEqual(validate_factory_machine(text_port), ["state b foreach.over input 'draft' must have type 'json'"])
         bad_max = {
             "states": [
                 state("a", entry=True, outputs=[{"name": "items", "type": "json"}]),
@@ -1106,9 +1106,9 @@ class ValidateSwarmMachineTest(unittest.TestCase):
             ],
             "transitions": [{"from": "a", "to": "b"}],
         }
-        self.assertEqual(validate_swarm_machine(bad_max), ["state b foreach.max must be an integer between 1 and 256"])
+        self.assertEqual(validate_factory_machine(bad_max), ["state b foreach.max must be an integer between 1 and 256"])
         not_object = {"states": [state("a", entry=True, foreach=["bad"])], "transitions": []}
-        self.assertEqual(validate_swarm_machine(not_object), ["state a foreach must be an object"])
+        self.assertEqual(validate_factory_machine(not_object), ["state a foreach must be an object"])
 
     def test_transitions_reference_existing_states(self) -> None:
         unknown_from = {
@@ -1116,21 +1116,21 @@ class ValidateSwarmMachineTest(unittest.TestCase):
             "transitions": [{"from": "ghost", "to": "a"}],
         }
         self.assertEqual(
-            validate_swarm_machine(unknown_from),
+            validate_factory_machine(unknown_from),
             ["transitions[0] references unknown from-state 'ghost'"],
         )
         unknown_to = {"states": [state("a", entry=True)], "transitions": [{"from": "a", "to": "ghost"}]}
         self.assertEqual(
-            validate_swarm_machine(unknown_to),
+            validate_factory_machine(unknown_to),
             ["transitions[0] references unknown to-state 'ghost'"],
         )
         not_object = {"states": [state("a", entry=True)], "transitions": ["bad"]}
-        self.assertEqual(validate_swarm_machine(not_object), ["transitions[0] must be an object"])
+        self.assertEqual(validate_factory_machine(not_object), ["transitions[0] must be an object"])
         not_a_list = {"states": [state("a", entry=True)], "transitions": "bad"}
-        self.assertEqual(validate_swarm_machine(not_a_list), ["swarm machine transitions must be a list"])
+        self.assertEqual(validate_factory_machine(not_a_list), ["factory machine transitions must be a list"])
         bad_on = {"states": [state("a", entry=True)], "transitions": [{"from": "a", "to": "a", "on": "manual"}]}
         self.assertEqual(
-            validate_swarm_machine(bad_on),
+            validate_factory_machine(bad_on),
             ["transitions[0] on must be one of ['settled'], got 'manual'"],
         )
 
@@ -1139,7 +1139,7 @@ class ValidateSwarmMachineTest(unittest.TestCase):
             "states": [state("a", entry=True, max_entries=5, outputs=[{"name": "o", "type": "json"}])],
             "transitions": [{"from": "a", "to": "a"}],
         }
-        self.assertEqual(validate_swarm_machine(machine), [])
+        self.assertEqual(validate_factory_machine(machine), [])
 
     def test_cyclic_machine_validates(self) -> None:
         machine = {
@@ -1154,8 +1154,8 @@ class ValidateSwarmMachineTest(unittest.TestCase):
                 {"from": "c", "to": "b"},
             ],
         }
-        self.assertEqual(validate_swarm_machine(machine), [])
-        self.assertEqual(validate_swarm_spec(machine), [])
+        self.assertEqual(validate_factory_machine(machine), [])
+        self.assertEqual(validate_factory_spec(machine), [])
 
     def test_guard_rules(self) -> None:
         def machine_with(when: Any) -> dict[str, Any]:
@@ -1166,16 +1166,16 @@ class ValidateSwarmMachineTest(unittest.TestCase):
 
         unknown_output = machine_with({"output": "missing", "op": "exists"})
         self.assertEqual(
-            validate_swarm_machine(unknown_output),
+            validate_factory_machine(unknown_output),
             ["transitions[0] when.output 'missing' is not a declared output of state 'a'"],
         )
         empty_output = machine_with({"output": "", "op": "exists"})
         self.assertEqual(
-            validate_swarm_machine(empty_output),
+            validate_factory_machine(empty_output),
             ["transitions[0] when requires a non-empty output"],
         )
         not_object = machine_with("nope")
-        self.assertEqual(validate_swarm_machine(not_object), ["transitions[0] when must be an object"])
+        self.assertEqual(validate_factory_machine(not_object), ["transitions[0] when must be an object"])
         path_on_text = {
             "states": [
                 state("a", entry=True, outputs=[{"name": "note", "type": "text"}]),
@@ -1184,34 +1184,34 @@ class ValidateSwarmMachineTest(unittest.TestCase):
             "transitions": [{"from": "a", "to": "b", "when": {"output": "note", "path": "x", "op": "eq", "value": 1}}],
         }
         self.assertEqual(
-            validate_swarm_machine(path_on_text),
+            validate_factory_machine(path_on_text),
             ["transitions[0] when.path requires a json output, got text output 'note'"],
         )
         bad_op = machine_with({"output": "verdict", "op": "matches", "value": 1})
         self.assertEqual(
-            validate_swarm_machine(bad_op),
+            validate_factory_machine(bad_op),
             ["transitions[0] when.op must be one of ['eq', 'ne', 'gt', 'gte', 'lt', 'lte', 'exists', 'contains'], got 'matches'"],
         )
         for op in ("gt", "gte", "lt", "lte"):
             non_numeric = machine_with({"output": "verdict", "op": op, "value": "1"})
             self.assertEqual(
-                validate_swarm_machine(non_numeric),
+                validate_factory_machine(non_numeric),
                 [f"transitions[0] when.op {op!r} requires a numeric value"],
                 op,
             )
         contains_needs_list = machine_with({"output": "verdict", "op": "contains", "value": "x"})
         self.assertEqual(
-            validate_swarm_machine(contains_needs_list),
+            validate_factory_machine(contains_needs_list),
             ["transitions[0] when.op 'contains' requires a list value"],
         )
         eq_rejects_list = machine_with({"output": "verdict", "op": "eq", "value": [1]})
         self.assertEqual(
-            validate_swarm_machine(eq_rejects_list),
+            validate_factory_machine(eq_rejects_list),
             ["transitions[0] when.op 'eq' requires a scalar value"],
         )
         ne_rejects_list = machine_with({"output": "verdict", "op": "ne", "value": [1]})
         self.assertEqual(
-            validate_swarm_machine(ne_rejects_list),
+            validate_factory_machine(ne_rejects_list),
             ["transitions[0] when.op 'ne' requires a scalar value"],
         )
         # Valid guard shapes across every op.
@@ -1226,7 +1226,7 @@ class ValidateSwarmMachineTest(unittest.TestCase):
             {"output": "verdict", "path": "tags", "op": "contains", "value": ["a", "b"]},
             {"output": "verdict", "op": "exists"},
         ):
-            self.assertEqual(validate_swarm_machine(machine_with(when)), [], repr(when))
+            self.assertEqual(validate_factory_machine(machine_with(when)), [], repr(when))
 
     def test_collects_multiple_errors(self) -> None:
         machine = {
@@ -1238,7 +1238,7 @@ class ValidateSwarmMachineTest(unittest.TestCase):
             "transitions": [{"from": "a", "to": "ghost"}],
         }
         self.assertEqual(
-            validate_swarm_machine(machine),
+            validate_factory_machine(machine),
             [
                 "run failure_policy must be one of ['fail_fast', 'continue', 'escalate'], got 'nope'",
                 "run max_parallel must be an integer between 1 and 64",
@@ -1249,7 +1249,7 @@ class ValidateSwarmMachineTest(unittest.TestCase):
         )
 
 
-class CompileSwarmDagTest(unittest.TestCase):
+class CompileFactoryDagTest(unittest.TestCase):
     """The dag sugar compiles to machine form."""
 
     def test_chain_compiles(self) -> None:
@@ -1260,7 +1260,7 @@ class CompileSwarmDagTest(unittest.TestCase):
                 node("c", depends_on=["b"]),
             ]
         }
-        machine, errors = compile_swarm_dag(dag)
+        machine, errors = compile_factory_dag(dag)
         self.assertEqual(errors, [])
         self.assertEqual(
             machine,
@@ -1276,7 +1276,7 @@ class CompileSwarmDagTest(unittest.TestCase):
                 ],
             },
         )
-        self.assertEqual(validate_swarm_machine(machine), [])
+        self.assertEqual(validate_factory_machine(machine), [])
 
     def test_diamond_compiles(self) -> None:
         dag = {
@@ -1293,7 +1293,7 @@ class CompileSwarmDagTest(unittest.TestCase):
                 ),
             ],
         }
-        machine, errors = compile_swarm_dag(dag)
+        machine, errors = compile_factory_dag(dag)
         self.assertEqual(errors, [])
         self.assertEqual(
             machine,
@@ -1323,7 +1323,7 @@ class CompileSwarmDagTest(unittest.TestCase):
                 ],
             },
         )
-        self.assertEqual(validate_swarm_machine(machine), [])
+        self.assertEqual(validate_factory_machine(machine), [])
 
     def test_data_edge_alone_creates_a_transition(self) -> None:
         dag = {
@@ -1332,7 +1332,7 @@ class CompileSwarmDagTest(unittest.TestCase):
                 node("b", inputs=[{"name": "i", "type": "text", "from": "a.o"}]),
             ]
         }
-        machine, errors = compile_swarm_dag(dag)
+        machine, errors = compile_factory_dag(dag)
         self.assertEqual(errors, [])
         self.assertEqual(machine["states"][1]["entry"], False)
         self.assertEqual(machine["transitions"], [{"from": "a", "to": "b"}])
@@ -1344,25 +1344,25 @@ class CompileSwarmDagTest(unittest.TestCase):
                 node("b", depends_on=["a", "a"], inputs=[{"name": "i", "type": "text", "from": "a.o"}]),
             ]
         }
-        machine, errors = compile_swarm_dag(dag)
+        machine, errors = compile_factory_dag(dag)
         self.assertEqual(errors, [])
         self.assertEqual(machine["transitions"], [{"from": "a", "to": "b"}])
 
     def test_explicit_empty_depends_on_still_enters(self) -> None:
         dag = {"nodes": [node("a", depends_on=[])]}
-        machine, errors = compile_swarm_dag(dag)
+        machine, errors = compile_factory_dag(dag)
         self.assertEqual(errors, [])
         self.assertEqual(machine["states"][0]["entry"], True)
         self.assertEqual(machine["transitions"], [])
 
     def test_invalid_dag_returns_errors_without_a_machine(self) -> None:
         for bad, expected in (
-            ("nope", "swarm dag must be a JSON object"),
-            ({"nodes": "nope"}, "swarm dag requires a nodes list"),
-            ({"nodes": []}, "swarm dag must declare between 1 and 1024 nodes, got 0"),
+            ("nope", "factory dag must be a JSON object"),
+            ({"nodes": "nope"}, "factory dag requires a nodes list"),
+            ({"nodes": []}, "factory dag must declare between 1 and 1024 nodes, got 0"),
             ({"nodes": [node("a", depends_on=["ghost"])]}, "node a depends on unknown node 'ghost'"),
         ):
-            machine, errors = compile_swarm_dag(bad)
+            machine, errors = compile_factory_dag(bad)
             self.assertIsNone(machine, repr(bad))
             self.assertEqual(len(errors), 1, repr(bad))
             self.assertIn(expected, errors[0])
@@ -1383,34 +1383,34 @@ class CompileSwarmDagTest(unittest.TestCase):
             ],
             "transitions": [{"from": "a", "to": "b"}],
         }
-        self.assertEqual(canonicalize_swarm_spec(dag), canonicalize_swarm_spec(machine))
+        self.assertEqual(canonicalize_factory_spec(dag), canonicalize_factory_spec(machine))
 
 
-class ValidateSwarmSpecFormTest(unittest.TestCase):
+class ValidateFactorySpecFormTest(unittest.TestCase):
     """The unified entry point detects the form first."""
 
     def test_both_forms_are_rejected_together(self) -> None:
         both = {"nodes": [node("a")], "states": [state("a", entry=True)]}
-        self.assertEqual(validate_swarm_spec(both), ["pass either dag or machine form, not both"])
+        self.assertEqual(validate_factory_spec(both), ["pass either dag or machine form, not both"])
         with self.assertRaisesRegex(ValueError, "not both"):
-            canonicalize_swarm_spec(both)
+            canonicalize_factory_spec(both)
 
     def test_machine_wins_when_states_or_transitions_present(self) -> None:
         transitions_only = {"transitions": [{"from": "a", "to": "b"}]}
         self.assertEqual(
-            validate_swarm_spec(transitions_only),
-            ["swarm machine requires a states list"],
+            validate_factory_spec(transitions_only),
+            ["factory machine requires a states list"],
         )
 
     def test_dag_wording_without_machine_keys(self) -> None:
         self.assertEqual(
-            validate_swarm_spec({"nodes": "nope"}),
-            ["swarm dag requires a nodes list"],
+            validate_factory_spec({"nodes": "nope"}),
+            ["factory dag requires a nodes list"],
         )
 
     def test_non_object_specs_reject_with_dag_wording(self) -> None:
         for bad in (None, [], "nodes", 42):
-            self.assertEqual(validate_swarm_spec(bad), ["swarm dag must be a JSON object"], repr(bad))
+            self.assertEqual(validate_factory_spec(bad), ["factory dag must be a JSON object"], repr(bad))
 
 
 class TopologicalOrderTest(unittest.TestCase):

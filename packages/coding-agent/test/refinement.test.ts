@@ -73,7 +73,7 @@ function makeTempDir(): string {
 	return tempDir;
 }
 
-const kinds = ["prompt", "memory", "skill", "subagent", "swarm"] as const satisfies readonly RefinementKind[];
+const kinds = ["prompt", "memory", "skill", "subagent", "factory"] as const satisfies readonly RefinementKind[];
 const skillReference = {
 	type: "python",
 	import: "agent_skills.example",
@@ -84,7 +84,7 @@ const skillContract = {
 	reference: skillReference,
 	arguments: { input: { type: "string", required: true, description: "Task input" } },
 };
-const swarmDag = {
+const factoryDag = {
 	nodes: [
 		{
 			id: "collect",
@@ -155,7 +155,7 @@ function seedEntry(state: HarnessState, kind: RefinementKind, id = `${kind}_entr
 				title: `${kind} title`,
 				content: `${kind} content`,
 				path: `${kind}/path`,
-				...(kind === "skill" ? skillContract : kind === "swarm" ? { arguments: { dag: swarmDag } } : {}),
+				...(kind === "skill" ? skillContract : kind === "factory" ? { arguments: { dag: factoryDag } } : {}),
 				metadata: { seeded: true },
 			},
 		]),
@@ -229,7 +229,8 @@ describe("harness refinement", () => {
 	it.each(kinds)("applies the create/update/delete lifecycle for %s entries", (kind) => {
 		const state = loadHarnessState(makeTempDir());
 		const id = `${kind}_entry`;
-		const skillFields = kind === "skill" ? skillContract : kind === "swarm" ? { arguments: { dag: swarmDag } } : {};
+		const skillFields =
+			kind === "skill" ? skillContract : kind === "factory" ? { arguments: { dag: factoryDag } } : {};
 		const apply = (edits: RefinementProposal["edits"], refinementId: string) =>
 			applyRefinementProposal(state, proposal(`${refinementId} ${kind}`, edits), { id: refinementId });
 
@@ -296,99 +297,99 @@ describe("harness refinement", () => {
 		expect(state.refinements.at(-1)?.changes).toEqual([`delete ${kind}:${id}`]);
 	});
 
-	it("requires a dag object in arguments for swarm creates and updates", () => {
+	it("requires a dag object in arguments for factory creates and updates", () => {
 		const state = loadHarnessState(makeTempDir());
 
 		const missingDag = applyRefinementProposal(
 			state,
-			proposal("Create swarm without a dag", [
+			proposal("Create factory without a dag", [
 				{
 					action: "create",
-					kind: "swarm",
-					id: "swarm_entry",
-					title: "Swarm title",
-					content: "Swarm content",
+					kind: "factory",
+					id: "factory_entry",
+					title: "Factory title",
+					content: "Factory content",
 				},
 			]),
-			{ id: "refine_swarm_missing_dag" },
+			{ id: "refine_factory_missing_dag" },
 		);
 
 		expect(missingDag.appliedEdits[0]).toMatchObject({
 			applied: false,
-			error: "swarm entry requires a dag object in arguments",
+			error: "factory entry requires a dag object in arguments",
 		});
-		expect(state.entries.swarm.swarm_entry).toBeUndefined();
+		expect(state.entries.factory.factory_entry).toBeUndefined();
 		expect(state.refinements.at(-1)?.changes).toEqual([]);
 
 		const nonObjectDag = applyRefinementProposal(
 			state,
-			proposal("Create swarm with a non-object dag", [
+			proposal("Create factory with a non-object dag", [
 				{
 					action: "create",
-					kind: "swarm",
-					id: "swarm_entry",
-					title: "Swarm title",
-					content: "Swarm content",
+					kind: "factory",
+					id: "factory_entry",
+					title: "Factory title",
+					content: "Factory content",
 					arguments: { dag: ["not", "an", "object"] },
 				},
 			]),
-			{ id: "refine_swarm_non_object_dag" },
+			{ id: "refine_factory_non_object_dag" },
 		);
 
 		expect(nonObjectDag.appliedEdits[0]).toMatchObject({
 			applied: false,
-			error: "swarm entry requires a dag object in arguments",
+			error: "factory entry requires a dag object in arguments",
 		});
 
 		const created = applyRefinementProposal(
 			state,
-			proposal("Create swarm with a dag", [
+			proposal("Create factory with a dag", [
 				{
 					action: "create",
-					kind: "swarm",
-					id: "swarm_entry",
-					title: "Swarm title",
-					content: "Swarm content",
-					path: "swarm/created",
-					arguments: { dag: swarmDag },
-					metadata: { kind: "swarm" },
+					kind: "factory",
+					id: "factory_entry",
+					title: "Factory title",
+					content: "Factory content",
+					path: "factory/created",
+					arguments: { dag: factoryDag },
+					metadata: { kind: "factory" },
 				},
 			]),
-			{ id: "refine_swarm_valid" },
+			{ id: "refine_factory_valid" },
 		);
 
 		expect(created.appliedEdits[0].applied).toBe(true);
-		expect(state.entries.swarm.swarm_entry.arguments).toEqual({ dag: swarmDag });
+		expect(state.entries.factory.factory_entry.arguments).toEqual({ dag: factoryDag });
 
 		const updateWithoutDag = applyRefinementProposal(
 			state,
-			proposal("Update swarm without a dag", [
+			proposal("Update factory without a dag", [
 				{
 					action: "update",
-					kind: "swarm",
-					id: "swarm_entry",
-					title: "Swarm title updated",
-					content: "Swarm content updated",
+					kind: "factory",
+					id: "factory_entry",
+					title: "Factory title updated",
+					content: "Factory content updated",
 				},
 			]),
-			{ id: "refine_swarm_update_missing_dag" },
+			{ id: "refine_factory_update_missing_dag" },
 		);
 
 		expect(updateWithoutDag.appliedEdits[0]).toMatchObject({
 			applied: false,
-			error: "swarm entry requires a dag object in arguments",
+			error: "factory entry requires a dag object in arguments",
 		});
-		expect(state.entries.swarm.swarm_entry.title).toBe("Swarm title");
+		expect(state.entries.factory.factory_entry.title).toBe("Factory title");
 	});
 
-	it("renders the swarm invoke contract in the harness digest", () => {
+	it("renders the factory invoke contract in the harness digest", () => {
 		const state = loadHarnessState(makeTempDir());
-		seedEntry(state, "swarm", "sweep");
+		seedEntry(state, "factory", "sweep");
 
 		const digest = formatHarnessStateForPrompt(state);
 
-		expect(digest).toContain("swarm: 1");
-		expect(digest).toContain("await rlm.swarm.run('<id>')");
+		expect(digest).toContain("factory: 1");
+		expect(digest).toContain("await rlm.factory.run('<id>')");
 	});
 
 	it("creates ids from titles and uses default path and metadata when omitted", () => {
@@ -417,7 +418,7 @@ describe("harness refinement", () => {
 		seed?: RefinementKind;
 	};
 	const skillFieldsFor = (kind: RefinementKind) =>
-		kind === "skill" ? skillContract : kind === "swarm" ? { arguments: { dag: swarmDag } } : {};
+		kind === "skill" ? skillContract : kind === "factory" ? { arguments: { dag: factoryDag } } : {};
 	// Raw (unnormalized) edit shapes for apply-time validation; overrides carry the violation.
 	const editWith = (
 		action: RefinementAction,
@@ -655,7 +656,7 @@ describe("harness refinement", () => {
 
 			const state = loadHarnessState(dir);
 
-			expect(state.entries).toEqual({ prompt: {}, memory: {}, skill: {}, subagent: {}, swarm: {} });
+			expect(state.entries).toEqual({ prompt: {}, memory: {}, skill: {}, subagent: {}, factory: {} });
 			expect(state.refinements).toEqual([]);
 			applyRefinementProposal(
 				state,

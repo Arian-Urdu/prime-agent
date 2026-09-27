@@ -144,6 +144,12 @@ impl EntryRows {
         }
     }
 
+    /// Whether the section holds no rows (the touch surface's
+    /// shows-tail peek skips empty trailing sections).
+    pub(super) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Rows `[from, to)` in the expanded `Vec<Line>` form.
     pub(super) fn range(&self, from: usize, to: usize) -> Vec<Line> {
         match self {

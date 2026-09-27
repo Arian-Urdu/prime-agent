@@ -177,9 +177,9 @@ export function sessionActivityDetail(summary: SessionSummary, options: SessionA
 		return "replied";
 	}
 	if (summary.activity === "working") {
-		// Local rows in this state are mid-classification; a remote mesh row only
-		// publishes coarse activity, so "working" is the honest word there.
-		return summary.remoteHost !== undefined ? "working" : "classifying";
+		// A remote mesh row publishes only coarse activity, so "working" is the honest
+		// word there; a local row's "working" is its own live session.
+		return "working";
 	}
 	if (summary.taskState === "error") {
 		return "error";

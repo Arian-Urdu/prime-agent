@@ -25,7 +25,7 @@ use crate::daemon_reconnect::RecoveryKind;
 use crate::exit_guard::ExitGuard;
 use crate::keybindings::KeybindingsManager;
 use crate::session_ui::SessionUi;
-use crate::view::{AgentView, FlushPlan};
+use crate::view::AgentView;
 
 use crossterm::event::KeyEvent;
 use crossterm::terminal;
@@ -3564,32 +3564,48 @@ impl Renderer {
             return Ok(());
         }
         let (width, height) = terminal::size()?;
-        let plan = view.take_flush_plan(width as usize, height as usize);
+        // The flush streams row-by-row in bounded chunks: a long transcript
+        // must reach the terminal without ever holding the whole frame (a
+        // +O(rows) peak right at exit) — the bytes are the materialized
+        // flush's bytes, the peak is one section plus one chunk.
         let mut out = std::io::stdout();
-        let mut buffer = String::new();
-        match plan {
-            FlushPlan::Append(rows) if rows.is_empty() => {}
-            FlushPlan::Append(rows) => {
-                write_flush_rows(&mut buffer, &rows);
+        // The flush streams row-by-row in bounded chunks: a long transcript
+        // must reach the terminal without ever holding the whole frame (a
+        // +O(rows) peak right at exit) — the bytes are the materialized
+        // flush's bytes, the peak is one section plus one chunk.
+        let mut out = std::io::stdout();
+        // PROBE-ONLY (tui-scroll-retain): tee the streamed flush bytes to
+        // PA_TUI_FLUSH_DUMP for the ANSI byte-parity oracle (never ships).
+        struct FlushTee<W: std::io::Write> {
+            out: W,
+            dump: Option<std::fs::File>,
+        }
+        impl<W: std::io::Write> std::io::Write for FlushTee<W> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if let Some(dump) = self.dump.as_mut() {
+                    let _ = dump.write_all(buf);
+                }
+                self.out.write(buf)
             }
-            FlushPlan::Repaint(rows) => {
-                // Erase the visible screen only — scrollback above it
-                // stays (TS `fullRender`'s `\x1b[2J\x1b[H`).
-                buffer.push_str("\x1b[2J\x1b[H");
-                write_flush_rows(&mut buffer, &rows);
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.out.flush()
             }
         }
-        // PROBE-ONLY (tui-scroll-retain): dump the composed exit-flush
-        // byte stream for the ANSI byte-parity oracle (never ships).
-        if let Ok(dump) = std::env::var("PA_TUI_FLUSH_DUMP") {
-            use std::io::Write as _;
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&dump)
-                .and_then(|mut f| f.write_all(buffer.as_bytes()));
-        }
-        out.write_all(buffer.as_bytes())?;
+        let dump = std::env::var("PA_TUI_FLUSH_DUMP")
+            .ok()
+            .and_then(|path| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .ok()
+            });
+        let mut tee = FlushTee {
+            out,
+            dump,
+        };
+        view.stream_flush_to(&mut tee, width as usize, height as usize)?;
+        tee.flush()?;
         out.flush()?;
         Ok(())
     }
@@ -3734,7 +3750,7 @@ impl Renderer {
 /// feed), rows are joined with CRLF, and a trailing CRLF parks the cursor
 /// below the frame (TS `TUI.stop`'s closing newline) so whatever prints
 /// next — the shell prompt or the resume hint — starts on a fresh line.
-fn write_flush_rows(buffer: &mut String, rows: &[crate::Line]) {
+pub(crate) fn write_flush_rows(buffer: &mut String, rows: &[crate::Line]) {
     for row in rows {
         buffer.push('\r');
         // An image-placement row is written raw (TS `applyLineResets` /

@@ -74,9 +74,14 @@ impl RowPack {
     pub(super) fn pack(rows: &[Line]) -> Self {
         let span_count: usize = rows.iter().map(Line::len).sum();
         debug_assert!(span_count <= u32::MAX as usize, "row pack offsets fit u32");
+        let content_bytes: usize = rows
+            .iter()
+            .flat_map(|line| line.iter())
+            .map(|span| span.content.len())
+            .sum();
         let mut first = Vec::with_capacity(rows.len() + 1);
         let mut spans = Vec::with_capacity(span_count);
-        let mut blob = String::new();
+        let mut blob = String::with_capacity(content_bytes);
         for line in rows {
             first.push(spans.len() as u32);
             for span in line {

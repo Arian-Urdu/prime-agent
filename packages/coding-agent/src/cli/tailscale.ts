@@ -382,8 +382,8 @@ export function runTailscaleServe(port: number, funnel: boolean): number {
 		return 1;
 	}
 	console.log("");
-	if (probe.hostname) {
-		const suffix = probe.magicDnsSuffix?.replace(/\.+$/, "") ?? "ts.net";
+	const suffix = probe.magicDnsSuffix?.replace(/\.+$/, "");
+	if (probe.hostname && suffix) {
 		// Exact domain-suffix match: the hostname must end with ".<suffix>" (or equal it).
 		const host =
 			probe.hostname.endsWith(`.${suffix}`) || probe.hostname === suffix
@@ -393,6 +393,12 @@ export function runTailscaleServe(port: number, funnel: boolean): number {
 		if (funnel) {
 			console.log(`Public URL: https://${host}/`);
 		}
+	} else if (probe.hostname) {
+		// Only a suffix Tailscale reported may be appended; inventing "ts.net" would
+		// print a host that may not resolve.
+		console.log(
+			chalk.yellow(`Tailscale reported no MagicDNS suffix; the reachable name for ${probe.hostname} is unknown`),
+		);
 	}
 	console.log("Stop with: tailscale serve status, then tailscale serve off (or funnel off)");
 	return 0;

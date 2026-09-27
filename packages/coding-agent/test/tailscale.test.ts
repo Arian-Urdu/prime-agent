@@ -191,6 +191,27 @@ describe("runTailscaleServe", () => {
 		process.env.PATH = `${notPublic.dir}:${process.env.PATH}`;
 		expect(runTailscaleServe(3000, true)).toBe(1); // funnel requested, endpoint not funnel-enabled
 	});
+	it("never invents a MagicDNS suffix for the reachable host", () => {
+		const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+		process.env.PATH = `${shimTailscale(ONLINE, serveStatusFor(3000)).dir}:${process.env.PATH}`;
+		expect(runTailscaleServe(3000, true)).toBe(0);
+		const logged = spy.mock.calls.map((call) => call.join(" ")).join("\n");
+		spy.mockRestore();
+		expect(logged).toContain("Now reachable on your tailnet as milk.tailnet.ts.net");
+		expect(logged).toContain("Public URL: https://milk.tailnet.ts.net/");
+
+		// No MagicDNSSuffix in the status JSON: "ts.net" must NOT be invented and
+		// appended, because that prints a host that may not resolve.
+		const noSuffix = JSON.stringify({ BackendState: "Running", Self: { Online: true, HostName: "milk" } });
+		const spy2 = vi.spyOn(console, "log").mockImplementation(() => {});
+		process.env.PATH = `${shimTailscale(noSuffix, serveStatusFor(3000)).dir}:${process.env.PATH}`;
+		expect(runTailscaleServe(3000, true)).toBe(0);
+		const loggedBare = spy2.mock.calls.map((call) => call.join(" ")).join("\n");
+		spy2.mockRestore();
+		expect(loggedBare).toContain("no MagicDNS suffix");
+		expect(loggedBare).not.toContain("milk.ts.net");
+		expect(loggedBare).not.toContain("Public URL");
+	});
 });
 
 describe("parseTailscaleArgs", () => {

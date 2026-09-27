@@ -28,6 +28,12 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		options: ["-a, --all  Include saved agents", "--json      Print JSON"],
 	},
 	{
+		path: ["sessions"],
+		usage: "sessions [--all] [--json]",
+		summary: "Show agent status, activity, and usage",
+		options: ["-a, --all  Include saved agents", "--json      Print JSON"],
+	},
+	{
 		path: ["attach"],
 		usage: "attach <agent>",
 		summary: "Attach the interactive UI to an agent",
@@ -95,6 +101,17 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 			"serve --port <n>    expose localhost:<n> on your tailnet (wraps `tailscale serve --bg`)",
 			"--funnel            with serve: expose publicly via tailscale funnel",
 		],
+		path: ["incident"],
+		usage: "incident [--since <time>] [--until <time>] [--session <id>]",
+		summary: "Reconstruct a daemon incident from its logs",
+		description:
+			"Summarizes the daemon logs for a time window into an operator timeline: supervisor and worker events, session anomalies, and recovery actions. Times without a timezone are read as UTC, matching the log; the default window is the last 24 hours.",
+		options: [
+			"--since <time>  Window start (ISO date/time, date, or HH:MM today; default: 24h ago)",
+			"--until <time>  Window end (default: now)",
+			"--session <id>  Only events naming this session id, worker id, or session name (prefix match)",
+		],
+		examples: ['incident --since "2026-09-16T20:02" --until "2026-09-16T20:21"', "incident --session 2339fb7da605"],
 	},
 	{
 		path: ["shutdown"],

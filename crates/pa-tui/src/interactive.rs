@@ -3606,7 +3606,6 @@ impl Renderer {
         };
         view.stream_flush_to(&mut tee, width as usize, height as usize)?;
         tee.flush()?;
-        out.flush()?;
         Ok(())
     }
 

@@ -2,14 +2,16 @@ import { existsSync, mkdirSync, rmSync, unlinkSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
-import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@earendil-works/pi-ai";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { type AssistantMessage, type AssistantMessageEvent, EventStream } from "@earendil-works/pi-ai";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import type { HostRequestHandlers } from "../src/core/kernel/index.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
+import { getCodingAgentFixtureModel } from "./fixture-models.js";
+import { createDeferred } from "./suite/scheduling.js";
 import { createTestResourceLoader } from "./utilities.js";
 
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -64,7 +66,7 @@ describe("rlm path watches", () => {
 	});
 
 	function createSession() {
-		const model = getModel("anthropic", "claude-sonnet-4-5")!;
+		const model = getCodingAgentFixtureModel("anthropic", "claude-sonnet-4-5");
 
 		const agent = new Agent({
 			getApiKey: () => "test-key",
@@ -112,6 +114,17 @@ describe("rlm path watches", () => {
 		);
 	}
 
+	/** Resolve when the session emits the runtime notice of `customType`. */
+	function noticeArrival(customType: string): Promise<void> {
+		const arrived = createDeferred();
+		const unsubscribe = session.subscribe((event) => {
+			if (event.type !== "message_end") return;
+			const message = event.message;
+			if (message.role === "custom" && message.customType === customType) arrived.resolve();
+		});
+		return arrived.promise.finally(unsubscribe);
+	}
+
 	it("registers a watch and delivers a debounced change notice into the session", async () => {
 		createSession();
 		const handlers = kernelHandlers();
@@ -124,10 +137,11 @@ describe("rlm path watches", () => {
 		expect(registered.watch.status).toBe("active");
 		expect(registered.watch.path).toBe(shared);
 
+		const arrived = noticeArrival("watch_path_changed");
 		writeFileSync(join(shared, "signal-1.txt"), "one");
 		writeFileSync(join(shared, "signal-2.txt"), "two");
 
-		await vi.waitFor(() => expect(watchNotice("watch_path_changed")).toBeDefined(), { timeout: 5_000 });
+		await arrived;
 		const notice = watchNotice("watch_path_changed");
 		expect(notice?.content).toContain(`[watch-path id:${registered.watch.watch_id} path:${shared}]`);
 		expect(notice?.content).toContain("signal-1.txt");
@@ -173,9 +187,10 @@ describe("rlm path watches", () => {
 		const registered = (await handlers["rlm.watch_path"]!({ path: target })) as {
 			watch: { watch_id: string };
 		};
+		const arrived = noticeArrival("watch_path_failed");
 		unlinkSync(target);
 
-		await vi.waitFor(() => expect(watchNotice("watch_path_failed")).toBeDefined(), { timeout: 5_000 });
+		await arrived;
 		const failure = watchNotice("watch_path_failed");
 		expect(failure?.content).toContain("[watch-path-failed");
 		expect(failure?.content).toContain("removed");

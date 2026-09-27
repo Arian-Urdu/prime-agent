@@ -76,6 +76,20 @@ The Python kernel runtime is set up automatically on first invocation. Set `PRIM
 
 For each built-in provider, Prime Agent maintains a list of tool-capable models, updated with every release. Authenticate via subscription (`/login`) or API key, then select any model from that provider via `/model` (or Ctrl+L).
 
+Development checkouts do not commit the generated bundled catalog snapshots. Before running catalog-dependent tests in a fresh checkout, generate them once from the catalog repo:
+
+```bash
+npm run catalog:assets -- --catalog-dir /path/to/prime-agent-catalog
+```
+
+Or fetch the private catalog with `GITHUB_TOKEN` or `PRIME_CATALOG_REPO_TOKEN`:
+
+```bash
+PRIME_CATALOG_REPO_TOKEN=... npm run catalog:assets
+```
+
+For pack-smoke work without catalog access, use `npm run catalog:assets -- --fixture`. Fixture assets are not release assets.
+
 **Subscriptions:**
 - Anthropic Claude Pro/Max
 - OpenAI ChatGPT Plus/Pro (Codex)
@@ -161,6 +175,7 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 | `/session` | Show session info (file, ID, messages) |
 | `/traces [status\|on\|off\|preview\|upload-current\|upload-all\|login]` | Preview traces, run one-shot current/all uploads, and manage automatic sharing (`upload` aliases `upload-current`) |
 | `/usage` | Show token, cost, and context usage |
+| `/speed [on\|off]` | Toggle footer readout of model output tok/sec (latest response and session average) |
 | `/tree` | Jump to any point in the session and continue from there |
 | `/fork` | Create a new session from a previous user message |
 | `/clone` | Duplicate the current active branch into a new session |
@@ -507,6 +522,7 @@ Run `prime-agent help` for the command list and `prime-agent help <command>` for
 ```bash
 prime-agent agents                         # Search running, idle, and inactive sessions
 prime-agent list [--all]                   # List active or saved agents
+prime-agent sessions [--all] [--json]     # Show agent status, activity, and usage
 prime-agent attach <agent>                 # Attach the interactive UI
 prime-agent stop <agent>                   # Stop one agent
 prime-agent rename <agent> <name>          # Rename an agent

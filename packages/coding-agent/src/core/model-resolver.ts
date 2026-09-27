@@ -8,6 +8,7 @@ import chalk from "chalk";
 import { minimatch } from "minimatch";
 import { isValidThinkingLevel } from "../cli/args.js";
 import { APP_NAME } from "../config.js";
+import { getPreferredDefaultModelId, resolvePreferredDefaultModel } from "./default-model-catalog.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { isPrivatePrimeInferenceModel } from "./prime-inference-models.js";
@@ -174,9 +175,8 @@ function buildFallbackModel(provider: string, modelId: string, availableModels: 
 	// Daemon-created sessions (rlm.create_session) re-resolve their model from
 	// provider/id strings in a registry that has not refreshed the team-authorized
 	// private catalog, so unknown private ids reach this fallback. They must
-	// inherit a private-route template: the public provider default carries the
-	// zai thinking format, whose enable_thinking parameter the private endpoint
-	// rejects with a 400 on every request.
+	// inherit a private-route template: public-route limits and thinking-level
+	// maps do not describe private routes.
 	if (isPrivatePrimeInferenceModel({ provider, id: modelId })) {
 		const privateTemplate = providerModels.find((m) => isPrivatePrimeInferenceModel(m));
 		if (!privateTemplate) return undefined;
@@ -195,7 +195,14 @@ function buildFallbackModel(provider: string, modelId: string, availableModels: 
 	};
 }
 
-function findPreferredDefaultModel(availableModels: Model<Api>[]): Model<Api> | undefined {
+function findPreferredDefaultModel(availableModels: Model<Api>[], preferredId?: string): Model<Api> | undefined {
+	// The catalog-defined default wins when it resolves to an available model: retiring
+	// or replacing the default ships to every installed client without a release.
+	const catalogDefault = resolvePreferredDefaultModel(preferredId, availableModels);
+	if (catalogDefault) {
+		return catalogDefault;
+	}
+
 	const primeInferenceDefault = availableModels.find(
 		(model) => model.provider === "prime-inference" && model.id === PRIME_INFERENCE_DEFAULT_MODEL_ID,
 	);
@@ -591,7 +598,7 @@ export async function findInitialModel(options: {
 		}
 	}
 	if (availableModels.length > 0) {
-		const defaultModel = findPreferredDefaultModel(availableModels);
+		const defaultModel = findPreferredDefaultModel(availableModels, getPreferredDefaultModelId());
 		if (defaultModel) {
 			return { model: defaultModel, thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
 		}
@@ -693,7 +700,8 @@ export async function restoreModelFromSession(
 		};
 	}
 	if (availableModels.length > 0) {
-		const fallbackModel = findPreferredDefaultModel(availableModels) ?? availableModels[0];
+		const fallbackModel =
+			findPreferredDefaultModel(availableModels, getPreferredDefaultModelId()) ?? availableModels[0];
 
 		if (shouldPrintMessages) {
 			console.log(chalk.dim(`Falling back to: ${fallbackModel.provider}/${fallbackModel.id}`));

@@ -1,4 +1,13 @@
-import { appendFileSync, chmodSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+	appendFileSync,
+	chmodSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -298,6 +307,22 @@ describe("harness refinement", () => {
 		seed?: RefinementKind;
 	};
 	const skillFieldsFor = (kind: RefinementKind) => (kind === "skill" ? skillContract : {});
+	// Raw (unnormalized) edit shapes for apply-time validation; overrides carry the violation.
+	const editWith = (
+		action: RefinementAction,
+		kind: RefinementKind,
+		id: string,
+		overrides: Record<string, unknown> = {},
+	): RefinementProposal["edits"][number] =>
+		({
+			action,
+			kind,
+			id,
+			title: "t",
+			content: "c",
+			...skillFieldsFor(kind),
+			...overrides,
+		}) as RefinementProposal["edits"][number];
 	it.each<InvalidCase>([
 		...kinds.map(
 			(kind): InvalidCase => ({
@@ -387,6 +412,48 @@ describe("harness refinement", () => {
 			label: "a create whose title derives the base system prompt id",
 			edit: { action: "create", kind: "prompt", title: "Base System Prompt", content: "c" },
 			error: "base system prompt",
+		},
+		{
+			label: "a create with list content",
+			edit: editWith("create", "memory", "list_content", { content: ["one string"] }),
+			error: "create requires title and content to be non-empty strings",
+		},
+		{
+			label: "a create with list title",
+			edit: editWith("create", "prompt", "list_title", { title: ["t"] }),
+			error: "create requires title and content to be non-empty strings",
+		},
+		{
+			label: "an update restoring list content",
+			seed: "memory",
+			edit: editWith("update", "memory", "memory_entry", { content: ["one string"] }),
+			error: "update requires title and content to be non-empty strings",
+		},
+		{
+			label: "a create with a numeric id",
+			edit: editWith("create", "memory", "numeric_id", { id: 7 }),
+			error: "create requires id to be a non-empty string when provided",
+		},
+		{
+			label: "a skill with a list reference",
+			edit: editWith("create", "skill", "list_reference", { reference: ["bad"] }),
+			error: "create requires reference to be an object when provided",
+		},
+		{
+			label: "a create with a numeric path",
+			edit: editWith("create", "memory", "bad_path", { path: 7 }),
+			error: "create requires path to be a non-empty string when provided",
+		},
+		{
+			label: "a skill with list arguments",
+			edit: editWith("create", "skill", "list_arguments", { arguments: ["a"] }),
+			error: "create requires arguments to be an object when provided",
+		},
+		{
+			label: "an update with list metadata",
+			seed: "memory",
+			edit: editWith("update", "memory", "memory_entry", { metadata: ["m"] }),
+			error: "update requires metadata to be an object when provided",
 		},
 	])("rejects $label without mutating state", ({ seed, edit, error }) => {
 		const state = loadHarnessState(makeTempDir());
@@ -666,6 +733,80 @@ describe("harness refinement", () => {
 		await expect(
 			refineHarness([], state, [], {} as never, "api-key", { rollbackId: "missing_refinement" }),
 		).rejects.toThrow("Refinement missing_refinement not found");
+	});
+});
+
+describe("topic-era harness state migration", () => {
+	it("loads a persisted entry whose grouping is spelled topic and saves it back under path", () => {
+		const harnessStateDir = makeTempDir();
+		writeFileSync(
+			getHarnessStatePath(harnessStateDir),
+			`${JSON.stringify({
+				schema: 1,
+				entries: {
+					prompt: {},
+					memory: {
+						topic_entry: {
+							id: "topic_entry",
+							kind: "memory",
+							title: "Topic entry",
+							content: "Window-era content.",
+							topic: "window/era",
+							scope: "local",
+							reference: {},
+							arguments: {},
+							metadata: {},
+							version: 1,
+						},
+					},
+					skill: {},
+					subagent: {},
+				},
+				refinements: [],
+			})}\n`,
+		);
+
+		const state = loadHarnessState(harnessStateDir, "local");
+
+		expect(state.entries.memory.topic_entry?.path).toBe("window/era");
+		expect(formatHarnessStateForPrompt(state)).toContain("(window/era, v1)");
+		const persisted = readFileSync(saveHarnessState(harnessStateDir, state), "utf8");
+		expect(persisted).toContain('"path": "window/era"');
+		expect(persisted).not.toContain('"topic"');
+	});
+
+	it("rolls back a legacy snapshot whose recorded before state carries only topic", async () => {
+		const state = loadHarnessState(makeTempDir());
+		seedEntry(state, "memory", "grouped_memory");
+		const target = applyRefinementProposal(
+			state,
+			proposal("Target refinement", [
+				{
+					action: "update",
+					kind: "memory",
+					id: "grouped_memory",
+					title: "Updated memory",
+					content: "Updated memory content",
+					path: "updated/path",
+				},
+			]),
+			{ id: "refine_topic_snapshot" },
+		);
+		// Record the pre-edit snapshot the way a build that spelled the grouping `topic` wrote it.
+		for (const applied of target.appliedEdits) {
+			if (!applied.before) continue;
+			const before: Record<string, unknown> = { ...applied.before };
+			before.topic = before.path;
+			delete before.path;
+			applied.before = before as unknown as HarnessEntry;
+		}
+
+		const rollback = await refineHarness([], state, [target], {} as never, "api-key", {
+			rollbackId: "refine_topic_snapshot",
+		});
+
+		expect(rollback.appliedEdits.map((applied) => applied.applied)).toEqual([true]);
+		expect(state.entries.memory.grouped_memory).toMatchObject({ content: "memory content", path: "memory/path" });
 	});
 });
 

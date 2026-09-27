@@ -1,5 +1,6 @@
-import { type Api, getModels, getSupportedThinkingLevels, type KnownProvider, type Model } from "@earendil-works/pi-ai";
+import { type Api, getModels, getSupportedThinkingLevels, type Model } from "@earendil-works/pi-ai";
 import { describe, expect, test, vi } from "vitest";
+import { getBundledModels } from "../src/core/bundled-model-catalog.js";
 import {
 	defaultModelPerProvider,
 	findInitialModel,
@@ -168,23 +169,24 @@ describe("resolveCliModel", () => {
 		expect(priv.model?.provider).toBe("prime-inference");
 		expect(priv.model?.baseUrl).toBe("https://api.pinference.ai/api/v1");
 		const privateModel = priv.model as Model<"openai-completions">;
-		// The public provider default carries the zai thinking format; a private
-		// route must not inherit it (enable_thinking is a provider 400 there).
+		// Prime Inference rejects enable_thinking, so no route may carry the zai
+		// thinking format.
 		expect(privateModel.compat?.thinkingFormat).toBeUndefined();
-		// The zai thinkingLevelMap would coerce thinking "off" to "low".
+		// The public template's thinkingLevelMap would coerce thinking "off" to "low".
 		expect(getSupportedThinkingLevels(privateModel).includes("off")).toBe(true);
 
 		const pub = resolveCliModel({ cliProvider: "prime-inference", cliModel: "z-ai/glm-9", modelRegistry: registry });
 		expect(pub.error).toBeUndefined();
 		expect(pub.model?.id).toBe("z-ai/glm-9");
-		expect((pub.model as Model<"openai-completions">).compat?.thinkingFormat).toBe("zai");
+		expect((pub.model as Model<"openai-completions">).compat?.thinkingFormat).toBeUndefined();
 	});
 });
 
 describe("default model selection", () => {
-	test("every per-provider default exists in the model catalog", () => {
+	test("every per-provider default exists in the bundled runtime catalog", () => {
+		const bundledModels = getBundledModels();
 		for (const [provider, modelId] of Object.entries(defaultModelPerProvider)) {
-			const models = getModels(provider as KnownProvider);
+			const models = bundledModels.filter((entry) => entry.provider === provider);
 			if (models.length === 0) continue;
 			expect(
 				models.map((entry) => entry.id),

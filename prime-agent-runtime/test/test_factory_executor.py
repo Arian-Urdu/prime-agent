@@ -24,6 +24,13 @@ def async_test(coroutine):
     return wrapper
 
 
+async def yield_loop_turn() -> None:
+    """Yield one event-loop turn: cooperative, with no wall-clock wait."""
+    resumed = asyncio.Event()
+    asyncio.get_running_loop().call_soon(resumed.set)
+    await resumed.wait()
+
+
 class FakeClock:
     """Injectable monotonic clock with optional per-collect advancement."""
 
@@ -253,14 +260,14 @@ class FactoryExecutorTest(unittest.TestCase):
             run = self.executor._runs[run_id]
             if run.state != "running":
                 return await rlm_module.rlm.factory.status(run_id)
-            await asyncio.sleep(0)
+            await yield_loop_turn()
         self.fail(f"run {run_id} never left the running state")
 
     async def wait_until(self, predicate, *, max_polls: int = 50_000) -> None:
         for _ in range(max_polls):
             if predicate():
                 return
-            await asyncio.sleep(0)
+            await yield_loop_turn()
         self.fail("condition never became true")
 
     def node_status(self, status: dict[str, Any], node_id: str) -> dict[str, Any]:
@@ -907,12 +914,12 @@ class FactoryExecutorTest(unittest.TestCase):
         result = await self.start()
         self.assertEqual(result["started"], ["a", "b"])  # c waits for a slot
         run = self.executor._runs[result["run_id"]]
-        await asyncio.sleep(0)  # the loop reaches collect#1 and suspends
+        await yield_loop_turn()  # the loop reaches collect#1 and suspends
         stop_task = asyncio.ensure_future(rlm_module.rlm.factory.stop(result["run_id"]))
         for _ in range(1000):
             if run.state == "stopping":
                 break
-            await asyncio.sleep(0)
+            await yield_loop_turn()
         self.assertEqual(run.state, "stopping")
         # release the collect: the loop settles a and b inside the stop window
         collect_gate.set()

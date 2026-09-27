@@ -102,8 +102,13 @@ pub struct Supervisor {
     /// run start (None = opted out); never blocks supervision paths.
     telemetry: std::sync::Mutex<Option<pa_telemetry::TelemetryClient>>,
     pub(crate) registry: SessionRegistry,
-    /// Worker outbound frames, with their client routing.
-    pub(crate) events: broadcast::Sender<(ClientRouting, Value)>,
+    /// Worker outbound frames, with their client routing. The payload is
+    /// shared (`Arc`): every connected client's event arm receives every
+    /// frame to decide delivery, and a per-receiver deep `Value` clone
+    /// would multiply the frame's heap by the connection count on every
+    /// event — the refcount bump is the whole cost for non-matching
+    /// connections.
+    pub(crate) events: broadcast::Sender<(ClientRouting, std::sync::Arc<Value>)>,
     /// The supervisor's agent roster (classified entries; the roster arms
     /// live in `supervisor_roster.rs`).
     pub(crate) roster: std::sync::Mutex<crate::agent_roster::AgentRoster>,
@@ -310,7 +315,7 @@ impl Supervisor {
                     ClientRouting::AttachedSession {
                         active_session_id: previous,
                     },
-                    event,
+                    std::sync::Arc::new(event),
                 ));
             }
         }
@@ -361,13 +366,13 @@ impl Supervisor {
                 ClientRouting::AttachedSession {
                     active_session_id: current.clone(),
                 },
-                json!({
+                std::sync::Arc::new(json!({
                     "type": "session_binding",
                     "previousActiveSessionId": selector,
                     "activeSessionId": current,
                     "sessionId": session_id,
                     "sessionFile": session_file,
-                }),
+                })),
             ));
         }
         current
@@ -1514,7 +1519,7 @@ impl Supervisor {
                     ClientRouting::BroadcastExcept {
                         connection_id: connection_id.to_string(),
                     },
-                    closing.clone(),
+                    std::sync::Arc::new(closing.clone()),
                 ));
                 lines.push(closing);
                 // Answer first, then shut down: the connection loop writes
@@ -2376,7 +2381,9 @@ impl Supervisor {
                         "sessions": sessions,
                     }
                 });
-                let _ = self.events.send((ClientRouting::Broadcast, closing));
+                let _ = self
+                    .events
+                    .send((ClientRouting::Broadcast, std::sync::Arc::new(closing)));
                 // The response is written before the accept loop exits (the
                 // write path is the dispatch channel; the 100ms drain only
                 // orders the exit behind it - the coordinator's Booting
@@ -3362,9 +3369,10 @@ impl Supervisor {
         self.log_line(
             "received shutdown signal; entering graceful drain: new client commands refused, running turns settle through the workers' routed shutdown",
         );
-        let _ = self
-            .events
-            .send((ClientRouting::Broadcast, daemon_closing_shutdown_event()));
+        let _ = self.events.send((
+            ClientRouting::Broadcast,
+            std::sync::Arc::new(daemon_closing_shutdown_event()),
+        ));
         let supervisor = Arc::clone(self);
         tokio::spawn(async move {
             supervisor.ensure_shutdown_started().await;
@@ -4376,7 +4384,7 @@ mod tests {
             "every client learns the closing"
         );
         assert_eq!(
-            closing,
+            *closing,
             json!({ "type": "daemon_closing", "reason": "shutdown" })
         );
         tokio::time::timeout(Duration::from_secs(2), shutdown_routed_rx)
@@ -4569,7 +4577,9 @@ mod tests {
         for index in 0..flood {
             let _ = supervisor.events.send((
                 ClientRouting::Broadcast,
-                json!({ "type": "session_event", "index": index, "padding": padding }),
+                std::sync::Arc::new(json!({
+                    "type": "session_event", "index": index, "padding": padding
+                })),
             ));
         }
         // Drain the parked connection while watching for the log line: the

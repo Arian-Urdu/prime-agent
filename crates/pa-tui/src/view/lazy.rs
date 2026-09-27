@@ -2,6 +2,13 @@
 //! for callers that require absolute coordinates (selection and scroll info).
 use super::{layout::EntryLayout, layout::EntryRows, layout::RowPack, AgentView};
 use crate::chat::Detail;
+
+/// The row count above which packing frees a large enough transient that
+/// the freed heap is returned to the OS immediately (allocator plumbing;
+/// no output-path effect). Ordinary transcript entries render far fewer
+/// rows; only a resumed session's pad-scale row sets cross this.
+const HUGE_PACKED_ROWS: usize = 8192;
+
 use crate::chrome::render_splash;
 use crate::Line;
 
@@ -518,6 +525,15 @@ impl AgentView {
                 spacing,
                 rows: std::sync::Arc::new(RowPack::pack(&rows)),
             });
+            // A huge entry's rendered rows are the transcript's biggest
+            // single transient (the pad row set of a resumed large
+            // session): the pack just replaced them, and the freed
+            // pages only return to the OS if the allocator's trim can
+            // reach them. Gate on the row count so ordinary entries
+            // never pay a trim call — only the rare huge materialization.
+            if rows.len() >= HUGE_PACKED_ROWS {
+                pa_types::memory_release::trim_freed_heap();
+            }
         }
         EntryRows::Fresh(rows)
     }

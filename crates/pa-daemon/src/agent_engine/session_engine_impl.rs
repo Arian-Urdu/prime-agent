@@ -459,6 +459,12 @@ impl SessionEngine for AgentSessionEngine {
         }))
     }
 
+    /// True while the session is parked waiting out a provider-reported
+    /// usage reset (TS `session.isQuotaParked`).
+    fn is_quota_parked(&self) -> bool {
+        AgentSessionEngine::is_quota_parked(self)
+    }
+
     /// `compact` over the hosted pa-core session: the session summarizes
     /// its own branch, persists the entry on its in-memory store, and
     /// rebuilds the loop context; the worker persists the durable entry.

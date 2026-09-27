@@ -1,4 +1,4 @@
-import { Container, Input, setKeybindings, type TUI } from "@earendil-works/pi-tui";
+import { type Component, Container, Input, setKeybindings, Text, type TUI } from "@earendil-works/pi-tui";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { KeybindingsManager } from "../../../src/core/keybindings.js";
 import type { ModelRegistry } from "../../../src/core/model-registry.js";
@@ -10,7 +10,6 @@ import { initTheme } from "../../../src/modes/interactive/theme/theme.js";
 import { createHarness, type Harness } from "../harness.js";
 
 interface OnboardingSplashHandle {
-	showProgress(message: string): void;
 	dismiss(): void;
 }
 
@@ -33,6 +32,7 @@ interface ConfigurationHarness {
 	editor: Input;
 	editorContainer: Container;
 	ui: TUI;
+	inlineAuthPanelClosers: Array<() => void>;
 	uiServices: {
 		modelRegistry: ModelRegistry;
 		settingsManager: Harness["settingsManager"];
@@ -71,13 +71,11 @@ describe("ENG-4658 onboarding transitions", () => {
 		}
 	});
 
-	test("dismisses the splash before opening first-launch model selection inline", async () => {
+	test("finishes first-launch onboarding after login without the model picker", async () => {
 		const harness = await createHarness({ provider: "prime-inference", withConfiguredAuth: false });
 		harnesses.push(harness);
 		const order: string[] = [];
-		const configuration = deferred<void>();
 		const splash: OnboardingSplashHandle = {
-			showProgress: (message) => order.push(`progress:${message}`),
 			dismiss: () => order.push("dismiss"),
 		};
 		const fakeThis = Object.create(InteractiveMode.prototype) as InteractiveOnboardingHarness;
@@ -102,28 +100,22 @@ describe("ENG-4658 onboarding transitions", () => {
 		});
 		fakeThis.showConfigurationMenu = vi.fn((tab) => {
 			order.push(`configuration:${tab}`);
-			return configuration.promise;
+			return Promise.resolve();
 		});
 
-		const onboarding = fakeThis.runOnboardingFlow(false);
-		await vi.waitFor(() => expect(fakeThis.showConfigurationMenu).toHaveBeenCalledWith("models"));
+		await fakeThis.runOnboardingFlow(false);
 
-		expect(order.slice(-2)).toEqual(["dismiss", "configuration:models"]);
-		configuration.resolve();
-		await onboarding;
-
+		// The login and the questions after it mount inside the onboarding block,
+		// so the flows are the inline ones rather than overlays.
+		expect(fakeThis.createAuthFlows).toHaveBeenCalledWith();
 		expect(fakeThis.showOnboardingSplash).toHaveBeenCalledWith();
-		expect(order).toEqual([
-			"progress:Signing in to Prime Intellect...",
-			"login",
-			"progress:Preparing models...",
-			"prepare",
-			"dismiss",
-			"configuration:models",
-		]);
+		// Onboarding now ends at the trace question; the model picker is no longer
+		// part of the first-launch sequence.
+		expect(fakeThis.showConfigurationMenu).not.toHaveBeenCalled();
+		expect(order).toEqual(["login", "prepare", "dismiss"]);
 	});
 
-	test("keeps the inline picker mounted during authentication and restores the draft after closing", async () => {
+	test("swaps the inline picker for the login panel and restores the draft after closing", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const login = deferred<AuthenticationResult>();
@@ -138,6 +130,7 @@ describe("ENG-4658 onboarding transitions", () => {
 			requestRender: vi.fn(),
 			setFocus: vi.fn(),
 		} as unknown as TUI;
+		fakeThis.inlineAuthPanelClosers = [];
 		fakeThis.uiServices = {
 			modelRegistry: harness.session.modelRegistry,
 			settingsManager: harness.settingsManager,
@@ -146,9 +139,19 @@ describe("ENG-4658 onboarding transitions", () => {
 		fakeThis.getScopedModelState = () => [];
 		fakeThis.getCurrentModel = () => model;
 		fakeThis.getModelSelectorRefreshPromise = () => undefined;
+		const showInlineAuthPanel = (
+			InteractiveMode.prototype as unknown as {
+				showInlineAuthPanel(component: Component): () => void;
+			}
+		).showInlineAuthPanel;
+		const loginPanel = new Text("Login panel", 0, 0);
 		fakeThis.createAuthFlows = () => ({
 			getLoginProviderOptions: () => [{ id: model.provider, name: model.provider, authType: "api_key" }],
-			loginProvider: () => login.promise,
+			loginProvider: () => {
+				const close = showInlineAuthPanel.call(fakeThis, loginPanel);
+				void login.promise.then(() => close());
+				return login.promise;
+			},
 		});
 		fakeThis.showError = vi.fn();
 		fakeThis.showStatus = vi.fn();
@@ -158,13 +161,12 @@ describe("ENG-4658 onboarding transitions", () => {
 		expect(menu).toBeInstanceOf(ConfigurationMenuComponent);
 		menu.handleInput("\r");
 
-		expect(fakeThis.editorContainer.children).toEqual([menu]);
+		expect(fakeThis.editorContainer.children).toEqual([loginPanel]);
 		expect(fakeThis.editor.getValue()).toBe("draft prompt");
 
 		login.resolve({ status: "cancelled" });
-		await vi.waitFor(() => expect(fakeThis.ui.setFocus).toHaveBeenCalledTimes(2));
+		await vi.waitFor(() => expect(fakeThis.editorContainer.children).toEqual([menu]));
 		expect(fakeThis.ui.setFocus).toHaveBeenLastCalledWith(menu);
-		expect(fakeThis.editorContainer.children).toEqual([menu]);
 		menu.handleInput("\x1b");
 		await expect(configuration).resolves.toBeUndefined();
 		expect(fakeThis.editorContainer.children).toEqual([fakeThis.editor]);

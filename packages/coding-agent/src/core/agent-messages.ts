@@ -13,6 +13,7 @@ export const AGENT_MESSAGE_CUSTOM_TYPE = "agent_message";
 export const AGENT_MESSAGE_SKILL_NAME = "agent-message";
 export const AGENT_MESSAGE_IMPORT_NAME = "agent_message";
 export const AGENT_MESSAGE_SOURCE = "agent_message";
+export const AGENT_MESSAGE_ID_PREFIX = "agentmsg_";
 export const AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL = "Agent message received";
 export const DEFAULT_AGENT_MESSAGE_MAX_CHARS = 16_384;
 export const DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION = 20;
@@ -110,6 +111,13 @@ export interface AgentSessionNameScope {
 export interface AgentSessionNameAvailabilityInput extends AgentSessionNameScope {
 	name: string;
 	ignoreSessionId?: string;
+	/**
+	 * Session ids of children whose delete receipt already returned. The daemon
+	 * catalog keeps listing such a child until its detached unwind removes the
+	 * runtime, so the caller passes every freed id it still holds and a same-name
+	 * respawn is admitted at the receipt instead of at the unwind.
+	 */
+	ignoreSessionIds?: string[];
 }
 
 export interface AgentSessionMessagePayload {
@@ -204,9 +212,11 @@ export function assertAgentSessionNameAvailable(
 	catalog: readonly AgentFamilyCatalogEntry[],
 	input: AgentSessionNameAvailabilityInput,
 ): void {
+	const freedSessionIds = input.ignoreSessionIds?.length ? new Set(input.ignoreSessionIds) : undefined;
 	const conflict = catalog.some(
 		(entry) =>
 			entry.id !== input.ignoreSessionId &&
+			!freedSessionIds?.has(entry.id) &&
 			entry.name === input.name &&
 			entry.depth === input.depth &&
 			sameAgentSessionNameParent(entry, input, catalog),
@@ -318,7 +328,12 @@ export function assertAgentFamilyReach(
 }
 
 export function createAgentSessionMessageId(): string {
-	return `agentmsg_${randomUUID()}`;
+	return `${AGENT_MESSAGE_ID_PREFIX}${randomUUID()}`;
+}
+
+/** Distinguishes agent-to-agent ids from the synthetic ids callers mint to track prompt completion. */
+export function isAgentSessionMessageId(id: string | undefined): boolean {
+	return id !== undefined && id.startsWith(AGENT_MESSAGE_ID_PREFIX);
 }
 
 export function normalizeAgentSessionMessage(message: string, maxChars = DEFAULT_AGENT_MESSAGE_MAX_CHARS): string {

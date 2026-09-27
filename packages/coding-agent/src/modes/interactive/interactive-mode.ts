@@ -11,9 +11,11 @@ import {
 	type Model,
 	type ServiceTier,
 	supportsFastMode,
+	supportsServiceTier,
 	type ToolCall,
 } from "@earendil-works/pi-ai";
 import { BUILTIN_MCP_CATALOG } from "@earendil-works/pi-ai/mcp";
+import { registerOAuthProvider, unregisterOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import type {
 	AutocompleteItem,
 	AutocompleteProvider,
@@ -26,9 +28,11 @@ import type {
 	SlashCommand,
 } from "@earendil-works/pi-tui";
 import {
+	type ClickRegion,
 	CombinedAutocompleteProvider,
 	type Component,
 	Container,
+	isFocusable,
 	Loader,
 	type LoaderIndicatorOptions,
 	Markdown,
@@ -60,6 +64,7 @@ import {
 	getAgentTracesLogPath,
 	getDebugLogPath,
 	getLogsDir,
+	getMcpCacheDir,
 	getShareViewerUrl,
 	SELF_UPDATE_INTERACTIVE_CHILD_ENV,
 	SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE,
@@ -80,6 +85,7 @@ import {
 	uploadAllAgentTraces,
 } from "../../core/agent-traces.js";
 import { isNoModelsAvailableMessage } from "../../core/auth-guidance.js";
+import type { AuthCredential } from "../../core/auth-storage.js";
 import {
 	type AgentCronJob,
 	type AgentHeartbeatManagementAction,
@@ -102,30 +108,62 @@ import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/
 import { emptyGoalState, formatGoalUsage, GOAL_CONTEXT_PREVIEW_LABEL, type GoalState } from "../../core/goals.js";
 import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.js";
+import {
+	logoutMcpAccount,
+	type McpConnectionRecord,
+	McpConnectionStore,
+	type McpRemoveAccountResult,
+} from "../../core/mcp/connection-store.js";
 import { runMcpManagementCommand } from "../../core/mcp/mcp-command.js";
+import {
+	accountStateFor,
+	buildPluginViews,
+	createConfiguredMcpProvider,
+	isPasteableTokenService,
+	type McpPasteCredential,
+	type McpPluginView,
+	type McpServiceDescriptor,
+	mcpCredentialFieldPromptLabel,
+	mcpCredentialKey,
+	mcpLoginEligibility,
+	mcpPasteCredential,
+	nextMcpConnectionId,
+	reservedMcpOwnership,
+	resolveMcpOAuthIdentity,
+	resolveServiceCatalogWithDiagnostics,
+	verifyMcpConnection,
+} from "../../core/mcp/service-catalog.js";
 import {
 	ASYNC_BASH_COMPLETION_PREVIEW_LABEL,
 	bashOutputToText,
 	COMPACTION_OUTCOME_CUSTOM_TYPE,
 	type CustomMessage,
 	createHeartbeatPromptMessage,
+	createMcpConnectionOutcomeMessage,
+	formatMcpConnectionOutcomeNotice,
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	isCompactionOutcomeMessage,
+	isMcpConnectionOutcomeMessage,
 	isRefinementOutcomeMessage,
 	isSessionSlashCommandMessage,
 	isSessionSlashCommandResultMessage,
+	MCP_CONNECTION_OUTCOME_CUSTOM_TYPE,
+	type McpDisconnectionOutcomeDetails,
+	type McpDisconnectionState,
+	type McpOutcomeDetails,
 	REFINEMENT_OUTCOME_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
 } from "../../core/messages.js";
 import { findExactModelReferenceMatch, resolveModelScopeFromModels } from "../../core/model-resolver.js";
 import { parseNewSessionCommand } from "../../core/new-session-command.js";
-import { resolvePrimeAgentTracesBaseUrl } from "../../core/prime-inference-auth.js";
+import { PRIME_INFERENCE_PROVIDER_ID, resolvePrimeAgentTracesBaseUrl } from "../../core/prime-inference-auth.js";
 import { resolvePrimeInferencePostLoginModelAction } from "../../core/prime-inference-model-selection.js";
 import { parseCommandArgs } from "../../core/prompt-templates.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
 import { resolveSessionPath, SessionSelectorError, SessionSelectorNotFoundError } from "../../core/session-resolver.js";
+import type { ChatDetail, McpServerConfig } from "../../core/settings-manager.js";
 import { parseSkillBlock } from "../../core/skill-blocks.js";
 import {
 	BUILTIN_SLASH_COMMANDS,
@@ -150,7 +188,7 @@ import { resizeImage } from "../../utils/image-resize.js";
 import { getCwdRelativePath } from "../../utils/paths.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import { ensureTool, ensureToolWithStatus, formatMissingRipgrepMessage } from "../../utils/tools-manager.js";
-import { checkForNewPiVersion } from "../../utils/version-check.js";
+import { checkForNewPiVersion, resolveUpdateChannel } from "../../utils/version-check.js";
 import type {
 	AgentConnection,
 	AgentConnectionExtensionUiRequest,
@@ -219,8 +257,15 @@ import {
 	keyText,
 	rawKeyHint,
 } from "./components/keybinding-hints.js";
+import {
+	MalformedMcpConnectionOutcomeMessageComponent,
+	McpConnectionOutcomeMessageComponent,
+} from "./components/mcp-connection-outcome-message.js";
+import { McpTokenPastePanelComponent } from "./components/mcp-token-paste-panel.js";
 import { createMermaidMarkdownTransform } from "./components/mermaid.js";
 import type { AuthSelectorProvider } from "./components/oauth-selector.js";
+import { OnboardingChoiceComponent } from "./components/onboarding-choice.js";
+import { OnboardingPickerComponent } from "./components/onboarding-picker.js";
 import { PrimeOnboardingSplashComponent } from "./components/prime-onboarding-splash.js";
 import { PromptContextLine } from "./components/prompt-context-line.js";
 import { styleArgumentTokens } from "./components/prompt-highlight.js";
@@ -229,6 +274,10 @@ import {
 	RefinementOutcomeMessageComponent,
 } from "./components/refinement-outcome-message.js";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.js";
+import {
+	ServiceCatalogPickerComponent,
+	type ServiceCatalogPickerOptions,
+} from "./components/service-catalog-picker.js";
 import { SettingsSelectorComponent } from "./components/settings-selector.js";
 import { SideQuestionComponent } from "./components/side-question.js";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.js";
@@ -249,6 +298,7 @@ import {
 	ToolExecutionComponent,
 	type ToolExecutionDefinition,
 } from "./components/tool-execution.js";
+import { TopBar } from "./components/top-bar.js";
 import { TreeSelectorComponent } from "./components/tree-selector.js";
 import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
@@ -265,12 +315,7 @@ import type {
 	InteractiveModeLocalToolRendererDefinition,
 	InteractiveModeUiServices,
 } from "./interactive-mode-services.js";
-import {
-	isOnboardingModelReady,
-	type OnboardingStartupState,
-	shouldRunOnboarding,
-	shouldRunPrimeCliOnboardingSplash,
-} from "./onboarding.js";
+import { isOnboardingModelReady, type OnboardingStartupState, shouldRunOnboarding } from "./onboarding.js";
 import type { ClientPromptStashStore, PromptStash, PromptStashState } from "./prompt-stash-state.js";
 import { QueueSelection, type QueueSelectionItem } from "./queue-selection.js";
 import { formatResumeHint } from "./resume-hint.js";
@@ -305,6 +350,9 @@ interface PendingToolCallRenderInput {
 const HEARTBEAT_LEGACY_PROMPT_MIN_TOLERANCE_MS = 15_000;
 const HEARTBEAT_LEGACY_PROMPT_MAX_TOLERANCE_MS = 120_000;
 const MODEL_CATALOG_REFRESH_TTL_MS = 60_000;
+// Status-driven top bar cost refreshes rebuild the full context tree; agent_end
+// and attach/reconnect refresh unthrottled for per-turn and per-attach convergence.
+const TOP_BAR_COST_REFRESH_MIN_INTERVAL_MS = 1_000;
 function isLabeledQueuedPreview(message: string): boolean {
 	return (
 		message.startsWith(`${HEARTBEAT_PROMPT_PREVIEW_LABEL}: `) ||
@@ -314,13 +362,13 @@ function isLabeledQueuedPreview(message: string): boolean {
 	);
 }
 
-export function formatQueuedMessagePreview(message: string, label: "Steering" | "Follow-up"): string {
+export function formatQueuedMessagePreview(message: string, label: "Steering" | "Follow-up" | "Starting"): string {
 	return isLabeledQueuedPreview(message) ? message : `${label}: ${message}`;
 }
 
 export function styleQueuedMessagePreview(
 	message: string,
-	label: "Steering" | "Follow-up",
+	label: "Steering" | "Follow-up" | "Starting",
 	isRecognizedSlashCommand: (name: string) => boolean,
 ): string {
 	const preview = formatQueuedMessagePreview(message, label);
@@ -350,6 +398,9 @@ function hasEditDiffsExpansion(obj: unknown): obj is EditDiffsExpandable {
 }
 
 class ExpandableText extends Text implements Expandable {
+	private expandedState: boolean;
+	private clickRegions: ClickRegion[] = [];
+
 	constructor(
 		private readonly getCollapsedText: () => string,
 		private readonly getExpandedText: () => string,
@@ -358,10 +409,25 @@ class ExpandableText extends Text implements Expandable {
 		paddingY = 0,
 	) {
 		super(expanded ? getExpandedText() : getCollapsedText(), paddingX, paddingY);
+		this.expandedState = expanded;
 	}
 
 	setExpanded(expanded: boolean): void {
+		this.expandedState = expanded;
 		this.setText(expanded ? this.getExpandedText() : this.getCollapsedText());
+	}
+
+	override render(width: number): string[] {
+		const lines = super.render(width);
+		this.clickRegions =
+			lines.length > 0
+				? [{ line: 0, col: 0, width, height: 1, onClick: () => this.setExpanded(!this.expandedState) }]
+				: [];
+		return lines;
+	}
+
+	getClickRegions(): ReadonlyArray<ClickRegion> {
+		return this.clickRegions;
 	}
 }
 
@@ -431,6 +497,13 @@ export interface BrandSplashHeaderOptions {
 	topPadding?: boolean;
 	getModelId?: () => string | undefined;
 	getExtraMetadata?: () => readonly BrandSplashMetadataLine[];
+	/** Suppress the header entirely, e.g. while inline onboarding owns the top rows. */
+	getHidden?: () => boolean;
+}
+
+/** Flow panels that can settle their pending step when unmounted early. */
+function isAbortablePanel(component: Component): component is Component & { abort(): void } {
+	return typeof (component as { abort?: unknown }).abort === "function";
 }
 
 export class BrandSplashHeader implements Component {
@@ -453,6 +526,9 @@ export class BrandSplashHeader implements Component {
 	}
 
 	render(width: number): string[] {
+		if (this.options.getHidden?.()) {
+			return [];
+		}
 		const safeWidth = Math.max(1, width);
 		const paddingX = safeWidth > 1 ? 1 : 0;
 		const contentWidth = Math.max(1, safeWidth - paddingX * 2);
@@ -527,8 +603,83 @@ type GoalAnnouncementSnapshot = {
 
 type ModelFallbackWarningAction = "show" | "suppress";
 
+/** The connection target a picker row dispatches to: a concrete endpoint and
+ * its auth shape, or a settings-managed stdio server. */
+interface McpPickerTarget {
+	url?: string;
+	usesOAuth: boolean;
+	bearerTokenEnvVar?: string;
+	managedBySettings: boolean;
+	transport?: "stdio";
+	name?: string;
+}
+
+/**
+ * What a picker action means for the picker chain that launched it. `ran`
+ * marks an action that STARTED a real flow — a login or paste panel, a
+ * verification, a removal, a settings change — so the chain re-enters the
+ * right surface, rebuilt from the live stores. `ran: false` is a status-only
+ * dead end: the transient line is the outcome and the chain ends, so an
+ * action that cannot proceed never reopens the picker (no re-entry loop).
+ */
+type McpPickerActionOutcome = { ran: boolean };
+
+/** Where the accounts surface sends the picker chain when it returns. */
+type McpAccountsSurfaceExit = "closed" | "catalog";
+
+/**
+ * The settled outcome of one mounted catalog/accounts picker: a selected row,
+ * a cancellation (Esc / stale settle — the surface closes), or "back" (the
+ * left arrow / a sub-picker's Esc: hand control to the parent surface without
+ * acting).
+ */
+type McpPickerSelection = { status: "selected"; service: McpPluginView } | { status: "cancelled" } | { status: "back" };
+
+/**
+ * Connect targets keyed by serviceId: catalog services with a concrete HTTP
+ * endpoint (built-ins keep their bundled endpoint unless the user configured
+ * that id) and every user-declared server, HTTP or stdio.
+ */
+function buildMcpPickerTargets(
+	services: readonly McpServiceDescriptor[],
+	userServers: Record<string, McpServerConfig>,
+): Map<string, McpPickerTarget> {
+	const targets = new Map<string, McpPickerTarget>();
+	for (const service of services) {
+		if (
+			service.transport.type === "http" &&
+			service.transport.url &&
+			(service.legacyBuiltin || !userServers[service.serviceId])
+		) {
+			targets.set(service.serviceId, {
+				url: service.transport.url,
+				usesOAuth: service.authStrategy === "oauth" || service.authStrategy === "unknown",
+				managedBySettings: false,
+			});
+		}
+	}
+	for (const [name, config] of Object.entries(userServers)) {
+		if (services.some((entry) => entry.serviceId === name && entry.legacyBuiltin)) continue;
+		if (config.type === "http") {
+			targets.set(name, {
+				url: config.url,
+				usesOAuth: config.oauth === true,
+				...(config.bearerTokenEnvVar ? { bearerTokenEnvVar: config.bearerTokenEnvVar } : {}),
+				managedBySettings: true,
+			});
+		} else if (config.type === "stdio") {
+			targets.set(name, {
+				usesOAuth: false,
+				managedBySettings: true,
+				transport: "stdio",
+				name,
+			});
+		}
+	}
+	return targets;
+}
+
 interface OnboardingSplashHandle {
-	showProgress(message: string): void;
 	dismiss(): void;
 }
 
@@ -540,6 +691,16 @@ const THINKING_LEVEL_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 	high: "Deep reasoning",
 	xhigh: "Very deep reasoning",
 	max: "Maximum reasoning",
+};
+
+const SERVICE_TIER_CHOICES = ["default", "flex", "priority", "auto"] as const satisfies ServiceTier[];
+type ServiceTierChoice = (typeof SERVICE_TIER_CHOICES)[number];
+
+const SERVICE_TIER_DESCRIPTIONS: Record<ServiceTierChoice, string> = {
+	default: "Standard processing",
+	flex: "Cheaper, slower, may hit capacity limits",
+	priority: "Faster, more expensive (fast mode)",
+	auto: "Provider picks the tier",
 };
 
 const HEARTBEAT_ARGUMENT_COMPLETIONS: AutocompleteItem[] = [
@@ -581,6 +742,36 @@ const INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT = 400;
 // Coalesce at most this many heartbeats_changed refreshes into one refresh
 // promise; sustained churn must not hold rebindCurrentSession in a drain loop.
 const HEARTBEAT_REFRESH_DRAIN_LIMIT = 25;
+// A busy daemon can serialize a catalog fetch behind session work or worker
+// recovery for minutes; the TUI waits at most this long before keeping the
+// last catalog and letting the next heartbeats_changed event retry.
+export const HEARTBEAT_REFRESH_FETCH_TIMEOUT_MS = 10_000;
+// After a deadline expiry, retry the open manager's refresh on this short
+// cadence so the view always has a next scheduled retrieval even when no
+// heartbeats_changed event arrives and the catalog has no nextRunAt to
+// schedule from.
+export const HEARTBEAT_REFRESH_RETRY_DELAY_MS = 5_000;
+
+/** Race a catalog fetch against the refresh deadline; resolves undefined on expiry. */
+async function fetchHeartbeatsWithinDeadline(
+	fetch: Promise<AgentConnectionHeartbeat[]>,
+): Promise<AgentConnectionHeartbeat[] | undefined> {
+	// The deadline can settle first; a late failure must not surface as an
+	// unhandled rejection after this refresh has moved on.
+	void fetch.catch(() => undefined);
+	let timeout: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			fetch,
+			new Promise<undefined>((resolve) => {
+				timeout = setTimeout(() => resolve(undefined), HEARTBEAT_REFRESH_FETCH_TIMEOUT_MS);
+				timeout.unref?.();
+			}),
+		]);
+	} finally {
+		clearTimeout(timeout);
+	}
+}
 
 function initialRenderMessages(messages: AgentMessage[]): AgentMessage[] {
 	if (messages.length <= INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT) {
@@ -730,6 +921,78 @@ function getPayloadWorkingIndicatorOptions(
 		...(frames === undefined ? {} : { frames }),
 		...(intervalMs === undefined ? {} : { intervalMs }),
 	};
+}
+
+export interface DaemonReconnectBanner {
+	message: string;
+	tone: "dim" | "warning";
+}
+
+/**
+ * One-line banner for a recovered daemon connection. When the restarted daemon
+ * is NEWER than this window's binary, say so instead of pretending the window
+ * is updated; the user restarts the window to pick up the new version. An
+ * older or unorderable daemon version is reported without the advice (restarting
+ * this window would pick up nothing).
+ */
+export function formatDaemonReconnectBanner(
+	daemonVersion: string | undefined,
+	clientVersion: string,
+): DaemonReconnectBanner {
+	if (!daemonVersion) {
+		return { message: "Daemon reconnected", tone: "dim" };
+	}
+	if (daemonVersion === clientVersion) {
+		return { message: `Daemon restarted (v${daemonVersion}) - reconnected`, tone: "dim" };
+	}
+	if (isDaemonVersionNewer(daemonVersion, clientVersion)) {
+		return {
+			message: `Daemon restarted (v${daemonVersion}), this window still runs v${clientVersion} - restart the window to pick up the update.`,
+			tone: "warning",
+		};
+	}
+	return { message: `Daemon restarted (v${daemonVersion}), this window runs v${clientVersion}.`, tone: "dim" };
+}
+
+/**
+ * Numeric version-prefix comparison ("0.9.5-beta.7" orders by 0.9.5); unparseable segments
+ * end the comparison. A numeric-equal release outranks the same version's prereleases.
+ */
+function isDaemonVersionNewer(daemonVersion: string, clientVersion: string): boolean {
+	const daemon = parseNumericVersionPrefix(daemonVersion);
+	const client = parseNumericVersionPrefix(clientVersion);
+	for (let index = 0; index < Math.max(daemon.length, client.length); index++) {
+		const difference = (daemon[index] ?? 0) - (client[index] ?? 0);
+		if (difference !== 0) {
+			return difference > 0;
+		}
+	}
+	// Semver orders a release ahead of its own prereleases ("1.2.3" > "1.2.3-beta.1"),
+	// so a numeric-equal daemon without a prerelease suffix outranks a client with one.
+	return !hasPrereleaseSuffix(daemonVersion) && hasPrereleaseSuffix(clientVersion);
+}
+
+/** The dot- and dash-separated segments of a version: "1.2.3-beta.1" -> ["1", "2", "3", "beta", "1"]. */
+function splitVersionSegments(value: string): string[] {
+	return value.split(/[.-]/);
+}
+
+/** The leading numeric segments of a version string; the first unparseable segment ends the prefix. */
+function parseNumericVersionPrefix(value: string): number[] {
+	const segments: number[] = [];
+	for (const segment of splitVersionSegments(value)) {
+		const parsed = Number(segment);
+		if (!Number.isFinite(parsed)) break;
+		segments.push(parsed);
+	}
+	return segments;
+}
+
+/** Whether a version string continues past its numeric prefix with a prerelease suffix. */
+function hasPrereleaseSuffix(version: string): boolean {
+	const segments = splitVersionSegments(version);
+	const prefixLength = parseNumericVersionPrefix(version).length;
+	return prefixLength > 0 && prefixLength < segments.length;
 }
 
 export function updateArgsIncludeSelf(args: readonly string[]): boolean {
@@ -907,6 +1170,44 @@ export function formatAgentDepthLabel(depth: number | undefined, hasChildren: bo
 	return `depth ${depth}`;
 }
 
+/**
+ * Map a fixed verification category to user-readable wording. The persisted
+ * record keeps only the category; this layer adds the friendly explanation.
+ */
+const MCP_VERIFICATION_ISSUES: Record<string, string> = {
+	"http-unauthorized": "the endpoint rejected the stored credentials (reconnect)",
+	"verification-timeout": "the endpoint did not respond in time",
+	"network-unreachable": "the endpoint could not be reached",
+	"server-rejected-handshake": "the server rejected the MCP handshake",
+	"http-error": "the endpoint returned an HTTP error",
+	"invalid-response": "the endpoint returned an invalid MCP response",
+	"verification-failed": "the handshake could not be completed",
+	"credential-changed": "the stored credentials changed during verification",
+};
+
+function formatMcpVerificationIssue(category: string | undefined): string {
+	return MCP_VERIFICATION_ISSUES[category ?? ""] ?? "the endpoint did not complete an MCP handshake";
+}
+
+/**
+ * Which removal outcomes earn a durable "Disconnected" entry: only the three
+ * that actually removed the stored credential. "logged-out" (partial save
+ * failure), "failed", "missing", and the state-neutral "refused" keep their
+ * honest transient lines — an entry would claim the disconnect is done.
+ */
+function mcpDisconnectionState(result: McpRemoveAccountResult): McpDisconnectionState | undefined {
+	switch (result) {
+		case "removed":
+			return "removed";
+		case "credential-only":
+			return "credential-only";
+		case "preserved":
+			return "preserved";
+		default:
+			return undefined;
+	}
+}
+
 export class InteractiveMode {
 	private static readonly EXIT_HINT_DURATION_MS = 2000;
 	private static readonly ESCAPE_REPEAT_WINDOW_MS = 500;
@@ -938,6 +1239,10 @@ export class InteractiveMode {
 	// wraps the active footer so custom-footer swaps reflect in both layouts
 	private footerSlot: Container;
 	private fullscreenEnabled = false;
+	// /speed state: display flag plus per-session output tok/sec tracking (see recordSpeedSample).
+	private speedDisplayEnabled = false;
+	// Accumulated output-token/duration totals; allocated on the first recorded sample.
+	private speedStats: { tokens: number; durationMs: number; samples: number } | undefined;
 	private editorContainer: Container;
 	private footer: FooterComponent;
 	private footerDataProvider: FooterDataProvider;
@@ -1015,7 +1320,7 @@ export class InteractiveMode {
 	// renders await it so they never interleave with a half-built transcript.
 	private initialRenderPromise: Promise<void> | undefined = undefined;
 	private sessionEventGeneration = 0;
-	private fastModeToggleQueue: Promise<void> = Promise.resolve();
+	private serviceTierChangeQueue: Promise<void> = Promise.resolve();
 
 	private pendingTools = new Map<string, ToolExecutionComponent>();
 	private ipythonToolComponents = new Map<string, ToolExecutionComponent>();
@@ -1032,10 +1337,10 @@ export class InteractiveMode {
 	private rlmNodeId: string | undefined;
 	private rosterBar: { summaries(): SessionSummary[]; dispose(): Promise<void> } | undefined;
 
-	private toolOutputExpanded = false;
-	private editDiffsExpanded = false;
+	private toolOutputExpanded!: boolean;
+	private editDiffsExpanded!: boolean;
 
-	private hideThinkingBlock = true;
+	private hideThinkingBlock!: boolean;
 	private readonly mermaidMarkdownTransform = createMermaidMarkdownTransform({
 		getMode: () => this.settingsManager.getMermaidRenderingMode(),
 		theme,
@@ -1049,6 +1354,8 @@ export class InteractiveMode {
 	private connectionModelsRefreshVersion = 0;
 	private connectionModelsRefreshInFlight: { version: number; promise: Promise<AgentConnectionModel[]> } | undefined;
 	private closeConfigurationMenu: (() => void) | undefined;
+	private inlineAuthPanelClosers: ((reason?: "reset") => void)[] = [];
+	private closeServiceCatalogPicker: (() => void) | undefined;
 	private configurationModelSelection: Promise<void> | undefined;
 	private connectionState: AgentConnectionState | undefined;
 	private connectionResourceSnapshot: AgentConnectionResourceSnapshot | undefined;
@@ -1059,6 +1366,15 @@ export class InteractiveMode {
 	private heartbeatManagerHandle: OverlayHandle | undefined;
 	private heartbeatManagerRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 	private heartbeatManagerRefreshAt: number | undefined;
+	private heartbeatManagerFetchRetryTimer: ReturnType<typeof setTimeout> | undefined;
+	// Last catalog fetch failure surfaced in the open manager view; cleared by
+	// the next successful apply and on manager open.
+	private heartbeatCatalogFetchError: string | undefined;
+	// Monotonic issue-order sequence for catalog writes (fetches and heartbeat
+	// management actions). A fetch write sequenced behind an already-applied
+	// newer one is dropped, so a late/older snapshot cannot revert newer state.
+	private heartbeatCatalogSeq = 0;
+	private heartbeatCatalogAppliedSeq = 0;
 
 	// Registry of images pasted this session, keyed by the `[image #N]` marker
 	// shown to the user. Insertion-ordered; the bytes persist (bounded by
@@ -1069,6 +1385,21 @@ export class InteractiveMode {
 	private nextImageMarkerId = 1;
 
 	private unsubscribe?: () => void;
+	private mcpConnectionStore?: McpConnectionStore;
+	/**
+	 * MCP changes made while streaming/compacting; activated at the next safe boundary.
+	 * Connection outcomes carry structured details so the boundary renders the
+	 * durable outcome message instead of a transient status line.
+	 */
+	private pendingPostRunActivation:
+		| { message: string; successMessage: string; connectionOutcome?: McpOutcomeDetails }
+		| undefined;
+	/**
+	 * Durable outcome for an MCP logout the generic /logout route just made:
+	 * the host owns the store op, the route reports, and the selector records
+	 * the entry after the single reload.
+	 */
+	private pendingMcpDisconnectionOutcome: McpDisconnectionOutcomeDetails | undefined;
 	private signalCleanupHandlers: Array<() => void> = [];
 
 	private autoCompactionLoader: Loader | undefined = undefined;
@@ -1104,8 +1435,26 @@ export class InteractiveMode {
 	private customFooter: (Component & { dispose?(): void }) | undefined = undefined;
 
 	private headerContainer: Container;
+	/** Pinned fullscreen top bar identifying the chat by name while scrolling. */
+	private topBar: TopBar;
+	/** Cached session spend (USD) for the top bar, keyed to the session it was fetched for. */
+	private topBarCost: { sessionId?: string; total?: number } = {};
+	/** Stale-discard state for top bar cost refreshes (mirrors contextUsageRefresh). */
+	private topBarCostRefresh = { generation: 0, lastSuccessGeneration: 0, lastRefreshAt: 0 };
 
 	private builtInHeader: Component | undefined = undefined;
+
+	/** True while the inline onboarding block owns the top rows (header stays hidden). */
+	private onboardingUiActive = false;
+
+	/** The mounted onboarding block, so flow panels can render inside it. */
+	private onboardingSplash: PrimeOnboardingSplashComponent | undefined = undefined;
+
+	/** Tears the block down and settles the pending flow, e.g. on a session reset. */
+	private onboardingAbort: (() => void) | undefined = undefined;
+
+	/** Aborted when onboarding is torn down so in-flight steps stop waiting. */
+	private onboardingFlowAbort: AbortController | undefined = undefined;
 
 	private customHeader: (Component & { dispose?(): void }) | undefined = undefined;
 
@@ -1128,6 +1477,7 @@ export class InteractiveMode {
 			throw new Error("InteractiveMode requires uiServices when no localSessionHost is supplied");
 		}
 		this.uiServices = uiServices;
+		this.assignChatDetail(this.settingsManager.getChatDetail());
 		this.agentConnection = options.agentConnection;
 		this.promptStashStore = options.promptStashStore;
 		this.promptStashSessionId = options.promptStashSessionId;
@@ -1152,6 +1502,14 @@ export class InteractiveMode {
 			void this.copyFullscreenSelection(text);
 		};
 		this.headerContainer = new Container();
+		this.topBar = new TopBar({
+			getChatName: () => this.getCurrentSessionName() ?? path.basename(this.getCurrentCwd()),
+			// Hide the cached spend unless it was fetched for the session now bound:
+			// a pending or failed refresh must not attribute the previous
+			// session's spend to the new chat.
+			getCostUsd: () =>
+				this.topBarCost.sessionId === this.connectionState?.sessionId ? this.topBarCost.total : undefined,
+		});
 		this.chatContainer = new Container();
 		this.shortcutGuideContainer = new Container();
 		this.pendingMessagesContainer = new Container();
@@ -1349,6 +1707,12 @@ export class InteractiveMode {
 			}
 		}
 
+		const tierCommand = slashCommands.find((command) => command.name === "tier");
+		if (tierCommand) {
+			tierCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null =>
+				this.getServiceTierCompletions(prefix);
+		}
+
 		const heartbeatCommand = slashCommands.find((command) => command.name === "heartbeat");
 		if (heartbeatCommand) {
 			heartbeatCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null =>
@@ -1459,6 +1823,7 @@ export class InteractiveMode {
 			this.builtInHeader = new BrandSplashHeader(this.version, () => this.getCurrentCwd(), verboseInstructions, {
 				topPadding: true,
 				getModelId: () => this.getCurrentModelId(),
+				getHidden: () => this.onboardingUiActive,
 			});
 			this.headerContainer.addChild(this.builtInHeader);
 			this.headerContainer.addChild(new Spacer(1));
@@ -1519,6 +1884,51 @@ export class InteractiveMode {
 		await this.updateAvailableProviderCount();
 	}
 
+	/** Leading-edge throttled refresh for status-driven call sites; direct refreshes stamp the window too. */
+	private refreshTopBarCostThrottled(): void {
+		const refresh = this.topBarCostRefresh ?? { lastRefreshAt: 0 };
+		if (Date.now() - refresh.lastRefreshAt < TOP_BAR_COST_REFRESH_MIN_INTERVAL_MS) return;
+		this.refreshTopBarCost();
+	}
+
+	/**
+	 * Refresh the top bar's cached session spend from the context tree.
+	 * Results for a replaced session, or superseded by a newer successful
+	 * refresh, are discarded — mirroring refreshConnectionContextUsage.
+	 */
+	private refreshTopBarCost(): void {
+		// Partial-mode test harnesses skip the constructor, so the field
+		// initializer may be absent there; the refresh is cosmetic and must
+		// never crash a real flow on any `this`.
+		this.topBarCostRefresh ??= { generation: 0, lastSuccessGeneration: 0, lastRefreshAt: 0 };
+		const refresh = this.topBarCostRefresh;
+		refresh.lastRefreshAt = Date.now();
+		const generation = ++refresh.generation;
+		const connection = this.agentConnection;
+		const sessionId = this.connectionState?.sessionId;
+		void (async () => {
+			try {
+				const tree = await connection.getContextTree();
+				const total = tree?.totalUsage?.cost?.total;
+				if (
+					typeof total !== "number" ||
+					!Number.isFinite(total) ||
+					generation < refresh.lastSuccessGeneration ||
+					this.agentConnection !== connection ||
+					this.connectionState?.sessionId !== sessionId
+				) {
+					return;
+				}
+				refresh.lastSuccessGeneration = generation;
+				this.topBarCost = { sessionId, total };
+				this.ui.requestRender();
+			} catch {
+				// Cost is cosmetic; a failed fetch keeps the previous value
+				// (the session-keyed getter still hides cross-session leaks).
+			}
+		})();
+	}
+
 	private updateTerminalTitle(): void {
 		const cwdBasename = path.basename(this.getCurrentCwd());
 		const sessionName = this.getCurrentSessionName();
@@ -1540,7 +1950,9 @@ export class InteractiveMode {
 		// `returnToAgentsView`, which is also set for direct daemon attaches that never
 		// rendered the agents view and still want the in-session fallback.)
 		const ownsGlobalStartupNotices = !this.options.agentsViewOwnsStartupNotices;
-		const newVersionPromise = ownsGlobalStartupNotices ? checkForNewPiVersion(this.version) : undefined;
+		const newVersionPromise = ownsGlobalStartupNotices
+			? checkForNewPiVersion(this.version, this.settingsManager.getUpdateChannel())
+			: undefined;
 		const packageUpdatesPromise = ownsGlobalStartupNotices
 			? checkForPackageUpdates({
 					cwd: this.getCurrentCwd(),
@@ -1765,10 +2177,6 @@ export class InteractiveMode {
 		return shouldRunOnboarding(this.getOnboardingState());
 	}
 
-	private shouldRunPrimeCliOnboardingSplash(): boolean {
-		return shouldRunPrimeCliOnboardingSplash(this.getOnboardingState());
-	}
-
 	private markOnboardingShown(): void {
 		if (!this.settingsManager.getOnboardingShown()) {
 			this.settingsManager.setOnboardingShown(true);
@@ -1781,15 +2189,16 @@ export class InteractiveMode {
 		}
 
 		const startedAt = Date.now();
-		const showPrimeCliSplash = this.shouldRunPrimeCliOnboardingSplash();
 		let outcome: TelemetryOnboardingOutcome = "aborted";
 		try {
-			await this.runOnboardingFlow(showPrimeCliSplash);
-			outcome = isOnboardingModelReady(this.getOnboardingState()) ? "success" : "aborted";
+			// The flow reports completion itself: a user who already had a working
+			// model would otherwise look "ready" straight after cancelling it, and
+			// the questions they never saw would be skipped for good.
+			const completed = await this.runOnboardingFlow();
+			outcome = completed && isOnboardingModelReady(this.getOnboardingState()) ? "success" : "aborted";
 			if (outcome === "success") {
-				// Only a completed onboarding counts as seen: an escaped splash or a
-				// failed login leaves the flag unset so the next launch retries, and
-				// shouldRunOnboarding already skips users who configured a model.
+				// Only a completed onboarding counts as seen: a cancelled sign-in
+				// leaves the flag unset so the next launch retries the flow.
 				this.markOnboardingShown();
 				await this.settingsManager.flush();
 			}
@@ -1813,44 +2222,171 @@ export class InteractiveMode {
 		}
 	}
 
-	private async showOnboardingModelSelection(splash: OnboardingSplashHandle): Promise<void> {
-		splash.dismiss();
-		await this.showConfigurationMenu("models");
-	}
-
-	private async runOnboardingFlow(showPrimeCliSplash = this.shouldRunPrimeCliOnboardingSplash()): Promise<void> {
+	/** Runs the first-launch sequence. Resolves true only when every step ran. */
+	private async runOnboardingFlow(): Promise<boolean> {
 		this.modelRegistry.refresh();
-		if (showPrimeCliSplash) {
-			const splash = await this.showOnboardingSplash("choose a model");
-			if (!splash) {
-				return;
+
+		// Existing users (working model with configured auth) skip login and
+		// the provider picker entirely. They see only the trace question, or
+		// nothing at all when traces are already enabled.
+		if (isOnboardingModelReady(this.getOnboardingState())) {
+			if (this.settingsManager.getAgentTracesEnabled()) {
+				return true;
 			}
-
-			await this.showOnboardingModelSelection(splash);
-			return;
+			const abort = new AbortController();
+			this.onboardingFlowAbort = abort;
+			const splash = await this.showOnboardingSplash({ immediate: true });
+			if (!splash) {
+				return false;
+			}
+			await this.askOnboardingTraceOptIn();
+			if (abort.signal.aborted) {
+				return false;
+			}
+			splash.dismiss();
+			return true;
 		}
 
-		const availableModels = await this.getModelCandidates();
-		if (availableModels.length > 0) {
-			await this.showConfigurationMenu("models");
-			return;
-		}
-
+		const abort = new AbortController();
+		this.onboardingFlowAbort = abort;
 		const splash = await this.showOnboardingSplash();
 		if (!splash) {
-			return;
+			return false;
 		}
 
-		splash.showProgress("Signing in to Prime Intellect...");
+		// One sequence for every first launch. Signing in is instant when a Prime
+		// CLI token is already on disk, so users who arrive with credentials still
+		// reach the same account, provider and trace questions.
 		const authResult = await this.createAuthFlows().runPrimeInferenceLogin();
-		if (authResult.status !== "success") {
+		if (abort.signal.aborted || authResult.status !== "success") {
 			splash.dismiss();
-			return;
+			return false;
 		}
 
-		splash.showProgress("Preparing models...");
-		await this.prepareForModelSelectionAfterLogin(authResult);
-		await this.showOnboardingModelSelection(splash);
+		await this.prepareForModelSelectionAfterLogin(authResult, abort.signal);
+		if (abort.signal.aborted) {
+			return false;
+		}
+		await this.askOnboardingProviders(abort.signal);
+		if (abort.signal.aborted) {
+			return false;
+		}
+		await this.askOnboardingTraceOptIn();
+		if (abort.signal.aborted) {
+			return false;
+		}
+		splash.dismiss();
+		return true;
+	}
+
+	/**
+	 * Optional step: connect more providers before the first chat. The picker
+	 * stays mounted between logins so several can be connected in one pass.
+	 */
+	private async askOnboardingProviders(signal: AbortSignal): Promise<void> {
+		if (!this.onboardingSplash) {
+			return;
+		}
+		const authFlows = this.createAuthFlows();
+		for (;;) {
+			// A reset that cancels a provider login must end the question too,
+			// otherwise the next picker opens in the editor and waits for input.
+			// The signal is passed in: tearing the block down clears the field.
+			if (signal.aborted) {
+				return;
+			}
+			// One row per provider: a provider offering both a subscription and an
+			// API key would otherwise appear twice under the same name.
+			const options = [
+				...new Map(
+					authFlows
+						.getLoginProviderOptions()
+						.filter((option) => option.id !== PRIME_INFERENCE_PROVIDER_ID && option.category !== "service")
+						.map((option) => [option.id, option]),
+				).values(),
+			];
+			if (options.length === 0) {
+				return;
+			}
+			const items = options.map((option) => ({
+				id: option.id,
+				label: option.name,
+				...(this.modelRegistry.getProviderAuthStatus(option.id).configured ? { connected: true } : {}),
+			}));
+			const picked = await new Promise<string | undefined>((resolve) => {
+				let settled = false;
+				let close: (() => void) | undefined;
+				const settle = (id: string | undefined) => {
+					if (settled) {
+						return;
+					}
+					settled = true;
+					close?.();
+					resolve(id);
+				};
+				const picker = new OnboardingPickerComponent(
+					items,
+					(id) => settle(id),
+					() => settle(undefined),
+					() => settle(undefined),
+					{
+						prompt: "Connect other providers, or continue.",
+						searchPlaceholder: "Search providers",
+						note: "You can add providers anytime with /login.",
+						onExit: () => void this.shutdown(),
+						requestRender: () => this.ui.requestRender(),
+					},
+				);
+				close = this.showInlineAuthPanel(picker, { onReset: () => settle(undefined) });
+				this.ui.requestRender();
+			});
+			if (!picked) {
+				return;
+			}
+			const option = options.find((candidate) => candidate.id === picked);
+			if (option) {
+				await authFlows.loginProvider(option);
+			}
+		}
+	}
+
+	/** Final onboarding question: trace collection, with a reminder it is reversible. */
+	private askOnboardingTraceOptIn(): Promise<void> {
+		const splash = this.onboardingSplash;
+		if (!splash) {
+			return Promise.resolve();
+		}
+		return new Promise<void>((resolve) => {
+			let closed = false;
+			let close: (() => void) | undefined;
+			const finish = (enabled?: boolean) => {
+				if (closed) {
+					return;
+				}
+				closed = true;
+				if (enabled !== undefined) {
+					this.settingsManager.setAgentTracesEnabled(enabled);
+					void this.settingsManager.flush();
+				}
+				close?.();
+				resolve();
+			};
+			const choice = new OnboardingChoiceComponent(
+				[{ label: "Share" }, { label: "Not now" }],
+				(index) => finish(index === 0),
+				() => finish(undefined),
+				{
+					onExit: () => void this.shutdown(),
+					prompt: "Share agent traces with Prime Intellect?",
+					description:
+						"Trace sharing helps us train better open-source models and improve the open agent ecosystem for everyone.",
+					note: "You can change this anytime with /traces.",
+					requestRender: () => this.ui.requestRender(),
+				},
+			);
+			close = this.showInlineAuthPanel(choice, { onReset: () => finish(undefined) });
+			this.ui.requestRender();
+		});
 	}
 
 	private getMarkdownThemeWithSettings(): MarkdownTheme {
@@ -2599,9 +3135,22 @@ export class InteractiveMode {
 			// starve an awaiting rebind (and its transcript render) indefinitely.
 			for (let drain = 0; drain <= HEARTBEAT_REFRESH_DRAIN_LIMIT; drain++) {
 				this.heartbeatRefreshRequested = false;
-				const heartbeats = await connection.listHeartbeats();
+				const fetchSeq = ++this.heartbeatCatalogSeq;
+				const fetch = connection.listHeartbeats();
+				const heartbeats = await fetchHeartbeatsWithinDeadline(fetch);
 				if (this.isShuttingDown || this.isReturningToAgentsView || this.agentConnection !== connection) return;
-				this.applyHeartbeatCatalog(heartbeats);
+				if (heartbeats === undefined) {
+					// The fetch deadline expired: keep the last catalog, retain the
+					// in-flight result so the open view still converges when the
+					// late answer lands, and arm a bounded retry so the open view
+					// always has a next scheduled retrieval even if it never does.
+					// A change event that arrived mid-fetch still re-triggers a
+					// refresh through the follow-up scheduling below.
+					this.retainHeartbeatCatalogFetch(fetch, connection, fetchSeq);
+					this.armHeartbeatManagerFetchRetry();
+					return;
+				}
+				this.applyHeartbeatCatalog(heartbeats, fetchSeq);
 				if (!this.heartbeatRefreshRequested) return;
 			}
 		})().finally(() => {
@@ -2619,8 +3168,15 @@ export class InteractiveMode {
 		return refresh;
 	}
 
-	private applyHeartbeatCatalog(heartbeats: AgentConnectionHeartbeat[]): void {
+	private applyHeartbeatCatalog(heartbeats: AgentConnectionHeartbeat[], seq?: number): void {
+		// A sequenced fetch write that lost the race to a newer catalog write
+		// (a later fetch or a management action) must not revert it.
+		if (seq !== undefined) {
+			if (seq < this.heartbeatCatalogAppliedSeq) return;
+			this.heartbeatCatalogAppliedSeq = seq;
+		}
 		this.heartbeatCatalog = heartbeats;
+		this.heartbeatCatalogFetchError = undefined;
 		this.scheduleHeartbeatManagerRefresh();
 		this.updateSubagentSummaryLine();
 		this.ui.requestRender();
@@ -2722,6 +3278,7 @@ export class InteractiveMode {
 			}
 			case "agent_end":
 				this.patchConnectionState({ isStreaming: false, activeToolNames: [] });
+				void this.maybeRunQueuedMcpActivation();
 				break;
 			case "session_action_update":
 				this.patchConnectionState({ sessionActions: event.actions });
@@ -2732,6 +3289,7 @@ export class InteractiveMode {
 				break;
 			case "compaction_end":
 				this.patchConnectionState({ isCompacting: false });
+				void this.maybeRunQueuedMcpActivation();
 				break;
 			case "session_info_changed":
 				this.patchConnectionState({ sessionName: event.name });
@@ -2853,6 +3411,10 @@ export class InteractiveMode {
 	private async rebindCurrentSession(): Promise<void> {
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
+		// Sessions are independent: a rebind (new/resume/switch) restarts tok/sec stats
+		// and clears the readout left over from the previous session.
+		this.speedStats = undefined;
+		this.footer?.setSpeedText?.(undefined);
 		void this.rosterBar?.dispose();
 		this.rosterBar = undefined;
 		if (this.localSessionHost) {
@@ -2892,6 +3454,7 @@ export class InteractiveMode {
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
 		this.updateTerminalTitle();
+		this.refreshTopBarCost();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
 		this.syncWorkingLoader();
@@ -3016,6 +3579,7 @@ export class InteractiveMode {
 			this.sideQuestionBashDiscarded = undefined;
 		}
 		this.updateTerminalTitle();
+		this.refreshTopBarCost();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
 		this.syncWorkingLoader();
@@ -3522,7 +4086,17 @@ export class InteractiveMode {
 	}
 
 	private resetExtensionUI(): void {
+		// Close inline auth panels before the configuration menu so a restored
+		// menu is still torn down by the closeConfigurationMenu call below.
+		// Innermost panels close first, ending at the pre-login content.
+		for (const close of this.inlineAuthPanelClosers.splice(0).reverse()) {
+			close("reset");
+		}
+		// A reset mid-onboarding leaves the block with no flow to host: tear it
+		// down too, so the overlay, its animation and the pending step all end.
+		this.onboardingAbort?.();
 		this.closeConfigurationMenu?.();
+		this.closeServiceCatalogPicker?.();
 		this.cancelActiveConnectionExtensionUiRequests();
 		this.closeHeartbeatManager();
 		if (this.extensionSelector) {
@@ -3546,6 +4120,7 @@ export class InteractiveMode {
 		this.setupAutocompleteProvider();
 		this.defaultEditor.onExtensionShortcut = undefined;
 		this.updateTerminalTitle();
+		this.refreshTopBarCost();
 		this.workingMessage = undefined;
 		this.workingVisible = true;
 		this.setWorkingIndicator();
@@ -4116,7 +4691,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.subagents.focus", () => this.focusSubagentSummary());
 		this.defaultEditor.onAction("app.heartbeats.open", () => {
-			void this.showHeartbeatManager();
+			this.showHeartbeatManager();
 		});
 		this.defaultEditor.onAction("app.editor.external", () => this.openExternalEditor());
 		this.defaultEditor.onAction("app.prompt.stash", () => this.handlePromptStash());
@@ -4344,8 +4919,15 @@ export class InteractiveMode {
 			this.ui.requestRender();
 
 			const model = this.getCurrentModel();
-			if (model && !model.input.includes("image")) {
-				this.showStatus("Current model does not support images; the attachment will be omitted.");
+			if (
+				model &&
+				!model.input.includes("image") &&
+				!this.settingsManager.getImageModel() &&
+				!this.settingsManager.getBlockImages()
+			) {
+				this.showStatus(
+					"Current model does not support images; set imageModel in settings.json or the turn will fail with setup guidance.",
+				);
 			}
 		} catch {
 			// Silently ignore clipboard errors (may not have permission, etc.)
@@ -4398,15 +4980,11 @@ export class InteractiveMode {
 	 * dequeue) brings it back. Marker presence in the sent text is the single
 	 * source of truth.
 	 *
-	 * Resolved against the current model: if it has no image input, attachments
-	 * are dropped here (matching the paste-time hint) rather than sent and
-	 * downgraded downstream.
+	 * Attachments always reach the session: a text-only session model is either
+	 * routed to settings.imageModel at dispatch or the turn fails there with an
+	 * actionable setup error, so nothing is silently downgraded downstream.
 	 */
 	private collectImagesFor(text: string): ImageContent[] | undefined {
-		const model = this.getCurrentModel();
-		if (model && !model.input.includes("image")) {
-			return undefined;
-		}
 		const images = collectMarkedImages(this.pastedImages, text);
 		return images.length > 0 ? images : undefined;
 	}
@@ -4679,6 +5257,11 @@ export class InteractiveMode {
 					}
 					return;
 				}
+				if (commandName === "tier") {
+					this.editor.setText("");
+					this.handleTierCommand(commandArgs);
+					return;
+				}
 				if (commandName === "export") {
 					await this.handleExportCommand(canonicalCommandText);
 					this.editor.setText("");
@@ -4861,6 +5444,11 @@ export class InteractiveMode {
 					await this.handleMcpCommand(commandArgs);
 					return;
 				}
+				if (commandName === "plugins") {
+					this.editor.setText("");
+					await this.handlePluginsCommand(commandArgs);
+					return;
+				}
 				if (slashCommand?.name === "clear") {
 					if (commandArgs) {
 						this.editor.setText(text);
@@ -4899,6 +5487,37 @@ export class InteractiveMode {
 					await this.handleReloadCommand();
 					return;
 				}
+				if (commandName === "nightly") {
+					this.editor.setText("");
+					const nightlyArg = commandArgs?.trim().toLowerCase();
+					if (nightlyArg === "status") {
+						const channel = resolveUpdateChannel(this.version, this.settingsManager.getUpdateChannel());
+						const source = this.settingsManager.getUpdateChannel()
+							? "set in settings"
+							: "inferred from the running version";
+						this.showStatus(`Updates follow the ${channel} channel (${source}). v${this.version} installed.`);
+						return;
+					}
+					if (nightlyArg === "off" || nightlyArg === "stable") {
+						this.settingsManager.setUpdateChannel("stable");
+						this.showStatus(
+							"Updates now follow the stable channel. Run /update to install the latest stable release.",
+						);
+						return;
+					}
+					if (nightlyArg && nightlyArg !== "on") {
+						this.showError("Usage: /nightly [on|off|status]");
+						return;
+					}
+					if (this.isAgentCompacting() || this.isAgentStreaming() || this.isBashRunning()) {
+						this.showWarning("Wait for the current work to finish before updating.");
+						return;
+					}
+					// The update command owns the nightly warning, the channel switch, and the
+					// busy-session confirmation, so declining either leaves settings untouched.
+					await this.handleUpdateCommand("--self --nightly");
+					return;
+				}
 				if (commandName === "update") {
 					this.editor.setText("");
 					const updateArgs = parseCommandArgs(commandArgs);
@@ -4921,6 +5540,17 @@ export class InteractiveMode {
 					}
 					const enable = arg === "on" ? true : arg === "off" ? false : !this.fullscreenEnabled;
 					this.setFullscreenMode(enable);
+					return;
+				}
+				if (commandName === "speed") {
+					this.editor.setText("");
+					const arg = commandArgs?.trim().toLowerCase();
+					if (arg && arg !== "on" && arg !== "off") {
+						this.showError("Usage: /speed [on|off]");
+						return;
+					}
+					const enable = arg === "on" ? true : arg === "off" ? false : !this.speedDisplayEnabled;
+					this.setSpeedDisplay(enable);
 					return;
 				}
 				if (commandName === "debug") {
@@ -5198,15 +5828,18 @@ export class InteractiveMode {
 					this.sessionRecap = event.recap;
 					this.patchConnectionState({ recap: event.recap });
 					this.renderRecap();
+					this.refreshTopBarCostThrottled();
 				} else if (event.type === "side_question_event") {
 					this.handleSideQuestionEvent(event.event);
 				} else if (event.type === "extension_ui_request") {
 					await this.handleConnectionExtensionUiRequest(event.request);
 				} else if (event.type === "connection_status") {
-					this.showStatus(
-						event.status === "connected" ? "Daemon reconnected" : "Daemon connection lost; reconnecting…",
-						event.status === "reconnecting" ? "warning" : "dim",
-					);
+					if (event.status === "connected") {
+						const banner = formatDaemonReconnectBanner(event.daemonVersion, VERSION);
+						this.showStatus(banner.message, banner.tone);
+					} else {
+						this.showStatus("Daemon connection lost; reconnecting…", "warning");
+					}
 					if (event.status === "connected") {
 						await this.refreshHeartbeatCatalog();
 					}
@@ -5444,6 +6077,7 @@ export class InteractiveMode {
 
 			case "session_info_changed":
 				this.updateTerminalTitle();
+				this.refreshTopBarCostThrottled();
 				this.footer.invalidate();
 				this.ui.requestRender();
 				break;
@@ -5624,6 +6258,7 @@ export class InteractiveMode {
 							component.setArgsComplete();
 						}
 					}
+					this.recordSpeedSample(event.message);
 					this.streamingComponent = undefined;
 					this.streamingMessage = undefined;
 					this.footer.invalidate();
@@ -5688,6 +6323,7 @@ export class InteractiveMode {
 					this.ui.terminal.setProgress(false);
 				}
 				this.turnStartedAt = undefined;
+				this.refreshTopBarCost();
 				// Drops the loader; background subagents are shown by the tree, not the loader.
 				this.syncWorkingLoader();
 				if (this.streamingComponent) {
@@ -6141,6 +6777,8 @@ export class InteractiveMode {
 
 	private getPromptContextLabel(maxWidth: number): string | undefined {
 		if (maxWidth < 1) return undefined;
+		// Onboarding owns the screen; chat chrome under it reads as clutter.
+		if (this.onboardingUiActive) return undefined;
 		return theme.fg(
 			"dim",
 			truncateToWidth(formatConversationDetailStatus(this.toolOutputExpanded, this.editDiffsExpanded), maxWidth, ""),
@@ -6156,8 +6794,11 @@ export class InteractiveMode {
 			const modelId = model.id.startsWith(providerPrefix) ? model.id.slice(providerPrefix.length) : model.id;
 			const effort = model.reasoning ? this.connectionState?.thinkingLevel : undefined;
 			parts.push(effort ? `${modelId}:${effort.toLowerCase()}` : modelId);
-			if (this.connectionState?.serviceTier === "priority") {
+			const serviceTier = this.connectionState?.serviceTier;
+			if (serviceTier === "priority") {
 				parts.push("fast");
+			} else if (serviceTier && serviceTier !== "default") {
+				parts.push(serviceTier);
 			}
 		}
 		const usage = this.getConnectionContextUsage();
@@ -6363,6 +7004,10 @@ export class InteractiveMode {
 		if (isCompactionOutcomeMessage(message)) return new CompactionOutcomeMessageComponent(message);
 		if (message.customType === COMPACTION_OUTCOME_CUSTOM_TYPE) {
 			return new MalformedCompactionOutcomeMessageComponent();
+		}
+		if (isMcpConnectionOutcomeMessage(message)) return new McpConnectionOutcomeMessageComponent(message);
+		if (message.customType === MCP_CONNECTION_OUTCOME_CUSTOM_TYPE) {
+			return new MalformedMcpConnectionOutcomeMessageComponent();
 		}
 		if (isRefinementOutcomeMessage(message)) return new RefinementOutcomeMessageComponent(message);
 		if (message.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE) {
@@ -6867,9 +7512,7 @@ export class InteractiveMode {
 			void this.agentConnection.abortBash();
 		}
 		if (this.isAgentStreaming()) {
-			// The queue is preserved server-side; draining resumes on the next
-			// submit or queued-message edit.
-			void this.agentConnection.abort().catch((error) => {
+			void this.agentConnection.abortAndSendQueued().catch((error) => {
 				this.showError(error instanceof Error ? error.message : String(error));
 			});
 		}
@@ -7383,6 +8026,7 @@ export class InteractiveMode {
 					this.widgetContainerBelow,
 				],
 				dock: this.promptDock,
+				pin: this.topBar,
 				mouse: this.settingsManager.getFullscreenMouse(),
 			});
 		} else {
@@ -7407,19 +8051,75 @@ export class InteractiveMode {
 		);
 	}
 
+	/** /speed on/off: toggles the footer tok/sec readout for this session. */
+	private setSpeedDisplay(enabled: boolean): void {
+		this.speedDisplayEnabled = enabled;
+		if (!enabled) {
+			this.resetSpeedStats();
+		}
+		this.footer.setSpeedEnabled(enabled);
+		this.showStatus(
+			enabled
+				? "Speed display on — footer shows output tok/s per model response and a session average"
+				: "Speed display off",
+		);
+		this.ui.requestRender();
+	}
+
+	/** Clears per-session tok/sec stats and the footer readout; keeps the display flag. */
+	private resetSpeedStats(): void {
+		this.speedStats = undefined;
+		this.footer.setSpeedText(undefined);
+	}
+
+	/**
+	 * Updates the footer tok/sec readout from a completed assistant message:
+	 * output tokens over the wall-clock span from the message timestamp (set at
+	 * provider stream start) to this message_end arrival. Timestamps keep the span
+	 * true even when buffered session events replay back-to-back on attach.
+	 * Aborted/failed responses and samples without a finite positive span or token
+	 * count are skipped: some providers only fill usage at stream end, and extension
+	 * message replacements may strip fields, so they never produce a bogus rate.
+	 */
+	private recordSpeedSample(message: AssistantMessage): void {
+		if (!this.speedDisplayEnabled || message.stopReason === "aborted" || message.stopReason === "error") {
+			return;
+		}
+		const durationMs = Date.now() - Number(message.timestamp);
+		const outputTokens = Number(message.usage?.output ?? 0);
+		if (!(durationMs > 0) || !(outputTokens > 0)) {
+			return;
+		}
+		this.speedStats ??= { tokens: 0, durationMs: 0, samples: 0 };
+		this.speedStats.tokens += outputTokens;
+		this.speedStats.durationMs += durationMs;
+		this.speedStats.samples++;
+		const formatRate = (tokensPerSecond: number): string =>
+			tokensPerSecond >= 100 ? tokensPerSecond.toFixed(0) : tokensPerSecond.toFixed(1);
+		const last = formatRate(outputTokens / (durationMs / 1000));
+		const average = formatRate(this.speedStats.tokens / (this.speedStats.durationMs / 1000));
+		this.footer.setSpeedText(this.speedStats.samples > 1 ? `${last} tok/s · avg ${average}` : `${last} tok/s`);
+	}
+
 	private toggleToolOutputExpansion(): void {
-		this.setChatDetail(this.toolOutputExpanded ? "overview" : this.editDiffsExpanded ? "all" : "details");
+		const detail = this.toolOutputExpanded ? "overview" : this.editDiffsExpanded ? "all" : "details";
+		this.settingsManager.setChatDetail(detail);
+		this.setChatDetail(detail);
 	}
 
 	private setToolsExpanded(expanded: boolean): void {
 		this.setChatDetail(expanded ? "all" : "overview");
 	}
 
-	/** Presentation only: never rewrite messages, settings, or the session trace. */
-	private setChatDetail(detail: "overview" | "details" | "all"): void {
+	private assignChatDetail(detail: ChatDetail): void {
 		this.toolOutputExpanded = detail === "all";
 		this.editDiffsExpanded = detail !== "overview";
 		this.hideThinkingBlock = detail === "overview";
+	}
+
+	/** Applies a detail level to the rendered chat; never rewrites messages or the session trace. */
+	private setChatDetail(detail: ChatDetail): void {
+		this.assignChatDetail(detail);
 		this.applyChatExpansion();
 	}
 
@@ -7554,9 +8254,18 @@ export class InteractiveMode {
 		// their own container below the execution indicator and recap.
 		this.queuedMessagesContainer.clear();
 		const { steering: steeringMessages, followUp: followUpMessages } = this.getAllQueuedMessages();
+		const active = this.connectionState?.sessionActions.active;
+		// A queued turn leaves its lane once the pump selects it; its own pre-turn compaction can hold it here for minutes.
+		const startingTurn = active?.kind === "turn" && active.phase === "preparing" ? active.label : undefined;
 		const hasQueuedMessages = steeringMessages.length > 0 || followUpMessages.length > 0;
-		if (hasQueuedMessages) {
+		if (hasQueuedMessages || startingTurn !== undefined) {
 			this.queuedMessagesContainer.addChild(new Spacer(1));
+			if (startingTurn !== undefined) {
+				const text = styleQueuedMessagePreview(startingTurn, "Starting", (name) =>
+					this.isRecognizedSlashCommand(name),
+				);
+				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
+			}
 			for (const message of steeringMessages) {
 				const text = styleQueuedMessagePreview(message, "Steering", (name) => this.isRecognizedSlashCommand(name));
 				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
@@ -7565,6 +8274,8 @@ export class InteractiveMode {
 				const text = styleQueuedMessagePreview(message, "Follow-up", (name) => this.isRecognizedSlashCommand(name));
 				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
 			}
+		}
+		if (hasQueuedMessages) {
 			const dequeueHint = this.getAppKeyDisplay("app.message.navigateOlder");
 			const hintText = theme.fg("dim", `╰─ ${dequeueHint} to browse and edit queued messages`);
 			this.queuedMessagesContainer.addChild(new TruncatedText(hintText, 1, 0));
@@ -7622,6 +8333,7 @@ export class InteractiveMode {
 					steeringMode: state.steeringMode,
 					followUpMode: state.followUpMode,
 					transport: this.settingsManager.getTransport(),
+					defaultServiceTier: this.settingsManager.getDefaultServiceTier() ?? "default",
 					thinkingLevel: state.thinkingLevel,
 					availableThinkingLevels: state.availableThinkingLevels,
 					currentTheme: this.settingsManager.getTheme() || "prime",
@@ -7681,6 +8393,13 @@ export class InteractiveMode {
 						void this.agentConnection.setFollowUpMode(mode).catch((error) => {
 							this.showError(error instanceof Error ? error.message : String(error));
 						});
+					},
+					onDefaultServiceTierChange: (serviceTier) => {
+						this.settingsManager.setDefaultServiceTier(serviceTier);
+						this.enqueueServiceTierChange(
+							() => serviceTier,
+							(applied) => `Default service tier: ${serviceTier} (session: ${applied ?? "default"})`,
+						);
 					},
 					onTransportChange: (transport) => {
 						void this.agentConnection.setTransport(transport).catch((error) => {
@@ -8084,25 +8803,83 @@ export class InteractiveMode {
 	}
 
 	private handleFastCommand(): void {
-		const unavailableMessage =
-			"Fast mode requires GPT-5.4, GPT-5.5, or GPT-5.6 with ChatGPT or OpenAI API key authentication";
+		const unavailableMessage = "Current model does not support fast mode (priority tier)";
 		if (!this.currentModelSupportsFastMode()) {
 			this.showStatus(unavailableMessage);
 			return;
 		}
+		this.enqueueServiceTierChange(
+			() => {
+				if (!this.currentModelSupportsFastMode()) {
+					this.showStatus(unavailableMessage);
+					return undefined;
+				}
+				return this.connectionState?.serviceTier === "priority" ? "default" : "priority";
+			},
+			(serviceTier) => `Fast mode: ${serviceTier === "priority" ? "on" : "off"}`,
+		);
+	}
+
+	private getAvailableServiceTiers(): ServiceTierChoice[] {
+		const model = this.getCurrentModel();
+		return SERVICE_TIER_CHOICES.filter(
+			(tier) => tier === "default" || (model !== undefined && supportsServiceTier(model, tier)),
+		);
+	}
+
+	private getServiceTierCompletions(prefix: string): AutocompleteItem[] | null {
+		const tiers = this.getAvailableServiceTiers();
+		const current = this.connectionState?.serviceTier ?? "default";
+		const term = prefix.trim().toLowerCase();
+		const matches = term ? tiers.filter((tier) => tier.startsWith(term)) : tiers;
+		if (matches.length === 0) return null;
+		return matches.map((tier) => ({
+			value: tier,
+			label: tier,
+			description:
+				tier === current ? `${SERVICE_TIER_DESCRIPTIONS[tier]} (current)` : SERVICE_TIER_DESCRIPTIONS[tier],
+		}));
+	}
+
+	private handleTierCommand(arg: string): void {
+		const tiers = this.getAvailableServiceTiers();
+		const requested = arg.trim().toLowerCase();
+		if (!requested) {
+			const current = this.connectionState?.serviceTier ?? "default";
+			this.showStatus(`Service tier: ${current} (available: ${tiers.join(", ")})`);
+			return;
+		}
+		if (!tiers.includes(requested as ServiceTierChoice)) {
+			this.showError(
+				`Service tier '${requested}' is not available for the current model. Available: ${tiers.join(", ")}`,
+			);
+			return;
+		}
+		this.enqueueServiceTierChange(
+			() => requested as ServiceTier,
+			(serviceTier) => `Service tier: ${serviceTier ?? "default"}`,
+		);
+	}
+
+	/**
+	 * Serializes tier changes (/fast, /tier, settings row) through one queue so
+	 * rapid commands apply in order against the same session.
+	 */
+	private enqueueServiceTierChange(
+		computeTier: () => ServiceTier | undefined,
+		formatStatus: (serviceTier: ServiceTier) => string,
+	): void {
 		const connection = this.agentConnection;
 		const sessionId = this.connectionState?.sessionId;
-		this.fastModeToggleQueue = this.fastModeToggleQueue
+		this.serviceTierChangeQueue = this.serviceTierChangeQueue
 			.then(async () => {
 				if (this.agentConnection !== connection || this.connectionState?.sessionId !== sessionId) {
 					return;
 				}
-				if (!this.currentModelSupportsFastMode()) {
-					this.showStatus(unavailableMessage);
+				const serviceTier = computeTier();
+				if (serviceTier === undefined) {
 					return;
 				}
-				const enabled = this.connectionState?.serviceTier === "priority";
-				const serviceTier: ServiceTier = enabled ? "default" : "priority";
 				await connection.setServiceTier(serviceTier);
 				if (this.agentConnection !== connection || this.connectionState?.sessionId !== sessionId) {
 					return;
@@ -8118,7 +8895,7 @@ export class InteractiveMode {
 				this.patchConnectionState({ serviceTier: state.serviceTier });
 				this.footer.invalidate();
 				this.subagentSummaryLine.invalidate();
-				this.showStatus(`Fast mode: ${state.serviceTier === "priority" ? "on" : "off"}`);
+				this.showStatus(formatStatus(state.serviceTier));
 			})
 			.catch((error) => {
 				this.showError(error instanceof Error ? error.message : String(error));
@@ -8215,6 +8992,7 @@ export class InteractiveMode {
 	private showConfigurationMenu(initialTab: ConfigurationMenuTab, initialModelSearch?: string): Promise<void> {
 		if (this.configurationModelSelection) return this.configurationModelSelection;
 		this.closeConfigurationMenu?.();
+		this.closeServiceCatalogPicker?.();
 		const modelCatalog = this.getCachedModelCandidates();
 		const authFlows = this.createAuthFlows();
 		const providerOptions = authFlows.getLoginProviderOptions();
@@ -8264,12 +9042,8 @@ export class InteractiveMode {
 
 						if (tab === "mcp-connections") {
 							if (!authResult.providerId.startsWith("mcp:")) return;
-							if (this.isAgentStreaming() || this.isAgentCompacting()) {
-								this.showStatus("Connected. Run /reload (after the current turn) to activate the integration.");
-								return;
-							}
+							// The guarded operation already verified and scheduled activation.
 							finish();
-							await this.handleReloadCommand();
 							return;
 						}
 
@@ -8280,7 +9054,6 @@ export class InteractiveMode {
 							this.getCachedModelCandidates(),
 							this.connectionConfiguredProviders,
 						);
-						menu.setActiveTab("models");
 						refreshModels(true);
 					})
 					.catch((error) => {
@@ -8705,7 +9478,7 @@ export class InteractiveMode {
 		}
 	}
 
-	private showOnboardingSplash(continueActionLabel?: string): Promise<OnboardingSplashHandle | undefined> {
+	private showOnboardingSplash(options?: { immediate?: boolean }): Promise<OnboardingSplashHandle | undefined> {
 		return new Promise((resolve) => {
 			let settled = false;
 			let dismissed = false;
@@ -8725,41 +9498,69 @@ export class InteractiveMode {
 				dismissed = true;
 				selector?.dispose();
 				handle?.hide();
+				this.onboardingSplash = undefined;
+				this.onboardingAbort = undefined;
+				this.onboardingFlowAbort = undefined;
+				this.onboardingUiActive = false;
+				this.builtInHeader?.invalidate();
 				this.ui.requestRender();
 			};
 			selector = new PrimeOnboardingSplashComponent(
 				() => {
-					selector?.dispose();
-					settle({
-						showProgress: (message) => selector?.showProgress(message),
-						dismiss,
-					});
-				},
-				() => {
-					dismiss();
-					settle(undefined);
+					// The field keeps animating behind the flow panels; only dismissal
+					// stops it.
+					settle({ dismiss });
 				},
 				{
 					getRows: () => this.ui.terminal.rows,
+					// Nothing else owns Ctrl+C yet, so the block exits the app itself.
+					onExit: () => void this.shutdown(),
 					requestRender: () => this.ui.requestRender(),
-					...(continueActionLabel ? { continueActionLabel } : {}),
+					immediate: options?.immediate,
 				},
 			);
+			// The block owns the pane while onboarding runs: the brand header hides
+			// so the two marks never stack, and flow panels mount inside the block.
+			this.onboardingAbort = () => {
+				// Cancel the running step first: after Enter the splash promise is
+				// already settled, so dismissing alone would leave the login waiting
+				// on an unmounted dialog and remount later panels in the prompt dock.
+				this.onboardingFlowAbort?.abort();
+				dismiss();
+				settle(undefined);
+			};
+			this.onboardingUiActive = true;
+			this.onboardingSplash = selector;
+			this.builtInHeader?.invalidate();
 			handle = this.ui.showOverlay(selector, {
 				width: "100%",
 				maxHeight: "100%",
 				row: 0,
 				col: 0,
 			});
+			// Immediate mode: settle without waiting for the user to press Enter
+			// on the login action. The flow panels mount directly under the brand
+			// mark with no welcome text or action row flash.
+			if (options?.immediate) {
+				settle({ dismiss });
+			}
 		});
 	}
 
 	private createAuthFlows(): ProviderAuthFlows {
+		const showAuthPanel = (component: Component, options?: { heading?: string; onReset?: () => void }) =>
+			this.showInlineAuthPanel(component, options);
 		return new ProviderAuthFlows({
 			ui: this.ui,
 			modelRegistry: this.modelRegistry,
 			showStatus: (message) => this.showStatus(message),
 			showError: (message) => this.showError(message),
+			showAuthPanel,
+			exitApp: () => void this.shutdown(),
+			getAuthPanelRows: () => Math.max(1, Math.min(20, this.ui.terminal.rows - 3)),
+			// Onboarding renders its own heading above the panel and asks its
+			// questions in the onboarding selection language.
+			isOnboardingSurface: () => this.onboardingUiActive,
 			getAvailableModels: () => this.getConnectionAvailableModels(),
 			onAuthChanged: async () => {
 				await this.refreshConnectionModelsAfterAuthChange();
@@ -8770,10 +9571,130 @@ export class InteractiveMode {
 			onLoginCompleted: () => {
 				void this.maybeWarnAboutAnthropicSubscriptionAuth();
 			},
+			onMcpAccountLogout: (providerId) => this.logoutMcpAccount(providerId),
+			onMcpAccountLogin: async (providerId) => {
+				const name = providerId.slice("mcp:".length);
+				const { resolved, result } = await this.connectMcpAccountByName(name);
+				if (!resolved) {
+					this.showStatus(`No endpoint configured for ${name}; add it with /mcp add or connect from /plugins.`);
+				}
+				return result;
+			},
 		});
 	}
 
-	private async prepareForModelSelectionAfterLogin(authResult: AuthenticationResult): Promise<boolean> {
+	/**
+	 * Mount a provider-auth panel inline in place of the prompt area, matching
+	 * the inline pickers. Returns a callback that unmounts the panel and
+	 * restores the previous content and focus. Closers are tracked in a stack
+	 * because in-flow selectors mount on top of the login dialog;
+	 * resetExtensionUI tears the whole stack down on session resets. Each
+	 * closer runs once, so a reset cannot stomp a picker opened afterwards.
+	 */
+	private showInlineAuthPanel(
+		component: Component,
+		options?: { heading?: string; onReset?: () => void },
+	): (reason?: "reset") => void {
+		// Onboarding owns the top of the screen: mount the panel inside its block
+		// rather than down in the prompt dock.
+		const splash = this.onboardingSplash;
+		if (splash) {
+			splash.setPanel(component, options?.heading);
+			this.ui.setFocus(component);
+			this.ui.requestRender();
+			let splashPanelClosed = false;
+			const closeSplashPanel = (reason?: "reset") => {
+				if (splashPanelClosed) return;
+				splashPanelClosed = true;
+				const index = this.inlineAuthPanelClosers.indexOf(closeSplashPanel);
+				if (index !== -1) {
+					this.inlineAuthPanelClosers.splice(index, 1);
+				}
+				// A reset unmounts the panel without its flow finishing: settle the
+				// step the caller is awaiting, or it waits on a dead panel forever.
+				if (reason === "reset") {
+					options?.onReset?.();
+					if (isAbortablePanel(component)) {
+						component.abort();
+					}
+				}
+				splash.setPanel(undefined);
+				// The splash ignores keys while a panel is mounted, so focus has to
+				// land on whichever panel the pop restored, not on the block itself.
+				this.ui.setFocus(splash.getActivePanel() ?? splash);
+				this.ui.requestRender();
+			};
+			this.inlineAuthPanelClosers.push(closeSplashPanel);
+			return closeSplashPanel;
+		}
+		const previousChildren = [...this.editorContainer.children];
+		const previousFocus = previousChildren.find((child) => isFocusable(child) && child.focused) ?? this.editor;
+		this.editorContainer.clear();
+		this.editorContainer.addChild(component);
+		this.ui.setFocus(component);
+		this.ui.requestRender();
+		let closed = false;
+		const close = (reason?: "reset") => {
+			if (closed) return;
+			closed = true;
+			if (reason === "reset") {
+				options?.onReset?.();
+				if (isAbortablePanel(component)) {
+					component.abort();
+				}
+			}
+			const index = this.inlineAuthPanelClosers.indexOf(close);
+			if (index !== -1) {
+				this.inlineAuthPanelClosers.splice(index, 1);
+			}
+			this.editorContainer.clear();
+			for (const child of previousChildren) {
+				this.editorContainer.addChild(child);
+			}
+			this.ui.setFocus(previousFocus);
+			this.ui.requestRender();
+		};
+		this.inlineAuthPanelClosers.push(close);
+		return close;
+	}
+
+	/**
+	 * The ENTIRE MCP account logout, owned by ONE connection-store critical
+	 * section (store->auth ordering): verified credential deletion AND
+	 * pending-attempt cancellation happen under the store's file lock BEFORE
+	 * the generic /logout route reports anything. The route delegates here
+	 * instead of calling authStorage.logout first — a plain logout could be
+	 * defeated by a concurrent finalize re-creating the credential after it.
+	 *
+	 * Id resolution is exact-first: a local service id may itself contain
+	 * "--", so a staged key maps back ONLY through its actually recorded
+	 * attempt nonce.
+	 */
+	private async logoutMcpAccount(providerId: string): Promise<McpRemoveAccountResult> {
+		// The shared exported one-op handler: same code the reviewer's route
+		// tests drive, no copied literals.
+		const store = this.getMcpConnectionStore();
+		const connectionId = providerId.startsWith("mcp:") ? providerId.slice("mcp:".length) : providerId;
+		// Read the display label BEFORE the op: a "removed" outcome deletes the
+		// record, so afterwards only the id survives.
+		const label = store.get(connectionId)?.label ?? connectionId;
+		const result = await logoutMcpAccount(providerId, store, this.modelRegistry.authStorage);
+		// The route reports next; the durable entry waits for the reload the
+		// selector already runs, so the logout stays ONE store op and ONE reload.
+		const removal = mcpDisconnectionState(result);
+		this.pendingMcpDisconnectionOutcome = removal ? { kind: "disconnect", label, removal, connectionId } : undefined;
+		return result;
+	}
+
+	private async prepareForModelSelectionAfterLogin(
+		authResult: AuthenticationResult,
+		abortSignal?: AbortSignal,
+	): Promise<boolean> {
+		// A reset rebinds the session; selection prepared for the old one must
+		// not be applied to the new one.
+		if (abortSignal?.aborted) {
+			return false;
+		}
 		const currentModel = this.getCurrentModel();
 		// The agent core uses unknown/unknown as its no-model sentinel.
 		const selectedModel =
@@ -8797,6 +9718,9 @@ export class InteractiveMode {
 		}
 
 		if (action.fallbackModel) {
+			if (abortSignal?.aborted) {
+				return false;
+			}
 			try {
 				await this.applySelectedModel(action.fallbackModel);
 				await this.settingsManager.flush();
@@ -8816,7 +9740,7 @@ export class InteractiveMode {
 		const argv = parseCommandArgs((args ?? "").trim());
 		const [sub, server] = argv;
 		if (!sub) {
-			await this.showConfigurationMenu("mcp-connections");
+			await this.showServiceCatalogPicker();
 			return;
 		}
 
@@ -8827,8 +9751,13 @@ export class InteractiveMode {
 				this.showError("Usage: /mcp login <name> (e.g. /mcp login linear)");
 				return;
 			}
-			const result = await this.createAuthFlows().runMcpLogin(server);
-			if (result.status === "success") await this.reloadAfterMcpChange(`Connected ${server}.`);
+			// /mcp login routes through the ONE guarded connect operation (claim
+			// -> staged OAuth -> guarded finalize): the raw dialog that wrote the
+			// final credential directly is gone.
+			const { resolved } = await this.connectMcpAccountByName(server);
+			if (!resolved) {
+				this.showError(`No endpoint configured for ${server}; add it with /mcp add or connect from /plugins.`);
+			}
 			return;
 		}
 
@@ -8841,13 +9770,59 @@ export class InteractiveMode {
 				this.showStatus(`${server} is not connected.`);
 				return;
 			}
-			authStorage.logout(`mcp:${server}`);
+			// Read the display label BEFORE the op: a removed record leaves only
+			// the id the user typed.
+			const logoutLabel = this.getMcpConnectionStore().get(server)?.label ?? server;
+			// Credential AND record removal in one store-locked step (the same
+			// lock ordering finalize uses): no orphan credential can survive.
+			const loggedOut = await this.getMcpConnectionStore().removeAccount({
+				connectionId: server,
+				authCleanup: (connectionId) => {
+					// Disk-authoritative logout: remove() swallows persistence
+					// errors, so a failed auth-file write could report the logout
+					// done while the credential survives. removeVerified throws
+					// instead (the honest "failed" path) and returns whether a
+					// credential was actually removed from disk.
+					return authStorage.removeVerified(mcpCredentialKey(connectionId));
+				},
+			});
+			// Honest outcomes: removed/credential-only changed durable state,
+			// missing is a no-op, logged-out keeps the durable logout but says
+			// the record save failed, and failed is state-neutral (the cleanup
+			// may or may not have run — it never claims a specific state).
+			if (loggedOut === "failed") {
+				this.showWarning(`The change could not be saved; try logging out ${server} again.`);
+				return;
+			}
+			if (loggedOut === "logged-out") {
+				this.showWarning(
+					`Logged out ${server}, but the change could not be saved. It may still appear in the list; try again to finish cleanup.`,
+				);
+				return;
+			}
+			if (loggedOut === "missing") {
+				this.showStatus(`${server} is no longer connected.`);
+				return;
+			}
+			const removal = mcpDisconnectionState(loggedOut);
+			if (removal) {
+				await this.completeMcpConnectionOutcome({
+					kind: "disconnect",
+					label: logoutLabel,
+					removal,
+					connectionId: server,
+				});
+				return;
+			}
 			await this.reloadAfterMcpChange(`Disconnected ${server}.`);
 			return;
 		}
 
 		try {
 			const result = await runMcpManagementCommand(argv, this.settingsManager, this.modelRegistry.authStorage);
+			if (result.changed && result.serverChange?.verb === "removed") {
+				await this.removeMcpConnectionRecord(result.serverChange.name);
+			}
 			if (result.changed && result.serverChange) {
 				const { name, transport, verb, usesOAuth } = result.serverChange;
 				const hasMcpProviderRefresh = this.uiServices.refreshMcpProviders !== undefined;
@@ -8874,9 +9849,1266 @@ export class InteractiveMode {
 		}
 	}
 
+	private getMcpConnectionStore(): McpConnectionStore {
+		this.mcpConnectionStore ??= McpConnectionStore.open(path.join(getAgentDir(), "mcp-connections.json"));
+		return this.mcpConnectionStore;
+	}
+
+	private async removeMcpConnectionRecord(connectionId: string): Promise<void> {
+		const store = this.getMcpConnectionStore();
+		store.remove(connectionId);
+		await store.flush().catch(() => undefined);
+	}
+
+	/**
+	 * External-service cards for the /plugins picker. Uses the SAME resolver the
+	 * host uses (built-in catalog + declared local sources from settings) and
+	 * re-reads the shared connection records from disk, so the UI never renders
+	 * a stale in-process cache.
+	 */
+	private buildServiceCatalogViews(): {
+		services: readonly McpServiceDescriptor[];
+		views: McpPluginView[];
+		diagnostics: string[];
+	} {
+		// Fresh records first: the resolver pins vanished-source services from them.
+		this.getMcpConnectionStore().load();
+		const resolution = resolveServiceCatalogWithDiagnostics(
+			this.settingsManager.getMcpCatalogSources(),
+			this.getMcpConnectionStore().records(),
+			path.join(getMcpCacheDir(), "mcp-service-catalog.v2.json"),
+		);
+		const views = buildPluginViews({
+			services: resolution.descriptors,
+			userServers: this.settingsManager.getGlobalMcpServers(),
+			authStorage: this.modelRegistry.authStorage,
+			connectionStore: this.getMcpConnectionStore(),
+		});
+		return { services: resolution.descriptors, views, diagnostics: resolution.diagnostics };
+	}
+
+	/**
+	 * Catalog resolution WITHOUT reloading the store: mid-flow admission
+	 * keeps this process's pending (unflushed) record writes visible — a
+	 * load() here would wipe in-memory state a queued op still owns. The
+	 * authoritative cross-process gate stays the claim/reserve/finalize ops
+	 * under the store's file lock.
+	 */
+	private resolveCurrentServiceCatalog(): readonly McpServiceDescriptor[] {
+		return resolveServiceCatalogWithDiagnostics(
+			this.settingsManager.getMcpCatalogSources(),
+			this.getMcpConnectionStore().records(),
+			path.join(getMcpCacheDir(), "mcp-service-catalog.v2.json"),
+		).descriptors;
+	}
+
+	private getMcpLoginEligibility(
+		connectionId: string,
+		catalogServiceId = connectionId,
+		addAccount = false,
+		locked?: { record: McpConnectionRecord },
+		explicitLogin = false,
+		precomputedService?: McpServiceDescriptor,
+	): ReturnType<typeof mcpLoginEligibility> {
+		const services = precomputedService ? [precomputedService] : this.resolveCurrentServiceCatalog();
+		const record = locked ? locked.record : this.getMcpConnectionStore().get(connectionId);
+		const service = services.find((entry) => entry.serviceId === (record?.serviceId ?? catalogServiceId));
+		const userServers = this.settingsManager.getGlobalMcpServers() ?? {};
+		return mcpLoginEligibility({
+			connectionId,
+			service,
+			record,
+			addAccount,
+			explicitLogin,
+			userConfig: userServers[connectionId],
+			reservedConfig: service ? userServers[service.serviceId] : undefined,
+			credential: this.modelRegistry.authStorage.getVerified(mcpCredentialKey(connectionId)),
+		});
+	}
+
+	private async handlePluginsCommand(args: string | undefined): Promise<void> {
+		await this.showServiceCatalogPicker((args ?? "").trim() || undefined);
+	}
+
+	private selectServiceCatalogRow(
+		views: readonly McpPluginView[],
+		options: Omit<ServiceCatalogPickerOptions, "getRows"> = {},
+	): Promise<McpPickerSelection> {
+		this.closeConfigurationMenu?.();
+		this.closeServiceCatalogPicker?.();
+		return new Promise((resolve) => {
+			this.showSelector((done) => {
+				let settled = false;
+				let wentBack = false;
+				const finish = (selection?: McpPluginView) => {
+					if (settled) return;
+					settled = true;
+					const ownsEditor = this.editorContainer.children.includes(picker);
+					if (ownsEditor) done();
+					if (this.closeServiceCatalogPicker === close) this.closeServiceCatalogPicker = undefined;
+					this.ui.requestRender();
+					// A stale selection settles as cancellation without replacing the
+					// next picker or starting an operation from its old row.
+					if (!ownsEditor) return resolve({ status: "cancelled" });
+					if (wentBack) return resolve({ status: "back" });
+					resolve(selection ? { status: "selected", service: selection } : { status: "cancelled" });
+				};
+				const close = () => finish();
+				// "Back" is a surface transition, never a cancellation: the
+				// accounts menu's left arrow and the account sub-picker's Esc both
+				// hand control to the parent surface with nothing acted on. An
+				// externally forced close (a newer picker taking over, teardown)
+				// still settles as cancellation.
+				const back = () => {
+					wentBack = true;
+					finish();
+				};
+				const picker = new ServiceCatalogPickerComponent(views, finish, options.cancelBack ? back : close, {
+					...options,
+					getRows: () => Math.max(1, Math.min(20, this.ui.terminal.rows - 3)),
+					...(options.back ? { onBack: back } : {}),
+				});
+				this.closeServiceCatalogPicker = close;
+				return { component: picker, focus: picker };
+			});
+		});
+	}
+
+	private async showServiceCatalogPicker(initialSearch?: string): Promise<void> {
+		// The picker CHAIN, not a one-shot (Kevin, live testing): an action that
+		// ran lands the user back in the right surface — that service's
+		// accounts menu while it still owns an account, otherwise the catalog —
+		// never the bare prompt. Every entry rebuilds views, targets, and
+		// routing from the LIVE catalog + connection store, so a removed
+		// account is gone and a fresh one shows; Esc anywhere closes the whole
+		// chain.
+		let surface: { kind: "catalog"; search?: string } | { kind: "accounts"; service: McpPluginView } = {
+			kind: "catalog",
+			search: initialSearch,
+		};
+		while (true) {
+			const { services, views, diagnostics } = this.buildServiceCatalogViews();
+			// Wiring problems (a declared local source that vanished, duplicate ids,
+			// truncation) are visible, never silent.
+			if (diagnostics.length > 0) {
+				this.showWarning(`Service catalog notice: ${diagnostics[0]}`);
+			}
+			// Connect targets keyed by serviceId; user-declared servers resolve from settings.
+			const userServers = this.settingsManager.getGlobalMcpServers() ?? {};
+			const targets = buildMcpPickerTargets(services, userServers);
+			// Freeze the displayed intent: guidance must never become a mutation
+			// when settings change while the picker is open.
+			const settingsActions = new Map<
+				string,
+				"disable local server" | "settings guidance" | "verify" | "manage saved account"
+			>();
+			for (const [name, config] of Object.entries(userServers)) {
+				if (views.find((view) => view.serviceId === name)?.source !== "user") continue;
+				if (config.type === "stdio") {
+					settingsActions.set(name, config.enabled === false ? "settings guidance" : "disable local server");
+				} else if (!config.oauth) {
+					const hasSavedAccount =
+						this.getMcpConnectionStore().get(name) !== undefined ||
+						this.modelRegistry.authStorage.getVerified(mcpCredentialKey(name)) !== undefined;
+					const pending =
+						config.enabled !== false &&
+						views.find((view) => view.serviceId === name)?.connectionStatus === "pending";
+					settingsActions.set(
+						name,
+						hasSavedAccount ? "manage saved account" : pending ? "verify" : "settings guidance",
+					);
+				}
+			}
+			if (surface.kind === "accounts") {
+				// The accounts surface handed the chain back: re-enter through the
+				// same freshly built targets every catalog entry uses.
+				const exit = await this.showAccountPickerForService(
+					surface.service,
+					targets.get(surface.service.serviceId),
+					{
+						knownIds: new Set<string>([...services.map((entry) => entry.serviceId), ...Object.keys(userServers)]),
+					},
+				);
+				if (exit === "closed") return;
+				surface = { kind: "catalog" };
+				continue;
+			}
+			const catalogSelection = await this.selectServiceCatalogRow(views, {
+				...(surface.search !== undefined ? { initialSearch: surface.search } : {}),
+				getRowPresentation: (view) => {
+					const action = settingsActions.get(view.serviceId);
+					return action ? { action } : undefined;
+				},
+			});
+			// The catalog is the chain's root: there is no parent surface to go
+			// back to, so any non-selection ends the chain.
+			if (catalogSelection.status !== "selected") return;
+			const service = catalogSelection.service;
+			// Every configured id is off-limits for new account ids.
+			const knownIds = new Set<string>([...services.map((entry) => entry.serviceId), ...Object.keys(userServers)]);
+			try {
+				const settingsAction = settingsActions.get(service.serviceId);
+				if (settingsAction === "settings guidance") {
+					this.showStatus(
+						service.setupHint ??
+							`${service.label} is configured through settings; manage it with /mcp or your settings file.`,
+					);
+					return;
+				}
+				if (settingsAction === "disable local server" || settingsAction === "verify") {
+					const { ran } = await this.connectServiceFromPicker(service, targets.get(service.serviceId));
+					// A blocked action (status-only dead end) ends the chain: its
+					// transient message is the outcome, and reopening forever would
+					// trap the user — an action that cannot proceed never re-enters.
+					if (!ran) return;
+					const disableReentry = this.mcpAccountsReentrySurface(service.serviceId);
+					surface = disableReentry ? { kind: "accounts", service: disableReentry.service } : { kind: "catalog" };
+					continue;
+				}
+				if (settingsAction === "manage saved account" || service.connectionIds.length > 0) {
+					const accountService =
+						settingsAction === "manage saved account"
+							? { ...service, connectionIds: [service.serviceId] }
+							: service;
+					surface = { kind: "accounts", service: accountService };
+					continue;
+				}
+				const { ran } = await this.connectServiceFromPicker(service, targets.get(service.serviceId), { knownIds });
+				if (!ran) return;
+				const reentry = this.mcpAccountsReentrySurface(service.serviceId);
+				surface = reentry ? { kind: "accounts", service: reentry.service } : { kind: "catalog" };
+			} catch {
+				this.showError("MCP connection action did not complete. Try again.");
+				return;
+			}
+		}
+	}
+
+	/**
+	 * Account management for a service with at least one existing account
+	 * (Kevin, live testing): the menu is exactly one "Reconnect" row, one
+	 * "Disconnect" row, and an "Add another account" row that allocates a new
+	 * id and runs a fresh login — a second account never overwrites the first.
+	 *
+	 * One account acts directly: Reconnect runs the SAME re-verify path (never
+	 * a disconnect) and Disconnect the same remove path. Several accounts add
+	 * a second picker that picks the connection id first ("linear",
+	 * "linear-2"); Esc or left there returns to this menu with nothing acted
+	 * on, and the chosen account runs the action a single account would.
+	 *
+	 * Re-entry: after an action that ran, the SAME accounts menu is rebuilt
+	 * from the live stores and shown again — a disconnected account is gone, a
+	 * fresh one shows, statuses refresh — until the service loses its last
+	 * account, at which point the chain hands the user back to the catalog.
+	 * Esc, blocked status-only actions, and failures close the whole chain;
+	 * the left arrow goes back to the catalog, the chain's parent surface.
+	 */
+	private async showAccountPickerForService(
+		service: McpPluginView,
+		target: McpPickerTarget | undefined,
+		options: { knownIds: Set<string> },
+	): Promise<McpAccountsSurfaceExit> {
+		let currentService = service;
+		let currentTarget = target;
+		while (true) {
+			const catalogServiceId = currentService.serviceId;
+			const settingsOnly = currentService.source === "user" && !currentService.usesOAuth;
+			const definition = this.buildServiceCatalogViews().services.find(
+				(entry) => entry.serviceId === catalogServiceId,
+			);
+			const ownership = reservedMcpOwnership(
+				definition,
+				this.settingsManager.getGlobalMcpServers()?.[catalogServiceId],
+			);
+			const accountCards: McpPluginView[] = [];
+			const accountTargets = new Map<string, McpPickerTarget | undefined>();
+			// Per-account acting rows, keyed by connection id: a single account's
+			// menu rows and every multi-account sub-picker row come from the SAME
+			// per-account state computation — only the label differs.
+			const reconnectRows = new Map<string, McpPluginView>();
+			const disconnectRows = new Map<string, McpPluginView>();
+			for (const connectionId of currentService.connectionIds) {
+				// Centralized per-account state: credential binding, expiry, and the
+				// record combine through the SAME computation as the plugin aggregate
+				// and the inventory — the picker never trusts a raw record.status.
+				const admission = this.getMcpLoginEligibility(connectionId, catalogServiceId);
+				const accountTarget =
+					currentTarget && admission.endpoint ? { ...currentTarget, url: admission.endpoint } : currentTarget;
+				accountTargets.set(connectionId, accountTarget);
+				const state = settingsOnly
+					? {
+							status: currentService.connectionStatus,
+							setupHint: currentService.setupHint,
+							toolCount: currentService.toolCount,
+						}
+					: accountStateFor({
+							connectionId,
+							endpoint: accountTarget?.url ?? "",
+							authStorage: this.modelRegistry.authStorage,
+							connectionStore: this.getMcpConnectionStore(),
+							usesOAuth: currentService.usesOAuth,
+						});
+				const blocked = ownership.status !== "canonical" || currentService.connectionStatus === "disabled";
+				const status = blocked ? currentService.connectionStatus : state.status;
+				const loginPending = "loginPending" in state && state.loginPending === true;
+				const repairHint =
+					admission.repair && admission.endpoint
+						? `Saved endpoint: ${new URL(admission.endpoint).origin}${new URL(admission.endpoint).pathname}`
+						: undefined;
+				if (settingsOnly) {
+					// Settings-managed servers are single-account by construction:
+					// pending re-verifies, anything else only shows management
+					// guidance, and remove keeps the server settings and its
+					// environment token ("remove saved data").
+					accountCards.push({
+						...currentService,
+						serviceId: connectionId,
+						label: status === "pending" ? "Reconnect" : `Manage ${connectionId}`,
+						connectionIds: [connectionId],
+						connectionStatus: status,
+						connectable:
+							!blocked &&
+							!loginPending &&
+							admission.allowed &&
+							(status === "error" || status === "not_connected"),
+						loginPending,
+						setupHint: blocked
+							? currentService.setupHint
+							: !admission.allowed
+								? admission.setupHint
+								: [repairHint, state.setupHint].filter(Boolean).join(" · ") || undefined,
+						...(state.toolCount !== undefined ? { toolCount: state.toolCount } : {}),
+					});
+					accountCards.push({
+						...currentService,
+						serviceId: connectionId,
+						label: `Remove saved data for ${connectionId}`,
+						connectionIds: [connectionId],
+						connectionStatus: status,
+						connectable: false,
+						removeAction: true,
+					});
+					continue;
+				}
+				// The sub-picker rows carry the account id; the single-account menu
+				// relabels them below ("Reconnect"/"Disconnect", Kevin, live
+				// testing). Enter keeps running the SAME re-verify path —
+				// verifyMcpConnection plus the existing retry outcome — and never
+				// disconnects; the disconnect row is the explicit remove action,
+				// state-independent.
+				reconnectRows.set(connectionId, {
+					...currentService,
+					serviceId: connectionId,
+					label: connectionId,
+					connectionIds: [connectionId],
+					connectionStatus: status,
+					connectable:
+						!blocked && !loginPending && admission.allowed && (status === "error" || status === "not_connected"),
+					loginPending,
+					setupHint: blocked
+						? currentService.setupHint
+						: !admission.allowed
+							? admission.setupHint
+							: [repairHint, state.setupHint].filter(Boolean).join(" · ") || undefined,
+					...(state.toolCount !== undefined ? { toolCount: state.toolCount } : {}),
+				});
+				disconnectRows.set(connectionId, {
+					...currentService,
+					serviceId: connectionId,
+					label: connectionId,
+					connectionIds: [connectionId],
+					connectionStatus: status,
+					connectable: false,
+					removeAction: true,
+				});
+			}
+			if (!settingsOnly && currentService.connectionIds.length === 1) {
+				// Single account (Kevin, live testing): Enter acts on it directly —
+				// no id suffix on the labels, no sub-picker.
+				const only = currentService.connectionIds[0]!;
+				const reconnect = reconnectRows.get(only);
+				if (reconnect) accountCards.push({ ...reconnect, label: "Reconnect" });
+				const disconnect = disconnectRows.get(only);
+				if (disconnect) accountCards.push({ ...disconnect, label: "Disconnect" });
+			} else if (!settingsOnly && currentService.connectionIds.length > 1) {
+				// Several accounts (Kevin, live testing): ONE Reconnect row and ONE
+				// Disconnect row for the whole service — Enter opens the account
+				// sub-picker that picks the connection id first.
+				accountCards.push({
+					...currentService,
+					label: "Reconnect",
+					connectionIds: [...currentService.connectionIds],
+					connectable: false,
+				});
+				accountCards.push({
+					...currentService,
+					label: "Disconnect",
+					connectionIds: [...currentService.connectionIds],
+					connectable: false,
+					removeAction: true,
+				});
+			}
+			if (
+				currentService.usesOAuth &&
+				currentTarget?.usesOAuth &&
+				!currentService.loginPending &&
+				this.getMcpLoginEligibility(catalogServiceId, catalogServiceId, true, undefined, false, definition).allowed
+			) {
+				accountCards.push({
+					...currentService,
+					label: "Add another account",
+					connectionIds: [],
+					connectionStatus: "not_connected",
+					connectable: true,
+					setupHint: undefined,
+				});
+			}
+			// Token services keep a paste entry point: a stored token the handshake
+			// rejected needs a NEW paste, not a re-verify of the same value.
+			if (definition && isPasteableTokenService(definition) && !currentService.loginPending) {
+				accountCards.push({
+					...currentService,
+					label: "Paste a new token",
+					connectionIds: [],
+					connectionStatus: "not_connected",
+					connectable: false,
+					pasteToken: true,
+					setupHint: undefined,
+				});
+			}
+			const selection = await this.selectServiceCatalogRow(accountCards, {
+				// Kevin (live testing): "Accounts — Cloudflare" reads as a caption;
+				// the menu is just the service, with the description above the
+				// options instead of under the list.
+				title: `${currentService.label} MCP`,
+				mode: "accounts",
+				description: settingsOnly
+					? "Saved account data for a settings-managed server. Removing it keeps the server settings and environment token."
+					: currentService.description,
+				// The accounts redesign renders no trailing status or per-row detail;
+				// the hint names the action and the description block carries the
+				// panel-level explanation.
+				getRowPresentation: (row) =>
+					settingsOnly
+						? row.removeAction
+							? { action: "remove saved data" }
+							: { action: row.connectionStatus === "pending" ? "verify" : "settings guidance" }
+						: undefined,
+				// Kevin (live testing): left arrow goes BACK to the /mcp catalog —
+				// the picker chain's parent surface. Esc still closes the chain.
+				back: true,
+			});
+			if (selection.status === "cancelled") return "closed";
+			if (selection.status === "back") return "catalog";
+			let card = selection.service;
+			if (card.connectionIds.length > 1) {
+				// The multi-account Reconnect/Disconnect chooser (Kevin, live
+				// testing): a second picker in the same choice-list shape picks
+				// WHICH account first. Esc or left there returns to this menu
+				// without acting — no status noise — and the chosen account runs
+				// the same action a single account would, so the picker never
+				// nests deeper than this.
+				const actionRows = card.removeAction === true ? disconnectRows : reconnectRows;
+				const chosen = await this.selectServiceCatalogRow([...actionRows.values()], {
+					title: "Accounts",
+					mode: "accounts",
+					// The accounts menu one surface up already carries the service
+					// description; the sub-picker is just the account list.
+					description: "",
+					back: true,
+					cancelBack: true,
+					closeHint: "back",
+				});
+				// Esc and left are the user's "back": return to the accounts
+				// menu, freshly rebuilt, with nothing acted on. An externally
+				// forced close (a newer picker taking over, teardown) settles as
+				// cancellation and ends the chain — the same rule every other
+				// surface follows.
+				if (chosen.status === "back") continue;
+				if (chosen.status === "cancelled") return "closed";
+				card = chosen.service;
+			}
+			try {
+				if (settingsOnly && !card.removeAction && card.connectionStatus !== "pending") {
+					this.showStatus(
+						card.setupHint ??
+							`${currentService.label} is configured through settings; manage it with /mcp or your settings file.`,
+					);
+					return "closed";
+				}
+				const { ran } =
+					card.connectionIds.length === 0
+						? await this.connectServiceFromPicker(card, currentTarget, {
+								catalogServiceId,
+								addAccount: true,
+								knownIds: options.knownIds,
+							})
+						: await this.connectServiceFromPicker(card, accountTargets.get(card.serviceId), { catalogServiceId });
+				// A blocked action (status-only dead end) ends the chain: its
+				// transient message is the outcome, and reopening forever would
+				// trap the user — an action that cannot proceed never re-enters.
+				if (!ran) return "closed";
+			} catch {
+				this.showError("MCP connection action did not complete. Try again.");
+				return "closed";
+			}
+			// The action ran: land back in the RIGHT surface, freshly rebuilt
+			// from the live catalog + connection store. When the last account
+			// is gone, hand the chain back to the catalog.
+			const reentry = this.mcpAccountsReentrySurface(catalogServiceId);
+			if (!reentry) return "catalog";
+			currentService = reentry.service;
+			currentTarget = reentry.target;
+		}
+	}
+
+	/**
+	 * The re-entry surface after a picker action on `catalogServiceId` (Kevin,
+	 * live testing): stay in that service's accounts menu while it still owns
+	 * an account, otherwise fall back to the catalog. Everything is rebuilt
+	 * from the LIVE catalog + connection store — the re-entered menu must not
+	 * show a row the action just removed, and a freshly added account must
+	 * show. Settings-managed servers keep saved data manageable even when the
+	 * core view carries no connectionIds — the same discovery that routes a
+	 * catalog row to "manage saved account".
+	 */
+	private mcpAccountsReentrySurface(
+		catalogServiceId: string,
+	): { service: McpPluginView; target: McpPickerTarget | undefined } | undefined {
+		const { services, views } = this.buildServiceCatalogViews();
+		const view = views.find((entry) => entry.serviceId === catalogServiceId);
+		if (!view) return undefined;
+		const target = buildMcpPickerTargets(services, this.settingsManager.getGlobalMcpServers() ?? {}).get(
+			catalogServiceId,
+		);
+		if (view.source === "user" && !view.usesOAuth) {
+			const hasSavedAccount =
+				this.getMcpConnectionStore().get(catalogServiceId) !== undefined ||
+				this.modelRegistry.authStorage.getVerified(mcpCredentialKey(catalogServiceId)) !== undefined;
+			return hasSavedAccount ? { service: { ...view, connectionIds: [catalogServiceId] }, target } : undefined;
+		}
+		return view.connectionIds.length > 0 ? { service: view, target } : undefined;
+	}
+	/**
+	 * Route a user-facing MCP login by NAME (/mcp login, the generic /login
+	 * service options, the config menu) through the ONE guarded connect
+	 * operation: the account is claimed under the store's file lock first,
+	 * the OAuth credential stages, and the guarded finalize commits it — a
+	 * concurrent logout can cancel us and a late callback can never
+	 * reactivate or clobber the account. Resolution and authentication outcomes
+	 * are separate; a cancelled login never reports success.
+	 */
+	private async connectMcpAccountByName(name: string): Promise<{ resolved: boolean; result: AuthenticationResult }> {
+		const { services } = this.buildServiceCatalogViews();
+		const record = this.getMcpConnectionStore().get(name);
+		const service =
+			services.find((entry) => entry.serviceId === (record?.serviceId ?? name)) ??
+			services.find((entry) => entry.aliases.includes(name));
+		const connectionId = record ? name : (service?.serviceId ?? name);
+		const config = this.settingsManager.getGlobalMcpServers()?.[connectionId];
+		const credential = this.modelRegistry.authStorage.getVerified(mcpCredentialKey(connectionId));
+		if (!service && !record && !config && !credential) return { resolved: false, result: { status: "failed" } };
+		const admission =
+			service || config || record
+				? this.getMcpLoginEligibility(connectionId, service?.serviceId ?? connectionId, false, undefined, true)
+				: { allowed: true, endpoint: undefined as string | undefined };
+		const endpoint =
+			admission.endpoint ?? (config?.type === "http" ? config.url : undefined) ?? record?.endpoint ?? "";
+		if (!admission.allowed || !endpoint) {
+			this.showStatus(admission.setupHint ?? "This service cannot be connected automatically.");
+			return { resolved: true, result: { status: "failed" } };
+		}
+		const { result } = await this.guardedMcpLogin(
+			{
+				serviceId: connectionId,
+				label: record?.label ?? service?.label ?? connectionId,
+				connectionStatus: record?.status ?? "not_connected",
+				connectionIds: record ? [connectionId] : [],
+				connectable: true,
+				usesOAuth: true,
+				source: service ? "catalog" : "user",
+			},
+			{
+				url: endpoint,
+				usesOAuth: true,
+				managedBySettings: config !== undefined && !service?.legacyBuiltin,
+			},
+			{
+				catalogServiceId: record?.serviceId ?? service?.serviceId ?? connectionId,
+				explicitLogin: true,
+			},
+		);
+		return { resolved: true, result };
+	}
+
+	private async connectServiceFromPicker(
+		service: McpPluginView,
+		target: McpPickerTarget | undefined,
+		options: {
+			catalogServiceId?: string;
+			addAccount?: boolean;
+			knownIds?: ReadonlySet<string>;
+		} = {},
+	): Promise<McpPickerActionOutcome> {
+		if (target?.transport === "stdio" && target.name) {
+			const serverName = target.name;
+			const config = this.settingsManager.getGlobalMcpServers()?.[serverName];
+			if (!config) {
+				this.showStatus(`${service.label} is no longer present in settings.`);
+				return { ran: false };
+			}
+			if (config.type !== "stdio" || config.enabled === false) {
+				this.showStatus(
+					`${service.label} is disabled. Re-enable or remove it with /mcp, or edit your settings file.`,
+				);
+				return { ran: false };
+			}
+			this.settingsManager.setGlobalMcpServer(serverName, { ...config, enabled: false }, true);
+			await this.settingsManager.flush();
+			this.uiServices.refreshMcpProviders?.();
+			await this.reloadAfterMcpChange(
+				`Disabled local server ${service.label}. Manage it with /mcp or your settings file.`,
+			);
+			return { ran: true };
+		}
+		// Explicit per-account remove: credential AND record removal in ONE
+		// store-locked step (the same lock ordering finalize uses), then reload.
+		if (service.removeAction === true) {
+			// Read the label before the op: a "removed" outcome deletes the record.
+			const removeLabel = this.getMcpConnectionStore().get(service.serviceId)?.label ?? service.label;
+			const removed = await this.getMcpConnectionStore().removeAccount({
+				connectionId: service.serviceId,
+				authCleanup: (connectionId) => {
+					// Disk-authoritative logout: remove() swallows persistence
+					// errors, so a failed auth-file write could report the logout
+					// done while the credential survives. removeVerified throws
+					// instead (the honest "failed" path) and returns whether a
+					// credential was actually removed from disk.
+					return this.modelRegistry.authStorage.removeVerified(mcpCredentialKey(connectionId));
+				},
+			});
+			// Honest outcomes: removed/credential-only removed the account (the
+			// credential-only case still had a credential to log out), missing is
+			// a no-op, logged-out keeps the durable logout but says the record
+			// save failed, and failed is state-neutral (the cleanup may or may
+			// not have run — it never claims a specific state).
+			if (removed === "failed") {
+				this.showWarning(`The change could not be saved; try removing account ${service.serviceId} again.`);
+				return { ran: true };
+			}
+			if (removed === "logged-out") {
+				this.showWarning(
+					`Logged out account ${service.serviceId}, but the change could not be saved. It may still appear in the list; try again to finish cleanup.`,
+				);
+				return { ran: true };
+			}
+			if (removed === "missing") {
+				this.showStatus(`Account ${service.serviceId} is no longer present.`);
+				return { ran: true };
+			}
+			// The explicit Remove row is the picker's primary disconnect gesture,
+			// so it records the same durable entry the /logout routes do instead
+			// of a status line that scrolls away (Kevin, live testing).
+			const removal = mcpDisconnectionState(removed);
+			if (removal) {
+				await this.completeMcpConnectionOutcome({
+					kind: "disconnect",
+					label: removeLabel,
+					removal,
+					connectionId: service.serviceId,
+				});
+				return { ran: true };
+			}
+			await this.reloadAfterMcpChange(`Removed account ${service.serviceId}.`);
+			return { ran: true };
+		}
+		if (service.loginPending || this.getMcpConnectionStore().get(service.serviceId)?.attemptId !== undefined) {
+			this.showStatus("Login in progress. Finish it or remove the account to cancel.");
+			return { ran: false };
+		}
+		// A requires-setup token service connects through the inline paste
+		// panel: nothing is stored until the panel completes, and the stored
+		// token is verified with a real handshake before anything claims
+		// Connected.
+		if (service.pasteToken === true) {
+			return this.pasteTokenForService(service, target, {
+				...(options.catalogServiceId ? { catalogServiceId: options.catalogServiceId } : {}),
+			});
+		}
+		const currentServices = this.resolveCurrentServiceCatalog();
+		const catalog = currentServices.find(
+			(entry) => entry.serviceId === (options.catalogServiceId ?? service.serviceId),
+		);
+		const ownership = reservedMcpOwnership(
+			catalog,
+			this.settingsManager.getGlobalMcpServers()?.[catalog?.serviceId ?? service.serviceId],
+		);
+		if (ownership.status !== "canonical" || service.connectionStatus === "disabled") {
+			this.showStatus(ownership.setupHint ?? service.setupHint ?? "Disabled in settings.");
+			return { ran: false };
+		}
+		if (service.connectionStatus === "connected" && target?.managedBySettings && !service.usesOAuth) {
+			this.showStatus(
+				`${service.label} is configured through settings; manage it with /mcp remove ${service.serviceId}.`,
+			);
+			return { ran: false };
+		}
+		// Connected and pending accounts retry verification explicitly — no
+		// login needed, the grant already exists; "retry from /plugins" must
+		// actually work. Enter on the account NAME row therefore never
+		// disconnects a working account (Kevin, live testing): removal is the
+		// explicit Remove row's job, and this is the only reachable branch for a
+		// connected account coming out of either picker.
+		if ((service.connectionStatus === "pending" || service.connectionStatus === "connected") && target?.url) {
+			let retried: McpConnectionRecord | undefined;
+			try {
+				retried = await verifyMcpConnection({
+					authStorage: this.modelRegistry.authStorage,
+					connectionStore: this.getMcpConnectionStore(),
+					connectionId: service.serviceId,
+					serviceId: options.catalogServiceId ?? service.serviceId,
+					label: service.label,
+					endpoint: target.url,
+					usesOAuth: target.usesOAuth,
+					...(target.bearerTokenEnvVar ? { bearerTokenEnvVar: target.bearerTokenEnvVar } : {}),
+				});
+			} catch {
+				retried = undefined;
+			}
+			await this.completeMcpConnectionOutcome(
+				retried?.status === "connected"
+					? {
+							label: service.label,
+							source: "retry",
+							verification: "connected",
+							...(retried.toolCount !== undefined ? { toolCount: retried.toolCount } : {}),
+						}
+					: retried
+						? {
+								label: service.label,
+								source: "retry",
+								verification: "unverified",
+								issue: formatMcpVerificationIssue(retried.lastError),
+								...(retried.lastError ? { issueCategory: retried.lastError } : {}),
+							}
+						: { label: service.label, source: "retry", verification: "unsaved" },
+			);
+			return { ran: true };
+		}
+
+		// Actual connects route through the ONE guarded OAuth operation —
+		// separate from the picker's disconnect/verify actions above, so LOGIN
+		// intent (from any route) never dispatches a disconnect by record
+		// status.
+		const login = await this.guardedMcpLogin(service, target, options);
+		return { ran: login.ran };
+	}
+
+	/**
+	 * The ONE guarded MCP OAuth login operation (initial connect, reconnect,
+	 * add account, /mcp login, the generic /login service options, the config
+	 * menu): claim/reserve under the store's file lock, staged OAuth, guarded
+	 * finalize, verification. Never dispatches on the record's status — the
+	 * picker's remove/verify actions live in connectServiceFromPicker.
+	 * Reports success only after the finalize committed.
+	 */
+	private async guardedMcpLogin(
+		service: McpPluginView,
+		target: McpPickerTarget | undefined,
+		options: {
+			catalogServiceId?: string;
+			addAccount?: boolean;
+			knownIds?: ReadonlySet<string>;
+			explicitLogin?: boolean;
+		} = {},
+	): Promise<{ ran: boolean; result: AuthenticationResult }> {
+		if (!service.connectable || !target) {
+			this.showStatus(service.setupHint ?? `${service.label} cannot be connected automatically in this build.`);
+			return { ran: false, result: { status: "failed" } };
+		}
+		const currentServices = this.resolveCurrentServiceCatalog();
+		const definition = currentServices.find(
+			(entry) => entry.serviceId === (options.catalogServiceId ?? service.serviceId),
+		);
+		const userConfig = this.settingsManager.getGlobalMcpServers()?.[service.serviceId];
+		const admission =
+			definition || userConfig
+				? this.getMcpLoginEligibility(
+						service.serviceId,
+						options.catalogServiceId ?? service.serviceId,
+						options.addAccount === true,
+						undefined,
+						options.explicitLogin === true,
+					)
+				: { allowed: true, endpoint: target.url };
+		const targetUrl = admission.endpoint;
+		if (!admission.allowed || !targetUrl || target.url !== targetUrl || !target.usesOAuth) {
+			this.showStatus(admission.setupHint ?? "The connection target changed. Open the catalog again to review it.");
+			return { ran: false, result: { status: "failed" } };
+		}
+		// EVERY user-facing MCP login is guarded (initial connect, reconnect,
+		// add account): the account is claimed under the store's file lock first
+		// — a durable pending reservation for a fresh id, a nonce claim on an
+		// existing record — so a concurrent logout can cancel us and a late
+		// OAuth callback can never reactivate or clobber the account.
+		let connectionId = service.serviceId;
+		let attemptId: string | undefined;
+		let stagedServerId: string | undefined;
+		// The full on-disk identity a guarded REPLACE expects to swap out —
+		// captured for EVERY login, even without a record: legacy
+		// credential-only accounts can hold a grant with no record, and a
+		// reconnect must replace it without clearing it first.
+		let expectedOldCredential: AuthCredential | undefined;
+		if (options.addAccount === true) {
+			const store = this.getMcpConnectionStore();
+			const taken = (id: string): boolean =>
+				store.get(id) !== undefined ||
+				this.modelRegistry.authStorage.get(mcpCredentialKey(id)) !== undefined ||
+				(options.knownIds?.has(id) ?? false) ||
+				this.settingsManager.getGlobalMcpServers()?.[id] !== undefined;
+			const usedIds = new Set<string>();
+			for (let attempt = 0; attempt < 20; attempt++) {
+				const candidate = nextMcpConnectionId(service.serviceId, (id) => taken(id) || usedIds.has(id));
+				const now = Date.now();
+				const nonce = randomUUID();
+				// Durable, commit-gated reservation: the pending marker (with the
+				// opaque attempt nonce) only counts once the record write commits.
+				const won = await store.reserveConnectionId({
+					connectionId: candidate,
+					serviceId: options.catalogServiceId ?? service.serviceId,
+					endpoint: targetUrl,
+					label: `${service.label} (${candidate})`,
+					status: "pending",
+					createdAt: now,
+					updatedAt: now,
+					attemptId: nonce,
+				});
+				if (won) {
+					connectionId = candidate;
+					attemptId = nonce;
+					break;
+				}
+				usedIds.add(candidate);
+			}
+			if (attemptId === undefined) {
+				this.showStatus(`Could not allocate a free account id for ${service.label}.`);
+				return { ran: true, result: { status: "failed" } };
+			}
+		} else {
+			const store = this.getMcpConnectionStore();
+			const nonce = randomUUID();
+			// Disk-authoritative identity capture (never the per-instance cache):
+			// an intentional replacement CASes against exactly this value, and a
+			// newer external writer refuses instead of being clobbered.
+			expectedOldCredential = this.modelRegistry.authStorage.getVerified(mcpCredentialKey(connectionId));
+			const existing = store.get(connectionId);
+			if (existing === undefined) {
+				const now = Date.now();
+				const won = await store.reserveConnectionId({
+					connectionId,
+					serviceId: options.catalogServiceId ?? service.serviceId,
+					endpoint: targetUrl,
+					label: service.label,
+					status: "pending",
+					createdAt: now,
+					updatedAt: now,
+					attemptId: nonce,
+				});
+				if (!won) {
+					this.showStatus(`${service.label} is already being connected from another client.`);
+					return { ran: true, result: { status: "failed" } };
+				}
+			} else {
+				const claimed = await store.claimConnectionId({
+					connectionId,
+					attemptId: nonce,
+					isStillCurrent: (record) => {
+						const current = this.getMcpLoginEligibility(
+							connectionId,
+							options.catalogServiceId ?? service.serviceId,
+							false,
+							{ record },
+							options.explicitLogin === true,
+						);
+						return current.allowed && current.endpoint === targetUrl;
+					},
+				});
+				if (!claimed) {
+					this.showStatus(`${service.label} is already being connected from another client.`);
+					return { ran: true, result: { status: "failed" } };
+				}
+			}
+			attemptId = nonce;
+		}
+		// The OAuth credential ALWAYS stages under a per-attempt key; the real
+		// account key is only written by the guarded finalize below.
+		stagedServerId = `${connectionId}--${attemptId}`;
+		const releaseAttempt = async (): Promise<boolean> => {
+			let discarded = false;
+			try {
+				this.modelRegistry.authStorage.removeVerified(mcpCredentialKey(stagedServerId));
+				discarded = true;
+			} catch {
+				// Keep recovery data if staged credential deletion fails.
+			}
+			unregisterOAuthProvider(mcpCredentialKey(stagedServerId));
+			if (discarded)
+				this.showStatus(
+					`The login result was discarded. Account settings for ${connectionId} were kept; reconnect or remove the account from /plugins.`,
+				);
+			// Never delete a shell on cancellation: an external auth writer can
+			// change the account key at any moment, outside the store lock.
+			const released = await this.getMcpConnectionStore().releaseClaim({ connectionId, attemptId });
+			if (!released || !discarded) {
+				this.showWarning(
+					`Could not confirm login cleanup for ${connectionId}. Account settings and any remaining credentials were kept; retry from /plugins or remove the account.`,
+				);
+			}
+			return released && discarded;
+		};
+		// The SERVICE's display name, never the picked row's label: the accounts
+		// picker's "Add another account" row would otherwise name the outcome
+		// "Connected Add another account (linear-2)" (Kevin, live testing).
+		const serviceLabel = definition?.label ?? service.label;
+		const parentServiceId = options.catalogServiceId ?? service.serviceId;
+		const loginLabel = connectionId === parentServiceId ? serviceLabel : `${serviceLabel} (${connectionId})`;
+		// ONE login-time client identity, shared by the staged login and the
+		// post-finalize real-id registration: the engine pins the client
+		// identity on the stored credential and refuses drift at refresh, so
+		// both registrations must resolve the exact same config. Settings
+		// identity applies to user-owned servers; reserved builtins never take
+		// a user-configured client identity.
+		const parentConfig = this.settingsManager.getGlobalMcpServers()?.[options.catalogServiceId ?? service.serviceId];
+		const loginIdentity = definition?.legacyBuiltin ? {} : resolveMcpOAuthIdentity(parentConfig);
+		let result: AuthenticationResult;
+		try {
+			registerOAuthProvider(
+				createConfiguredMcpProvider({
+					server: stagedServerId,
+					label: loginLabel,
+					url: targetUrl,
+					identity: loginIdentity,
+					reviewedScopes: definition?.reviewedScopes,
+					clientRegistration: definition?.clientRegistration,
+				}),
+			);
+			result = await this.createAuthFlows().runMcpLogin(stagedServerId, loginLabel);
+		} catch {
+			result = { status: "failed" };
+		}
+		if (result.status !== "success") {
+			const cleaned = await releaseAttempt();
+			if (cleaned)
+				this.showStatus(
+					`Login did not complete. Account settings for ${connectionId} were kept; reconnect or remove the account from /plugins.`,
+				);
+			return cleaned ? { ran: true, result } : { ran: true, result: { status: "failed" } };
+		}
+		{
+			const stagedKey = mcpCredentialKey(stagedServerId);
+			const realKey = mcpCredentialKey(connectionId);
+			// Guarded commit: the staged credential moves to the REAL account key
+			// under the store's file lock, only while our claim is still ours.
+			// A FRESH account (no existing grant) moves set-if-absent — a
+			// bystander credential is never clobbered. A REPLACEMENT (reconnect,
+			// or a legacy grant with no record) CASes against the captured full
+			// identity; a newer external credential refuses. When the record
+			// write fails, the compensate runs under the SAME lock and RESTORES
+			// the previous credential (never delete-only, never clobbering a
+			// newer writer); a failed rollback surfaces recovery-required with
+			// the credential RETAINED.
+			let movedCredential: AuthCredential | undefined;
+			let replacedPrevious: AuthCredential | undefined;
+			const finalization = await this.getMcpConnectionStore().finalizeAttempt({
+				connectionId,
+				attemptId,
+				commit: (record) => {
+					// Atomic, disk-authoritative move under the AUTH backend's
+					// own file lock: the store's lock cannot cover an ordinary
+					// login in another process, so the conditional move reads
+					// CURRENT on-disk data.
+					const move =
+						expectedOldCredential === undefined
+							? this.modelRegistry.authStorage.moveStagedCredential(stagedKey, realKey)
+							: this.modelRegistry.authStorage.replaceStagedCredential(
+									stagedKey,
+									realKey,
+									expectedOldCredential,
+								);
+					if (move.status === "occupied") {
+						// A newer external credential - or a deleted old grant -
+						// owns the account key: fail CLOSED and preserve the
+						// account shell in the cleanup.
+						throw new Error("account key occupied by a newer login");
+					}
+					if (move.status === "nothing") throw new Error("staged login credential is missing");
+					if (move.status === "replaced") {
+						movedCredential = move.credential;
+						replacedPrevious = expectedOldCredential;
+					} else if (move.status === "moved") {
+						movedCredential = move.credential;
+					}
+					// Pending-verification: the commit CONSUMES the nonce and
+					// clears the previous verification state — an old Connected
+					// status never carries onto a newly replaced grant.
+					const {
+						attemptId: _consumedNonce,
+						verifiedAt: _oldVerifiedAt,
+						toolCount: _oldToolCount,
+						lastError: _oldLastError,
+						...pendingRecord
+					} = record;
+					return { ...pendingRecord, status: "pending", updatedAt: Date.now() };
+				},
+				compensate: () => {
+					if (!movedCredential) {
+						// Never moved: nothing of ours to undo.
+						return { status: "failed" };
+					}
+					if (replacedPrevious !== undefined) {
+						// RESTORE the previous credential (never delete-only) via
+						// a full-identity CAS: a newer writer is never clobbered.
+						this.modelRegistry.authStorage.replaceCredentialIfMatches(realKey, movedCredential, replacedPrevious);
+						return { status: "failed" };
+					}
+					// Fresh-account rollback: restore ours to the staged slot only
+					// when it is empty, then delete it from the real slot only
+					// when it is still exactly ours — a credential written by
+					// anyone else is never deleted.
+					this.modelRegistry.authStorage.restoreCredentialIfAbsent(stagedKey, movedCredential);
+					this.modelRegistry.authStorage.removeIfCredentialMatches(realKey, movedCredential);
+				},
+			});
+			if (finalization === "recovery-required") {
+				// Explicit recovery state: the commit or its rollback failed and
+				// partial state may remain. RETAIN the credential wherever it
+				// lives (staged key or real key) — never discard recovery data —
+				// and tell the user exactly that.
+				this.showWarning(
+					`The login for account ${connectionId} could not be committed. The credential is retained and can be recovered; retry from /plugins or remove the placeholder account.`,
+				);
+				return { ran: true, result: { status: "failed" } };
+			}
+			if (finalization !== "committed") {
+				this.showStatus(
+					`The account ${connectionId} was logged out or replaced during login, or the change could not be saved; login was not committed.`,
+				);
+				await releaseAttempt();
+				return { ran: true, result: { status: "failed" } };
+			}
+			// Committed: the real id now owns the credential — register its
+			// provider and drop the staged registration.
+			registerOAuthProvider(
+				createConfiguredMcpProvider({
+					server: connectionId,
+					label: `${service.label} (${connectionId})`,
+					url: targetUrl,
+					identity: loginIdentity,
+					reviewedScopes: definition?.reviewedScopes,
+					clientRegistration: definition?.clientRegistration,
+				}),
+			);
+			unregisterOAuthProvider(mcpCredentialKey(stagedServerId));
+		}
+		// A stored token is not "Connected": verify with a real MCP handshake. The
+		// record's serviceId stays the catalog id; the connectionId is the account.
+		let verification: McpConnectionRecord | undefined;
+		try {
+			verification = await verifyMcpConnection({
+				authStorage: this.modelRegistry.authStorage,
+				connectionStore: this.getMcpConnectionStore(),
+				connectionId,
+				serviceId: options.catalogServiceId ?? service.serviceId,
+				label: loginLabel,
+				endpoint: targetUrl,
+				usesOAuth: target.usesOAuth,
+				...(target.bearerTokenEnvVar ? { bearerTokenEnvVar: target.bearerTokenEnvVar } : {}),
+			});
+		} catch {
+			verification = undefined;
+		}
+		const accountScoped = options.addAccount === true;
+		await this.completeMcpConnectionOutcome(
+			verification?.status === "connected"
+				? {
+						label: loginLabel,
+						source: "login",
+						verification: "connected",
+						...(accountScoped ? { connectionId, addedAccount: true } : {}),
+						...(verification.toolCount !== undefined ? { toolCount: verification.toolCount } : {}),
+					}
+				: verification
+					? {
+							label: loginLabel,
+							source: "login",
+							verification: "unverified",
+							issue: formatMcpVerificationIssue(verification.lastError),
+							...(verification.lastError ? { issueCategory: verification.lastError } : {}),
+							...(accountScoped ? { connectionId, addedAccount: true } : {}),
+						}
+					: {
+							label: loginLabel,
+							source: "login",
+							verification: "unsaved",
+							...(accountScoped ? { connectionId, addedAccount: true } : {}),
+						},
+		);
+		return {
+			ran: true,
+			result: {
+				status: "success",
+				providerId: mcpCredentialKey(connectionId),
+				providerName: loginLabel,
+				authType: "oauth",
+				kind: "service",
+			},
+		};
+	}
+
+	/**
+	 * The inline paste flow for requires-setup token services: prompt every
+	 * required credential field in order (masked), store ONE static-token
+	 * credential under the SAME credential key OAuth uses, then verify with a
+	 * real MCP handshake. Esc cancels with nothing stored; a verification
+	 * failure keeps the decision honest (unverified, never Connected). No
+	 * fail-closed rule is relaxed: setup field ids are never read as env vars,
+	 * the credential is bound to this exact id and endpoint, and
+	 * reserved/shadowed names still fail closed.
+	 */
+	private async pasteTokenForService(
+		service: McpPluginView,
+		target: McpPickerTarget | undefined,
+		options: { catalogServiceId?: string } = {},
+	): Promise<McpPickerActionOutcome> {
+		const serviceId = options.catalogServiceId ?? service.serviceId;
+		const definition = this.resolveCurrentServiceCatalog().find((entry) => entry.serviceId === serviceId);
+		if (!definition || !isPasteableTokenService(definition)) {
+			this.showStatus(service.setupHint ?? `${service.label} cannot be connected by pasting a token.`);
+			return { ran: false };
+		}
+		const ownership = reservedMcpOwnership(
+			definition,
+			this.settingsManager.getGlobalMcpServers()?.[definition.serviceId],
+		);
+		if (ownership.status !== "canonical" || service.connectionStatus === "disabled") {
+			this.showStatus(ownership.setupHint ?? "Disabled in settings.");
+			return { ran: false };
+		}
+		// The paste flow serves CATALOG definitions; a settings-managed server
+		// owns its id and keeps its settings-managed authentication.
+		if (target?.managedBySettings) {
+			this.showStatus(`${service.label} is configured through settings; manage it with /mcp or your settings file.`);
+			return { ran: false };
+		}
+		if (
+			definition.transport.type !== "http" ||
+			!definition.transport.url ||
+			target?.url !== definition.transport.url
+		) {
+			this.showStatus("The connection target changed. Open the catalog again to review it.");
+			return { ran: false };
+		}
+		const connectionId = definition.serviceId;
+		if (this.getMcpConnectionStore().get(connectionId)?.attemptId !== undefined) {
+			this.showStatus("Login in progress. Finish it or remove the account to cancel.");
+			return { ran: false };
+		}
+		// The ONE credential the runtime sends as the bearer. isPasteableTokenService
+		// above already established that this resolves, so it is read, not re-checked.
+		const credential = mcpPasteCredential(definition);
+		if (!credential) return { ran: false };
+		const value = await this.promptForMcpTokenValues(definition, credential);
+		// Esc (or an empty submit): nothing stored, no record, no status line —
+		// the paste panel ran, so the surface that opened it re-enters.
+		if (!value) return { ran: true };
+		// Stored ONLY in the agent credential store (auth.json), under the SAME
+		// key OAuth uses — never settings.json, never a status line or log.
+		this.modelRegistry.authStorage.set(mcpCredentialKey(connectionId), {
+			type: "mcp_static_token",
+			endpoint: definition.transport.url,
+			bearer: value,
+			bearerFieldId: credential.field.id,
+			createdAt: Date.now(),
+		});
+		// A stored token is not "Connected": verify with a real MCP handshake
+		// that uses the stored token as the bearer.
+		let verification: McpConnectionRecord | undefined;
+		try {
+			verification = await verifyMcpConnection({
+				authStorage: this.modelRegistry.authStorage,
+				connectionStore: this.getMcpConnectionStore(),
+				connectionId,
+				serviceId: definition.serviceId,
+				label: service.label,
+				endpoint: definition.transport.url,
+				usesOAuth: false,
+				staticToken: true,
+			});
+		} catch {
+			verification = undefined;
+		}
+		// The SAME durable outcome entry the OAuth path records: success only
+		// from a verified handshake, unverified/unsaved otherwise — the token
+		// value itself never appears in the entry.
+		await this.completeMcpConnectionOutcome(
+			verification?.status === "connected"
+				? {
+						label: service.label,
+						source: "paste",
+						verification: "connected",
+						...(verification.toolCount !== undefined ? { toolCount: verification.toolCount } : {}),
+					}
+				: verification
+					? {
+							label: service.label,
+							source: "paste",
+							verification: "unverified",
+							issue: formatMcpVerificationIssue(verification.lastError),
+							...(verification.lastError ? { issueCategory: verification.lastError } : {}),
+						}
+					: { label: service.label, source: "paste", verification: "unsaved" },
+		);
+		// Success or failure, the paste RAN: the re-entry decision is state,
+		// not the verification verdict.
+		return { ran: true };
+	}
+
+	/**
+	 * The masked inline prompt for a service's ONE credential — the same inline
+	 * surface as the OAuth login panel (showInlineAuthPanel), in the
+	 * #2331/#2340 panel language. Resolves with the pasted value, or undefined
+	 * when the user cancelled. The raw value never leaves this seam: no status
+	 * line, no log, no transcript entry, and no rendered line contains it.
+	 */
+	private promptForMcpTokenValues(
+		definition: McpServiceDescriptor,
+		credential: McpPasteCredential,
+	): Promise<string | undefined> {
+		return new Promise((resolve) => {
+			let close: (() => void) | undefined;
+			const panel = new McpTokenPastePanelComponent({
+				serviceLabel: definition.label,
+				...(definition.setup.reason ? { reason: definition.setup.reason } : {}),
+				field: {
+					id: credential.field.id,
+					label: mcpCredentialFieldPromptLabel(definition, credential.field),
+				},
+				onSubmit: (value) => {
+					close?.();
+					resolve(value);
+				},
+				onCancel: () => {
+					close?.();
+					resolve(undefined);
+				},
+			});
+			close = this.showInlineAuthPanel(panel);
+		});
+	}
+
 	private async reloadAfterMcpChange(message: string, successMessage = message): Promise<void> {
 		if (this.isAgentStreaming() || this.isAgentCompacting()) {
-			this.showStatus(`${message} The change was saved. Run /reload after the current turn to activate it.`);
+			this.queueMcpActivationForNextBoundary(message, successMessage);
 			return;
 		}
 		const reloaded = await this.handleReloadCommand();
@@ -8887,13 +11119,85 @@ export class InteractiveMode {
 		}
 	}
 
+	/**
+	 * Connect AND disconnect outcomes are durable chat entries, not transient
+	 * status lines: reload the session, then record the outcome where it stays
+	 * visible.
+	 */
+	private async completeMcpConnectionOutcome(details: McpOutcomeDetails): Promise<void> {
+		const notice = formatMcpConnectionOutcomeNotice(details);
+		if (this.isAgentStreaming() || this.isAgentCompacting()) {
+			this.queueMcpActivationForNextBoundary(notice, notice, details);
+			return;
+		}
+		const reloaded = await this.handleReloadCommand();
+		await this.appendMcpConnectionOutcome({ ...details, activation: reloaded ? "active" : "inactive" });
+	}
+
+	private async appendMcpConnectionOutcome(details: McpOutcomeDetails): Promise<void> {
+		const message = createMcpConnectionOutcomeMessage(details);
+		try {
+			await this.agentConnection.appendCustomMessage({
+				customType: message.customType,
+				content: message.content,
+				display: message.display,
+				details: message.details,
+			});
+		} catch {
+			// The connection change itself is already saved; never fail the flow
+			// over a transcript entry — fall back to the transient line.
+			this.showWarning(message.content);
+		}
+	}
+
+	/**
+	 * Defer an MCP change's activation to the next safe boundary (agent run end and
+	 * compaction end both check); the user never has to run /reload manually.
+	 */
+	private queueMcpActivationForNextBoundary(
+		message: string,
+		successMessage = message,
+		connectionOutcome?: McpOutcomeDetails,
+	): void {
+		this.pendingPostRunActivation = { message, successMessage, ...(connectionOutcome ? { connectionOutcome } : {}) };
+		this.showStatus(`${message} It will activate automatically when the current turn finishes.`);
+	}
+
+	private async maybeRunQueuedMcpActivation(): Promise<void> {
+		if (!this.pendingPostRunActivation) return;
+		if (this.isAgentStreaming() || this.isAgentCompacting()) return;
+		const pending = this.pendingPostRunActivation;
+		this.pendingPostRunActivation = undefined;
+		const reloaded = await this.handleReloadCommand();
+		if (pending.connectionOutcome) {
+			await this.appendMcpConnectionOutcome({
+				...pending.connectionOutcome,
+				activation: reloaded ? "active" : "inactive",
+			});
+			return;
+		}
+		if (reloaded) {
+			this.showStatus(pending.successMessage);
+		} else {
+			this.showWarning(`${pending.message} The change remains saved, but it is not active in this session.`);
+		}
+	}
+
 	private async showLogoutSelector(): Promise<void> {
 		// Only reload when an MCP integration was actually removed (its skill must
 		// be disabled); a cancelled or non-MCP logout needs no reload.
+		this.pendingMcpDisconnectionOutcome = undefined;
 		const loggedOut = await this.createAuthFlows().runLogout();
-		if (loggedOut?.startsWith("mcp:")) {
-			await this.handleReloadCommand();
+		const outcome = this.pendingMcpDisconnectionOutcome;
+		this.pendingMcpDisconnectionOutcome = undefined;
+		if (!loggedOut?.startsWith("mcp:")) return;
+		if (outcome) {
+			// The outcome path reloads itself, then leaves the durable entry; a
+			// refused/partial logout falls back to the reload-only behaviour.
+			await this.completeMcpConnectionOutcome(outcome);
+			return;
 		}
+		await this.handleReloadCommand();
 	}
 
 	private async handleUpdateCommand(args: string): Promise<void> {
@@ -9006,6 +11310,10 @@ export class InteractiveMode {
 		}
 		this.ui.requestRender(true);
 
+		// The updater ran in a child process and may have persisted settings, for example the
+		// update channel, without installing anything. Pick those up before reporting.
+		await this.settingsManager.reload().catch(() => undefined);
+
 		if (selfUpdateNotAttempted) {
 			this.showStatus(`Update did not change ${APP_NAME}. Reloading resources...`);
 			await this.handleReloadCommand();
@@ -9065,6 +11373,7 @@ export class InteractiveMode {
 
 		try {
 			await this.agentConnection.reload();
+			this.pendingPostRunActivation = undefined;
 			this.toolDefinitionCache.clear();
 			this.keybindings.reload();
 			const activeHeader = this.customHeader ?? this.builtInHeader;
@@ -9777,19 +12086,22 @@ export class InteractiveMode {
 		}
 	}
 
-	private async showHeartbeatManager(): Promise<void> {
+	private showHeartbeatManager(): void {
 		if (this.heartbeatManagerHandle) {
 			this.heartbeatManagerHandle.focus();
 			return;
 		}
-		try {
-			await this.refreshHeartbeatCatalog();
-		} catch (error) {
-			this.showError(error instanceof Error ? error.message : String(error));
-			return;
-		}
+		// Stale-while-revalidate: open immediately with the cached catalog. A
+		// busy session can take minutes to answer the fetch, and the overlay
+		// must not wait for it; the background refresh updates the open view
+		// when fresh data lands (the component reads the catalog per render).
+		// A failed fetch surfaces inside the view instead of silently showing a
+		// possibly-stale catalog; each open starts with a clean notice state.
+		this.heartbeatCatalogFetchError = undefined;
+		void this.refreshHeartbeatCatalog().catch((error) => this.onHeartbeatCatalogFetchError(error));
 		const manager = new HeartbeatManagerComponent({
 			getHeartbeats: () => this.getScopedHeartbeats(),
+			getFetchError: () => this.heartbeatCatalogFetchError,
 			getRows: () => this.ui.terminal.rows,
 			onAction: (heartbeat, action) => this.manageHeartbeat(heartbeat, action),
 			onClose: () => this.closeHeartbeatManager(),
@@ -9805,6 +12117,7 @@ export class InteractiveMode {
 
 	private closeHeartbeatManager(): void {
 		this.clearHeartbeatManagerRefreshTimer();
+		this.clearHeartbeatManagerFetchRetryTimer();
 		this.heartbeatManagerHandle?.hide();
 		this.heartbeatManagerHandle = undefined;
 		this.heartbeatManager = undefined;
@@ -9859,10 +12172,64 @@ export class InteractiveMode {
 		this.heartbeatManagerRefreshAt = undefined;
 	}
 
+	private retainHeartbeatCatalogFetch(
+		fetch: Promise<AgentConnectionHeartbeat[]>,
+		connection: AgentConnection,
+		seq: number,
+	): void {
+		// The deadline expired while this fetch was still in flight: apply the
+		// late result when it lands so the open view converges even without a
+		// further heartbeats_changed event. Bounded by the same context guards
+		// as the drain loop and by the write sequence, so a superseded result
+		// cannot revert newer catalog state; a late failure is swallowed (the
+		// retry chain owns recovery from it).
+		void fetch
+			.then((heartbeats) => {
+				if (this.isShuttingDown || this.isReturningToAgentsView || this.agentConnection !== connection) {
+					return;
+				}
+				this.applyHeartbeatCatalog(heartbeats, seq);
+			})
+			.catch(() => undefined);
+	}
+
+	private armHeartbeatManagerFetchRetry(): void {
+		// Guarantee the open manager always has a next scheduled retrieval
+		// after a deadline expiry; a still-armed retry keeps the earliest slot.
+		if (!this.heartbeatManager || this.heartbeatManagerFetchRetryTimer) return;
+		this.heartbeatManagerFetchRetryTimer = setTimeout(() => {
+			this.heartbeatManagerFetchRetryTimer = undefined;
+			if (!this.heartbeatManager) return;
+			void this.refreshHeartbeatCatalog().catch((error) => this.onHeartbeatCatalogFetchError(error));
+		}, HEARTBEAT_REFRESH_RETRY_DELAY_MS);
+		this.heartbeatManagerFetchRetryTimer.unref?.();
+	}
+
+	private clearHeartbeatManagerFetchRetryTimer(): void {
+		if (this.heartbeatManagerFetchRetryTimer) {
+			clearTimeout(this.heartbeatManagerFetchRetryTimer);
+			this.heartbeatManagerFetchRetryTimer = undefined;
+		}
+	}
+
+	private onHeartbeatCatalogFetchError(error: unknown): void {
+		// Stale-while-revalidate opens the manager even when the fetch fails;
+		// surface the failure in the view instead of silently showing a stale
+		// catalog, and keep a next retrieval scheduled.
+		this.heartbeatCatalogFetchError = error instanceof Error ? error.message : String(error);
+		this.armHeartbeatManagerFetchRetry();
+		this.scheduleHeartbeatManagerRefresh();
+		this.ui.requestRender();
+	}
+
 	private async manageHeartbeat(
 		heartbeat: AgentConnectionHeartbeat,
 		action: AgentHeartbeatManagementAction,
 	): Promise<void> {
+		// Sequence the action by issue order so an older in-flight fetch
+		// cannot later revert its result; the action itself is authoritative
+		// and always applies.
+		const actionSeq = ++this.heartbeatCatalogSeq;
 		const updated = await this.agentConnection.manageHeartbeat(
 			heartbeat.job.activeSessionId,
 			heartbeat.job.id,
@@ -9871,6 +12238,7 @@ export class InteractiveMode {
 		if (updated.source === "heartbeat" && updated.activeSessionId === this.connectionState?.activeSessionId) {
 			this.patchConnectionState({ heartbeat: action === "stop" ? null : updated });
 		}
+		this.heartbeatCatalogAppliedSeq = Math.max(this.heartbeatCatalogAppliedSeq, actionSeq);
 		const remaining = this.heartbeatCatalog.filter((entry) => entry.job.id !== updated.id);
 		this.applyHeartbeatCatalog(
 			updated.status === "active" || updated.status === "paused"
@@ -10215,6 +12583,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 
 	stop(options: { preserveAltScreen?: boolean } = {}): void {
 		this.closeConfigurationMenu?.();
+		this.closeServiceCatalogPicker?.();
 		this.unregisterSignalHandlers();
 		this.clearCtrlCExitHint({ render: false });
 		this.clearEscapeRepeat();

@@ -1,17 +1,23 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resetOAuthProviders } from "@earendil-works/pi-ai/oauth";
 import type { Component, OverlayHandle, TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
 import { createAgentSessionServices } from "../src/core/agent-session-services.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
+import type { McpRemoveAccountResult } from "../src/core/mcp/connection-store.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "../src/core/prime-inference-auth.js";
 import { createAgentSession } from "../src/core/sdk.js";
 import { SessionManager } from "../src/core/session-manager.js";
+import type { AuthenticationResult } from "../src/modes/interactive/auth-flows.js";
 import { ProviderAuthFlows, type ProviderAuthFlowsHost } from "../src/modes/interactive/auth-flows.js";
+import { ExtensionSelectorComponent } from "../src/modes/interactive/components/extension-selector.js";
+import { LoginDialogComponent } from "../src/modes/interactive/components/login-dialog.js";
+import { OAuthSelectorComponent } from "../src/modes/interactive/components/oauth-selector.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 function jsonResponse(body: unknown, status: number = 200): Response {
@@ -50,10 +56,12 @@ function createHost(authStorage: AuthStorage): {
 	statusMessages: string[];
 	errorMessages: string[];
 	overlays: Component[];
+	panels: Component[];
 } {
 	const statusMessages: string[] = [];
 	const errorMessages: string[] = [];
 	const overlays: Component[] = [];
+	const panels: Component[] = [];
 	const modelRegistry = {
 		authStorage,
 		refresh: vi.fn(),
@@ -68,13 +76,62 @@ function createHost(authStorage: AuthStorage): {
 			modelRegistry,
 			showStatus: (message) => statusMessages.push(message),
 			showError: (message) => errorMessages.push(message),
+			showAuthPanel: (component) => {
+				panels.push(component);
+				return () => {
+					const index = panels.lastIndexOf(component);
+					if (index !== -1) {
+						panels.splice(index, 1);
+					}
+				};
+			},
+			getAuthPanelRows: () => 24,
 			getAvailableModels: async () => [],
 		},
 		statusMessages,
 		errorMessages,
 		overlays,
+		panels,
 	};
 }
+
+describe("Prime login completion guard", () => {
+	it("does not complete the Prime login after the dialog was aborted", async () => {
+		const onAuthChanged = vi.fn();
+		const host = {
+			modelRegistry: { refresh: vi.fn(), authStorage: { setPrimeInferenceApiKey: vi.fn() } },
+			onAuthChanged,
+			isOnboardingSurface: () => true,
+		};
+		const flows = new ProviderAuthFlows(host as never);
+		const complete = (
+			flows as unknown as {
+				completePrimeInferenceLogin: (
+					apiKey: string,
+					dialog: unknown,
+					close: () => void,
+					team?: unknown,
+				) => Promise<AuthenticationResult>;
+			}
+		).completePrimeInferenceLogin;
+		const controller = new AbortController();
+		controller.abort();
+		const dialog = { signal: controller.signal } as never;
+		const select = vi
+			.spyOn(
+				flows as unknown as { selectPrimeInferenceTeam: () => Promise<string | undefined> },
+				"selectPrimeInferenceTeam",
+			)
+			.mockResolvedValue(undefined);
+
+		const result = await complete.call(flows, "key", dialog, () => {}, undefined);
+
+		expect(result).toEqual({ status: "cancelled" });
+		expect(onAuthChanged).not.toHaveBeenCalled();
+		expect(host.modelRegistry.refresh).not.toHaveBeenCalled();
+		expect(select).toHaveBeenCalledOnce();
+	});
+});
 
 describe("ProviderAuthFlows", () => {
 	let tempDir: string;
@@ -88,6 +145,7 @@ describe("ProviderAuthFlows", () => {
 	});
 
 	beforeEach(() => {
+		resetOAuthProviders();
 		vi.stubEnv("PRIME_AGENT_INFERENCE_API_BASE_URL", "");
 		vi.stubEnv("PRIME_AGENT_INFERENCE_FRONTEND_URL", "");
 		tempDir = join(tmpdir(), `pi-auth-flows-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -113,6 +171,7 @@ describe("ProviderAuthFlows", () => {
 		if (existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true });
 		}
+		resetOAuthProviders();
 		vi.restoreAllMocks();
 		vi.unstubAllEnvs();
 	});
@@ -194,21 +253,165 @@ describe("ProviderAuthFlows", () => {
 		writeFileSync(join(defaultPrimeDir, "config.json"), JSON.stringify({ api_key: "prime-cli-key" }));
 		const authStorage = AuthStorage.create(authJsonPath, { usePrimeCliConfig: false });
 		const fetchMock = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("offline"));
-		const { host, overlays } = createHost(authStorage);
+		const { host, overlays, panels } = createHost(authStorage);
 		const result = new ProviderAuthFlows(host).runPrimeInferenceLogin();
 		await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
 		expect(String(fetchMock.mock.calls[0]?.[0])).toBe("https://api.primeintellect.ai/api/v1/auth_challenge/generate");
-		overlays[0]?.handleInput?.("\x1b");
+		panels[0]?.handleInput?.("\x1b");
 		await expect(result).resolves.toEqual({ status: "cancelled" });
 		expect(authStorage.has(PRIME_INFERENCE_PROVIDER_ID)).toBe(false);
+		// The login dialog mounts inline in the host, never as an overlay.
+		expect(overlays).toHaveLength(0);
+	});
+
+	it("the generic /logout route delegates MCP logouts whole before touching auth", async () => {
+		const authStorage = AuthStorage.create(authJsonPath, { usePrimeCliConfig: false });
+		authStorage.set("mcp:acme-2", {
+			type: "oauth",
+			access: "real-for-acme-2",
+			refresh: "r",
+			expires: Date.now() + 3600_000,
+			endpoint: "https://mcp.acme.test/mcp",
+		});
+		const { host, panels, statusMessages, errorMessages } = createHost(authStorage);
+		const logout = vi.spyOn(authStorage, "logout");
+		const delegated = vi.fn(async () => "removed" as McpRemoveAccountResult);
+		(host as { onMcpAccountLogout?: unknown }).onMcpAccountLogout = delegated;
+
+		const logoutResult = new ProviderAuthFlows(host).runLogout();
+		expect(panels).toHaveLength(1); // #2331: the route selector mounts inline, not as an overlay
+		for (const char of "acme-2") {
+			panels[0]?.handleInput?.(char);
+		}
+		panels[0]?.handleInput?.("\r");
+		await expect(logoutResult).resolves.toBe("mcp:acme-2");
+		// The route never touched auth directly for the MCP id: the host-owned
+		// critical section (store->auth) did everything.
+		expect(logout).not.toHaveBeenCalled();
+		expect(delegated).toHaveBeenCalledWith("mcp:acme-2");
+		expect(errorMessages).toEqual([]);
+		expect(statusMessages.join("\n")).toContain("Logged out of acme-2");
+	});
+
+	it("a failed MCP logout outcome reports the failure honestly instead of success", async () => {
+		const authStorage = AuthStorage.create(authJsonPath, { usePrimeCliConfig: false });
+		authStorage.set("mcp:acme-2", {
+			type: "oauth",
+			access: "real-for-acme-2",
+			refresh: "r",
+			expires: Date.now() + 3600_000,
+			endpoint: "https://mcp.acme.test/mcp",
+		});
+		const { host, panels, statusMessages, errorMessages } = createHost(authStorage);
+		(host as { onMcpAccountLogout?: unknown }).onMcpAccountLogout = vi.fn(
+			async () => "failed" as McpRemoveAccountResult,
+		);
+
+		const logoutResult = new ProviderAuthFlows(host).runLogout();
+		expect(panels).toHaveLength(1); // #2331: the route selector mounts inline, not as an overlay
+		for (const char of "acme-2") {
+			panels[0]?.handleInput?.(char);
+		}
+		panels[0]?.handleInput?.("\r");
+		await expect(logoutResult).resolves.toBeNull();
+		expect(errorMessages.join("\n")).toContain("Logout failed");
+		expect(statusMessages.join("\n")).not.toContain("Logged out of acme-2");
+	});
+
+	// The honest partial-state wording ("could not be saved... try again") is pinned ONCE at the removeAction seam in
+	// mcp-activation-queue.test.ts ("a removeAccount whose record write fails after the logout reports the honest
+	// partial state").
+
+	it("the generic /login service option for an MCP account delegates to the guarded host hook", async () => {
+		const authStorage = AuthStorage.create(authJsonPath, { usePrimeCliConfig: false });
+		const { host } = createHost(authStorage);
+		const delegated = vi.fn(async () => ({
+			status: "success" as const,
+			providerId: "mcp:acme",
+			providerName: "Acme",
+			authType: "oauth" as const,
+			kind: "service" as const,
+		}));
+		(host as { onMcpAccountLogin?: unknown }).onMcpAccountLogin = delegated;
+
+		const result = await new ProviderAuthFlows(host).loginProvider({
+			id: "mcp:acme",
+			name: "Acme",
+			authType: "oauth",
+			category: "service",
+		});
+
+		// The MCP login went through the guarded hook — never a raw dialog writing the final credential directly.
+		expect(delegated).toHaveBeenCalledWith("mcp:acme");
+		expect(result.status).toBe("success");
+	});
+
+	it("an MCP login without a guarded host hook fails closed without opening a dialog", async () => {
+		const { host, overlays, errorMessages } = createHost(
+			AuthStorage.create(authJsonPath, { usePrimeCliConfig: false }),
+		);
+		const result = await new ProviderAuthFlows(host).loginProvider({
+			id: "mcp:my--service",
+			name: "My service",
+			authType: "oauth",
+			category: "service",
+		});
+		expect(result).toEqual({ status: "failed" });
+		expect(overlays).toEqual([]);
+		expect(errorMessages.join("\n")).toContain("guarded host");
+	});
+
+	it("an unresolvable MCP login reports an explicit failure — never a raw-dialog fallback", async () => {
+		const authStorage = AuthStorage.create(authJsonPath, { usePrimeCliConfig: false });
+		const { host } = createHost(authStorage);
+		const delegated = vi.fn(async () => ({ status: "failed" as const }));
+		(host as { onMcpAccountLogin?: unknown }).onMcpAccountLogin = delegated;
+
+		const result = await new ProviderAuthFlows(host).loginProvider({
+			id: "mcp:acme",
+			name: "Acme",
+			authType: "oauth",
+			category: "service",
+		});
+
+		// The hook OWNS every MCP login (including unresolvable names): its explicit failed outcome is the route's result —
+		// no raw dialog ever writes the final credential directly.
+		expect(delegated).toHaveBeenCalledWith("mcp:acme");
+		expect(result).toEqual({ status: "failed" });
+	});
+
+	// A refused stale staged logout staying state-neutral is pinned at the STORE level in mcp-connection-store.test.ts
+	// ("a staged-key logout queued behind a finalize-first move refuses fail-closed" and "a staged-key logout with a
+	// bystander on the real key preserves the account shell") and at the resolution seam in
+	// mcp-activation-queue.test.ts ("logoutMcpAccount resolves exact ids first...").
+
+	it("non-MCP logouts stay unchanged: the route removes them directly", async () => {
+		const authStorage = AuthStorage.create(authJsonPath, { usePrimeCliConfig: false });
+		authStorage.set("anthropic", { type: "api_key", key: "sk-ant-test" });
+		const { host, panels, statusMessages } = createHost(authStorage);
+		const delegated = vi.fn(async () => "removed" as McpRemoveAccountResult);
+		(host as { onMcpAccountLogout?: unknown }).onMcpAccountLogout = delegated;
+		const logout = vi.spyOn(authStorage, "logout");
+
+		const logoutResult = new ProviderAuthFlows(host).runLogout();
+		expect(panels).toHaveLength(1); // #2331: the route selector mounts inline, not as an overlay
+		for (const char of "anthropic") {
+			panels[0]?.handleInput?.(char);
+		}
+		panels[0]?.handleInput?.("\r");
+		await expect(logoutResult).resolves.toBe("anthropic");
+		expect(delegated).not.toHaveBeenCalled();
+		expect(logout).toHaveBeenCalledWith("anthropic");
+		expect(statusMessages.join("\n")).toContain("Removed stored API key for anthropic");
 	});
 
 	it("does not offer logout for credentials owned only by the Prime CLI", async () => {
 		writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key" }));
 		const authStorage = AuthStorage.create(authJsonPath, { primeCliConfigPath: primeConfigPath });
-		const { host, overlays } = createHost(authStorage);
+		const { host, overlays, panels } = createHost(authStorage);
 		await expect(new ProviderAuthFlows(host).runLogout()).resolves.toBeNull();
 		expect(overlays).toHaveLength(0);
+		expect(panels).toHaveLength(0);
 		expect(JSON.parse(readFileSync(primeConfigPath, "utf-8"))).toEqual({ api_key: "prime-cli-key" });
 	});
 
@@ -237,13 +440,14 @@ describe("ProviderAuthFlows", () => {
 					return jsonResponse({ data: [], total_count: 0 });
 				throw new Error(`Unexpected URL: ${url}`);
 			});
-			const { host, overlays, errorMessages } = createHost(authStorage);
+			const { host, overlays, panels, errorMessages } = createHost(authStorage);
 			const result = new ProviderAuthFlows(host).runPrimeInferenceLogin();
 			await vi.waitFor(() =>
-				expect(stripAnsi(overlays[0]?.render(80).join("\n") ?? "")).toContain("Paste a Prime API key below:"),
+				expect(stripAnsi(panels[0]?.render(80).join("\n") ?? "")).toContain("Paste a Prime API key below:"),
 			);
-			overlays[0]?.handleInput?.("manual-key");
-			overlays[0]?.handleInput?.("\r");
+			expect(overlays).toHaveLength(0);
+			panels[0]?.handleInput?.("manual-key");
+			panels[0]?.handleInput?.("\r");
 			await expect(result).resolves.toMatchObject({ status: "success" });
 			expect(errorMessages).toEqual([]);
 			expect(urls).toEqual([
@@ -275,15 +479,76 @@ describe("ProviderAuthFlows", () => {
 
 	it("opens login on the requested MCP Connections category", async () => {
 		const authStorage = AuthStorage.create(authJsonPath, { usePrimeCliConfig: false });
-		const { host, overlays } = createHost(authStorage);
+		const { host, overlays, panels } = createHost(authStorage);
 
 		const loginResult = new ProviderAuthFlows(host).runLogin({ initialCategory: "service" });
 
-		expect(overlays).toHaveLength(1);
-		const output = stripAnsi(overlays[0]?.render(80).join("\n") ?? "");
+		expect(overlays).toHaveLength(0);
+		expect(panels).toHaveLength(1);
+		expect(panels[0]).toBeInstanceOf(OAuthSelectorComponent);
+		const output = stripAnsi(panels[0]?.render(80).join("\n") ?? "");
 		expect(output).toContain("Serper (web search)");
 		expect(output).not.toContain("Anthropic");
-		overlays[0]?.handleInput?.("\x1b");
+		panels[0]?.handleInput?.("\x1b");
 		await expect(loginResult).resolves.toEqual({ status: "cancelled" });
+		expect(panels).toHaveLength(0);
+	});
+
+	it("mounts the API key login dialog inline and unmounts it after submitting", async () => {
+		const authStorage = AuthStorage.create(authJsonPath, { usePrimeCliConfig: false });
+		const { host, overlays, panels, statusMessages } = createHost(authStorage);
+
+		const loginPromise = new ProviderAuthFlows(host).loginProvider({
+			id: "xai",
+			name: "xAI (Grok)",
+			authType: "api_key",
+		});
+
+		await vi.waitFor(() => expect(stripAnsi(panels[0]?.render(80).join("\n") ?? "")).toContain("Enter API key:"));
+		expect(panels[0]).toBeInstanceOf(LoginDialogComponent);
+		expect(overlays).toHaveLength(0);
+		panels[0]?.handleInput?.("test-key");
+		panels[0]?.handleInput?.("\r");
+
+		await expect(loginPromise).resolves.toMatchObject({ status: "success", providerId: "xai" });
+		expect(panels).toHaveLength(0);
+		expect(authStorage.get("xai")).toEqual({ type: "api_key", key: "test-key" });
+		expect(statusMessages.join("\n")).toContain("Saved API key for xAI (Grok)");
+	});
+
+	it("restores the login dialog after an in-flow account selection", async () => {
+		const authStorage = AuthStorage.create(authJsonPath, { usePrimeCliConfig: false });
+		const { host, panels } = createHost(authStorage);
+		const loginSpy = vi.spyOn(authStorage, "login").mockImplementation(async (_providerId, handlers) => {
+			await handlers?.onSelect?.({
+				message: "Choose an account",
+				options: [
+					{ id: "personal", label: "Personal" },
+					{ id: "business", label: "Business" },
+				],
+			});
+		});
+
+		const loginPromise = new ProviderAuthFlows(host).loginProvider({
+			id: "anthropic",
+			name: "Anthropic",
+			authType: "oauth",
+		});
+
+		await vi.waitFor(() => expect(panels).toHaveLength(2));
+		expect(panels[0]).toBeInstanceOf(LoginDialogComponent);
+		expect(panels[1]).toBeInstanceOf(ExtensionSelectorComponent);
+		const selectorOutput = stripAnsi(panels[1]?.render(80).join("\n") ?? "");
+		expect(selectorOutput).toContain("Choose an account");
+		expect(selectorOutput).toContain("Personal");
+		expect(selectorOutput).toContain("Business");
+
+		panels[1]?.handleInput?.("\r");
+
+		await expect(loginPromise).resolves.toMatchObject({ status: "success", providerId: "anthropic" });
+		// Selecting an option unmounts the selector and restores the login dialog,
+		// which is then unmounted when the flow finishes.
+		expect(panels).toHaveLength(0);
+		expect(loginSpy).toHaveBeenCalledOnce();
 	});
 });

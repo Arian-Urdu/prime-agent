@@ -18,10 +18,26 @@ Edit directly or use `/settings` for common options.
 | `defaultProvider` | string | - | Default provider (e.g., `"anthropic"`, `"openai"`) |
 | `defaultModel` | string | - | Default model ID |
 | `subagentDefaultModel` | string | - | Model selector (`"provider/id"`) used when `rlm.spawn` does not pin a model; unset inherits the parent model |
-| `defaultThinkingLevel` | string | `"xhigh"` | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` |
+| `imageModel` | string | none | Model (`"provider/model-id"` or a bare id) that serves turns attaching images when the session model does not accept image input |
+| `defaultThinkingLevel` | string | `"medium"` | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` |
 | `thinkingBudgets` | object | - | Custom token budgets per thinking level |
 
 `subagentDefaultModel` applies only to spawned subagents whose `rlm.spawn` call omits `model=`. An explicit `model=` per spawn always wins, and an unset setting keeps the inherit-parent behavior. If the configured default is unavailable, unauthenticated, or expired, the spawn fails with that error instead of silently falling back.
+
+When `defaultThinkingLevel` is unset, new sessions start at `"medium"` reasoning, clamped to the levels each model supports.
+
+`imageModel` routes image turns on text-only session or subagent models. When a
+turn attaches images and the selected model has no image input, that turn (and
+its retries and post-compaction continuations) is served by the configured
+image-capable model instead; the session model selection stays unchanged, and
+the routed assistant messages record the model that served them. Later
+image-free turns return to the session model, where images already in the
+transcript appear as "(image omitted: model does not support images)"
+placeholders. With no `imageModel` set (default), image turns on a text-only
+model fail with an actionable error instead of silently dropping the images:
+switch the session model with `/model` or configure `imageModel`. Set
+`images.blockImages: true` to drop images everywhere instead of routing or
+refusing.
 
 ### Autonomous Runs
 
@@ -58,14 +74,14 @@ These are the persisted defaults for the same limits as the `--autonomous-*` CLI
 
 ### UI & Display
 
-Conversation output starts in overview. Ctrl+O cycles through details and all output; the old `hideThinkingBlock` setting no longer controls visibility.
+Conversation output starts at the `chatDetail` level (default `details`). Ctrl+O cycles overview -> details -> all output and saves the choice, so new, resumed, and attached chats open at the level you last picked. The old `hideThinkingBlock` setting no longer controls visibility.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `theme` | string | `"dark"` | Theme name (`"dark"`, `"light"`, or custom) |
+| `theme` | string | detected | Theme name (built-ins: `"prime"`, `"dark"`, `"light"`; or custom). Unset uses `"prime"` on dark terminals and `"light"` on light terminals |
 | `quietStartup` | boolean | `false` | Hide startup header |
-| `collapseChangelog` | boolean | `false` | Show condensed changelog after updates |
 | `treeFilterMode` | string | `"user-only"` | Default filter for `/tree`: `"default"`, `"no-tools"`, `"user-only"`, `"labeled-only"`, `"all"` |
+| `chatDetail` | string | `"details"` | Conversation detail level: `"overview"`, `"details"`, or `"all"`. Ctrl+O updates it |
 | `editorPaddingX` | number | `0` | Horizontal padding for input editor (0-3) |
 | `autocompleteMaxVisible` | number | `5` | Max visible items in autocomplete dropdown (3-20) |
 | `showHardwareCursor` | boolean | `false` | Show terminal cursor |
@@ -91,6 +107,21 @@ The stable `latest.json` and beta `beta.json` manifests use the same JSON shape:
 ### Pseudonymous usage analytics
 
 Prime Agent sends pseudonymous, aggregate usage and performance events to Prime Intellect. These events include version and operating-system category, onboarding outcome and duration, execution mode (`interactive`, `print`, `json`, `rpc`, or `acp`), run outcomes, TTFT and latency, prompt and turn counts, token usage, tool success counts, retries, and compactions.
+
+Every event also carries a small platform descriptor, used to decide which prebuilt binaries Prime Agent has to ship:
+
+| Property | Values |
+|----------|--------|
+| `os_family` | `linux`, `darwin`, `win32`, ... |
+| `architecture` | `arm64`, `x64`, ... |
+| `install_method` | `bun-binary`, `homebrew`, `npm`, `pnpm`, `yarn`, `bun`, `unknown` |
+| `libc` | `glibc`, `musl`, `none` (not Linux), `unknown` |
+| `libc_version` | glibc runtime version such as `2.39`, else `unknown` |
+| `cpu_baseline` | `avx2`, `no_avx2` (both measured on x86_64), `avx2_assumed` (Intel Macs, inferred), `not_applicable` (not x86_64), `unknown` |
+| `os_release` | kernel version such as `6.8.0-45-generic` or `24.6.0` |
+| `os_product_version` | macOS product version such as `15.6`; `unknown` elsewhere |
+
+Most of these are coarse platform categories shared by millions of machines. `os_release` is the one exception: it is the raw kernel release string, capped at 64 characters. Stock kernel names such as `6.8.0-45-generic` are shared widely, but custom or self-built kernels can embed organization-, user-, or machine-specific labels in that string, so `os_release` is not guaranteed to be non-identifying. The remaining fields contain no hostname, username, path, serial number, or other hardware identifier.
 
 Prime Agent does not send prompts, responses, thinking, tool arguments or results, command text, filenames, paths, repository information, environment variables, credentials, raw error messages, hostnames, usernames, emails, or hardware identifiers. A random installation ID is stored as `telemetry.json` in the configured agent directory (normally `~/.prime/agent/`).
 
@@ -178,6 +209,9 @@ When a provider requests a retry delay longer than `retry.provider.maxRetryDelay
 | `retry.provider.waitForUsage.maxDelayMs` | number | `300000` | Per-ping ceiling (5m) |
 | `retry.provider.waitForUsage.maxAttempts` | number | `30` | Abort bound: maximum recovery pings |
 | `retry.provider.waitForUsage.maxWaitMs` | number | `900000` | Abort bound: maximum total wait (15m) |
+| `retry.provider.waitForUsage.pauseUntilReset` | boolean | `true` | Park quota-blocked sessions until the provider-reported reset instead of dying mid-task |
+| `retry.provider.waitForUsage.maxPauseMs` | number | `86400000` | Abort bound: maximum single park (24h; clamped to 7d) |
+| `retry.provider.waitForUsage.maxParks` | number | `8` | Abort bound: maximum parks per quota episode |
 | `providerBackupModel` | string | none | Backup model ("provider/model-id" or bare id) used while the primary is quota-blocked or unavailable |
 
 The wait loop runs under the `retry.enabled` master switch: with retries
@@ -195,6 +229,23 @@ status line, and both abort bounds (`maxAttempts`, `maxWaitMs`) are hard stops:
 waits never hang. When a reported reset time exceeds `maxWaitMs`, the wait gives
 up immediately with an informative error instead of pinging pointlessly — raise
 `maxWaitMs` to wait out long subscription windows.
+
+When `pauseUntilReset` is on (the default) and such a reset is reported — e.g.
+the ChatGPT-plan "Try again in ~7272 min" 429 — the session does not die
+mid-task: it parks. The turn ends cleanly with a "parked until ..." status, the
+park/resume transitions are recorded in the session log, and one durable
+one-shot scheduled job (visible via `/cron`) wakes the session at the reset
+time — or sooner when `maxPauseMs` caps the park. While parked the session
+itself makes no model calls. The wake delivers an
+in-context marker telling the model the pause happened and to continue the
+interrupted task; that turn's single model call probes the quota. If the quota
+is back, the task resumes with its context. If not, the session re-parks with
+the newly reported reset, bounded by `maxPauseMs` per park and `maxParks` per
+quota episode; when the budget is spent, it aborts exactly like the bounded
+wait it replaced. Parks apply at the session level (subagents included), only
+for quota failures with a provider-reported reset, and only when no backup
+model took over; a `maxPauseMs` above 7 days is clamped. Set
+`pauseUntilReset: false` to keep the pre-park behavior of failing immediately.
 
 `providerBackupModel` routes failed turns to a user-defined backup model
 instead of waiting while the primary is quota-blocked or unavailable. It is
@@ -219,7 +270,10 @@ available, authenticated model, the bounded wait runs instead.
         "baseDelayMs": 1000,
         "maxDelayMs": 300000,
         "maxAttempts": 30,
-        "maxWaitMs": 900000
+        "maxWaitMs": 900000,
+        "pauseUntilReset": true,
+        "maxPauseMs": 86400000,
+        "maxParks": 8
       }
     }
   },
@@ -227,13 +281,19 @@ available, authenticated model, the bounded wait runs instead.
 }
 ```
 
+### Diagnostics
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `requestTiming` | boolean | `false` | Log per-request provider timing phases to the diagnostic log (see [Development: Request timing](development.md#request-timing)); `PI_REQUEST_TIMING=1` also enables it |
+
 ### Message Delivery
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `steeringMode` | string | `"one-at-a-time"` | How steering messages are sent: `"all"` or `"one-at-a-time"` |
 | `followUpMode` | string | `"one-at-a-time"` | How follow-up messages are sent: `"all"` or `"one-at-a-time"` |
-| `transport` | string | `"sse"` | Preferred transport for providers that support multiple transports: `"sse"`, `"websocket"`, or `"auto"` |
+| `transport` | string | `"auto"` | Preferred transport for providers that support multiple transports: `"sse"`, `"websocket"`, `"websocket-cached"`, or `"auto"` |
 
 ### Terminal & Images
 

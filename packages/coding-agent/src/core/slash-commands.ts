@@ -89,6 +89,7 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "model", description: "Select model (opens selector UI)", argumentHint: "[search]" },
 	{ name: "effort", description: "Select reasoning/thinking level (opens selector UI)", argumentHint: "[level]" },
 	{ name: "fast", description: "Toggle OpenAI Fast mode" },
+	{ name: "tier", description: "Show or set the service tier", argumentHint: "[default|flex|priority|auto]" },
 	{ name: "scoped-models", description: "Enable/disable models for Alt+M cycling" },
 	{
 		name: "export",
@@ -129,7 +130,13 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{
 		name: "update",
 		description: `Update ${APP_NAME} and installed packages`,
-		argumentHint: "[source|--self|--extensions]",
+		argumentHint: "[source|--self|--extensions|--nightly|--stable]",
+		takesArgument: true,
+	},
+	{
+		name: "nightly",
+		description: `Switch ${APP_NAME} updates to the nightly channel (unreleased builds, may be broken)`,
+		argumentHint: "[on|off|status]",
 		takesArgument: true,
 	},
 	{ name: "hotkeys", description: "Show all keyboard shortcuts" },
@@ -140,8 +147,14 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "logout", description: "Remove provider authentication" },
 	{
 		name: "mcp",
-		description: "Open MCP Connections or manage MCP integrations",
+		description: "Browse external services or manage MCP integrations",
 		argumentHint: "[add|list|get|remove|login|logout]",
+		takesArgument: true,
+	},
+	{
+		name: "plugins",
+		description: "Browse and connect external services",
+		argumentHint: "[search]",
 		takesArgument: true,
 	},
 	{
@@ -197,6 +210,12 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{
 		name: "fullscreen",
 		description: "Toggle fullscreen (alternate screen) rendering with scrollable transcript",
+		argumentHint: "[on|off]",
+		takesArgument: true,
+	},
+	{
+		name: "speed",
+		description: "Toggle footer readout of model output tok/sec (latest response and session average)",
 		argumentHint: "[on|off]",
 		takesArgument: true,
 	},

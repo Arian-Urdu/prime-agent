@@ -1,6 +1,6 @@
 # Standalone binaries
 
-The macOS and Linux release archives contain `prime-agent` and its support files. Normal application execution does not require Node, npm, or Bun. Keep the archive contents together: moving only the executable breaks asset and Python runtime discovery. Linux archives target glibc; Alpine/musl and Windows are outside this distribution.
+The macOS and Linux release archives contain `prime-agent` and its support files. Normal application execution does not require Node, npm, or Bun. Keep the archive contents together: moving only the executable breaks asset and Python runtime discovery. Linux archives cover glibc and musl (Alpine), on ARM64 and x64, plus baseline x64 builds for CPUs without AVX2. Windows is outside this distribution.
 
 On macOS, use the published installer:
 
@@ -10,7 +10,20 @@ curl --proto '=https' --proto-redir '=https' -fsSL https://app.primeintellect.ai
 
 The current macOS archives are not Developer ID signed or notarized. A browser-downloaded archive may retain quarantine metadata and be blocked by Gatekeeper, so manual macOS archive installation is not supported yet. Do not bypass Gatekeeper; use the installer until signed and notarized downloads are available.
 
-On Linux, download `prime-agent-<version>-<platform>.tar.gz` and `SHA256SUMS` over HTTPS from the same release. Platforms are `linux-arm64` and `linux-x64`. Check the selected archive's SHA-256 against that inventory, extract it into its own directory, and run `./prime-agent --help`.
+On Linux, download `prime-agent-<version>-<platform>.tar.gz` and `SHA256SUMS` over HTTPS from the same release. Platforms are:
+
+| Platform | Host |
+| --- | --- |
+| `linux-arm64` | glibc 2.17+, ARM64 |
+| `linux-arm64-musl` | musl (Alpine), ARM64 |
+| `linux-x64` | glibc 2.17+, x64 with AVX2 |
+| `linux-x64-baseline` | glibc 2.17+, x64 without AVX2 |
+| `linux-x64-musl` | musl (Alpine), x64 with AVX2 |
+| `linux-x64-musl-baseline` | musl (Alpine), x64 without AVX2 |
+
+Bun's default x64 build requires AVX2, so hosts without it need the `baseline` archive; `grep -q avx2 /proc/cpuinfo` answers that question. Check the selected archive's SHA-256 against the release inventory, extract it into its own directory, and run `./prime-agent --help`.
+
+musl archives link against `libstdc++`, which Alpine does not preinstall. Run `apk add --no-cache libstdc++` first; without it the executable cannot start. The installer recognizes that loader failure, names the package, and stops instead of downloading the much larger Node installation; set `PRIME_AGENT_INSTALL_METHOD=node` to take the Node route anyway.
 
 The Python tool uses the existing managed CPython setup. Its first use requires uv and network access to install Python and Python dependencies. The archive includes the matching `prime-agent-runtime` sources and built-in Python skills. It contains no prebuilt virtual environment or `node_modules` directory. External tools and extension-specific dependencies retain their own requirements.
 
@@ -27,7 +40,7 @@ npm run build:binary
 npm run build:binary -- --platform all
 ```
 
-The first command builds the native platform; the second cross-compiles all four targets. A single target can also be selected with `--platform linux-arm64`. Both commands compile the workspace TypeScript packages using the committed model catalog, then bundle the existing Bun CLI entry. They do not install dependencies or change the lockfile. Output goes to `packages/coding-agent/binaries/<platform>/`.
+The first command builds the host platform; the second cross-compiles every release target listed in `scripts/release-platforms.mjs`. A single target can also be selected with `--platform linux-x64-musl`. Both commands compile the workspace TypeScript packages using the committed model catalog, then bundle the existing Bun CLI entry. They do not install dependencies or change the lockfile. Output goes to `packages/coding-agent/binaries/<platform>/`.
 
 Assemble local archives from the repository root:
 
@@ -64,13 +77,15 @@ npx tsx ../../node_modules/vitest/dist/cli.js --run test/compiled-artifact.test.
 
 The suite extracts outside the checkout, creates isolated homes and a PATH without JavaScript runtimes, and exercises provider requests against a local HTTP/2 server, extension and skill loading, Photon image resizing, HTML export, RPC, managed Python, and daemon shutdown. It never uses real provider credentials. Python bootstrap requires network access. Other tests skip this suite when `PRIME_AGENT_TEST_ARCHIVE` is unset.
 
-CI builds and tests natively on all four target platforms. Before testing, it moves the build checkout so absolute build-time paths and its original `node_modules` cannot satisfy missing runtime files. Cross-compilation alone is not native execution evidence.
+CI builds each release target on a runner of the same architecture and executes it there. Before testing, it moves the build checkout so absolute build-time paths and its original `node_modules` cannot satisfy missing runtime files. Cross-compilation alone is not native execution evidence.
 
-The release workflow consumes those tested artifacts, adds the stable or beta package version, and includes all four archives in the existing aggregate `SHA256SUMS`. Existing npm tarballs and manifest fields remain. The `binaries` array adds `{ platform, file, sha256 }` entries; each file lives under `releases/v<version>/`. Stable/beta pointers retain their existing routing. Production and beta uploads use the same archives for GitHub and R2.
+glibc and baseline archives run the Vitest suites directly on the runner. A musl archive cannot run on the glibc runner that cross-compiled it, and the checkout's `node_modules` are glibc builds, so Vitest cannot follow it into Alpine. Those archives are instead extracted and executed inside an Alpine container on the same runner, with no JavaScript runtime present.
+
+The release workflow consumes those tested artifacts, adds the stable or beta package version, and includes every platform archive in the existing aggregate `SHA256SUMS`. Existing npm tarballs and manifest fields remain. The `binaries` array adds `{ platform, file, sha256 }` entries; each file lives under `releases/v<version>/`. Stable/beta pointers retain their existing routing. Production and beta uploads use the same archives for GitHub and R2.
 
 ## Installation
 
-The published installer defaults to the compiled archive on macOS 13+ and glibc Linux, on ARM64 or x64. It requires an HTTPS release base, allows redirects only to HTTPS, checks the exact release checksum, rejects unsafe archive entries, validates required assets, and runs the executable before activating it. Machines outside those targets use the existing Node installer; an executable that cannot run also falls back to Node. A failed checksum never triggers a fallback.
+The published installer defaults to the compiled archive on macOS 13+, glibc 2.17+ Linux, and musl Linux, on ARM64 or x64. On x64 it reads `/proc/cpuinfo` and selects the `baseline` archive when the CPU has no AVX2; an unreadable CPU inventory also selects `baseline`, which runs on every x86-64 CPU. It requires an HTTPS release base, allows redirects only to HTTPS, checks the exact release checksum, rejects unsafe archive entries, validates required assets, and runs the executable before activating it. Machines outside those targets use the existing Node installer; an executable that cannot run also falls back to Node. A failed checksum never triggers a fallback.
 
 The archive and `SHA256SUMS` inventory are served by the same release origin. The checksum detects corruption or inconsistent content but is not an independent signature and does not protect against a compromised origin; HTTPS authentication of the configured origin is the trust boundary.
 
@@ -104,7 +119,7 @@ Failed automatic migrations retry after 24 hours; `PRIME_AGENT_MIGRATE_RETRY=1` 
 
 ## Updates and rollback
 
-Run `prime-agent update` or `/update` to install the latest version on the current stable or beta channel. Managed compiled installations require a matching platform entry in the release manifest and verify its SHA-256 against both the release checksums and downloaded archive. Failed downloads or validation leave the current executable and assets active. Unmanaged archives must be updated through their original installer.
+Run `prime-agent update` or `/update` to install the latest version on the current stable or beta channel. The channel follows the running version unless you choose one: `/nightly` (or `prime-agent update --nightly`) warns that nightly builds are unreleased and may be broken, asks for confirmation, then switches to the nightly channel and runs the update with the usual busy-session confirmation, `/nightly off` (or `--stable`) returns to stable, and `/nightly status` shows the current choice. Nightly builds are the `-beta` prereleases published in `beta.json`. The channel is stored only after you confirm, and only after the busy-session confirmation, so declining either leaves settings untouched. If the nightly manifest cannot be resolved, nothing is installed and the channel is not changed. The preference is per user and cannot be overridden by project settings; later `/update` runs keep following it. Updates never move to a lower base version. If the channel's current release is behind what you have installed, `update` reports that you are ahead and installs nothing; with `--force` it refuses explicitly. Compiled installs can use `--rollback` to go back to the retained previous release. Managed compiled installations require a matching platform entry in the release manifest and verify its SHA-256 against both the release checksums and downloaded archive. Failed downloads or validation leave the current executable and assets active. Unmanaged archives must be updated through their original installer.
 
 Updates retain the previous release, preserve user configuration and sessions, and use the existing busy-session confirmation and daemon restart coordination. Relaunches resolve the stable launcher after activation, so the new process runs the updated application. The installer checks that the active release has not changed since the update was planned and serializes activation with its installation lock.
 
@@ -116,7 +131,7 @@ Normal interruption during rollback finishes retaining the release being left. A
 
 ## Coverage and recovery limits
 
-Native CI runs the extracted archives on macOS 15 (ARM64 and x64) and Ubuntu 24.04 (ARM64 and x64). It tests installation, forced reinstall, later update, offline rollback, daemon replacement, runtime assets, RPC, and managed Python without JavaScript runtimes on the application PATH. The installer selects macOS 13+ and compatible glibc Linux, but these selection checks do not constitute execution testing on every older OS release.
+Native CI runs the extracted archives on macOS 15 (ARM64 and x64), Ubuntu 24.04 (ARM64 and x64), and Alpine containers on those Ubuntu runners for the musl archives. It tests installation, forced reinstall, later update, offline rollback, daemon replacement, runtime assets, RPC, and managed Python without JavaScript runtimes on the application PATH. The installer selects macOS 13+, compatible glibc Linux, and musl Linux, but these selection checks do not constitute execution testing on every older OS release. No CI runner lacks AVX2, so `baseline` selection is covered by fixture tests against a substituted `/proc/cpuinfo` rather than by no-AVX2 hardware.
 
 Focused regressions cover migration without lifecycle scripts, incompatible existing binaries, deferred migration during internal daemon startup, competing installs and npm command handoffs, checksum/manifest failures, rollback metadata and executable-version mismatches, interrupted activation recovery, conservative release retention, and orphan staging cleanup. Normal installer hangups release the lock. A forced kill still requires confirming and clearing its stale lock before recovery can run; complete filesystem power-loss, disk-exhaustion, ACL, and network-filesystem fault testing is outside this matrix.
 

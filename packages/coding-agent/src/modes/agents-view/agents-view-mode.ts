@@ -13,7 +13,14 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import { APP_TITLE, appendRotatingLog, getAgentDir, getClientErrorLogPath, VERSION } from "../../config.js";
+import {
+	APP_TITLE,
+	appendRotatingLog,
+	getAgentDir,
+	getAgentLogPath,
+	getClientErrorLogPath,
+	VERSION,
+} from "../../config.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import { KeybindingsManager } from "../../core/keybindings.js";
 import { SessionManager } from "../../core/session-manager.js";
@@ -29,14 +36,16 @@ import { ensureTool } from "../../utils/tools-manager.js";
 import { DaemonAgentConnection } from "../agent-connection/daemon-agent-connection.js";
 import type { AgentConnectionHeartbeat, AgentConnectionSavedSessionInfo } from "../agent-connection/types.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../daemon/daemon-client.js";
-import { DaemonSessionRecoveringError } from "../daemon/daemon-errors.js";
+import { DaemonSessionRecoveringError, isDaemonUpdateRestartingError } from "../daemon/daemon-errors.js";
 import {
 	collectDaemonClientEnv,
 	type DaemonClosingReason,
 	type DaemonCommand,
 	type DaemonResponse,
+	isSessionSummary,
 	isUnknownDaemonCommandError,
 } from "../daemon/daemon-protocol.js";
+import { DaemonControlPlaneTransportError } from "../daemon/daemon-routed-client.js";
 import { resolveAttachModelFallbackMessage, type SessionSummary } from "../daemon/daemon-session-list.js";
 import { listDaemonHeartbeats } from "../daemon/heartbeat-catalog.js";
 import {
@@ -100,6 +109,14 @@ import {
 	type UnifiedSessionIndex,
 	type UnifiedSessionRecord,
 } from "./agents-view-state.js";
+import {
+	createIncidentNoticeState,
+	dismissIncidentNoticeState,
+	formatIncidentNoticeLine,
+	INCIDENT_NOTICE_POLL_INTERVAL_MS,
+	type IncidentNoticeState,
+	refreshIncidentNoticeState,
+} from "./incident-notices.js";
 import { AgentsViewRosterStore, STALE_ROSTER_DAEMON_MESSAGE } from "./roster-store.js";
 import { matchesSearchText } from "./session-view-search.js";
 
@@ -167,6 +184,10 @@ export type AgentsViewPersistentState = {
 	// re-entry and render the moment they resolve, even if the first view was left early.
 	startupNotices?: StartupNotices;
 	startupNoticesPromise?: Promise<StartupNotices>;
+	// Incident notice state (windowed log entries, log offset, dismissal horizons)
+	// is reused the same way: a dismissed incident must stay dismissed across
+	// re-entry, and the log poll continues from the consumed offset.
+	incidentNoticeState?: IncidentNoticeState;
 	query?: string;
 	rosterClient?: DaemonClient;
 	rosterStore?: AgentsViewRosterStore;
@@ -316,6 +337,157 @@ interface OpenedAgentsViewSession {
 	connection: DaemonAgentConnection;
 	summary: SessionSummary;
 	cwdFallbackNotice?: string;
+	updateRestartWaitNotice?: string;
+}
+
+/**
+ * Bounded wait budget for an open that arrives while the daemon is preparing
+ * an update restart. Mirrors the update coordinator's worst case (100s
+ * prepare + supervisor stop + 60s successor startup + session restore), the
+ * same budget attached sessions get to reconnect after an update.
+ */
+export const DAEMON_UPDATE_RESTART_OPEN_WAIT_MS = 240_000;
+const DAEMON_UPDATE_RESTART_OPEN_RETRY_MS = 500;
+
+export interface DaemonUpdateRestartWaitResult<T> {
+	result: T;
+	waitedForUpdateRestart: boolean;
+}
+
+/**
+ * Transport-level error codes that mean the socket was down while the daemon
+ * exited or its successor had not finished booting.
+ */
+const DAEMON_UPDATE_RESTART_TRANSIENT_ERROR_CODES = new Set([
+	"ECONNREFUSED",
+	"ECONNRESET",
+	"EPIPE",
+	"ENOENT",
+	"ETIMEDOUT",
+	"ECONNABORTED",
+]);
+
+/**
+ * True when an open failure is part of the normal update-restart window
+ * rather than a permanent failure: the preparing-restart rejection itself,
+ * transport failures while the daemon exits and its successor boots (socket
+ * close, connect/handshake/request timeouts, routed control-plane transport
+ * failures), and session-not-restored-yet misses ("Unknown active session", a
+ * session still recovering). Permanent create and attach failures (e.g. a
+ * missing session import file) return false so the open fails immediately
+ * instead of hiding behind the bounded update wait.
+ */
+function isDaemonUpdateRestartTransientError(error: unknown): boolean {
+	if (isDaemonUpdateRestartingError(error)) return true;
+	if (!(error instanceof Error)) return false;
+	if (isUnknownActiveSessionError(error)) return true;
+	if (error instanceof DaemonSessionRecoveringError) return true;
+	// A routed session transport wraps any control-plane transport failure
+	// (socket close, connect, timeouts — the restart-window shapes above);
+	// capability errors stay unwrapped and permanent.
+	if (error instanceof DaemonControlPlaneTransportError) return true;
+	const code = (error as NodeJS.ErrnoException).code;
+	if (typeof code === "string" && DAEMON_UPDATE_RESTART_TRANSIENT_ERROR_CODES.has(code)) return true;
+	return (
+		// Socket closed while the daemon exits for the restart.
+		error.message.startsWith("Connection to the Prime Agent daemon closed.") ||
+		// Connect failures while the successor socket is not listening yet.
+		error.message.startsWith("Failed to connect to the Prime Agent daemon:") ||
+		// A request attempted while the transport is down between daemon processes.
+		error.message.startsWith("Cannot send daemon command") ||
+		// Transport timeouts while the daemon exits and its successor boots:
+		// connect, handshake, and in-flight requests (e.g. create) that cannot
+		// get a response until the successor is ready.
+		/^Timed out after \d+ms (connecting to the Prime Agent daemon|waiting for the Prime Agent daemon handshake|waiting for the Prime Agent daemon response to)/.test(
+			error.message,
+		)
+	);
+}
+
+function daemonUpdateRestartDeadlineError(waitMs: number, lastError: unknown): Error {
+	const lastErrorText =
+		lastError === undefined ? "none yet" : lastError instanceof Error ? lastError.message : String(lastError);
+	return new Error(
+		`The Prime Agent daemon did not finish its update restart within ${Math.round(waitMs / 1000)} seconds. Try opening this agent again once the update finishes. Last error: ${lastErrorText}`,
+	);
+}
+
+/**
+ * Run an open attempt, retrying while the daemon is in the update-restart
+ * transient state instead of failing the open. The first
+ * "preparing an update restart" rejection arms the wait; once armed, only
+ * restart-transient failures of the restart itself (socket close while the
+ * daemon exits, connect errors while the successor boots, session-not-yet-
+ * restored misses) stay inside the same bounded loop, because they are all part
+ * of the same normal update restart, while permanent failures (e.g. a missing
+ * session file) propagate immediately instead of hiding behind the wait. A
+ * non-update error before any update-restart signal propagates unchanged. The
+ * wait budget bounds the whole wait: each attempt is raced against the
+ * remaining budget, so an in-flight attempt (e.g. a create request with its own
+ * 30-second timeout) cannot hold the open past the deadline, which fails with a
+ * clear actionable message that includes the last error. A losing attempt that
+ * still settles afterwards is not abandoned silently: its result goes to
+ * onAbandoned for disposal and its failure is swallowed.
+ */
+export async function waitThroughDaemonUpdateRestart<T>(
+	attempt: () => Promise<T>,
+	options: {
+		waitMs?: number;
+		retryMs?: number;
+		onWait?: (error: unknown) => void;
+		/** Called with the result of an attempt that resolves after the deadline already failed the open, so resources nobody receives can be disposed. */
+		onAbandoned?: (result: T) => void;
+	} = {},
+): Promise<DaemonUpdateRestartWaitResult<T>> {
+	const waitMs = options.waitMs ?? DAEMON_UPDATE_RESTART_OPEN_WAIT_MS;
+	const retryMs = options.retryMs ?? DAEMON_UPDATE_RESTART_OPEN_RETRY_MS;
+	const deadline = Date.now() + waitMs;
+	let sawUpdateRestart = false;
+	let lastError: unknown;
+	let attemptAbandoned = false;
+	while (true) {
+		const deadlineError = daemonUpdateRestartDeadlineError(waitMs, lastError);
+		// An in-flight attempt (e.g. a create request with its own 30-second
+		// timeout) must not push the open past the deadline: race every attempt
+		// against the remaining budget so the bound holds.
+		let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+		const deadlineHit = new Promise<never>((_, reject) => {
+			deadlineTimer = setTimeout(() => reject(deadlineError), Math.max(0, deadline - Date.now()));
+		});
+		const attemptPromise = attempt();
+		// The race cannot cancel the losing attempt: when the deadline wins, a
+		// late success must still be disposed (nobody receives its result), and
+		// a late failure is expected and must not surface as unhandled.
+		void attemptPromise.then(
+			(result) => {
+				if (attemptAbandoned) options.onAbandoned?.(result);
+			},
+			() => undefined,
+		);
+		try {
+			const result = await Promise.race([attemptPromise, deadlineHit]);
+			clearTimeout(deadlineTimer);
+			return { result, waitedForUpdateRestart: sawUpdateRestart };
+		} catch (error) {
+			clearTimeout(deadlineTimer);
+			if (error === deadlineError) {
+				attemptAbandoned = true;
+				throw deadlineError;
+			}
+			if (!sawUpdateRestart) {
+				if (!isDaemonUpdateRestartingError(error)) throw error;
+				sawUpdateRestart = true;
+				options.onWait?.(error);
+			} else if (!isDaemonUpdateRestartTransientError(error)) {
+				throw error;
+			}
+			lastError = error;
+			if (Date.now() + retryMs > deadline) {
+				throw daemonUpdateRestartDeadlineError(waitMs, lastError);
+			}
+			await new Promise((resolve) => setTimeout(resolve, retryMs));
+		}
+	}
 }
 
 export function resolveAgentsViewOpenCwd(
@@ -478,13 +650,36 @@ async function runAgentsViewLoop(
 
 		let opened: OpenedAgentsViewSession | undefined;
 		try {
-			opened = await openAgentsViewSession(options, result.summary);
+			// An auto-update can fence session opens as "preparing an update
+			// restart" at the exact moment the user hits enter; the restart is a
+			// normal transient state, so wait through it instead of failing.
+			const openedThroughUpdate = await waitThroughDaemonUpdateRestart(
+				() => openAgentsViewSession(options, result.summary),
+				{
+					onWait: (error) => logClientError("Waiting for daemon update restart to finish before opening", error),
+					// An open that resolves after the deadline already failed the
+					// wait: dispose the connection nobody received instead of
+					// leaking it.
+					onAbandoned: (abandoned) => {
+						void abandoned.connection.dispose().catch(() => undefined);
+					},
+				},
+			);
+			opened = openedThroughUpdate.result;
 			persistentState.backSession = opened.summary;
-			if (opened.cwdFallbackNotice) {
-				persistentState.statusMessage = combineAgentsViewStartupNotices(
-					result.statusMessage,
-					opened.cwdFallbackNotice,
-				);
+			if (openedThroughUpdate.waitedForUpdateRestart) {
+				opened = {
+					...opened,
+					updateRestartWaitNotice:
+						"Waited for the Prime Agent daemon update restart to finish before opening this agent",
+				};
+			}
+			const openStartupNotice = combineAgentsViewStartupNotices(
+				opened.cwdFallbackNotice,
+				opened.updateRestartWaitNotice,
+			);
+			if (openStartupNotice) {
+				persistentState.statusMessage = combineAgentsViewStartupNotices(result.statusMessage, openStartupNotice);
 			}
 			const uiServices = await resolveAgentsViewSessionUiServices(options, opened.summary);
 			const interactiveMode = new InteractiveMode({
@@ -496,7 +691,7 @@ async function runAgentsViewLoop(
 				bindLocalSessionExtensions: false,
 				migratedProviders: options.migratedProviders,
 				modelFallbackMessage: resolveAttachModelFallbackMessage(opened.summary, options.modelFallbackMessage),
-				startupNotice: combineAgentsViewStartupNotices(result.statusMessage, opened.cwdFallbackNotice),
+				startupNotice: combineAgentsViewStartupNotices(result.statusMessage, openStartupNotice),
 				verbose: options.verbose,
 				returnToAgentsView: true,
 				forceFullscreen: true,
@@ -663,6 +858,7 @@ export class AgentsViewMode implements Component, Focusable {
 	private resolveRun: ((result: AgentsViewRunResult) => void) | undefined;
 	private heartbeatPollTimer: NodeJS.Timeout | undefined;
 	private animationTimer: NodeJS.Timeout | undefined;
+	private incidentNoticeTimer: NodeJS.Timeout | undefined;
 	private ctrlCExitHintExpiresAt = 0;
 	private ctrlCExitHintTimer: ReturnType<typeof setTimeout> | undefined;
 	private deleteConfirmExpiresAt = 0;
@@ -901,8 +1097,11 @@ export class AgentsViewMode implements Component, Focusable {
 		this.resolveMissingSelectionAnchor();
 		void this.refreshHeartbeats();
 		this.loadStartupNotices();
+		this.refreshIncidentNotices();
 		this.heartbeatPollTimer = setInterval(() => void this.refreshHeartbeats(), HEARTBEAT_POLL_INTERVAL_MS);
 		this.heartbeatPollTimer.unref?.();
+		this.incidentNoticeTimer = setInterval(() => this.refreshIncidentNotices(), INCIDENT_NOTICE_POLL_INTERVAL_MS);
+		this.incidentNoticeTimer.unref?.();
 		this.animationTimer = setInterval(() => {
 			const hasRunning = this.rows.some((row) => row.section === "running");
 			const hasStaleAge = this.rows.some((row) => row.summary.lastHeardFromAt !== undefined);
@@ -932,6 +1131,23 @@ export class AgentsViewMode implements Component, Focusable {
 				return;
 			}
 			this.handleCtrlC();
+			return;
+		}
+		// Esc (tui.select.cancel) dismisses the incident notice while it is the
+		// only thing to cancel: no armed reply, no autocomplete popup, an empty
+		// search prompt. An armed delete confirmation is the more dangerous state:
+		// Esc cancels it (below) and keeps the notice instead of dismissing the
+		// notice and leaving the delete armed to fire on the next press without
+		// a fresh confirmation. Without a visible notice, Esc keeps its back/exit
+		// meaning.
+		if (
+			this.editor.getText().length === 0 &&
+			!this.replyTarget &&
+			!this.editor.isShowingAutocomplete() &&
+			!this.isDeleteConfirmationVisible() &&
+			this.keybindings.matches(data, "tui.select.cancel") &&
+			this.dismissIncidentNotice()
+		) {
 			return;
 		}
 		if (this.editor.getText().length === 0 && this.keybindings.matches(data, "app.agents.rename")) {
@@ -1010,7 +1226,7 @@ export class AgentsViewMode implements Component, Focusable {
 			return [];
 		}
 		const headerLines = this.splash.render(width);
-		const noticeLines = this.renderStartupNotices(width);
+		const noticeLines = [...this.renderIncidentNotice(width), ...this.renderStartupNotices(width)];
 		if (noticeLines.length > 0) {
 			headerLines.push("", ...noticeLines);
 		}
@@ -1080,6 +1296,44 @@ export class AgentsViewMode implements Component, Focusable {
 		// (e.g. the tmux fix instructions) stay readable instead of truncating.
 		const wrapWidth = Math.max(1, width - 1);
 		return formatted.flatMap((line) => wrapTextWithAnsi(line, wrapWidth).map((wrapped) => ` ${wrapped}`));
+	}
+
+	private incidentNoticeState(): IncidentNoticeState {
+		// Reused across agents-view instances like the startup notices: the
+		// windowed entries, the consumed log offset, and the dismissal horizons
+		// survive leaving and re-entering the view, so a dismissed incident never
+		// comes back and the poll does not re-read consumed bytes.
+		this.persistentState.incidentNoticeState ??= createIncidentNoticeState();
+		return this.persistentState.incidentNoticeState;
+	}
+
+	private refreshIncidentNotices(): void {
+		// Best-effort, like the startup notices: a missing or unreadable log
+		// simply retries a bounded tail on the next poll and never breaks the view.
+		const changed = refreshIncidentNoticeState(this.incidentNoticeState(), getAgentLogPath(), Date.now());
+		if (changed) {
+			this.ui.requestRender();
+		}
+	}
+
+	/** Dismiss the collapsed incident notice; false when none is showing. */
+	private dismissIncidentNotice(): boolean {
+		if (!dismissIncidentNoticeState(this.incidentNoticeState())) {
+			return false;
+		}
+		this.setStatusMessage("Incident notice dismissed");
+		return true;
+	}
+
+	private renderIncidentNotice(width: number): string[] {
+		const notice = this.persistentState.incidentNoticeState?.notice;
+		if (!notice) {
+			return [];
+		}
+		// Same treatment as the startup notices: one-column gutter, wrap instead
+		// of truncating, so the pointer to the incident CLI stays readable.
+		const wrapWidth = Math.max(1, width - 1);
+		return wrapTextWithAnsi(formatIncidentNoticeLine(notice), wrapWidth).map((wrapped) => ` ${wrapped}`);
 	}
 
 	private handleListNavigation(data: string): boolean {
@@ -2390,6 +2644,10 @@ export class AgentsViewMode implements Component, Focusable {
 			clearInterval(this.heartbeatPollTimer);
 			this.heartbeatPollTimer = undefined;
 		}
+		if (this.incidentNoticeTimer) {
+			clearInterval(this.incidentNoticeTimer);
+			this.incidentNoticeTimer = undefined;
+		}
 		if (this.animationTimer) {
 			clearInterval(this.animationTimer);
 			this.animationTimer = undefined;
@@ -2454,10 +2712,16 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private async reconnectClient(client: DaemonClient, initialError: unknown): Promise<void> {
 		const deadline = Date.now() + (this.options.reconnectTimeoutMs ?? RECONNECT_TIMEOUT_MS);
+		// An update restart owns the daemon relaunch: while its coordinator stops and
+		// restores the daemon, this loop only polls, so it never spawns a competing
+		// daemon from this window's (possibly outdated) binary.
+		const mayRelaunch = !(initialError instanceof Error && getDaemonSocketCloseReason(initialError) === "update");
 		let lastError = initialError;
 		while (!this.stopped && !this.daemonShutdownReceived && client === this.client && Date.now() < deadline) {
 			try {
-				await this.options.recoverDaemon?.();
+				if (mayRelaunch) {
+					await this.options.recoverDaemon?.();
+				}
 				await client.reconnect(1000);
 				if (!this.rosterStore || !(await this.rosterStore.attach(client))) {
 					throw new Error("Daemon lost the agent_roster capability during reconnect");
@@ -2928,10 +3192,6 @@ function expectSessionSummary(value: unknown): SessionSummary {
 		throw new Error("Daemon returned an invalid session summary");
 	}
 	return value;
-}
-
-function isSessionSummary(value: unknown): value is SessionSummary {
-	return isRecord(value) && typeof value.id === "string" && typeof value.sessionId === "string";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

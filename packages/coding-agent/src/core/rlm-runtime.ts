@@ -34,6 +34,15 @@ export interface RlmSpawnHandle {
 
 export type RlmSubagentRegistryStatus = "running" | "completed" | "error";
 
+/**
+ * Kernel-wire shape of a child activity snapshot: snake_case like the rest of
+ * the registry, so `JSON.stringify` needs no key rewrite on the Python side.
+ */
+export interface RlmSubagentRegistryActivity {
+	kind: "waiting" | "writing" | "executing";
+	tool_name?: string;
+}
+
 export interface RlmSubagentRegistryEntry {
 	rlm_child_id: string;
 	active_session_id: string | null;
@@ -41,6 +50,21 @@ export interface RlmSubagentRegistryEntry {
 	session_name: string;
 	session_dir: string;
 	status: RlmSubagentRegistryStatus;
+	/** Live-state extras, present when the run or retained session is locally available. */
+	activity?: RlmSubagentRegistryActivity;
+	tool_use_count?: number;
+	duration_ms?: number;
+	/** Compacted answer preview, hard-capped for the kernel roster. */
+	answer_preview?: string;
+	replied_since_task?: boolean;
+	/** Latest child progress note (`rlm.progress.note`), newest wins. */
+	progress_note?: string;
+	/** One-line task label, hard-capped for the kernel roster. */
+	label?: string;
+	/** Wall-clock ms of the last tracked child activity; seeded at admission. */
+	last_activity_at?: number;
+	/** Set when a running child has had no tracked activity for the staleness threshold. */
+	activity_stale_ms?: number;
 }
 
 export interface RlmListSubagentsResult {
@@ -391,6 +415,37 @@ export function createRlmCollectHostHandler(handler: RlmCollectHandler): HostReq
 	};
 }
 
+export interface RlmProgressNoteResult {
+	accepted: boolean;
+	/** Milliseconds until the next note can be accepted; absent when accepted. */
+	retry_after_ms: number | undefined;
+}
+
+export type RlmProgressNoteHandler = (message: string) => RlmProgressNoteResult;
+
+/** Hard bound for one progress note; the session handler owns the time throttle. */
+export const RLM_PROGRESS_NOTE_MAX_LENGTH = 512;
+
+/**
+ * Child progress notes: `rlm.progress.note` lets a child report short in-flight
+ * status that its parent reads from snapshots and roster entries. Pull-based
+ * only — notes never steer the parent or grow its message queue.
+ */
+export function createRlmProgressNoteHostHandler(handler: RlmProgressNoteHandler): HostRequestHandler {
+	return async (payload) => {
+		const raw = payload.message;
+		if (typeof raw !== "string" || !raw.trim()) {
+			throw new Error("rlm.progress.note message must be a non-empty string");
+		}
+		const message = raw.trim();
+		if (message.length > RLM_PROGRESS_NOTE_MAX_LENGTH) {
+			throw new Error(`rlm.progress.note message must be at most ${RLM_PROGRESS_NOTE_MAX_LENGTH} characters`);
+		}
+		const { accepted, retry_after_ms } = handler(message);
+		return retry_after_ms === undefined ? { accepted } : { accepted, retry_after_ms };
+	};
+}
+
 export interface RlmSubagentRuntime {
 	session: AgentSession;
 }
@@ -419,6 +474,13 @@ export interface CreateRlmSubagentRuntimeOptions {
 	spawnCode?: string;
 	/** Publish the session to the parent before a host makes the runtime addressable. */
 	onSessionPublished?: (session: AgentSession) => void;
+	/**
+	 * Session ids of children whose delete receipt already returned. A host that
+	 * re-asserts the name against a catalog still listing the unwinding child
+	 * ignores these, so an admission the delete receipt freed holds at the host
+	 * boundary too.
+	 */
+	ignoreSessionIds?: string[];
 }
 
 export interface CreateRlmRootSessionOptions {

@@ -53,6 +53,48 @@ function serveStatusFor(port: number): string {
 	});
 }
 
+/**
+ * A realistic `status --json` payload for a `peerCount`-node tailnet: the real one carries every
+ * peer (~1 KB of JSON each), so this is the shape that overruns spawnSync's default 1 MiB buffer.
+ */
+function largeTailnetStatus(peerCount: number): string {
+	const peers: Record<string, Record<string, unknown>> = {};
+	for (let index = 0; index < peerCount; index++) {
+		const ip = `100.64.${index % 250}.${(index * 7) % 250}`;
+		const publicKey = `nodekey:${"a1b2c3d4e5f60718".repeat(3)}${index.toString(16).padStart(4, "0")}`;
+		peers[publicKey] = {
+			ID: `n${index}CNTRL`,
+			PublicKey: publicKey,
+			HostName: `build-${index}`,
+			DNSName: `build-${index}.tailnet.ts.net.`,
+			OS: index % 3 === 0 ? "linux" : "macOS",
+			UserID: 123456789,
+			TailscaleIPs: [ip, "fd7a:115c:a1e0:ab12:4843:cd96:6258:1c2d"],
+			AllowedIPs: [`${ip}/32`, "fd7a:115c:a1e0:ab12:4843:cd96:6258:1c2d/128"],
+			Addrs: [`192.168.${index % 250}.${(index * 3) % 250}:41641`],
+			CurAddr: `192.168.${index % 250}.${(index * 3) % 250}:41641`,
+			Relay: "nyc",
+			RxBytes: 123456789 + index,
+			TxBytes: 98765432 + index,
+			Created: "2024-01-05T12:34:56.789012345Z",
+			LastSeen: "2026-09-28T19:00:00Z",
+			LastHandshake: "2026-09-28T18:59:00Z",
+			Online: true,
+			ExitNode: false,
+			ExitNodeOption: false,
+			Active: false,
+			PeerAPIURL: [`http://${ip}:43210`],
+		};
+	}
+	return JSON.stringify({
+		BackendState: "Running",
+		Self: { Online: true, HostName: "milk", DNSName: "milk.tailnet.ts.net." },
+		MagicDNSSuffix: "tailnet.ts.net.",
+		CurrentTailnet: { Name: "example.com", MagicDNSSuffix: "tailnet.ts.net." },
+		Peer: peers,
+	});
+}
+
 function erroringShim(): string {
 	const dir = mkdtempSync(join(tmpdir(), "ts-shim-"));
 	return writeShim(dir, '#!/bin/sh\necho "shim failure" >&2\nexit 1\n');
@@ -102,6 +144,16 @@ describe("probeTailscale", () => {
 		const shim = shimTailscale(ONLINE, serveStatusFor(3000));
 		process.env.PATH = `${shim.dir}:${process.env.PATH}`;
 		expect(tailscaleDoctorFacts()[0]).toContain("on tailnet");
+	});
+	it("parses a status payload larger than spawnSync's default 1 MiB buffer", () => {
+		const payload = largeTailnetStatus(2000);
+		expect(Buffer.byteLength(payload)).toBeGreaterThan(1024 * 1024);
+		process.env.PATH = `${shimTailscale(payload).dir}:${process.env.PATH}`;
+		const probe = probeTailscale();
+		expect(probe.error).toBeNull();
+		expect(probe.onTailnet).toBe(true);
+		expect(probe.magicDnsSuffix).toBe("tailnet.ts.net.");
+		expect(probe.hostname).toBe("milk");
 	});
 	it("does not mark a healthy online node as offline", () => {
 		const shim = shimTailscale(ONLINE, serveStatusFor(3000));

@@ -37,9 +37,21 @@ interface TailscaleStatusJson {
 	BackendState?: string;
 }
 
+/**
+ * spawnSync's default 1 MiB maxBuffer truncates `status --json` (it carries every peer, ~1 KB
+ * of JSON per peer) and fails the run with ENOBUFS on a tailnet of roughly a thousand nodes;
+ * 32 MiB covers ~30k peers. Sized for the status payload, which is the largest output here.
+ */
+const TAILSCALE_MAX_BUFFER_BYTES = 32 * 1024 * 1024;
+
 /** Run the tailscale CLI once, returning stdout or an error descriptor. */
 function runTailscale(args: string[]): { code: number; stdout: string; stderr: string } {
-	const result = spawnSyncHidden("tailscale", args, { encoding: "utf8", timeout: 15000, killSignal: "SIGKILL" });
+	const result = spawnSyncHidden("tailscale", args, {
+		encoding: "utf8",
+		timeout: 15000,
+		killSignal: "SIGKILL",
+		maxBuffer: TAILSCALE_MAX_BUFFER_BYTES,
+	});
 	if (result.error) {
 		return { code: -1, stdout: "", stderr: result.error.message };
 	}

@@ -13,7 +13,7 @@ impl AgentView {
         let preceded_by_tool = index > 0 && self.is_compact_neighbor(&self.chat[index - 1]);
         let spacing = self.entry_spacing(index, entry, index == 0, preceded_by_tool);
         match entry {
-            ChatEntry::Status { text, .. } => {
+            ChatEntry::Status { text, .. } | ChatEntry::TranscriptNotice { text } => {
                 1 + if text.trim().is_empty() {
                     0
                 } else {

@@ -11,7 +11,7 @@ use crate::chat::{AssistantMessage, ChatEntry, MessageBlock, ToolCallCard, ToolR
 use pa_types::daemon::{DaemonEventCursor, DaemonReplayInfo};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The slim attach result: the `data` object of a successful `attach`
 /// response (`createAttachResult` wire shape).
@@ -69,6 +69,11 @@ pub struct Reconstructed {
     /// The session's effective service tier (`state.serviceTier`), the
     /// `/fast` toggle's baseline.
     pub service_tier: Option<String>,
+    /// The capped-replay notice (TS `renderSessionContext` prints
+    /// `Showing latest N of M messages for faster open.` above the
+    /// windowed rows): `None` unless the transcript exceeded the initial
+    /// render window.
+    pub transcript_notice: Option<String>,
 }
 
 impl Reconstructed {
@@ -220,11 +225,172 @@ fn order_messages_for_transcript(messages: &[Value]) -> Vec<&Value> {
     rest
 }
 
-pub fn transcript_to_entries(messages: &[Value]) -> Vec<ChatEntry> {
+/// TS `INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT` (interactive-mode.ts:741):
+/// the newest-message window the transcript renders at attach and rebuild
+/// (TS `renderSessionContext`'s `limitTranscript` pass). The wire still
+/// carries the whole history — the bound is render-side only, so editor
+/// history and the daemon's own state stay full-set.
+pub const INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT: usize = 400;
+
+/// The initial render window (TS `initialRenderMessages` +
+/// `omitOrphanToolResults`, interactive-mode.ts:776-861): the newest
+/// `INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT` messages plus each ancestor
+/// assistant message whose tool calls the kept tool results complete
+/// (every ancestor copy filtered to just those calls), with tool results
+/// whose calls fall outside the window dropped. Returns the stitched list
+/// plus the `(rendered, total)` pair the cap notice cites; `None` when the
+/// transcript never exceeded the limit.
+fn initial_render_window(ordered: &[&Value]) -> (Vec<Value>, Option<(usize, usize)>) {
+    let total = ordered.len();
+    if total <= INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT {
+        return (
+            ordered.iter().map(|message| (**message).clone()).collect(),
+            None,
+        );
+    }
+    // Every tool call id -> (its message's index, the assistant message).
+    let mut tool_call_messages: HashMap<&str, (usize, &Value)> = HashMap::new();
+    for (index, message) in ordered.iter().enumerate() {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        for content in message
+            .get("content")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            if content.get("type").and_then(Value::as_str) == Some("toolCall") {
+                if let Some(id) = content.get("id").and_then(Value::as_str) {
+                    tool_call_messages.insert(id, (index, *message));
+                }
+            }
+        }
+    }
+    // TS walks the window start forward from the bare tail until the
+    // required ancestors fit inside the limit (each step drops the oldest
+    // visible message, so the walk always terminates).
+    let initial_start = total - INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT;
+    for start in initial_start..total {
+        let visible = &ordered[start..];
+        let mut visible_tool_call_ids: HashSet<&str> = HashSet::new();
+        for message in visible {
+            if message.get("role").and_then(Value::as_str) != Some("assistant") {
+                continue;
+            }
+            for content in message
+                .get("content")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+            {
+                if content.get("type").and_then(Value::as_str) == Some("toolCall") {
+                    if let Some(id) = content.get("id").and_then(Value::as_str) {
+                        visible_tool_call_ids.insert(id);
+                    }
+                }
+            }
+        }
+        // The required ancestors: each visible tool result whose call sits
+        // before the window pulls that call's assistant message in.
+        let mut required: HashMap<usize, (&Value, Vec<&str>)> = HashMap::new();
+        for message in visible {
+            if message.get("role").and_then(Value::as_str) != Some("toolResult") {
+                continue;
+            }
+            let Some(tool_call_id) = message.get("toolCallId").and_then(Value::as_str) else {
+                continue;
+            };
+            if visible_tool_call_ids.contains(tool_call_id) {
+                continue;
+            }
+            let Some(&(index, call_message)) = tool_call_messages.get(tool_call_id) else {
+                continue;
+            };
+            if index >= start {
+                continue;
+            }
+            required
+                .entry(index)
+                .or_insert((call_message, Vec::new()))
+                .1
+                .push(tool_call_id);
+        }
+        if visible.len() + required.len() > INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT {
+            continue;
+        }
+        let mut stitched: Vec<Value> = Vec::with_capacity(visible.len() + required.len());
+        let mut ancestors: Vec<usize> = required.keys().copied().collect();
+        ancestors.sort_unstable();
+        for index in ancestors {
+            let (message, ids) = &required[&index];
+            // The ancestor copy keeps its non-call blocks and only the
+            // tool calls the kept results complete.
+            let mut copy = (**message).clone();
+            if let Some(content) = message.get("content").and_then(Value::as_array) {
+                copy["content"] = Value::Array(
+                    content
+                        .iter()
+                        .filter(|block| {
+                            block.get("type").and_then(Value::as_str) != Some("toolCall")
+                                || block
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|id| ids.contains(&id))
+                        })
+                        .cloned()
+                        .collect(),
+                );
+            }
+            stitched.push(copy);
+        }
+        stitched.extend(visible.iter().map(|message| (**message).clone()));
+        // A tool result whose call never rendered (outside the window,
+        // never stitched in) drops — the orphan the stitch never pulled.
+        let mut rendered_tool_call_ids: HashSet<String> = HashSet::new();
+        let rendered: Vec<Value> = stitched
+            .into_iter()
+            .filter(
+                |message| match message.get("role").and_then(Value::as_str) {
+                    Some("assistant") => {
+                        for content in message
+                            .get("content")
+                            .and_then(Value::as_array)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default()
+                        {
+                            if content.get("type").and_then(Value::as_str) == Some("toolCall") {
+                                if let Some(id) = content.get("id").and_then(Value::as_str) {
+                                    rendered_tool_call_ids.insert(id.to_string());
+                                }
+                            }
+                        }
+                        true
+                    }
+                    Some("toolResult") => message
+                        .get("toolCallId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| rendered_tool_call_ids.contains(id)),
+                    _ => true,
+                },
+            )
+            .collect();
+        let rendered_count = rendered.len();
+        return (rendered, Some((rendered_count, total)));
+    }
+    // TS renders nothing when no window fits the limit.
+    (Vec::new(), Some((0, total)))
+}
+
+/// Replay a transcript for a view rebuild: the folded chat entries plus,
+/// when the initial render window capped the replay, the dim notice TS
+/// renders above the windowed rows (interactive-mode.ts:7246-7253).
+pub fn transcript_replay(messages: &[Value]) -> (Vec<ChatEntry>, Option<String>) {
     let ordered = order_messages_for_transcript(messages);
+    let (windowed, window) = initial_render_window(&ordered);
     let mut chat: Vec<ChatEntry> = Vec::new();
     let mut card_index: HashMap<String, Vec<usize>> = HashMap::new();
-    for message in ordered {
+    for message in &windowed {
         if let Some(result) = tool_result_message_view(message) {
             let tool_call_id = result.tool_call_id.clone();
             if let Some(result) = settle_last_pending(
@@ -267,7 +433,16 @@ pub fn transcript_to_entries(messages: &[Value]) -> Vec<ChatEntry> {
             }
         }
     }
-    chat
+    let notice = window.map(|(rendered, total)| {
+        format!("Showing latest {rendered} of {total} messages for faster open.")
+    });
+    (chat, notice)
+}
+
+/// The folded chat entries of a transcript replay (the notice-free half of
+/// [`transcript_replay`]).
+pub fn transcript_to_entries(messages: &[Value]) -> Vec<ChatEntry> {
+    transcript_replay(messages).0
 }
 
 /// Settle one result onto the LAST pending card among `indices` (the
@@ -328,10 +503,10 @@ fn orphan_card(result: ToolResultReplay) -> ChatEntry {
 /// Reconstruct the view state from slim attach data.
 pub fn reconstruct(attach: &AttachData) -> Reconstructed {
     let snapshot = &attach.snapshot;
-    let messages = snapshot
+    let (messages, transcript_notice) = snapshot
         .get("messages")
         .and_then(Value::as_array)
-        .map(|messages| transcript_to_entries(messages))
+        .map(|messages| transcript_replay(messages.as_slice()))
         .unwrap_or_default();
     let state = snapshot.get("state");
     let (model_id, model_provider) = state
@@ -392,6 +567,7 @@ pub fn reconstruct(attach: &AttachData) -> Reconstructed {
         last_event_sequence,
         queued,
         service_tier,
+        transcript_notice,
     }
 }
 

@@ -833,6 +833,16 @@ impl AgentView {
                 rows.extend(render_text_rows(text, style, width));
                 rows
             }
+            ChatEntry::TranscriptNotice { text } => {
+                // TS `renderSessionContext`: the cap notice is a dim `Text`
+                // whose `Spacer(1)` follows it — the reverse of a
+                // `showStatus` row, whose spacer leads.
+                let style = self.theme.fg_style(ThemeColor::Dim);
+                let mut rows = Vec::new();
+                rows.extend(render_text_rows(text, style, width));
+                rows.push(Vec::new());
+                rows
+            }
             ChatEntry::User { text } => {
                 let mut rows = Vec::new();
                 // TS `addMessageToChat` separates a user submission from

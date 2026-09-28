@@ -154,8 +154,11 @@ impl SessionUi {
         let Some(messages) = data.get("messages").and_then(Value::as_array) else {
             return;
         };
-        let entries = crate::snapshot::transcript_to_entries(messages);
+        let (entries, notice) = crate::snapshot::transcript_replay(messages);
         view.clear_chat();
+        if let Some(text) = notice {
+            view.push_entry(ChatEntry::TranscriptNotice { text });
+        }
         for entry in entries {
             view.push_entry(entry);
         }

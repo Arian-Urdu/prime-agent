@@ -256,6 +256,7 @@ impl AgentView {
     pub(super) fn entry_cacheable(&self, entry: &ChatEntry) -> bool {
         match entry {
             ChatEntry::Status { .. }
+            | ChatEntry::TranscriptNotice { .. }
             | ChatEntry::User { .. }
             | ChatEntry::SlashCommand { .. }
             | ChatEntry::CompactionSummary { .. }
@@ -329,6 +330,7 @@ impl AgentView {
             ChatEntry::BashExecution(card) => !card.suppress_leading_space,
             ChatEntry::Assistant(_) => preceded_by_tool_activity,
             ChatEntry::Status { .. }
+            | ChatEntry::TranscriptNotice { .. }
             | ChatEntry::InjectedPrompt(_)
             | ChatEntry::RefinementOutcome(_)
             | ChatEntry::CustomPanel(_) => false,

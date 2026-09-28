@@ -96,6 +96,11 @@ pub enum ChatEntry {
     /// `showStatus` / `showWarning` / `showError` rows (startup notices,
     /// client notes, turn errors).
     Status { text: String, kind: StatusKind },
+    /// The capped-replay notice (TS `renderSessionContext`'s dim `Text`
+    /// above the windowed transcript): `Showing latest N of M messages
+    /// for faster open.` — the first entry of a rebuild whose replay the
+    /// initial render window capped.
+    TranscriptNotice { text: String },
     /// The user's submitted prompt.
     User { text: String },
     /// A durable session-command echo row (`session_slash_command`):

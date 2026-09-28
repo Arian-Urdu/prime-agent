@@ -2041,3 +2041,168 @@ fn attach_snapshot_carries_the_goal_state() {
     assert_eq!(goal.status, pa_types::goal::GoalStatus::Active);
     assert_eq!(goal.objective.as_deref(), Some("keep shipping"));
 }
+
+#[test]
+fn the_initial_render_window_caps_at_400_with_the_notice() {
+    // 460 plain messages: the newest 400 fold (TS
+    // `initialRenderMessages`), and the replay carries the exact
+    // TS notice text above them.
+    let messages: Vec<Value> = (0..460)
+        .map(|index| {
+            json!({
+                "role": if index % 2 == 0 { "user" } else { "assistant" },
+                "content": format!("row {index:03}"),
+                "timestamp": index,
+            })
+        })
+        .collect();
+    let (entries, notice) = transcript_replay(&messages);
+    assert_eq!(
+        notice.as_deref(),
+        Some("Showing latest 400 of 460 messages for faster open.")
+    );
+    assert_eq!(entries.len(), 400);
+    let Some(ChatEntry::User { text }) = entries.first() else {
+        panic!("the window's first message (index 60) folds first");
+    };
+    assert_eq!(text, "row 060");
+    let Some(ChatEntry::Assistant(last)) = entries.last() else {
+        panic!("the newest message folds last");
+    };
+    assert_eq!(last.blocks, vec![MessageBlock::Text("row 459".to_string())]);
+}
+
+#[test]
+fn the_window_stitches_required_tool_call_ancestors() {
+    // The tool call sits before the window; its result inside it: TS
+    // pulls the call's assistant message back in as a filtered copy
+    // carrying ONLY that call (the second, uncompleted call drops
+    // from the stitched ancestor).
+    let mut messages: Vec<Value> = (0..460)
+        .map(|index| {
+            json!({
+                "role": if index % 2 == 0 { "user" } else { "assistant" },
+                "content": format!("row {index:03}"),
+                "timestamp": index,
+            })
+        })
+        .collect();
+    messages[58] = json!({
+        "role": "assistant",
+        "content": [
+            { "type": "text", "text": "ancestor body" },
+            { "type": "toolCall", "id": "tc-required", "name": "ipython", "arguments": {"code": "1"} },
+            { "type": "toolCall", "id": "tc-uncompleted", "name": "ipython", "arguments": {"code": "2"} },
+        ],
+        "provider": "faux", "model": "faux-1", "timestamp": 58,
+    });
+    messages[440] = json!({
+        "role": "toolResult",
+        "toolCallId": "tc-required",
+        "toolName": "ipython",
+        "content": [{ "type": "text", "text": "the kept result" }],
+        "isError": false,
+        "timestamp": 440,
+    });
+    let (entries, notice) = transcript_replay(&messages);
+    // The stitch grows the rendered set past the bare 400-message
+    // window, so TS walks the start forward by one: 399 visible + the
+    // stitched ancestor.
+    assert_eq!(
+        notice.as_deref(),
+        Some("Showing latest 400 of 460 messages for faster open.")
+    );
+    assert_eq!(entries.len(), 400);
+    // The stitched ancestor leads the folded chat: its text renders
+    // and ONLY the required call's card appears.
+    let Some(ChatEntry::Assistant(ancestor)) = entries.first() else {
+        panic!("the stitched ancestor leads: {entries:?}");
+    };
+    assert_eq!(
+        ancestor.blocks,
+        vec![MessageBlock::Text("ancestor body".to_string())],
+        "the stitched copy keeps its text and only the required call"
+    );
+    let cards: Vec<&str> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            ChatEntry::Tool(card) => Some(card.id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cards, ["tc-required"], "only the stitched card renders");
+    let Some(ChatEntry::Tool(card)) = entries
+        .iter()
+        .find(|entry| matches!(entry, ChatEntry::Tool(card) if card.id == "tc-required"))
+    else {
+        panic!("the stitched card carries its result");
+    };
+    assert!(card.result.is_some(), "the kept result settles the card");
+}
+
+#[test]
+fn the_window_drops_dangling_results_like_ts() {
+    // A tool result whose call appears nowhere (the dangling id)
+    // drops from the CAPPED replay exactly like TS
+    // `omitOrphanToolResults`; under the limit the port's live-path
+    // orphan card contract is untouched.
+    let mut messages: Vec<Value> = (0..460)
+        .map(|index| {
+            json!({
+                "role": if index % 2 == 0 { "user" } else { "assistant" },
+                "content": format!("row {index:03}"),
+                "timestamp": index,
+            })
+        })
+        .collect();
+    messages[440] = json!({
+        "role": "toolResult",
+        "toolCallId": "tc-dangling",
+        "toolName": "ipython",
+        "content": [{ "type": "text", "text": "dangling output" }],
+        "isError": false,
+        "timestamp": 440,
+    });
+    let (entries, notice) = transcript_replay(&messages);
+    assert!(notice.is_some(), "the capped path served");
+    assert!(
+        entries
+            .iter()
+            .all(|entry| !matches!(entry, ChatEntry::Tool(card) if card.id == "tc-dangling")),
+        "the dangling result drops from the capped window"
+    );
+    // Under the limit the SAME dangling result keeps its standalone
+    // card (the live push path's twin): a 400-message transcript (the
+    // exact limit) carries the dangling result at its tail.
+    let mut short: Vec<Value> = messages[..399].to_vec();
+    short.push(messages[440].clone());
+    let (short_entries, short_notice) = transcript_replay(&short);
+    assert!(short_notice.is_none(), "no cap under the limit");
+    assert!(
+        short_entries
+            .iter()
+            .any(|entry| matches!(entry, ChatEntry::Tool(card) if card.id == "tc-dangling")),
+        "the uncapped replay keeps the orphan card"
+    );
+}
+
+#[test]
+fn under_the_limit_the_replay_is_uncapped() {
+    // The under-limit path folds the whole transcript and carries no
+    // notice: the frame bytes stay exactly the pre-window behavior.
+    let messages = [
+        json!({ "role": "user", "content": "hello", "timestamp": 1 }),
+        json!({
+            "role": "assistant",
+            "content": "settled answer",
+            "provider": "scripted",
+            "model": "faux-1",
+            "timestamp": 2,
+        }),
+    ];
+    let (entries, notice) = transcript_replay(&messages);
+    assert!(notice.is_none());
+    assert_eq!(entries.len(), 2);
+    let uncapped = transcript_to_entries(&messages);
+    assert_eq!(entries, uncapped);
+}

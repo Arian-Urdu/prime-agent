@@ -1098,7 +1098,14 @@ impl SessionUi {
                 _ => None,
             });
         self.pending_queue = Some(reconstructed.queued);
-        self.pending_snapshot = Some(reconstructed.chat);
+        let mut chat = reconstructed.chat;
+        if let Some(text) = reconstructed.transcript_notice {
+            // TS `renderSessionContext` adds the cap notice as the first
+            // chat child — a dim `Text` above the windowed rows — so the
+            // rebuilt transcript opens with it.
+            chat.insert(0, ChatEntry::TranscriptNotice { text });
+        }
+        self.pending_snapshot = Some(chat);
         self.goal_view.seed(reconstructed.goal.unwrap_or_default());
         // The resynced state owns the loader (TS `renderResyncedSession`
         // rebuilds from the snapshot): a turn that is still live behind the

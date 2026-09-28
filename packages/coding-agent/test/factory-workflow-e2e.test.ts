@@ -18,7 +18,8 @@
  * Kernel python: this suite pins PRIME_AGENT_KERNEL_PYTHON to (in order) the
  * caller's pin, the checkout-local runtime venv, or the shared kernel venv
  * resolved exactly like the bootstrap resolves it (PRIME_AGENT_KERNEL_VENV /
- * XDG). A pinned python is never rebuilt, so pinning is what keeps a dev
+ * XDG, including the bootstrap's XDG fallback dir for unwritable primary
+ * parents). A pinned python is never rebuilt, so pinning is what keeps a dev
  * checkout from touching the shared ~/.prime/agent/kernel-venv that live user
  * sessions run on. The shared venv is only pinned when the production
  * readiness probe (RUNTIME_READY_CHECK) passes for it, i.e. when the bootstrap
@@ -53,7 +54,7 @@ import {
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
-import { getKernelVenvDir, RUNTIME_READY_CHECK } from "../src/core/kernel/bootstrap.js";
+import { getKernelVenvDir, getXdgKernelVenvDir, RUNTIME_READY_CHECK } from "../src/core/kernel/bootstrap.js";
 import { convertToLlm, FACTORY_PROGRESS_NOTICE_CUSTOM_TYPE } from "../src/core/messages.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { getSessionArtifactPath, SessionManager } from "../src/core/session-manager.js";
@@ -103,11 +104,11 @@ function resolveKernelPython(): ResolvedKernelPython | undefined {
 	// path). A shared venv python is accepted only when the production
 	// readiness probe passes for it: a pinned python is never rebuilt, so
 	// pinning it cannot disturb the live sessions that share that venv.
-	const sharedVenvPython = join(getKernelVenvDir(), "bin", "python");
+	const sharedVenvPythons = [getKernelVenvDir(), getXdgKernelVenvDir()].map((dir) => join(dir, "bin", "python"));
 	const candidates = [
 		{ python: process.env.PRIME_AGENT_KERNEL_PYTHON, sharedVenv: false },
 		{ python: join(REPO_ROOT, "prime-agent-runtime", ".venv", "bin", "python"), sharedVenv: false },
-		{ python: sharedVenvPython, sharedVenv: true },
+		...sharedVenvPythons.map((python) => ({ python, sharedVenv: true })),
 	].filter((candidate): candidate is { python: string; sharedVenv: boolean } => Boolean(candidate.python));
 	for (const candidate of candidates) {
 		if (!existsSync(candidate.python)) continue;
@@ -731,12 +732,13 @@ describe("factory workflows over the real kernel bridge", { tags: ["kernel-heavy
 			process.env.PRIME_AGENT_KERNEL_PYTHON = resolved.python;
 			if (resolved.pythonPath) process.env.PYTHONPATH = resolved.pythonPath;
 		}
-		// No usable python at all and the shared kernel venv (resolved the same
-		// way the bootstrap resolves it) exists: the standard bootstrap would
+		// No usable python at all and a shared kernel venv exists (either path
+		// the bootstrap may write: the primary dir, or its XDG fallback when
+		// the primary's parent is not creatable): the standard bootstrap would
 		// rebuild that venv under live user sessions, so refuse instead. CI
 		// never has a pre-existing shared venv, so the bootstrap there is a
 		// safe build that bootstrap-cli pre-warms.
-		if (!resolved && existsSync(getKernelVenvDir())) {
+		if (!resolved && (existsSync(getKernelVenvDir()) || existsSync(getXdgKernelVenvDir()))) {
 			throw new Error(
 				"No usable kernel python: point PRIME_AGENT_KERNEL_PYTHON at a factory-capable kernel " +
 					"python, or create the checkout-local venv (cd prime-agent-runtime && uv venv .venv && " +

@@ -15,6 +15,7 @@ import type {
 } from "../../core/cron-jobs.js";
 import type { ExtensionUIContext } from "../../core/extensions/types.js";
 import type { AcpMcpServerConfig } from "../../core/mcp/acp-mcp-types.js";
+import type { CustomMessage } from "../../core/messages.js";
 import { providerRetryPolicy } from "../../core/provider-retry.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import { type DeleteSessionFileResult, deleteSessionFile } from "../../core/session-file-actions.js";
@@ -335,6 +336,12 @@ export class InProcessAgentConnection implements AgentConnection {
 		this.session.sessionManager.appendLabelChange(entryId, label);
 	}
 
+	async appendCustomMessage(
+		message: Pick<CustomMessage, "customType" | "content" | "display" | "details">,
+	): Promise<void> {
+		await this.session.sendCustomMessage(message);
+	}
+
 	async respondToExtensionUiRequest(_requestId: string, _response: AgentConnectionExtensionUiResponse): Promise<void> {
 		// In-process extension UI requests are handled directly by InteractiveMode.
 	}
@@ -427,6 +434,10 @@ export class InProcessAgentConnection implements AgentConnection {
 
 	async abort(): Promise<void> {
 		this.session.requestAbort();
+	}
+
+	async abortAndSendQueued(): Promise<void> {
+		this.session.abortAndSendQueued();
 	}
 
 	async cancelRlmChild(childId: string): Promise<boolean> {

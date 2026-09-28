@@ -2,61 +2,87 @@ import { resolve } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { describe, expect, it } from "vitest";
 import type { RlmChildAgentSnapshot } from "../src/core/agent-session.js";
+import type { AgentSessionRuntimeDiagnostic } from "../src/core/agent-session-services.js";
 import type { AgentCronJob } from "../src/core/cron-jobs.js";
-import type { SessionInfo } from "../src/core/session-manager.js";
+import type { SessionActionSnapshot } from "../src/core/session-action-store.js";
+import type { AgentStatus, SessionInfo } from "../src/core/session-manager.js";
 import type { SessionUsageSummary } from "../src/core/usage.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { passivatedWorkerRosterEntry, workerRosterEntryFromSummary } from "../src/modes/daemon/agent-roster.js";
 import {
 	buildRlmChildSnapshots,
 	buildSessionList,
+	latestMessageActivityAt,
+	type MessageActivityMemo,
 	resolveAttachModelFallbackMessage,
 	type SessionSummary,
+	sessionDisplayLabels,
 	summaryForActiveSession,
 } from "../src/modes/daemon/daemon-session-list.js";
 
 describe("buildSessionList", () => {
-	it("derives active session lifecycle and activity", () => {
-		const oneMessage = [{ role: "user", content: "hi" }] as unknown as AgentMessage[];
-		const currentSummary = { basedOnMessageCount: 1 } as ActiveSessionState["summaryState"];
-		const entries = buildSessionList(
-			[
-				makeState({
-					activeSessionId: "model",
-					sessionFile: "/tmp/model.jsonl",
-					isStreaming: true,
-					messages: oneMessage,
-				}),
-				makeState({
-					activeSessionId: "tool",
-					sessionFile: "/tmp/tool.jsonl",
-					isStreaming: true,
-					pendingToolCalls: ["tool-1"],
-					messages: oneMessage,
-				}),
-				makeState({
-					activeSessionId: "needs-user",
-					sessionFile: "/tmp/needs-user.jsonl",
-					clients: 1,
-					messages: oneMessage,
-					summaryState: currentSummary,
-				}),
-				makeState({
-					activeSessionId: "done",
-					sessionFile: "/tmp/done.jsonl",
-					messages: oneMessage,
-					summaryState: currentSummary,
-				}),
-			],
-			[],
-		);
+	const oneMessage = [{ role: "user", content: "hi" }] as unknown as AgentMessage[];
+	const currentSummary = { basedOnMessageCount: 1 } as ActiveSessionState["summaryState"];
 
-		expect(entries.map((entry) => [entry.id, entry.lifecycle, entry.activity])).toEqual([
-			["model", "live", "working"],
-			["tool", "live", "working"],
-			["needs-user", "live", "idle"],
-			["done", "live", "idle"],
-		]);
+	// Activity/lifecycle projection: one row per state shape the view must render honestly.
+	it.each([
+		["a streaming session is working", { isStreaming: true, messages: oneMessage }, { activity: "working" }],
+		[
+			"a streaming session waiting on a tool is working",
+			{ isStreaming: true, pendingToolCalls: ["tool-1"], messages: oneMessage },
+			{ activity: "working" },
+		],
+		[
+			"an attached settled session is idle",
+			{ clients: 1, messages: oneMessage, summaryState: currentSummary },
+			{ activity: "idle" },
+		],
+		[
+			"a detached settled session is idle",
+			{ messages: oneMessage, summaryState: currentSummary },
+			{ activity: "idle" },
+		],
+		[
+			"a resident session with a stale verdict is idle, not held at working",
+			{
+				messages: oneMessage,
+				summaryState: {
+					summary: "Old recap",
+					taskState: "completed",
+					basedOnMessageCount: 0,
+				} as ActiveSessionState["summaryState"],
+			},
+			{ activity: "idle", summary: "Old recap" },
+		],
+		["an empty resident session is idle", {}, { activity: "idle" }],
+		[
+			"a finished subagent is idle instead of stuck working",
+			{
+				isStreaming: false,
+				hasRunningRlmChildren: false,
+				messages: oneMessage,
+				metadata: { kind: "subagent" as const, createdAt: 1, parentActiveSessionId: "parent", rlmChildId: "c1" },
+			},
+			{ activity: "idle" },
+		],
+		[
+			"an accepted in-flight prompt is working with no queued work",
+			{ messages: oneMessage, summaryState: currentSummary, hasAcceptedPromptInFlight: true },
+			{ activity: "working", sessionActions: { queuedCount: 0, active: { kind: "turn", phase: "running" } } },
+		],
+		[
+			"the exact unfinished action count survives the visible action snapshot",
+			{ unfinishedActionCount: 3, hasAcceptedPromptInFlight: true },
+			{
+				activity: "working",
+				unfinishedActionCount: 3,
+				sessionActions: { queuedCount: 0, active: { kind: "turn" } },
+			},
+		],
+	])("%s", (_name, options, expected) => {
+		const summary = summaryForActiveSession(makeState({ activeSessionId: "active-1", ...options }));
+
+		expect(summary).toMatchObject(expected);
 	});
 
 	it("counts direct peers separately so the supervisor can add them to its own attachment count", () => {
@@ -228,59 +254,6 @@ describe("buildSessionList", () => {
 		);
 
 		expect(entry).toMatchObject({ hasRegisteredHeartbeat: true, hasRegisteredCronJob: true });
-	});
-
-	it("reports accepted in-flight prompts as active with no queued work", () => {
-		const oneMessage = [{ role: "user", content: "hi" }] as unknown as AgentMessage[];
-		const summary = summaryForActiveSession(
-			makeState({
-				activeSessionId: "accepted",
-				messages: oneMessage,
-				summaryState: { basedOnMessageCount: 1 } as ActiveSessionState["summaryState"],
-				hasAcceptedPromptInFlight: true,
-			}),
-		);
-
-		expect(summary.sessionActions).toMatchObject({ queuedCount: 0, active: { kind: "turn", phase: "running" } });
-		expect(summary.activity).toBe("working");
-	});
-
-	it("reports the exact unfinished action count independently of the visible action snapshot", () => {
-		const summary = summaryForActiveSession(
-			makeState({
-				activeSessionId: "batched",
-				unfinishedActionCount: 3,
-				hasAcceptedPromptInFlight: true,
-			}),
-		);
-
-		expect(summary.sessionActions).toMatchObject({ queuedCount: 0, active: { kind: "turn" } });
-		expect(summary.unfinishedActionCount).toBe(3);
-		expect(summary.activity).toBe("working");
-	});
-
-	it("marks an empty resident session idle instead of holding it at working", () => {
-		const summary = summaryForActiveSession(makeState({ activeSessionId: "empty" }));
-		expect(summary.activity).toBe("idle");
-	});
-
-	it("marks a finished subagent idle instead of holding it at working", () => {
-		const oneMessage = [{ role: "user", content: "hi" }] as unknown as AgentMessage[];
-		const entries = buildSessionList(
-			[
-				makeState({
-					activeSessionId: "child",
-					sessionFile: "/tmp/child.jsonl",
-					isStreaming: false,
-					hasRunningRlmChildren: false,
-					messages: oneMessage,
-					// No current summary verdict — a resident finished subagent never gets one.
-					metadata: { kind: "subagent", createdAt: 1, parentActiveSessionId: "parent", rlmChildId: "c1" },
-				}),
-			],
-			[],
-		);
-		expect(entries[0]?.activity).toBe("idle");
 	});
 
 	it("marks a retained completed subagent with an active RLM heartbeat", () => {
@@ -512,37 +485,232 @@ describe("summaryForActiveSession recap currency", () => {
 		{ role: "assistant", content: "ok" },
 	] as AgentMessage[];
 
-	it("surfaces both recap and verdict while the summary matches the turn", () => {
+	it.each([
+		[
+			"surfaces both recap and verdict while the summary matches the turn",
+			twoMessages,
+			{ summary: "Editing the router", taskState: "completed" as const, basedOnMessageCount: 2 },
+			{ summary: "Editing the router", taskState: "completed" },
+		],
+		[
+			// The recap text must survive so the agents view does not flicker to blank, but a
+			// stale "completed" verdict must not show on a turn that is active again.
+			"keeps the prior recap and drops the stale verdict once a new turn outpaces the summary",
+			[...twoMessages, { role: "user", content: "next" } as AgentMessage],
+			{ summary: "Editing the router", taskState: "completed" as const, basedOnMessageCount: 2 },
+			{ summary: "Editing the router", taskState: undefined },
+		],
+		[
+			"omits the recap entirely when there is no summary yet",
+			twoMessages,
+			undefined,
+			{ summary: undefined, taskState: undefined },
+		],
+	])("%s", (_name, messages, summaryState, expected) => {
 		const summary = summaryForActiveSession(
 			makeState({
 				activeSessionId: "s1",
-				messages: twoMessages,
-				summaryState: { summary: "Editing the router", taskState: "completed", basedOnMessageCount: 2 },
+				messages,
+				summaryState: summaryState as ActiveSessionState["summaryState"],
 			}),
 		);
-		expect(summary.summary).toBe("Editing the router");
-		expect(summary.taskState).toBe("completed");
+
+		expect(summary.summary).toBe(expected.summary);
+		expect(summary.taskState).toBe(expected.taskState);
+	});
+});
+
+describe("summary compose memoization", () => {
+	const messageAt = (iso: string, content = "hello") =>
+		({ role: "user", content, timestamp: Date.parse(iso) }) as AgentMessage;
+
+	it("returns the same summary object when nothing changed", () => {
+		const state = makeState({ activeSessionId: "steady", messages: [messageAt("2026-05-01T00:00:00.000Z")] });
+		const first = summaryForActiveSession(state);
+		expect(first).toMatchObject({ messageCount: 1, lastActivityAt: "2026-05-01T00:00:00.000Z" });
+		// Roster flushes recompose every session each cycle; an unchanged session
+		// must reuse the previous summary instead of recomposing it.
+		expect(summaryForActiveSession(state)).toBe(first);
+		expect(Object.isFrozen(first)).toBe(true);
 	});
 
-	it("keeps showing the prior recap once a new turn outpaces the summary", () => {
-		// New messages arrived (count 3) but the summary is still based on 2; the
-		// recap text must survive so the agents view does not flicker to blank.
-		const summary = summaryForActiveSession(
-			makeState({
-				activeSessionId: "s1",
-				messages: [...twoMessages, { role: "user", content: "next" } as AgentMessage],
-				summaryState: { summary: "Editing the router", taskState: "completed", basedOnMessageCount: 2 },
-			}),
+	it("recomposes when a message is appended and folds only the new tail", () => {
+		const messages = [messageAt("2026-05-01T00:00:00.000Z")];
+		const state = makeState({ activeSessionId: "append", messages });
+		const first = summaryForActiveSession(state);
+		messages.push(messageAt("2026-05-02T00:00:00.000Z"));
+		const second = summaryForActiveSession(state);
+		expect(second).not.toBe(first);
+		expect(second).toMatchObject({ messageCount: 2, lastActivityAt: "2026-05-02T00:00:00.000Z" });
+		// A stale appended timestamp must not unseat the existing latest activity.
+		messages.push(messageAt("2026-05-01T12:00:00.000Z"));
+		const third = summaryForActiveSession(state);
+		expect(third).not.toBe(second);
+		expect(third.lastActivityAt).toBe("2026-05-02T00:00:00.000Z");
+	});
+
+	it("recomposes when a compose input changes without an append", () => {
+		const state = makeState({ activeSessionId: "inputs", messages: [messageAt("2026-05-01T00:00:00.000Z")] });
+		const session = state.runtime.session as unknown as Record<string, unknown> & { state: Record<string, unknown> };
+		const runtime = state.runtime as unknown as { diagnostics: unknown[]; metadata: Record<string, unknown> };
+		const actions: SessionActionSnapshot = { queuedCount: 1, steering: ["revised plan"], followUps: [] };
+		const usage: SessionUsageSummary = { inputTokens: 120, outputTokens: 40, cost: 0.03 };
+		const model = { provider: "p", id: "m" } as SessionSummary["model"];
+		const streaming = messageAt("2026-05-01T00:00:01.000Z");
+		const diagnostic: AgentSessionRuntimeDiagnostic = { type: "warning", message: "rebuilt" };
+		const verdict: AgentStatus = { summary: "Editing the router", taskState: "completed", basedOnMessageCount: 1 };
+		const mutations: Array<[() => unknown, Partial<SessionSummary>]> = [
+			[() => Object.assign(state, { summaryState: verdict }), { summary: "Editing the router" }],
+			[() => Object.assign(session, { getSessionActionSnapshot: () => actions }), { sessionActions: actions }],
+			[() => Object.assign(session, { getOwnUsageSummary: () => usage }), { usage }],
+			[() => Object.assign(session, { model }), { model }],
+			[() => Object.assign(session.state, { streamingMessage: streaming }), { streamingMessage: streaming }],
+			[() => Object.assign(runtime, { diagnostics: [diagnostic] }), { diagnostics: [diagnostic] }],
+			[() => Object.assign(runtime.metadata, { spawnCode: "rlm.spawn('x')" }), { spawnCode: "rlm.spawn('x')" }],
+			[() => Object.assign(session, { isSessionActive: true }), { activity: "working" }],
+			[() => Object.assign(session, { isStreaming: true }), { isStreaming: true }],
+		];
+		let previous = summaryForActiveSession(state);
+		for (const [mutate, expected] of mutations) {
+			mutate();
+			const next = summaryForActiveSession(state);
+			expect(next).not.toBe(previous);
+			expect(next).toMatchObject(expected);
+			previous = next;
+		}
+	});
+
+	it("recomposes when heartbeat registration flags differ per call site", () => {
+		const state = makeState({ activeSessionId: "flags" });
+		const unflagged = summaryForActiveSession(state);
+		expect(unflagged.hasActiveHeartbeat).toBeUndefined();
+		const flagged = summaryForActiveSession(state, undefined, true);
+		expect(flagged).not.toBe(unflagged);
+		expect(flagged.hasActiveHeartbeat).toBe(true);
+		expect(summaryForActiveSession(state, undefined, true)).toBe(flagged);
+	});
+});
+
+describe("latestMessageActivityAt memo", () => {
+	const messageAt = (iso: string, content = "hello") =>
+		({ role: "user", content, timestamp: Date.parse(iso) }) as AgentMessage;
+
+	function countingArray(messages: AgentMessage[]): { reads: number[]; array: AgentMessage[] } {
+		const reads: number[] = [];
+		const array = new Proxy(messages, {
+			get(target, property, receiver) {
+				if (typeof property === "string" && /^\d+$/.test(property)) reads.push(Number(property));
+				return Reflect.get(target, property, receiver);
+			},
+		});
+		return { reads, array };
+	}
+
+	function freshMemo(): MessageActivityMemo {
+		return { source: undefined, scannedLength: 0, tailRef: undefined, latest: undefined };
+	}
+
+	it("scans the whole array once and then only appended messages", () => {
+		// Twenty messages stand in for a large transcript: the memo must never
+		// re-walk the old prefix once it has scanned it.
+		const messages = Array.from({ length: 20 }, (_, index) =>
+			messageAt(new Date(Date.UTC(2026, 4, 1, 0, 0, index)).toISOString()),
 		);
-		expect(summary.summary).toBe("Editing the router");
-		// ...but a stale "completed" verdict must not show on a turn that is active again.
-		expect(summary.taskState).toBeUndefined();
+		const { reads, array } = countingArray(messages);
+		const memo = freshMemo();
+
+		const latestIso = new Date(Date.UTC(2026, 4, 1, 0, 0, 19)).toISOString();
+		expect(latestMessageActivityAt(array, memo)).toBe(latestIso);
+		expect(reads).toContain(0);
+		expect(memo.scannedLength).toBe(20);
+
+		// Unchanged array: O(1) boundary/tail reads only, no message walk.
+		reads.length = 0;
+		expect(latestMessageActivityAt(array, memo)).toBe(latestIso);
+		expect(reads.length).toBeGreaterThan(0);
+		expect(reads.every((index) => index >= 19)).toBe(true);
+
+		// One append: the boundary check plus the new element, nothing older.
+		messages.push(messageAt("2026-06-01T00:00:00.000Z"));
+		reads.length = 0;
+		expect(latestMessageActivityAt(array, memo)).toBe("2026-06-01T00:00:00.000Z");
+		expect(reads.every((index) => index >= 19)).toBe(true);
+		expect(reads).toContain(20);
+		expect(memo.scannedLength).toBe(21);
 	});
 
-	it("omits the recap entirely when there is no summary yet", () => {
-		const summary = summaryForActiveSession(makeState({ activeSessionId: "s1", messages: twoMessages }));
-		expect(summary.summary).toBeUndefined();
-		expect(summary.taskState).toBeUndefined();
+	it("rescans everything after a mid-array insert shifts the boundary", () => {
+		const messages = [messageAt("2026-05-01T00:00:00.000Z"), messageAt("2026-05-04T00:00:00.000Z")];
+		const memo = freshMemo();
+		expect(latestMessageActivityAt(messages, memo)).toBe("2026-05-04T00:00:00.000Z");
+		// Insert before the tail: the pre-error splice path in agent-session.
+		messages.splice(1, 0, messageAt("2026-05-03T00:00:00.000Z"));
+		expect(latestMessageActivityAt(messages, memo)).toBe("2026-05-04T00:00:00.000Z");
+		expect(memo.scannedLength).toBe(3);
+		expect(memo.latest).toBe(Date.parse("2026-05-04T00:00:00.000Z"));
+	});
+
+	it("rescans when the array is replaced or shrinks", () => {
+		const messages = [messageAt("2026-05-01T00:00:00.000Z"), messageAt("2026-05-02T00:00:00.000Z")];
+		const memo = freshMemo();
+		expect(latestMessageActivityAt(messages, memo)).toBe("2026-05-02T00:00:00.000Z");
+		// Compaction and filtering reassign the array; the memo must not trust the old scan.
+		const replacement = [...messages];
+		expect(latestMessageActivityAt(replacement, memo)).toBe("2026-05-02T00:00:00.000Z");
+		replacement.pop();
+		expect(latestMessageActivityAt(replacement, memo)).toBe("2026-05-01T00:00:00.000Z");
+		expect(memo.scannedLength).toBe(1);
+	});
+
+	it("keeps ignoring invalid timestamps on appended messages", () => {
+		const messages = [messageAt("2026-05-01T00:00:00.000Z")];
+		const memo = freshMemo();
+		expect(latestMessageActivityAt(messages, memo)).toBe("2026-05-01T00:00:00.000Z");
+		messages.push({
+			role: "assistant",
+			content: "corrupt",
+			timestamp: 8.64e15 + 1,
+		} as unknown as AgentMessage);
+		expect(latestMessageActivityAt(messages, memo)).toBe("2026-05-01T00:00:00.000Z");
+		expect(memo.scannedLength).toBe(2);
+	});
+
+	it("matches a full rescan on every mutation pattern", () => {
+		const build = (count: number) =>
+			Array.from({ length: count }, (_, index) => messageAt(new Date(2026, 4, 1, 0, 0, index).toISOString()));
+		const messages = build(25);
+		const memo = freshMemo();
+		const fullScan = () => latestMessageActivityAt(messages);
+		for (const mutation of [
+			() => messages.push(messageAt("2026-06-01T00:00:00.000Z")),
+			() => messages.splice(10, 0, messageAt("2026-05-15T00:00:00.000Z")),
+			() => messages.pop(),
+			() => messages.push(messageAt("2026-04-01T00:00:00.000Z")),
+		]) {
+			mutation();
+			expect(latestMessageActivityAt(messages, memo)).toBe(fullScan());
+		}
+	});
+});
+
+describe("sessionDisplayLabels", () => {
+	it("mirrors the summary's session name and first message", () => {
+		const state = makeState({
+			activeSessionId: "labels",
+			messages: [{ role: "user", content: "first prompt" } as AgentMessage],
+		});
+		const labels = sessionDisplayLabels(state);
+		const summary = summaryForActiveSession(state);
+		expect(labels.sessionName).toBe(summary.sessionName);
+		expect(labels.firstMessage).toBe(summary.firstMessage);
+	});
+
+	it("uses the spawn prompt as the subagent title", () => {
+		const state = makeState({
+			activeSessionId: "spawned",
+			metadata: { kind: "subagent", createdAt: 1, prompt: "Audit the   retry\nlogic", rlmChildId: "c1" },
+		});
+		expect(sessionDisplayLabels(state).firstMessage).toBe("Audit the retry logic");
 	});
 });
 
@@ -606,20 +774,20 @@ describe("resolveAttachModelFallbackMessage", () => {
 		};
 	}
 
-	it("prefers the daemon's own fallback message", () => {
-		const summary = makeSummary({ modelFallbackMessage: "Could not restore model a/b. Using c/d" });
-
-		expect(resolveAttachModelFallbackMessage(summary, startupMessage)).toBe("Could not restore model a/b. Using c/d");
-	});
-
-	it("ignores the attaching process's snapshot when the session has a model", () => {
-		const summary = makeSummary({ model: { provider: "prime-inference", id: "gpt-5.5" } as SessionSummary["model"] });
-
-		expect(resolveAttachModelFallbackMessage(summary, startupMessage)).toBeUndefined();
-	});
-
-	it("falls back to the attaching process's snapshot when the session has no model", () => {
-		expect(resolveAttachModelFallbackMessage(makeSummary({}), startupMessage)).toBe(startupMessage);
+	it.each([
+		[
+			"prefers the daemon's own fallback message",
+			{ modelFallbackMessage: "Could not restore model a/b. Using c/d" },
+			"Could not restore model a/b. Using c/d",
+		],
+		[
+			"ignores the attaching process's snapshot when the session has a model",
+			{ model: { provider: "prime-inference", id: "gpt-5.5" } as SessionSummary["model"] },
+			undefined,
+		],
+		["falls back to the attaching process's snapshot when the session has no model", {}, startupMessage],
+	])("%s", (_name, overrides, expected) => {
+		expect(resolveAttachModelFallbackMessage(makeSummary(overrides), startupMessage)).toBe(expected);
 	});
 });
 

@@ -19,6 +19,7 @@ import { AgentCronJobStore } from "../src/core/cron-jobs.js";
 import { readActiveOrphanProcesses } from "../src/core/orphan-process-journal.js";
 import {
 	acquireSessionLease,
+	getPsProcessStartId,
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "../src/core/session-lease.js";
@@ -811,7 +812,7 @@ describe("daemon supervisor resident workers", () => {
 			throw new Error("Fixture session did not persist");
 		}
 		const cronStore = new AgentCronJobStore(getCronJobsPath(agentDir));
-		const heartbeat = cronStore.createHeartbeat({
+		const heartbeat = await cronStore.createHeartbeat({
 			activeSessionId: "old-active-session",
 			sessionId: sessionManager.getSessionId(),
 			sessionFile,
@@ -862,7 +863,7 @@ describe("daemon supervisor resident workers", () => {
 			throw new Error("Fixture session did not persist");
 		}
 		const cronStore = new AgentCronJobStore(getCronJobsPath(agentDir));
-		const heartbeat = cronStore.createHeartbeat({
+		const heartbeat = await cronStore.createHeartbeat({
 			activeSessionId: "deleted-worker",
 			sessionId: sessionManager.getSessionId(),
 			sessionFile,
@@ -1554,6 +1555,12 @@ describe("daemon supervisor resident workers", () => {
 		expect(replacementMessageCounts).toContain(0);
 		const switchedBack = await client.request({ type: "switch_session", activeSessionId, sessionPath: sessionFile });
 		expect(switchedBack.success).toBe(true);
+		// The switch reports the file it resolved, so a client that sent a relative
+		// path can still correlate the replacement snapshot it waits on.
+		expect(switchedBack.success ? switchedBack.data : undefined).toMatchObject({
+			cancelled: false,
+			sessionFile,
+		});
 		const restoredReplacementDeadline = Date.now() + 5000;
 		while (replacementMessageCounts.at(-1) !== 2 && Date.now() < restoredReplacementDeadline) {
 			await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
@@ -1823,5 +1830,38 @@ describe("daemon supervisor resident workers", () => {
 			chmodSync(socketDir, 0o755);
 		}
 		workerPids.delete(workerPid);
+	});
+});
+
+describe("issue #879 stable daemon process identity across timezone changes", () => {
+	it("pins the portable process query to UTC across caller timezone changes", () => {
+		const calls: Array<{ command: string; args: string[]; env: NodeJS.ProcessEnv | undefined }> = [];
+		const query = (command: string, args: string[], options?: { env?: NodeJS.ProcessEnv }) => {
+			calls.push({ command, args, env: options?.env });
+			return options?.env?.TZ === "UTC" ? "Sat Aug 29 20:55:18 2026\n" : "Sat Aug 29 16:55:18 2026\n";
+		};
+		const originalTimezone = process.env.TZ;
+		let before: string | undefined;
+		let after: string | undefined;
+		try {
+			process.env.TZ = "America/Los_Angeles";
+			before = getPsProcessStartId(42, query);
+			process.env.TZ = "America/New_York";
+			after = getPsProcessStartId(42, query);
+		} finally {
+			if (originalTimezone === undefined) delete process.env.TZ;
+			else process.env.TZ = originalTimezone;
+		}
+
+		expect(before).toBe("ps:Sat Aug 29 20:55:18 2026");
+		expect(after).toBe(before);
+		expect(calls).toHaveLength(2);
+		for (const call of calls) {
+			expect(call).toMatchObject({
+				command: "ps",
+				args: ["-p", "42", "-o", "lstart="],
+				env: { LC_ALL: "C", LC_TIME: "C", LANG: "C", TZ: "UTC" },
+			});
+		}
 	});
 });

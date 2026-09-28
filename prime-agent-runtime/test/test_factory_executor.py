@@ -236,6 +236,16 @@ class FakeHost:
         raise AssertionError(f"unexpected host request type {request_type!r}")
 
 
+class DeleteFailsHost(FakeHost):
+    """FakeHost whose rlm.delete_subagent always raises."""
+
+    async def __call__(self, request_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        if request_type == "rlm.delete_subagent":
+            self.calls.append((request_type, payload or {}))
+            raise RuntimeError("delete_subagent: child already gone")
+        return await super().__call__(request_type, payload)
+
+
 class FactoryExecutorTest(unittest.TestCase):
     def setUp(self) -> None:
         temp = TemporaryDirectory()
@@ -1051,6 +1061,64 @@ class FactoryExecutorTest(unittest.TestCase):
         self.assertEqual(len(self.host.spawn_calls("a")), 2)
         self.assertEqual(self.host.deleted_targets(), [])  # no child existed
         self.assertEqual(status["usage"]["spawns"], 0)
+
+    @async_test
+    async def test_stop_cancels_an_in_flight_earlier_entry_of_a_reentered_state(self) -> None:
+        # x re-enters (max_entries 2): entry 1 settles while entry 0 is still
+        # running, so the state's latest entry reads done. stop() must still
+        # report and cancel the in-flight entry 0, not read the state as done.
+        self.host.child_outcomes["child-3"] = {"status": "running"}
+        self.host.child_outcomes["child-4"] = {"status": "done", "answer": "x-two"}
+        self.store_machine(
+            {
+                "run": {"max_parallel": 4},
+                "states": [
+                    {"id": "a", "entry": True, "subagent": "worker"},
+                    {"id": "b", "entry": True, "subagent": "worker"},
+                    {"id": "x", "subagent": "worker", "max_entries": 2},
+                ],
+                "transitions": [{"from": "a", "to": "x"}, {"from": "b", "to": "x"}],
+            }
+        )
+        result = await self.start()
+        self.assertEqual(result["started"], ["a", "b"])
+        run = self.executor._runs[result["run_id"]]
+        # entry 1 settles while entry 0's child stays running forever
+        await self.wait_until(lambda: any(entry.status == "done" for entry in run.states["x"].entries))
+        stopped = await rlm_module.rlm.factory.stop(result["run_id"])
+        self.assertEqual(stopped["cancelled"], ["x"])  # not []: entry 0 is in flight
+        status = await rlm_module.rlm.factory.status(result["run_id"])
+        self.assertEqual(status["state"], "stopped")
+        node = self.node_status(status, "x")
+        self.assertEqual([(e["index"], e["status"]) for e in node["entries"]], [(0, "cancelled"), (1, "done")])
+        self.assertEqual([(i["index"], i["status"]) for i in node["instances"]], [(0, "cancelled"), (1, "done")])
+        self.assertEqual(self.host.deleted_targets(), ["child-3"])
+
+    @async_test
+    async def test_failed_delete_records_cancel_failed_and_cancelled(self) -> None:
+        # A delete that raises still releases the executor's slot, so the
+        # ledger records the failure AND the cancellation (the eval replay
+        # checker keys off cancelled events) while the instance reads
+        # cancelled in the stopped run.
+        failing = DeleteFailsHost(clock=self.clock)
+        patcher = patch.object(rlm_module, "host_request", failing)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        failing.outcomes["a"] = {"status": "running"}
+        self.store_factory({"nodes": [{"id": "a", "subagent": "worker"}]})
+        result = await self.start()
+        await self.wait_until(lambda: failing.collects >= 1)
+        stopped = await rlm_module.rlm.factory.stop(result["run_id"])
+        self.assertEqual(stopped["cancelled"], ["a"])
+        status = await rlm_module.rlm.factory.status(result["run_id"])
+        self.assertEqual(status["state"], "stopped")
+        instance = self.node_status(status, "a")["instances"][0]
+        self.assertEqual(instance["status"], "cancelled")
+        kinds = [(event["kind"], event.get("detail")) for event in status["events"]]
+        self.assertIn(("cancel_failed", None), kinds)
+        self.assertIn(("cancelled", "slot released despite the failed delete"), kinds)
+        # the failure is recorded before the cancellation it explains
+        self.assertLess(kinds.index(("cancel_failed", None)), kinds.index(("cancelled", "slot released despite the failed delete")))
 
     @async_test
     async def test_rate_limit_at_admission_defers_to_backoff(self) -> None:

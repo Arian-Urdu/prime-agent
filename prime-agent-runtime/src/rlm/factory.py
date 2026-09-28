@@ -1867,16 +1867,25 @@ class FactoryExecutor:
 
     async def _halt_nonterminal(self, run: FactoryRun, reason: str) -> list[str]:
         """Delete every running child, cancel every active watch, and cancel
-        every non-terminal entry; never-entered states are marked cancelled."""
+        every non-terminal entry; never-entered states are marked cancelled.
+
+        A state participates when ANY entry is non-terminal, not only the
+        latest one: a re-entered state can keep an earlier entry in flight
+        while its latest entry settled, and that entry must be cancelled too
+        (state.status reports the latest entry only).
+        """
         stopped = [
             state_id
             for state_id in run.order
-            if run.states[state_id].status in ("pending", "running", "waiting")
+            if any(
+                entry.status in ("pending", "running", "waiting") for entry in run.states[state_id].entries
+            )
+            or (not run.states[state_id].entries and run.states[state_id].status == "pending")
         ]
         await self._cancel_running(run)
         for state_id in stopped:
             state = run.states[state_id]
-            if state.status in ("pending", "running", "waiting"):
+            if any(entry.status in ("pending", "running", "waiting") for entry in state.entries) or not state.entries:
                 state.cancelled = True
                 for entry in state.entries:
                     if entry.status in ("pending", "running", "waiting"):
@@ -1917,6 +1926,10 @@ class FactoryExecutor:
             await delete_subagent(child_id)
         except Exception as exc:
             self._event(run, "cancel_failed", node=state.state_id, entry=entry.index, instance=instance.index, child=child_id, error=str(exc))
+            # The slot is released either way, so the ledger must record the
+            # cancellation next to the failure (the eval replay checker keys
+            # off cancelled events, and the instance below reads cancelled).
+            self._event(run, "cancelled", node=state.state_id, entry=entry.index, instance=instance.index, child=child_id, detail="slot released despite the failed delete")
         else:
             self._event(run, "cancelled", node=state.state_id, entry=entry.index, instance=instance.index, child=child_id)
         # The child is supervisor-owned; a failed delete leaves it running
@@ -1937,6 +1950,11 @@ class FactoryExecutor:
                         await delete_subagent(child_id)
                     except Exception as exc:
                         self._event(run, "cancel_failed", node=state_id, entry=entry.index, instance=instance.index, child=child_id, error=str(exc))
+                        # The slot is released either way, so the ledger also
+                        # records the cancellation next to the failure (the
+                        # eval replay checker keys off cancelled events, and
+                        # the instance below reads cancelled).
+                        self._event(run, "cancelled", node=state_id, entry=entry.index, instance=instance.index, child=child_id, detail="slot released despite the failed delete")
                     else:
                         self._event(run, "cancelled", node=state_id, entry=entry.index, instance=instance.index, child=child_id)
                     # The child is supervisor-owned; a failed delete leaves it

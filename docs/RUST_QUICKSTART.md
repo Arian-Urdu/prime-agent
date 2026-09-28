@@ -270,5 +270,4 @@ there and you no longer want the rollback).
   known and owned by a lane.
 - The pre-takeover `prime-agent-rust` layout still migrates: an old
   `~/.local/share/prime-agent-rust` install moves to the rollback slot on
-  the first takeover install (the sandbox test
-  `tests/installer/installer-takeover-test.sh` covers it).
+  the first takeover install.

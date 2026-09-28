@@ -5,7 +5,7 @@ import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
 import { writeFileAtomicSync } from "../utils/atomic-file.js";
-import type { ProviderWaitPolicy } from "./provider-retry.js";
+import { MAX_PROVIDER_PAUSE_MS, type ProviderWaitPolicy } from "./provider-retry.js";
 
 const RECENT_MODELS_LIMIT = 20;
 export const DEFAULT_IDLE_EVICTION_MINUTES = 90;
@@ -35,6 +35,9 @@ export interface ProviderWaitSettings {
 	maxDelayMs?: number; // default: 300000 (per-ping ceiling, 5m)
 	maxAttempts?: number; // default: 30 (abort bound: max pings)
 	maxWaitMs?: number; // default: 900000 (abort bound: max total wait, 15m)
+	pauseUntilReset?: boolean; // default: true - park quota-blocked sessions until the provider-reported reset
+	maxPauseMs?: number; // default: 86400000 (abort bound: max single park, 24h; clamped to 7d)
+	maxParks?: number; // default: 8 (abort bound: max parks per quota episode)
 }
 
 export interface ProviderRetrySettings {
@@ -110,6 +113,8 @@ function resolveAutonomousLimit(value: AutonomousLimitSetting | undefined): numb
 
 export type MermaidRenderingMode = "off" | "final" | "streaming";
 
+export type ChatDetail = "overview" | "details" | "all";
+
 export interface MarkdownSettings {
 	codeBlockIndent?: string; // default: "  "
 	mermaid?: MermaidRenderingMode; // default: "streaming"
@@ -141,10 +146,10 @@ export type PackageSource =
 	  };
 
 /**
- * Remote/local MCP server an integration connects to. Built-in integrations
- * (Linear/Notion) are defined in the ai/mcp catalog; this is for user-declared
- * servers. The kernel-side integration package reads creds from auth.json
- * (`mcp:<name>`); login/refresh run host-side.
+ * Remote/local MCP server an integration connects to. Catalog services are
+ * defined in the ai/mcp service catalog; this is for user-declared servers.
+ * The kernel's generic mcp runtime reads creds from auth.json (`mcp:<name>`);
+ * login/refresh/verification run host-side.
  */
 export type McpServerConfig =
 	| {
@@ -155,6 +160,18 @@ export type McpServerConfig =
 			bearerTokenEnvVar?: string;
 			/** Use the generic OAuth login flow for this server. */
 			oauth?: boolean;
+			/** Pre-registered OAuth client id for this server (optional). */
+			oauthClientId?: string;
+			/**
+			 * Env var holding the OAuth client secret. When set, a missing or
+			 * empty env value fails the login/refresh — never a stale stored
+			 * secret fallback.
+			 */
+			oauthClientSecretEnvVar?: string;
+			/** Client identity metadata document URL (CIMD) for this server. */
+			oauthClientMetadataUrl?: string;
+			/** Requested OAuth scopes for this server (config > PRM > omit). */
+			oauthScopes?: string[];
 			/** Force-disable even when credentials exist. */
 			enabled?: boolean;
 			enabledTools?: string[];
@@ -184,10 +201,13 @@ export interface Settings {
 	subagentDefaultModel?: string; // "provider/id" for rlm.spawn without a pinned model; unset inherits the parent model
 	updateChannel?: "stable" | "nightly"; // release channel for self-updates; unset follows the running version
 	recentModels?: string[]; // "provider/id" keys, most-recently-used first
-	// "provider/id" for background LLM passes (refinement review and planning);
-	// unset falls back to the session model. Routing these to a different model
-	// keeps their different prompt prefixes from evicting the session's provider
-	// prefix-cache entry.
+	// "provider/id" for background LLM passes (refinement review and planning,
+	// compaction summaries, branch summaries); unset falls back to the session
+	// model. These passes use their own prompt prefixes, so they can never hit
+	// the session's cached prefix: on the session model they re-read their whole
+	// input at peak price, and on OpenAI-style providers a divergent prefix
+	// riding the session's prompt_cache_key depresses hit rates. Routing them
+	// to a different model moves those calls off the session model.
 	auxiliaryModel?: string;
 	defaultThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	defaultServiceTier?: ServiceTier;
@@ -209,12 +229,20 @@ export interface Settings {
 	 * Default: none - requests never silently switch models.
 	 */
 	providerBackupModel?: string;
+	/**
+	 * Model ("provider/model-id" or a bare model id) that serves turns
+	 * attaching images when the session model does not accept image input.
+	 * Default: none - image turns on a text-only model fail with a
+	 * configuration hint instead of silently dropping the images.
+	 */
+	imageModel?: string;
 	autonomous?: AutonomousSettings;
 	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows)
 	quietStartup?: boolean;
 	shellCommandPrefix?: string; // Prefix prepended to every bash command (e.g., "shopt -s expand_aliases" for alias support)
 	npmCommand?: string[]; // Command used for npm package lookup/install operations, argv-style (e.g., ["mise", "exec", "node@20", "--", "npm"])
 	mcpServers?: Record<string, McpServerConfig>; // User-declared MCP servers (name → config); built-ins are in the ai/mcp catalog
+	mcpCatalogSources?: string[]; // Extra local MCP service catalog files (~-relative ok); merged after the built-in catalog, first source wins per id
 	packages?: PackageSource[]; // Array of npm/git package sources (string or object with filtering)
 	extensions?: string[]; // Array of local extension file paths or directories
 	skills?: string[]; // Array of local skill file paths or directories
@@ -227,6 +255,7 @@ export interface Settings {
 	images?: ImageSettings;
 	enabledModels?: string[]; // Model patterns for cycling (same format as --models CLI flag)
 	treeFilterMode?: "default" | "no-tools" | "user-only" | "labeled-only" | "all"; // Default: "user-only"
+	chatDetail?: ChatDetail; // Default: "details"
 	thinkingBudgets?: ThinkingBudgetsSettings; // Custom token budgets for thinking levels
 	editorPaddingX?: number; // Horizontal padding for input editor (default: 0)
 	autocompleteMaxVisible?: number; // Max visible items in autocomplete dropdown (default: 5)
@@ -234,6 +263,8 @@ export interface Settings {
 	markdown?: MarkdownSettings;
 	warnings?: WarningSettings;
 	sessionDir?: string; // Custom session storage directory (same format as --session-dir CLI flag)
+	/** Log per-request provider timing phases to the diagnostic log. Default: false */
+	requestTiming?: boolean;
 }
 
 export interface AgentTracesSettings {
@@ -800,9 +831,14 @@ export class SettingsManager {
 		this.save();
 	}
 
+	/**
+	 * "provider/id" of the model that runs background LLM passes (refinement
+	 * review and planning, compaction summaries, branch summaries). Falls back to
+	 * the session model when unset, equal to the session model, or unusable.
+	 */
 	getAuxiliaryModel(): string | undefined {
 		// Hand-edited or corrupt settings files can persist non-string values; treat
-		// anything malformed as unset so refinement falls back to the session model.
+		// anything malformed as unset so the pass falls back to the session model.
 		const value = this.settings.auxiliaryModel;
 		return typeof value === "string" ? value : undefined;
 	}
@@ -1074,6 +1110,11 @@ export class SettingsManager {
 			maxDelayMs: bound(wait?.maxDelayMs, 300_000),
 			maxAttempts: bound(wait?.maxAttempts, 30),
 			maxWaitMs: bound(wait?.maxWaitMs, 900_000),
+			pauseUntilReset: wait?.pauseUntilReset ?? true,
+			// Very large parks are clamped to MAX_PROVIDER_PAUSE_MS instead of
+			// silently waiting weeks for a stale reset.
+			maxPauseMs: Math.min(bound(wait?.maxPauseMs, 86_400_000), MAX_PROVIDER_PAUSE_MS),
+			maxParks: bound(wait?.maxParks, 8),
 		};
 	}
 
@@ -1081,6 +1122,14 @@ export class SettingsManager {
 		// Parsed settings are only cast to Settings; a non-string JSON value
 		// (e.g. 123) must behave as unset, never throw into the retry path.
 		const reference = this.settings.providerBackupModel;
+		if (typeof reference !== "string") return undefined;
+		return reference.trim() ? reference.trim() : undefined;
+	}
+
+	getImageModel(): string | undefined {
+		// Same shape as providerBackupModel: malformed values behave as unset
+		// and the image-turn refusal names the setting instead.
+		const reference = this.settings.imageModel;
 		if (typeof reference !== "string") return undefined;
 		return reference.trim() ? reference.trim() : undefined;
 	}
@@ -1332,6 +1381,10 @@ export class SettingsManager {
 		return this.settings.images?.blockImages ?? false;
 	}
 
+	getRequestTiming(): boolean {
+		return this.settings.requestTiming ?? false;
+	}
+
 	setBlockImages(blocked: boolean): void {
 		if (!this.globalSettings.images) {
 			this.globalSettings.images = {};
@@ -1348,6 +1401,11 @@ export class SettingsManager {
 	/** MCP execution is intentionally restricted to user/global settings. */
 	getGlobalMcpServers(): Record<string, McpServerConfig> | undefined {
 		return structuredClone(this.globalSettings.mcpServers);
+	}
+
+	/** Declared local service-catalog source paths (unexpanded ~ allowed). */
+	getMcpCatalogSources(): string[] {
+		return structuredClone(this.globalSettings.mcpCatalogSources ?? []);
 	}
 
 	setGlobalMcpServer(name: string, config: McpServerConfig, force = false): void {
@@ -1430,6 +1488,17 @@ export class SettingsManager {
 		this.globalSettings.markdown ??= {};
 		this.globalSettings.markdown.mermaid = mode;
 		this.markModified("markdown", "mermaid");
+		this.save();
+	}
+
+	getChatDetail(): ChatDetail {
+		const detail = this.settings.chatDetail;
+		return detail === "overview" || detail === "all" ? detail : "details";
+	}
+
+	setChatDetail(detail: ChatDetail): void {
+		this.globalSettings.chatDetail = detail;
+		this.markModified("chatDetail");
 		this.save();
 	}
 

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
@@ -19,6 +20,17 @@ const REFINEMENT_HISTORY_FILE_NAME = "refinements.jsonl";
 const DEFAULT_OVERVIEW_ENTRY_LIMIT = 6;
 const DEFAULT_OVERVIEW_REFINEMENT_LIMIT = 5;
 const DEFAULT_OVERVIEW_CONTENT_LIMIT = 180;
+
+/**
+ * Bump when the fingerprinted material or its canonical serialization changes,
+ * so fingerprints minted under different versions never compare equal.
+ * Normalizing a render-ignored flag out of the material does not need a
+ * bump: fingerprint equality still implies identical renders (with IPython
+ * examples off the normalization is a no-op; with them on, equality means
+ * the shell flag was already false, i.e. identical renders), so equality
+ * across the change is render-safe.
+ */
+const HARNESS_DIGEST_FINGERPRINT_VERSION = 1;
 
 export type RefinementKind = "prompt" | "memory" | "skill" | "subagent";
 export type RefinementAction = "create" | "update" | "delete";
@@ -251,7 +263,9 @@ function emptyHarnessState(): HarnessState {
 }
 
 function slug(raw: string, fallback: string): string {
-	const normalized = raw
+	// A malformed value (for example a non-string title) cannot be normalized; resolve
+	// to the fallback so apply-time validation can still reject the edit by id.
+	const normalized = (typeof raw === "string" ? raw : fallback)
 		.trim()
 		.toLowerCase()
 		.replace(/[^a-z0-9]+/g, "_")
@@ -269,6 +283,12 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
 		return undefined;
 	}
 	return value as Record<string, unknown>;
+}
+
+/** Grouping label of a persisted entry. State written while the grouping was named `topic` carries no `path`. */
+function storedHarnessPath(entry: { path?: unknown; topic?: unknown }): string | undefined {
+	if (typeof entry.path === "string") return entry.path;
+	return typeof entry.topic === "string" ? entry.topic : undefined;
 }
 
 function normalizeHarnessScope(value: unknown, fallback: HarnessScope): HarnessScope {
@@ -336,8 +356,13 @@ export function loadHarnessState(
 			for (const [id, rawEntry] of Object.entries(records)) {
 				const entry = objectRecord(rawEntry);
 				if (!entry) continue;
+				// Migrate a topic-spelled grouping to `path` on load; `topic` is dropped so a later save
+				// writes the `path` spelling only.
+				const { topic: _topic, ...rest } = entry;
+				const path = storedHarnessPath(entry);
 				state.entries[kind][id] = {
-					...(entry as unknown as HarnessEntry),
+					...(rest as unknown as HarnessEntry),
+					...(path === undefined ? {} : { path }),
 					scope: normalizeHarnessScope(entry.scope, scope),
 					reference: objectRecord(entry.reference) ?? {},
 					arguments: objectRecord(entry.arguments) ?? {},
@@ -440,6 +465,42 @@ export function mergeRefinementHistory(
 	return [...byId.values()];
 }
 
+/** Why a persisted harness entry cannot be rendered safely: the field whose
+ * stored type violates the entry contract (write paths reject these shapes).
+ * Render paths skip such entries with a diagnostic instead of throwing, so one
+ * corrupt entry (from an older build or a hand-edited store) can never break
+ * session creation by crashing the harness digest. */
+export function harnessEntryMalformation(entry: HarnessEntry): string | undefined {
+	if (typeof entry.content !== "string") return "content not a string";
+	if (typeof entry.title !== "string") return "title not a string";
+	return undefined;
+}
+
+/** Same contract for refinement events: the digest renders id, trigger, changes,
+ * and outcome with string operations, so a non-string id or trigger, non-array
+ * changes, non-string change elements, or non-string outcome must be skipped
+ * with a diagnostic rather than crash the digest or render junk. */
+export function harnessRefinementMalformation(event: HarnessRefinementEvent): string | undefined {
+	if (typeof event !== "object" || event === null) return "event not an object";
+	if (typeof event.id !== "string") return "id not a string";
+	if (typeof event.trigger !== "string") return "trigger not a string";
+	if (!Array.isArray(event.changes)) return "changes not an array";
+	if (!event.changes.every((change) => typeof change === "string")) return "changes contain a non-string";
+	if (event.outcome !== undefined && typeof event.outcome !== "string") return "outcome not a string";
+	return undefined;
+}
+
+/** Bounded label for a skipped malformed refinement event. Non-object elements
+ * and invalid ids are labeled by type, never by value: a corrupt store element
+ * must not inject arbitrary unbounded text into every session's prompt digest. */
+function malformedRefinementEventLabel(event: HarnessRefinementEvent): string {
+	if (event === null) return "null";
+	if (typeof event === "undefined") return "undefined";
+	if (typeof event !== "object") return `a ${typeof event}`;
+	if (Array.isArray(event)) return "an array";
+	return typeof event.id === "string" ? event.id : `a ${typeof event.id} id`;
+}
+
 function compactText(text: string, maxLength: number): string {
 	const normalized = text.replace(/\s+/g, " ").trim();
 	if (normalized.length <= maxLength) {
@@ -455,11 +516,12 @@ export function formatRefinementNoticeBody(result: RefinementResult): string {
 		if (!edit.applied) continue;
 		const entry = edit.after ?? edit.before;
 		const scope = entry?.scope ?? result.scope ?? "local";
+		const malformation = entry ? harnessEntryMalformation(entry) : undefined;
 		lines.push(
-			`- ${edit.action} ${edit.kind} [${scope}:${edit.id}] ${entry?.title ?? edit.id}: ${compactText(
-				entry?.content ?? "",
+			`- ${edit.action} ${edit.kind} [${scope}:${edit.id}] ${malformation ? edit.id : (entry?.title ?? edit.id)}: ${compactText(
+				malformation ? "" : (entry?.content ?? ""),
 				DEFAULT_OVERVIEW_CONTENT_LIMIT,
-			)}`,
+			)}${malformation ? ` (skipped malformed entry: ${malformation})` : ""}`,
 		);
 	}
 	return lines.join("\n");
@@ -468,8 +530,9 @@ export function formatRefinementNoticeBody(result: RefinementResult): string {
 /**
  * Query terms for relevance-ranked harness digests: term -> weight.
  * Built by the caller from task signal (goal objective, recent
- * messages). The ranking is a pure weighted-term overlap over the
- * entry's searchable fields.
+ * messages). The ranking is weighted term overlap over the entry's
+ * searchable fields, discounted per term by document frequency in the
+ * ranked corpus, so rare distinctive terms outweigh ubiquitous ones.
  */
 export type HarnessQueryTerms = Map<string, number>;
 
@@ -518,8 +581,45 @@ export function harnessQueryTerms(text: string): string[] {
 	return [...new Set(terms)];
 }
 
-/** Score one harness entry against query terms: weighted term overlap. */
-export function scoreHarnessEntryForQuery(entry: HarnessEntry, terms: HarnessQueryTerms): number {
+/**
+ * Inverse document frequency per query term over the entries being
+ * ranked: `log(1 + documents / matches)`. A term present in every entry
+ * still weighs `log(2)`, while a term in one entry of N weighs
+ * `log(1 + N)`, so rare distinctive terms outrank ubiquitous ones.
+ * Terms matching no entry are absent (they cannot score anything).
+ */
+export function harnessQueryTermIdf(entries: HarnessEntry[], terms: HarnessQueryTerms): Map<string, number> {
+	const idf = new Map<string, number>();
+	if (terms.size === 0) return idf;
+	let documents = 0;
+	const matches = new Map<string, number>();
+	for (const entry of entries) {
+		documents += 1;
+		const title = searchableField(entry.title);
+		const content = searchableField(entry.content);
+		const identifier = `${searchableField(entry.path)} ${searchableField(entry.id)}`;
+		for (const term of terms.keys()) {
+			if (title.includes(term) || content.includes(term) || identifier.includes(term)) {
+				matches.set(term, (matches.get(term) ?? 0) + 1);
+			}
+		}
+	}
+	for (const [term, documentFrequency] of matches) {
+		idf.set(term, Math.log(1 + documents / documentFrequency));
+	}
+	return idf;
+}
+
+/**
+ * Score one harness entry against query terms: weighted term overlap,
+ * with each matched term's weight discounted by its document frequency
+ * in the ranked corpus (`idf`; a missing map weights every term at 1).
+ */
+export function scoreHarnessEntryForQuery(
+	entry: HarnessEntry,
+	terms: HarnessQueryTerms,
+	idf?: Map<string, number>,
+): number {
 	if (terms.size === 0) return 0;
 	const title = searchableField(entry.title);
 	const content = searchableField(entry.content);
@@ -534,17 +634,24 @@ export function scoreHarnessEntryForQuery(entry: HarnessEntry, terms: HarnessQue
 		if (title.includes(term)) fields += 1;
 		if (content.includes(term)) fields += 1;
 		if (identifier.includes(term)) fields += 1;
-		if (fields > 0) score += weight * (1 + (fields - 1) * 0.5);
+		if (fields > 0) {
+			score += weight * (idf?.get(term) ?? 1) * (1 + (fields - 1) * 0.5);
+		}
 	}
 	return score;
 }
 
-function compareRankedHarnessEntries(a: HarnessEntry, b: HarnessEntry, terms: HarnessQueryTerms): number {
-	const scoreDifference = scoreHarnessEntryForQuery(b, terms) - scoreHarnessEntryForQuery(a, terms);
+function compareRankedHarnessEntries(
+	a: HarnessEntry,
+	b: HarnessEntry,
+	terms: HarnessQueryTerms,
+	idf?: Map<string, number>,
+): number {
+	const scoreDifference = scoreHarnessEntryForQuery(b, terms, idf) - scoreHarnessEntryForQuery(a, terms, idf);
 	if (scoreDifference !== 0) return scoreDifference;
-	// Recency breaks ties; alphabetical order keeps selection deterministic.
-	const recencyDifference = (Date.parse(b.updated_at) || 0) - (Date.parse(a.updated_at) || 0);
-	if (recencyDifference !== 0) return recencyDifference;
+	// Equal scores tie on stable identifier order (path, title, id), so
+	// touching unrelated entries never reshuffles equal-score siblings and the
+	// rendered digest keeps a stable prefix for provider prompt-cache reuse.
 	return [a.path, a.title, a.id].join("\0").localeCompare([b.path, b.title, b.id].join("\0"));
 }
 
@@ -590,9 +697,14 @@ export function formatHarnessStateForPrompt(
 	const queryTerms = options.queryTerms;
 	let totalEntries = 0;
 	for (const kind of Object.keys(state.entries) as RefinementKind[]) {
-		const entries = Object.values(state.entries[kind]).sort((a, b) =>
+		// The ranked corpus is the kind's own entries: they compete for the
+		// same top-k slots, so document frequency discounts terms ubiquitous
+		// within the kind rather than across unrelated kinds.
+		const ranked = Object.values(state.entries[kind]);
+		const idf = queryTerms !== undefined && queryTerms.size > 0 ? harnessQueryTermIdf(ranked, queryTerms) : undefined;
+		const entries = ranked.sort((a, b) =>
 			queryTerms !== undefined && queryTerms.size > 0
-				? compareRankedHarnessEntries(a, b, queryTerms)
+				? compareRankedHarnessEntries(a, b, queryTerms, idf)
 				: [a.path, a.title, a.id].join("\0").localeCompare([b.path, b.title, b.id].join("\0")),
 		);
 		totalEntries += entries.length;
@@ -610,6 +722,11 @@ export function formatHarnessStateForPrompt(
 			lines.push("(entries ranked by relevance to the current task; see harness.search)");
 		}
 		for (const entry of entries.slice(0, maxEntriesPerKind)) {
+			const malformation = harnessEntryMalformation(entry);
+			if (malformation) {
+				lines.push(`harness: skipped malformed entry ${entry.id} (${malformation})`);
+				continue;
+			}
 			const argumentsText =
 				entry.kind === "skill" && Object.keys(entry.arguments).length > 0
 					? ` args=${compactText(JSON.stringify(entry.arguments), maxContentLength)}`
@@ -638,6 +755,13 @@ export function formatHarnessStateForPrompt(
 
 	lines.push(`recent refinements: ${state.refinements.length}`);
 	for (const event of state.refinements.slice(-maxRefinements)) {
+		const malformation = harnessRefinementMalformation(event);
+		if (malformation) {
+			lines.push(
+				`harness: skipped malformed refinement event ${malformedRefinementEventLabel(event)} (${malformation})`,
+			);
+			continue;
+		}
 		const changes = event.changes.length > 0 ? event.changes.join(", ") : "no applied edits";
 		const outcome = event.outcome ? `; outcome: ${compactText(event.outcome, maxContentLength)}` : "";
 		lines.push(`- [${event.id}] ${compactText(event.trigger, maxContentLength)}: ${changes}${outcome}`);
@@ -650,12 +774,86 @@ export function formatHarnessStateForPrompt(
 	return lines.join("\n").trim();
 }
 
+/**
+ * Stable fingerprint of the harness material a digest renders. Equal states
+ * (per the fields the digest actually prints) produce equal fingerprints, so
+ * cold boundaries can skip digest re-delivery with a state comparison instead
+ * of a rendered-text comparison that query-term relevance keeps invalidating.
+ *
+ * Covered: entry identity and content (entry order is normalized away, as is
+ * the call contract on non-skill entries, which the formatter never prints),
+ * plus the render flags and each refinement's printed fields in stored order
+ * (a malformed event's printed fields are its skip-line label and reason),
+ * since the formatter renders a positional newest tail. The shell-examples
+ * flag participates only when IPython examples are not rendered: the formatter
+ * never reads it then, so it is normalized out of the fingerprint to keep an
+ * unchanged digest fresh. Excluded: `metadata`, `source`, and the invisible
+ * `created_at`/`updated_at` bookkeeping, and relevance query terms (the
+ * digest stays frozen per delivery; see `compareRankedHarnessEntries`).
+ */
+export function harnessDigestFingerprint(
+	state: HarnessState,
+	renderFlags: {
+		includeIpythonExamples: boolean;
+		includeShellExamples: boolean;
+		includeRefineExamples: boolean;
+	},
+): string {
+	const entries = (Object.keys(state.entries) as RefinementKind[])
+		.flatMap((kind) => Object.values(state.entries[kind]))
+		.map((entry) => ({
+			scope: entry.scope ?? "global",
+			kind: entry.kind,
+			id: entry.id,
+			title: entry.title,
+			path: entry.path,
+			version: entry.version,
+			content: entry.content,
+			// Only skills render the kernel call contract, so another kind can
+			// change these fields without changing a single digest byte.
+			reference: entry.kind === "skill" ? entry.reference : undefined,
+			arguments: entry.kind === "skill" ? entry.arguments : undefined,
+		}))
+		.sort((a, b) => [a.scope, a.kind, a.id].join("\0").localeCompare([b.scope, b.kind, b.id].join("\0")));
+	// Refinements keep their stored order: the formatter renders the newest
+	// tail of the array, so an order-only change renders differently and must
+	// not reuse the previous digest.
+	const refinements = state.refinements.map((event) => {
+		const malformation = harnessRefinementMalformation(event);
+		// A malformed event renders as a skip line (label + reason), not its
+		// fields, so that pair is the fingerprint material for it: fingerprint
+		// equality implies identical renders, corrupted stores included.
+		if (malformation !== undefined) {
+			return { malformed: malformation, label: malformedRefinementEventLabel(event) };
+		}
+		return { id: event.id, trigger: event.trigger, changes: event.changes, outcome: event.outcome };
+	});
+	// The formatter renders the shell call-contract only when IPython examples
+	// are absent, so the shell flag cannot change the digest while IPython
+	// examples take precedence; fingerprint only the flags the render reads.
+	const effectiveRenderFlags = renderFlags.includeIpythonExamples
+		? { ...renderFlags, includeShellExamples: false }
+		: renderFlags;
+	const material = JSON.stringify({
+		version: HARNESS_DIGEST_FINGERPRINT_VERSION,
+		renderFlags: effectiveRenderFlags,
+		entries,
+		refinements,
+	});
+	return createHash("sha256").update(material).digest("hex");
+}
+
 function overviewForPrompt(state: HarnessState): string {
 	const lines: string[] = [];
 	for (const kind of Object.keys(state.entries) as RefinementKind[]) {
 		const entries = Object.values(state.entries[kind]);
 		lines.push(`${kind}: ${entries.length}`);
 		for (const entry of entries.slice(0, 40)) {
+			const malformation = harnessEntryMalformation(entry);
+			if (malformation) {
+				lines.push(`- harness: skipped malformed entry ${entry.id} (${malformation})`);
+				continue;
+			}
 			const content = entry.content.replace(/\s+/g, " ").slice(0, 240);
 			const argumentsText =
 				entry.kind === "skill" && Object.keys(entry.arguments).length > 0
@@ -817,6 +1015,27 @@ function validateEdit(edit: RefinementEdit, computedId?: string): string | undef
 	if (edit.action !== "delete" && (!edit.title || !edit.content)) {
 		return `${edit.action} requires title and content`;
 	}
+	if (edit.id !== undefined && (typeof edit.id !== "string" || edit.id.length === 0)) {
+		return `${edit.action} requires id to be a non-empty string when provided`;
+	}
+	if (edit.path !== undefined && (typeof edit.path !== "string" || edit.path.length === 0)) {
+		return `${edit.action} requires path to be a non-empty string when provided`;
+	}
+	if (
+		edit.action !== "delete" &&
+		(typeof edit.title !== "string" || typeof edit.content !== "string" || !edit.title || !edit.content)
+	) {
+		return `${edit.action} requires title and content to be non-empty strings`;
+	}
+	if (edit.reference !== undefined && objectRecord(edit.reference) === undefined) {
+		return `${edit.action} requires reference to be an object when provided`;
+	}
+	if (edit.arguments !== undefined && objectRecord(edit.arguments) === undefined) {
+		return `${edit.action} requires arguments to be an object when provided`;
+	}
+	if (edit.metadata !== undefined && objectRecord(edit.metadata) === undefined) {
+		return `${edit.action} requires metadata to be an object when provided`;
+	}
 	if (edit.action !== "delete" && edit.kind === "skill" && edit.arguments === undefined) {
 		return `${edit.action} skill requires arguments`;
 	}
@@ -952,7 +1171,8 @@ function rollbackProposal(target: RefinementResult): RefinementProposal {
 				id: edit.id,
 				title: edit.before.title,
 				content: edit.before.content,
-				path: edit.before.path,
+				// A snapshot recorded while the grouping was named `topic` has no `path` to restore.
+				path: storedHarnessPath(edit.before),
 				reference: edit.before.reference,
 				arguments: edit.before.arguments,
 				metadata: edit.before.metadata,

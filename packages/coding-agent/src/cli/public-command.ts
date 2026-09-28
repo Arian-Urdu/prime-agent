@@ -18,6 +18,14 @@ import {
 import { handleDaemonCommand } from "./daemon-command.js";
 import { runPs, runReap, runShutdownAll } from "./daemon-ps.js";
 import { DAEMON_UPDATE_RESTART_COORDINATOR_FLAG } from "./daemon-update-restart.js";
+import { extractHelpCommandPath, rotateGlobalFlagsBeforeCommand } from "./global-flags.js";
+import {
+	type IncidentCommandOptions,
+	type IncidentWindow,
+	parseIncidentOptions,
+	resolveIncidentWindow,
+	runIncident,
+} from "./incident.js";
 
 export interface PublicCommandResult {
 	handled: boolean;
@@ -37,9 +45,13 @@ export async function handlePublicCommand(args: string[]): Promise<PublicCommand
 }
 
 async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
-	args = normalizeLeadingDaemonSocketOption(args);
-	if (args[0] === "help" && isHelpCommandRequest(args.slice(1))) {
-		return printRequestedHelp(args.slice(1));
+	args = rotateGlobalFlagsBeforeCommand(args);
+	// Global run flags are excluded from the help request, not forwarded as help
+	// arguments: `prime-agent --offline help` must print help, not chat the
+	// rotated argv to the model.
+	const helpPath = args[0] === "help" ? extractHelpCommandPath(args, 1) : undefined;
+	if (helpPath !== undefined && isHelpCommandRequest(helpPath)) {
+		return printRequestedHelp(helpPath);
 	}
 
 	const command = args[0];
@@ -77,6 +89,8 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 			return { handled: false, args: args.slice(1), explicitAgentsView: true };
 		case "list":
 			return runInternalAgentCommand("list", args.slice(1));
+		case "sessions":
+			return runInternalAgentCommand("sessions", args.slice(1));
 		case "attach": {
 			const rest = args.slice(1);
 			const agent = rest[0];
@@ -108,6 +122,8 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 			return runStatus(args.slice(1));
 		case "doctor":
 			return runDoctor(args.slice(1));
+		case "incident":
+			return runIncidentCommand(args.slice(1));
 		case "shutdown":
 			return runShutdown(args.slice(1));
 		case "package":
@@ -152,19 +168,6 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 		default:
 			return continueWith(args);
 	}
-}
-
-function normalizeLeadingDaemonSocketOption(args: string[]): string[] {
-	const option = args[0];
-	if (option !== "--daemon-socket") {
-		return args;
-	}
-	const socketPath = args[1];
-	const command = args[2];
-	if (socketPath === undefined || (command !== "stop" && command !== "rename")) {
-		return args;
-	}
-	return [command, ...args.slice(3), option, socketPath];
 }
 
 function continueWith(args: string[]): PublicCommandResult {
@@ -264,6 +267,21 @@ async function runDoctor(args: string[]): Promise<PublicCommandResult> {
 	} else {
 		await runPs(options.has("--json"));
 	}
+	return HANDLED;
+}
+
+async function runIncidentCommand(args: string[]): Promise<PublicCommandResult> {
+	let options: IncidentCommandOptions;
+	let window: IncidentWindow;
+	try {
+		options = parseIncidentOptions(args);
+		// Resolve once: re-resolving later can cross UTC midnight and render a
+		// different window than the one that was validated.
+		window = resolveIncidentWindow(options, new Date());
+	} catch (error) {
+		return fail(error instanceof Error ? error.message : String(error), `Run "${APP_NAME} help incident" for usage.`);
+	}
+	await runIncident(options, window);
 	return HANDLED;
 }
 

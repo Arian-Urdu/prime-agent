@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
-import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@earendil-works/pi-ai";
+import { type AssistantMessage, type AssistantMessageEvent, EventStream } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	AGENT_MESSAGE_SOURCE,
@@ -16,6 +16,7 @@ import { estimateMessagingTokens, MessagingStats } from "../src/core/messaging-s
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
+import { getCodingAgentFixtureModel } from "./fixture-models.js";
 import { createTestResourceLoader } from "./utilities.js";
 
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -104,7 +105,7 @@ describe("messaging stats session wiring", () => {
 	});
 
 	function createSession() {
-		const model = getModel("anthropic", "claude-sonnet-4-5")!;
+		const model = getCodingAgentFixtureModel("anthropic", "claude-sonnet-4-5");
 
 		const agent = new Agent({
 			getApiKey: () => "test-key",

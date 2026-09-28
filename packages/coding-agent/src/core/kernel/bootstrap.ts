@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, existsSync, readdirSync, readFileSync } from "node:fs";
-import { access, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { stderr, stdin } from "node:process";
@@ -72,6 +72,14 @@ export function buildBatchShimInvocation(
 }
 
 const UV_INSTALL_COMMAND = "curl -LsSf https://astral.sh/uv/install.sh | sh";
+/** MCP discovery surface the kernel runtime must expose for /plugins work. */
+const REQUIRED_MCP_DISCOVERY_METHODS = [
+	"list_plugins",
+	"search_plugins",
+	"list_connections",
+	"search_tools",
+	"describe_tool",
+];
 const REQUIRED_HARNESS_METHODS = [
 	"create_memory",
 	"update_memory",
@@ -87,10 +95,15 @@ const REQUIRED_HARNESS_METHODS = [
 	"delete_prompt_note",
 	"record_refinement",
 ];
-const RUNTIME_READY_CHECK = `import inspect; import rlm; from rlm import McpIntegration; import rlm.mcp as mcp; from rlm.harness import HarnessEntry; _harness_methods = ${JSON.stringify(REQUIRED_HARNESS_METHODS)}; assert callable(mcp.list_tools); assert callable(mcp.call_tool); assert callable(rlm.spawn); assert hasattr(rlm, 'rlm'); assert callable(rlm.rlm.spawn); assert inspect.signature(rlm.spawn).parameters['name'].default is inspect.Parameter.empty; assert not hasattr(rlm, 'run'); assert not hasattr(rlm.rlm, 'run'); assert callable(rlm.host_request); assert callable(rlm.find_models); assert callable(rlm.rlm.find_models); assert callable(rlm.create_session); assert callable(rlm.rlm.create_session); assert hasattr(rlm, 'harness'); assert hasattr(rlm, 'get_harness_state'); assert hasattr(rlm.rlm, 'harness'); assert hasattr(rlm.rlm, 'get_harness_state'); assert all(callable(getattr(_harness, _method, None)) for _harness in (rlm.harness, rlm.rlm.harness) for _method in _harness_methods); assert 'reference' in HarnessEntry.__dataclass_fields__; assert 'scope' in HarnessEntry.__dataclass_fields__; assert 'reference' in inspect.signature(rlm.harness.create_skill).parameters; assert 'reference' in inspect.signature(rlm.harness.update_skill).parameters; assert 'global_' in inspect.signature(rlm.harness.create_memory).parameters; assert 'global_' in inspect.signature(rlm.get_harness_state).parameters; assert not hasattr(rlm, 'background'); assert not hasattr(rlm.rlm, 'background'); from rlm.bash import BashHandle, BashResult; assert callable(rlm.bash); assert all(callable(getattr(BashHandle, _m, None)) for _m in ('tail', 'output', 'poll', 'kill')); assert {'exit_code', 'output', 'duration'} <= set(BashResult.__dataclass_fields__); import rlm.repl as _repl; assert callable(_repl.main); assert callable(_repl.emit); assert callable(_repl.host_request); assert callable(_repl.is_active); assert _repl.PROTOCOL_VERSION == 3; assert callable(rlm.emit); assert not hasattr(rlm, 'HOST_COMM_TARGET'); assert not hasattr(mcp, 'install_shutdown_hook')`;
+export const RUNTIME_READY_CHECK = `import inspect; import rlm; from rlm import McpIntegration; import rlm.mcp as mcp; from rlm.harness import HarnessEntry; _harness_methods = ${JSON.stringify(REQUIRED_HARNESS_METHODS)}; assert callable(mcp.list_tools); assert callable(mcp.call_tool); assert all(callable(getattr(mcp, _m, None)) for _m in ${JSON.stringify(REQUIRED_MCP_DISCOVERY_METHODS)}), "rlm.mcp is missing MCP discovery methods (list_plugins, search_plugins, list_connections, search_tools, describe_tool); the kernel venv needs a current prime-agent-runtime"; assert callable(rlm.spawn); assert hasattr(rlm, 'rlm'); assert callable(rlm.rlm.spawn); assert inspect.signature(rlm.spawn).parameters['name'].default is inspect.Parameter.empty; assert not hasattr(rlm, 'run'); assert not hasattr(rlm.rlm, 'run'); assert callable(rlm.host_request); assert callable(rlm.find_models); assert callable(rlm.rlm.find_models); assert callable(rlm.create_session); assert callable(rlm.rlm.create_session); assert callable(rlm.progress_note); assert callable(rlm.rlm.progress_note); assert hasattr(rlm, 'harness'); assert hasattr(rlm, 'get_harness_state'); assert hasattr(rlm.rlm, 'harness'); assert hasattr(rlm.rlm, 'get_harness_state'); assert all(callable(getattr(_harness, _method, None)) for _harness in (rlm.harness, rlm.rlm.harness) for _method in _harness_methods); assert 'reference' in HarnessEntry.__dataclass_fields__; assert 'scope' in HarnessEntry.__dataclass_fields__; assert 'reference' in inspect.signature(rlm.harness.create_skill).parameters; assert 'reference' in inspect.signature(rlm.harness.update_skill).parameters; assert 'global_' in inspect.signature(rlm.harness.create_memory).parameters; assert 'global_' in inspect.signature(rlm.get_harness_state).parameters; assert not hasattr(rlm, 'background'); assert not hasattr(rlm.rlm, 'background'); from rlm.bash import BashHandle, BashResult; assert callable(rlm.bash); assert all(callable(getattr(BashHandle, _m, None)) for _m in ('tail', 'output', 'poll', 'kill')); assert {'exit_code', 'output', 'duration'} <= set(BashResult.__dataclass_fields__); import rlm.repl as _repl; assert callable(_repl.main); assert callable(_repl.emit); assert callable(_repl.host_request); assert callable(_repl.is_active); assert _repl.PROTOCOL_VERSION == 3; assert callable(rlm.emit); assert not hasattr(rlm, 'HOST_COMM_TARGET'); assert not hasattr(mcp, 'install_shutdown_hook')`;
 const BOOTSTRAP_VERSION_FILE = ".bootstrap-version";
+const BOOTSTRAP_VERSION_TMP_FILE = `${BOOTSTRAP_VERSION_FILE}.tmp`;
 const BOOTSTRAP_LOCK_NAME = ".bootstrap.lock";
 const BOOTSTRAP_LOCK_RETRY_MS = 100;
+// Bounded retry for the atomic marker swap: replacing an existing marker can
+// fail while a scanner or editor holds the file open.
+const BOOTSTRAP_MARKER_SWAP_ATTEMPTS = 3;
+const BOOTSTRAP_MARKER_SWAP_RETRY_MS = 50;
 const BOOTSTRAP_LOCK_STALE_WITHOUT_PID_MS = 30_000;
 
 let inFlightEnsureKernelPython: { key: string; promise: Promise<string> } | null = null;
@@ -158,12 +171,16 @@ function fileContentHash(filePath: string): string {
 	}
 }
 
+function pythonSkillKey(skill: Pick<BootstrapPythonSkill, "importName" | "packagePath">): string {
+	return `${skill.importName}\0${skill.packagePath}`;
+}
+
 function normalizePythonSkills(pythonSkills: readonly KernelPythonSkill[] | undefined): BootstrapPythonSkill[] {
 	const byKey = new Map<string, BootstrapPythonSkill>();
 	const addSkill = (skill: Pick<KernelPythonSkill, "importName" | "packagePath" | "pyprojectPath">): void => {
 		const packagePath = path.resolve(skill.packagePath);
 		const pyprojectPath = path.resolve(skill.pyprojectPath);
-		const key = `${skill.importName}\0${packagePath}`;
+		const key = pythonSkillKey({ importName: skill.importName, packagePath });
 		if (byKey.has(key)) {
 			return;
 		}
@@ -634,18 +651,16 @@ function extraUvArgsMatch(a: string[] | undefined, b: string[] | undefined): boo
 	return a.every((v, i) => v === b[i]);
 }
 
+// The marker lists skills in install order and the caller in path order, so compare by key, not index.
 function pythonSkillsMatch(a: BootstrapPythonSkill[] | undefined, b: readonly BootstrapPythonSkill[]): boolean {
-	const left = a ?? [];
-	if (left.length !== b.length) return false;
-	return left.every((skill, index) => {
-		const expected = b[index];
-		return (
-			skill.importName === expected.importName &&
-			skill.packagePath === expected.packagePath &&
-			skill.pyprojectPath === expected.pyprojectPath &&
-			skill.pyprojectHash === expected.pyprojectHash
-		);
-	});
+	const recorded = new Map((a ?? []).map((skill) => [pythonSkillKey(skill), skill]));
+	return (
+		recorded.size === b.length &&
+		b.every((skill) => {
+			const match = recorded.get(pythonSkillKey(skill));
+			return match?.pyprojectPath === skill.pyprojectPath && match.pyprojectHash === skill.pyprojectHash;
+		})
+	);
 }
 
 function bootstrapVersionCurrent(
@@ -681,7 +696,49 @@ async function writeBootstrapVersion(
 		extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
 		pythonSkills: [...pythonSkills],
 	};
-	await writeFile(path.join(venv, BOOTSTRAP_VERSION_FILE), `${JSON.stringify(version)}\n`, "utf8");
+	const filePath = path.join(venv, BOOTSTRAP_VERSION_FILE);
+	const tmpPath = path.join(venv, BOOTSTRAP_VERSION_TMP_FILE);
+	const serialized = `${JSON.stringify(version)}\n`;
+	// Write-then-rename is atomic: a kill mid-write can never leave a partial
+	// marker, which would read as absent and force a rebuild. Replacing an
+	// existing marker can fail transiently while another process holds it, so
+	// retry the swap. A marker that stays unwritten is only stale: the next
+	// startup re-syncs skills, whereas an in-place overwrite truncated by a
+	// failure or a kill would read as absent and rebuild the whole venv.
+	let lastError: unknown;
+	for (let attempt = 1; attempt <= BOOTSTRAP_MARKER_SWAP_ATTEMPTS; attempt += 1) {
+		try {
+			await writeFile(tmpPath, serialized, "utf8");
+			await rename(tmpPath, filePath);
+			return;
+		} catch (error) {
+			lastError = error;
+			// Retry below; the previous marker is still intact.
+		}
+		if (attempt < BOOTSTRAP_MARKER_SWAP_ATTEMPTS) await sleep(BOOTSTRAP_MARKER_SWAP_RETRY_MS);
+	}
+	// Give up without overwriting the marker in place: a write truncated there
+	// by a failure or a kill reads as absent and forces a full venv rebuild,
+	// while the untouched previous marker stays valid. The failure still
+	// surfaces: a marker this process cannot write is one the next startup
+	// cannot trust.
+	await rm(tmpPath, { force: true }).catch(() => undefined);
+	throw lastError;
+}
+
+// Incremental marker write that merges fresh entries into the skills already
+// recorded on disk. A missing or corrupt marker contributes no base entries.
+async function writeMergedBootstrapVersion(
+	venv: string,
+	runtimeIdentity: string,
+	pythonSkills: readonly BootstrapPythonSkill[],
+): Promise<void> {
+	const version = await readBootstrapVersion(venv);
+	const merged = new Map((version?.pythonSkills ?? []).map((skill) => [pythonSkillKey(skill), skill]));
+	for (const skill of pythonSkills) {
+		merged.set(pythonSkillKey(skill), skill);
+	}
+	await writeBootstrapVersion(venv, runtimeIdentity, [...merged.values()]);
 }
 
 function runtimeCandidateDirs(): string[] {
@@ -761,7 +818,9 @@ async function bootstrapVenv(
 	const runtimeIdentity = await resolveRuntimeIdentity();
 
 	await run(uv, ["python", "install", PYTHON_VERSION]);
-	await run(uv, ["venv", venv, "--python", PYTHON_VERSION, "--seed"]);
+	// Nothing invokes the venv's own pip; every kernel-venv package is installed
+	// through `uv pip install --python`, so the venv is created unseeded.
+	await run(uv, ["venv", venv, "--python", PYTHON_VERSION]);
 	await run(uv, [
 		"pip",
 		"install",
@@ -771,6 +830,10 @@ async function bootstrapVenv(
 		STATE_SNAPSHOT_REQUIREMENT,
 		...DEFAULT_RLM_EXTRA_UV_ARGS,
 	]);
+	// Land the base marker before the skill sync: a session killed mid-sync
+	// must leave the next one on the skills-only path instead of wiping the
+	// venv and re-paying the runtime install.
+	await writeBootstrapVersion(venv, runtimeIdentity, []);
 	await syncPythonSkills(uv, venv, python, runtimeIdentity, pythonSkills, options);
 }
 
@@ -784,9 +847,7 @@ async function syncPythonSkills(
 ): Promise<void> {
 	const version = await readBootstrapVersion(venv);
 	const installedPythonSkills: BootstrapPythonSkill[] = [];
-	const currentPythonSkills = new Map(
-		(version?.pythonSkills ?? []).map((skill) => [`${skill.importName}\0${skill.packagePath}`, skill]),
-	);
+	const currentPythonSkills = new Map((version?.pythonSkills ?? []).map((skill) => [pythonSkillKey(skill), skill]));
 	const pythonSkillsByProjectName = new Map(
 		pythonSkills.map((skill) => [readPythonSkillProjectName(skill).replaceAll("_", "-").toLowerCase(), skill]),
 	);
@@ -804,7 +865,7 @@ async function syncPythonSkills(
 	);
 
 	for (const skill of sortPythonSkillsForInstall(pythonSkills)) {
-		const existingSkill = currentPythonSkills.get(`${skill.importName}\0${skill.packagePath}`);
+		const existingSkill = currentPythonSkills.get(pythonSkillKey(skill));
 		if (existingSkill?.pyprojectPath === skill.pyprojectPath && existingSkill.pyprojectHash === skill.pyprojectHash) {
 			installedPythonSkills.push(skill);
 			continue;
@@ -813,7 +874,7 @@ async function syncPythonSkills(
 		const localDependencies = dependenciesBySkill.get(skill) ?? [];
 		const localDependencyArgs = localDependencies
 			.filter((dependency) => {
-				const installedDependency = currentPythonSkills.get(`${dependency.importName}\0${dependency.packagePath}`);
+				const installedDependency = currentPythonSkills.get(pythonSkillKey(dependency));
 				const installedThisSync = installedPythonSkills.some(
 					(installed) =>
 						installed.importName === dependency.importName &&
@@ -838,16 +899,23 @@ async function syncPythonSkills(
 				...formatPythonSkillInstallArgs(skill),
 				...localDependencyArgs,
 			]);
-			installedPythonSkills.push(
-				skill,
-				...localDependencies.filter((dependency) => !installedPythonSkills.includes(dependency)),
-			);
 		} catch (error) {
 			reportProgress(
 				options,
 				`Warning: Python skill ${skill.importName} failed to install and will be unavailable: ${errorMessage(error)}`,
 			);
+			continue;
 		}
+		installedPythonSkills.push(
+			skill,
+			...localDependencies.filter((dependency) => !installedPythonSkills.includes(dependency)),
+		);
+		// Persist progress after every completed install so a killed session
+		// resumes at the first missing skill instead of re-syncing from scratch.
+		// Merge with the on-disk marker so skills already recorded but not yet
+		// visited this sync (they sit later in install order) survive this
+		// incremental write; the final write below stays an authoritative replace.
+		await writeMergedBootstrapVersion(venv, runtimeIdentity, installedPythonSkills);
 	}
 	await writeBootstrapVersion(venv, runtimeIdentity, installedPythonSkills);
 }
@@ -895,7 +963,7 @@ async function ensureKernelPythonUncached(
 		const missing: string[] = [];
 		if (!(await hasPrimeAgentRuntime(python))) {
 			missing.push(
-				"a current prime-agent-runtime with callable rlm.spawn, rlm.create_session, rlm.host_request, and explicit harness CRUD methods",
+				"a current prime-agent-runtime with callable rlm.spawn, rlm.create_session, rlm.host_request, rlm.progress_note, and explicit harness CRUD methods",
 			);
 		}
 		if (missing.length === 0) {
@@ -920,11 +988,19 @@ async function ensureKernelPythonUncached(
 	const venv = await resolveWritableKernelVenvDir();
 	const python = kernelVenvPython(venv);
 	const runtimeIdentity = await resolveRuntimeIdentity();
-	if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return python;
+	// No-skill callers (postinstall, runtime-bootstrap, bootstrap-cli) never sync skills;
+	// letting them reach syncPythonSkills would rewrite the marker with an empty list,
+	// wiping the recorded skills and forcing the next real session to re-sync every
+	// skill. They only need the base kernel to be ready.
+	const readyForCaller = async (): Promise<boolean> =>
+		pythonSkills.length === 0
+			? kernelBaseReady(python, venv, runtimeIdentity)
+			: kernelReady(python, venv, runtimeIdentity, pythonSkills);
+	if (await readyForCaller()) return python;
 
 	const releaseLock = await acquireBootstrapLock(venv);
 	try {
-		if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return python;
+		if (await readyForCaller()) return python;
 		if (await kernelBaseReady(python, venv, runtimeIdentity)) {
 			await syncPythonSkills(await ensureUv(options), venv, python, runtimeIdentity, pythonSkills, options);
 			return python;

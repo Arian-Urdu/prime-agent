@@ -3,16 +3,18 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, renameSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { releasePlatforms } from "../../../scripts/release-platforms.mjs";
+import { writeClipboardBinaryBinding } from "./clipboard-binary-binding.mjs";
 import { copyBinaryAssets, validateBinaryAssets } from "./copy-binary-assets.mjs";
 import { signMacosBinary } from "./macos-signature.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const packageDir = join(root, "packages/coding-agent");
-const platforms = ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"];
+const platforms = releasePlatforms;
 const args = process.argv.slice(2);
 const platform = args.length === 0 ? `${process.platform}-${process.arch}` : args[1];
 if (args.length !== 0 && (args.length !== 2 || args[0] !== "--platform")) {
-	throw new Error("Usage: npm run build:binary -- [--platform darwin-arm64|darwin-x64|linux-arm64|linux-x64|all]");
+	throw new Error(`Usage: npm run build:binary -- [--platform ${[...platforms, "all"].join("|")}]`);
 }
 if (platform !== "all" && !platforms.includes(platform)) throw new Error(`Unsupported binary platform: ${platform}`);
 
@@ -28,12 +30,18 @@ for (const name of ["tui", "ai", "agent", "coding-agent"]) {
 	});
 }
 
+execFileSync("node", ["scripts/catalog-assets.mjs", "copy-source", "--out", "dist"], {
+	cwd: packageDir,
+	stdio: "inherit",
+});
+
 const buildId = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
 const outputRoot = join(packageDir, "binaries");
 mkdirSync(outputRoot, { recursive: true });
 for (const target of platform === "all" ? platforms : [platform]) {
 	const staging = mkdtempSync(join(outputRoot, ".build-"));
 	try {
+		writeClipboardBinaryBinding(join(packageDir, "dist/utils/clipboard-binary-binding.js"), target);
 		execFileSync(
 			bun,
 			[

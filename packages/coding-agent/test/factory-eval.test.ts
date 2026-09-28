@@ -14,6 +14,7 @@ import {
 	buildResidentWatcherDag,
 	buildReviewSweepDag,
 	buildReviewSweepFailDag,
+	checkNoOrchestrationCode,
 	checkReplayLedger,
 	checkTaskSuccess,
 	computeVerdicts,
@@ -1327,8 +1328,20 @@ describe("computeVerdicts", () => {
 		expect(incorrect.contextPairs[0]!.bothCorrect).toBe(false);
 	});
 
-	it("keeps the no-orchestration verdict computed from the built prompts", () => {
+	it("keeps the no-orchestration verdict computed from the built prompts (falsifiable)", () => {
 		expect(computeVerdicts([trial({ factory: "review-sweep" })]).noOrchestrationCode).toBe(true);
+		// The verdict must track the prompts: a prompt that leaks orchestration
+		// code flips it to FAIL (a constant true would not).
+		const poisoned = computeVerdicts([trial({ factory: "review-sweep" })], {
+			referencePrompts: [buildFactoryParentPrompt(byKind("review-sweep"), "/tmp/ledger.json"), "x rlm.spawn(1) y"],
+		});
+		expect(poisoned.noOrchestrationCode).toBe(false);
+		// and the checker itself flags the leak, spawn or collect
+		expect(checkNoOrchestrationCode(["x rlm.spawn(1) y"])).toBe(false);
+		expect(checkNoOrchestrationCode(["x rlm.collect(1) y"])).toBe(false);
+		expect(
+			checkNoOrchestrationCode(referenceFactories.map((factory) => buildFactoryParentPrompt(factory, "/tmp/ledger.json"))),
+		).toBe(true);
 	});
 });
 

@@ -1877,18 +1877,24 @@ export interface EvalVerdicts {
 }
 
 /**
- * Static prompt invariant, computed (not assumed): every selected factory's
- * parent prompt orchestrates only through rlm.factory.* — no rlm.spawn or
- * rlm.collect call may leak into a factory parent prompt.
+ * Static prompt invariant, computed (not assumed): every factory parent
+ * prompt orchestrates only through rlm.factory.* — no rlm.spawn or
+ * rlm.collect call may leak into a factory parent prompt. Takes the built
+ * prompts so callers (and tests) can check any prompt set.
  */
-export function checkNoOrchestrationCode(factories: ReferenceFactory[]): boolean {
-	return factories.every((factory) => {
-		const prompt = buildFactoryParentPrompt(factory, "/tmp/ledger.json");
-		return !/rlm\.spawn/.test(prompt) && !/rlm\.collect/.test(prompt);
-	});
+export function checkNoOrchestrationCode(prompts: string[]): boolean {
+	return prompts.every((prompt) => !/rlm\.spawn/.test(prompt) && !/rlm\.collect/.test(prompt));
 }
 
-export function computeVerdicts(results: FactoryDagEvalTrialResult[]): EvalVerdicts {
+/** The reference factories' parent prompts, the prompts the verdict checks. */
+function buildReferenceParentPrompts(): string[] {
+	return buildReferenceFactories(DEFAULT_WIDTH).map((factory) => buildFactoryParentPrompt(factory, "/tmp/ledger.json"));
+}
+
+export function computeVerdicts(
+	results: FactoryDagEvalTrialResult[],
+	options?: { referencePrompts?: string[] },
+): EvalVerdicts {
 	const factoryArms = results.filter((row) => row.arm === "factory" && row.factory !== "review-sweep-fail" && row.factory !== "dry-run-reject");
 	const escalation = results.find((row) => row.factory === "review-sweep-fail" && row.arm === "factory");
 	const dryRun = results.find((row) => row.factory === "dry-run-reject" && row.arm === "factory");
@@ -1912,7 +1918,7 @@ export function computeVerdicts(results: FactoryDagEvalTrialResult[]): EvalVerdi
 	}
 	return {
 		// Computed from the built prompts (checkNoOrchestrationCode), not a constant.
-		noOrchestrationCode: checkNoOrchestrationCode(buildReferenceFactories(DEFAULT_WIDTH)),
+		noOrchestrationCode: checkNoOrchestrationCode(options?.referencePrompts ?? buildReferenceParentPrompts()),
 		failurePolicyMatched: escalation ? escalation.verdict === "pass" : null,
 		dryRunRejected: dryRun ? dryRun.verdict === "pass" : null,
 		budgetOvershootMs,

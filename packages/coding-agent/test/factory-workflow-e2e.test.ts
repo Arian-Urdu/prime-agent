@@ -15,28 +15,33 @@
  * One parent session and one kernel serve the whole file; every scenario waits
  * for its own milestone before the next drive, so the suite stays fast.
  *
- * Kernel python: this suite pins PRIME_AGENT_KERNEL_PYTHON to the
- * checkout-local runtime venv when one exists, so a dev checkout never touches
- * (or rebuilds -- its runtime hash mismatches the bootstrap marker) the shared
- * ~/.prime/agent/kernel-venv that live user sessions run on. Create it once
- * per checkout:
+ * Kernel python: this suite pins PRIME_AGENT_KERNEL_PYTHON to (in order) the
+ * caller's pin, the checkout-local runtime venv, or the shared kernel venv
+ * resolved exactly like the bootstrap resolves it (PRIME_AGENT_KERNEL_VENV /
+ * XDG). A pinned python is never rebuilt, so pinning is what keeps a dev
+ * checkout from touching the shared ~/.prime/agent/kernel-venv that live user
+ * sessions run on. The shared venv is only pinned when the production
+ * readiness probe (RUNTIME_READY_CHECK) passes for it, i.e. when the bootstrap
+ * itself would accept it; a stale shared venv is not. Pinning the shared venv
+ * also points PYTHONPATH at this checkout's runtime source (the venv's
+ * installed runtime is not this checkout's), so the kernel runs the code under
+ * test. Create the checkout-local venv once per checkout:
  *
  *   cd prime-agent-runtime
  *   uv venv .venv
  *   uv pip install --python .venv/bin/python -e . dill requests httpx pyyaml \
  *     tomli python-dotenv pandas numpy scipy beautifulsoup4 lxml pydantic tyro
  *
- * Without a usable pinned python the suite refuses to boot while a live shared
- * kernel venv exists (a dev checkout's runtime hash can only mismatch that
- * venv's bootstrap marker, so the standard bootstrap would rebuild it under
- * live sessions) and fails with the recipe above. With no pre-existing shared
- * venv (CI), the standard bootstrap builds it; CI pre-warms that via `npx tsx
+ * When no python is usable AND the shared kernel venv exists, the standard
+ * bootstrap would rebuild that venv under live sessions, so the suite refuses
+ * to boot and fails with the recipe above. With no pre-existing shared venv
+ * (CI), the standard bootstrap builds it; CI pre-warms that via `npx tsx
  * src/core/kernel/bootstrap-cli.ts` (test:ci), so no test pays a venv build.
  */
 
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Agent, type AgentMessage, type StreamFn } from "@earendil-works/pi-agent-core";
 import {
@@ -48,6 +53,7 @@ import {
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
+import { getKernelVenvDir, RUNTIME_READY_CHECK } from "../src/core/kernel/bootstrap.js";
 import { convertToLlm, FACTORY_PROGRESS_NOTICE_CUSTOM_TYPE } from "../src/core/messages.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { getSessionArtifactPath, SessionManager } from "../src/core/session-manager.js";
@@ -59,10 +65,9 @@ import { createTestResourceLoader } from "./utilities.js";
 const model = getCodingAgentFixtureModel("anthropic", "claude-sonnet-4-5");
 
 // ---------------------------------------------------------------------------
-// Kernel python: PRIME_AGENT_KERNEL_PYTHON, else the repo-local runtime venv.
-// The shared ~/.prime/agent/kernel-venv is deliberately not a candidate; the
-// header comment explains why (a mismatched marker would force a rebuild of
-// a venv live user sessions depend on).
+// Kernel python: PRIME_AGENT_KERNEL_PYTHON, else the repo-local runtime venv,
+// else the shared kernel venv when the bootstrap's own readiness probe passes
+// for it (a pinned python is never rebuilt). The header comment explains why.
 // ---------------------------------------------------------------------------
 
 const REPO_ROOT = resolve(__dirname, "..", "..", "..");
@@ -84,21 +89,49 @@ const KERNEL_REQUIRED_IMPORTS = [
 	"tyro",
 ].join(", ");
 
-function resolveKernelPython(): string | undefined {
-	// PRIME_AGENT_KERNEL_PYTHON first, then the checkout-local runtime venv: a
-	// dev checkout's runtime hash mismatches the shared ~/.prime/agent/kernel-venv
-	// bootstrap marker, and the standard bootstrap would rebuild that venv under
-	// live user sessions (beforeAll refuses that case). CI never has the isolated
-	// venv and no pre-existing shared one either, so the standard bootstrap there
-	// is a safe build that bootstrap-cli (test:ci) pre-warms.
+interface ResolvedKernelPython {
+	python: string;
+	sharedVenv: boolean;
+	/** PYTHONPATH the kernel needs (the shared venv runs this checkout's runtime source). */
+	pythonPath: string | undefined;
+}
+
+function resolveKernelPython(): ResolvedKernelPython | undefined {
+	// PRIME_AGENT_KERNEL_PYTHON first, then the checkout-local runtime venv,
+	// then the shared kernel venv resolved exactly like the bootstrap resolves
+	// it (PRIME_AGENT_KERNEL_VENV/XDG via getKernelVenvDir, never a hard-coded
+	// path). A shared venv python is accepted only when the production
+	// readiness probe passes for it: a pinned python is never rebuilt, so
+	// pinning it cannot disturb the live sessions that share that venv.
+	const sharedVenvPython = join(getKernelVenvDir(), "bin", "python");
 	const candidates = [
-		process.env.PRIME_AGENT_KERNEL_PYTHON,
-		join(REPO_ROOT, "prime-agent-runtime", ".venv", "bin", "python"),
-	].filter((python): python is string => Boolean(python));
-	for (const python of candidates) {
-		if (!existsSync(python)) continue;
-		const check = spawnSync(python, ["-c", `import ${KERNEL_REQUIRED_IMPORTS}`], { encoding: "utf8" });
-		if (check.status === 0) return python;
+		{ python: process.env.PRIME_AGENT_KERNEL_PYTHON, sharedVenv: false },
+		{ python: join(REPO_ROOT, "prime-agent-runtime", ".venv", "bin", "python"), sharedVenv: false },
+		{ python: sharedVenvPython, sharedVenv: true },
+	].filter((candidate): candidate is { python: string; sharedVenv: boolean } => Boolean(candidate.python));
+	for (const candidate of candidates) {
+		if (!existsSync(candidate.python)) continue;
+		// The shared venv's installed runtime is not this checkout's (the
+		// factory stack is not on main), so the kernel must import the
+		// checkout's runtime source through PYTHONPATH; a caller-provided
+		// PYTHONPATH wins. The repo-local venv is an editable install of this
+		// checkout already.
+		const pythonPath =
+			candidate.sharedVenv && !process.env.PYTHONPATH
+				? join(REPO_ROOT, "prime-agent-runtime", "src")
+				: process.env.PYTHONPATH;
+		const env = pythonPath ? { ...process.env, PYTHONPATH: pythonPath } : process.env;
+		const check = spawnSync(candidate.python, ["-c", `import ${KERNEL_REQUIRED_IMPORTS}`], {
+			encoding: "utf8",
+			env,
+		});
+		if (check.status !== 0) continue;
+		if (candidate.sharedVenv) {
+			// Only a python the bootstrap itself would accept is safe to pin.
+			const ready = spawnSync(candidate.python, ["-c", RUNTIME_READY_CHECK], { encoding: "utf8", env });
+			if (ready.status !== 0) continue;
+		}
+		return { ...candidate, pythonPath };
 	}
 	return undefined;
 }
@@ -435,7 +468,10 @@ function resumeCell(runId: string): string {
 // The bridge suite.
 // ---------------------------------------------------------------------------
 
-describe("factory workflows over the real kernel bridge", { tags: ["kernel-heavy"] }, () => {
+// A cold kernel-venv build can happen inside the first test (the pinned path
+// above refused to boot); budget for it like the sibling kernel-heavy files.
+// test-policy: allow explicit-test-timeout -- bounds a real cold kernel-venv bootstrap inside the first test, not the assertion
+describe("factory workflows over the real kernel bridge", { tags: ["kernel-heavy"], timeout: 180_000 }, () => {
 	let tempDir: string;
 	let session: AgentSession;
 	const driveCells: string[] = [];
@@ -645,6 +681,13 @@ describe("factory workflows over the real kernel bridge", { tags: ["kernel-heavy
 		try {
 			return await awaitWithDeadline(awaitFactoryNotice(kind, runId), 25_000, "factory milestone deadline");
 		} catch (error) {
+			// A timed-out wait must not leave its waiter registered: every
+			// later session event would rescan all messages per stale waiter.
+			for (const waiter of [...noticeWaiters]) {
+				if (waiter.runId === runId && waiter.kind === kind) {
+					noticeWaiters.splice(noticeWaiters.indexOf(waiter), 1);
+				}
+			}
 			// Surface the run's real state instead of a bare timeout.
 			let diagnostics = "";
 			try {
@@ -675,25 +718,32 @@ describe("factory workflows over the real kernel bridge", { tags: ["kernel-heavy
 		return notice;
 	}
 
-	let appliedKernelPythonOverride = false;
+	let previousKernelPython: string | undefined;
+	let previousPythonPath: string | undefined;
 
 	beforeAll(() => {
-		const pinnedKernelPython = resolveKernelPython();
-		const hadOwnOverride = Boolean(process.env.PRIME_AGENT_KERNEL_PYTHON);
-		if (pinnedKernelPython) process.env.PRIME_AGENT_KERNEL_PYTHON = pinnedKernelPython;
-		appliedKernelPythonOverride = !hadOwnOverride;
-		// A dev checkout's runtime hash can only mismatch the shared kernel
-		// venv's bootstrap marker, so the standard bootstrap would REBUILD that
-		// venv under live user sessions. Refuse instead; CI never has a
-		// pre-existing shared venv, so the bootstrap there is a safe build.
-		if (!pinnedKernelPython && existsSync(join(homedir(), ".prime", "agent", "kernel-venv"))) {
+		// Snapshot first so afterAll restores the caller's values (or their
+		// absence) whatever we pin over them.
+		previousKernelPython = process.env.PRIME_AGENT_KERNEL_PYTHON;
+		previousPythonPath = process.env.PYTHONPATH;
+		const resolved = resolveKernelPython();
+		if (resolved) {
+			process.env.PRIME_AGENT_KERNEL_PYTHON = resolved.python;
+			if (resolved.pythonPath) process.env.PYTHONPATH = resolved.pythonPath;
+		}
+		// No usable python at all and the shared kernel venv (resolved the same
+		// way the bootstrap resolves it) exists: the standard bootstrap would
+		// rebuild that venv under live user sessions, so refuse instead. CI
+		// never has a pre-existing shared venv, so the bootstrap there is a
+		// safe build that bootstrap-cli pre-warms.
+		if (!resolved && existsSync(getKernelVenvDir())) {
 			throw new Error(
-				"No usable isolated kernel python: point PRIME_AGENT_KERNEL_PYTHON at a factory-capable kernel " +
+				"No usable kernel python: point PRIME_AGENT_KERNEL_PYTHON at a factory-capable kernel " +
 					"python, or create the checkout-local venv (cd prime-agent-runtime && uv venv .venv && " +
 					"uv pip install --python .venv/bin/python -e . dill requests httpx pyyaml tomli python-dotenv " +
-					"pandas numpy scipy beautifulsoup4 lxml pydantic tyro). Refusing the standard kernel " +
-					"bootstrap because it would rebuild the shared ~/.prime/agent/kernel-venv that live " +
-					"sessions run on.",
+					"pandas numpy scipy beautifulsoup4 lxml pydantic tyro), or refresh the shared venv. " +
+					"Refusing the standard kernel bootstrap because it would rebuild the shared kernel " +
+					"venv that live sessions run on.",
 			);
 		}
 		tempDir = join(tmpdir(), `pi-factory-e2e-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -744,7 +794,10 @@ describe("factory workflows over the real kernel bridge", { tags: ["kernel-heavy
 
 	afterAll(() => {
 		session?.dispose();
-		if (appliedKernelPythonOverride) delete process.env.PRIME_AGENT_KERNEL_PYTHON;
+		if (previousKernelPython === undefined) delete process.env.PRIME_AGENT_KERNEL_PYTHON;
+		else process.env.PRIME_AGENT_KERNEL_PYTHON = previousKernelPython;
+		if (previousPythonPath === undefined) delete process.env.PYTHONPATH;
+		else process.env.PYTHONPATH = previousPythonPath;
 		if (tempDir) rmSync(tempDir, { recursive: true, force: true });
 	});
 
@@ -876,10 +929,9 @@ describe("factory workflows over the real kernel bridge", { tags: ["kernel-heavy
 		const status = await driveCell(statusCell(runId));
 		expect(status.state).toBe("stopped");
 		expect(status.nodes.after).toMatchObject({ status: "cancelled" });
-		// The in-flight entry settles as cancelled (halted by stop) or error (a
-		// cancelled collect racing the halt); the run state stays stopped either
-		// way.
-		expect(["cancelled", "error"]).toContain(status.nodes.hold.status);
+		// stop() halts the in-flight entry; its instance settles cancelled,
+		// never error (that would mean the child errored on its own).
+		expect(status.nodes.hold.status).toBe("cancelled");
 
 		// The real delete path removed the running child from the roster.
 		const rosterAfter = await session.listRlmSubagents();

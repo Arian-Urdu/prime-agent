@@ -36,7 +36,7 @@ The existing Vouch gate controls who can trigger compute usage.
 
 ## Measurements
 
-The default configuration uses two Linux x64 containers, each with 4 vCPU, 8 GB RAM, and 20 GB disk.
+The default configuration uses two Linux x64 VM sandboxes, each with 4 vCPU, 8 GB RAM, and 20 GB disk.
 `config.json` pins the image and sampling policy. Harness dependencies are locked with a seven-day
 release cutoff. Provisioning, harness setup, and source compilation have separate recorded durations
 outside the timed installation interval. Interactive runs use the same small committed Git fixture.
@@ -60,12 +60,14 @@ and other missing tools. Their setup time and disk usage are outside the install
 - **Installed footprint:** apparent bytes added after first use in the first fresh home, including stock Python,
   runtime, and tool assets; excluding download caches, session history, and logs. Shared system
   dependencies supplied by the base image and the fixture repository are excluded.
+- **Session-switch transcript fetch:** one warm switch into a 48k-entry session through a real daemon over a direct worker link; the value counts how many times the full transcript crosses the wire in the switch window (streamed replacement snapshots, inline replacements, and full-history refetch responses).
+- **Private frame decode:** one 32 MB frame with a snapshot-chunk routing header pushed through `PrivateFrameDecoder` in 8 KiB socket chunks, seconds per complete decode. This is the wire shape of the multi-MB snapshot and response frames on the daemon-worker and peer transport channels.
 - **Idle memory:** summed RSS across the benchmark user's entire process tree after input readiness
   and a one-second settle. Raw results include each process and PSS when Linux permits reading it.
   The controller, PTY harness, artifact server, and build user are excluded. RSS can double-count
   shared pages.
 
-Startup and memory use 10 trials per revision. Installation uses three; sizes are measured once. UI interactions use 3 trials per revision (`ui_trials`).
+Startup and memory use 10 trials per revision. Installation uses three; sizes are measured once. UI interactions use 3 trials per revision (`ui_trials`). Transport probes also use 10 trials: they run compiled Node code from the prepared source build, not the installed home, so they measure the source revision even when the installation step failed.
 Compiled revisions provision pinned Bun tooling and build their Linux x64 archive during untimed
 setup. The installer selects its normal default from the available artifacts; the harness does not
 force Node or compiled mode. Loopback downloads use the installer's explicit test exception, while

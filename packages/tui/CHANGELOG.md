@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.9.6] - 2026-09-21
+
+- Added a masked option to the Input component (and MenuSearchInput): the rendered line shows one bullet per grapheme while edits and submit keep the real buffer, so secret paste fields never draw the pasted value. The TUI's first consumer is the MCP token paste panel.
+- Added render-time click regions to the TUI: components expose them after render, containers aggregate them, and the fullscreen viewport projects them through the pinned header, scrolling transcript, clipped dock, and overlays (painted overlay pixels block click-through, and regions clipped at a viewport edge stay clickable on their visible rows). A clean unmodified left press/release pair dispatches the click; drag selection, shift/alt/ctrl clicks, and OSC-8 hyperlinks keep precedence, and fullscreen mouse stays opt-in.
+- Editor clicks now focus the editor and place the cursor from the authoritative rendered layout, handling wrapped lines, editor scroll, prompt and padding offsets, the CustomEditor header row, hidden `!`/`!!` prefixes, wide graphemes, and atomic paste/image markers.
+- Made Markdown link labels clickable in fullscreen while retaining visible URL fallbacks for terminals without native hyperlink support.
+
+## [0.9.5] - 2026-09-15
+
+- Kept slash-command completion separate from execution so Tab and partial Enter complete without submitting.
+- Fixed the argument separator when completing extension commands with custom argument suggestions.
+- Fixed the follow-output hint shifting horizontally while scrolling over tabs or wide characters.
+- Sped up transcript rendering on image-capable terminals: a cell-size response now re-renders only image components instead of invalidating every component cache.
+- Sped up width calculations for plain text when rendering long transcripts.
+- Fixed deep markdown headings to render as formatted headings at all six levels instead of dumping raw `#` prefixes for H3-H6: h1 stays bold+underlined, h2/h3 are bold, h4 is bold+italic, and h5/h6 are italic, all in the heading color ([ENG-6159](https://linear.app/primeintellect/issue/ENG-6159)).
+- Fullscreen frames can pin a component above the scrolling transcript: the viewport composes header, window, and dock rows and maps mouse selection, dock click targets, and the follow hint through the header offset.
+
 ## [0.9.4] - 2026-09-08
 
 - Table cell selection markers no longer crash the renderer when cell content contains a lone UTF-16 surrogate; the surrogate is replaced before encoding.

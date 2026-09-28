@@ -68,14 +68,17 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 19 adds daemon-held session input pauses.
 // Revision 20 lets cancellation target a prompt the session owns but has not started.
 // Revision 21 adds capability-gated, session-scoped ACP MCP server replacement.
+// Revision 22 scopes ACP MCP replacement and cleanup to a connection owner.
 // Revision 23 lets workers query the supervisor agent roster on demand.
 // Revision 24 adds the capability-gated agent-roster subscription and push.
 // Revision 25 adds capability-gated direct worker peer transport discovery.
 // Revision 26 publishes own-session usage totals on session summary and saved-session rows.
 // Revision 27 adds structured session_recovering failure info for known-but-unaddressable sessions.
 // Revision 28 publishes the last recorded model on saved-session rows.
-export const DAEMON_SCHEMA_REVISION = 28;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-28-92bc5368a082";
+// Revision 29 adds the capability-gated abort_and_send_queued command.
+// Revision 30 adds structured update_restarting failure info for opens fenced by an update restart.
+export const DAEMON_SCHEMA_REVISION = 30;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-30-f908f493c9e1";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -93,7 +96,9 @@ export type DaemonClientCapability =
 	| "extension_ui"
 	| "slim_attach"
 	| "chunked_snapshot"
-	| "client_owned_sessions";
+	| "client_owned_sessions"
+	// Client declaration, not a command gate: attach with it opts into heartbeats_changed pushes.
+	| "heartbeat_catalog";
 export type DaemonPromptAdmissionCancellationStatus = "cancelled" | "owned" | "unknown";
 export interface DaemonPromptAdmissionCancellationResult {
 	status: DaemonPromptAdmissionCancellationStatus;
@@ -122,7 +127,8 @@ export type DaemonServerCapability =
 	| "session_input_pause"
 	| "owned_prompt_cancellation"
 	| "acp_mcp_servers"
-	| "direct_peer_transport";
+	| "direct_peer_transport"
+	| "abort_and_send_queued";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -148,12 +154,12 @@ export const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: readonly DaemonClientCapabili
 	"slim_attach",
 	"chunked_snapshot",
 	"client_owned_sessions",
+	"heartbeat_catalog",
 ];
 
 export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
 	...DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
 	"delete_rlm_subagent",
-	"heartbeat_catalog",
 	"heartbeat_management",
 	"model_catalog",
 	"side_question_transcript",
@@ -167,6 +173,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"rlm_quiescence_barrier",
 	"session_input_pause",
 	"acp_mcp_servers",
+	"abort_and_send_queued",
 ];
 
 /** Single-use short-lived credential for one direct TUI connection to one worker process incarnation. */
@@ -528,6 +535,7 @@ export type DaemonCommand =
 	| { id?: string; type: "agent_messages_resume"; activeSessionId?: string }
 	| { id?: string; type: "agent_messages_clear"; activeSessionId: string }
 	| { id?: string; type: "abort"; activeSessionId: string }
+	| { id?: string; type: "abort_and_send_queued"; activeSessionId: string }
 	| {
 			id?: string;
 			type: "start_side_question";
@@ -774,6 +782,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	agent_messages_resume: LEGACY_DAEMON_COMMAND,
 	agent_messages_clear: LEGACY_DAEMON_COMMAND,
 	abort: LEGACY_DAEMON_COMMAND,
+	abort_and_send_queued: { minProtocol: 7, minSchemaRevision: 29, capability: "abort_and_send_queued" },
 	start_side_question: LEGACY_DAEMON_COMMAND,
 	abort_side_question: LEGACY_DAEMON_COMMAND,
 	execute_bash: LEGACY_DAEMON_COMMAND,
@@ -854,6 +863,24 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	shutdown: LEGACY_DAEMON_COMMAND,
 } as const satisfies Record<DaemonCommandName, DaemonCommandCompatibility>;
 
+/** Commands only the supervisor serves; a worker rejects them as unknown. */
+const SUPERVISOR_ONLY_DAEMON_COMMANDS: ReadonlySet<string> = new Set([
+	"complete_owned_session",
+	"get_direct_worker_transport",
+	"list_agent_peers",
+	"promote_owned_session",
+	"reattach",
+	"roster_subscribe",
+	"roster_unsubscribe",
+] satisfies DaemonCommandName[]);
+
+/** Commands the supervisor admits: every command in the compatibility table. */
+export const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set(Object.keys(DAEMON_COMMAND_COMPATIBILITY));
+
+export const WORKER_DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set(
+	[...DAEMON_COMMAND_TYPES].filter((type) => !SUPERVISOR_ONLY_DAEMON_COMMANDS.has(type)),
+);
+
 /**
  * Which endpoint serves each command when a client holds both a supervisor
  * (control-plane) and a direct worker (session-plane) connection. Session is
@@ -892,6 +919,7 @@ export const DAEMON_COMMAND_PLANE = {
 	agent_messages_resume: "control",
 	agent_messages_clear: "control",
 	abort: "session",
+	abort_and_send_queued: "session",
 	start_side_question: "session",
 	abort_side_question: "session",
 	execute_bash: "session",
@@ -1029,6 +1057,7 @@ export type DaemonErrorInfo =
 	| { code: "session_import_file_not_found"; filePath: string }
 	| { code: "session_already_active"; sessionPath: string; activeSessionId?: string }
 	| { code: "session_recovering"; activeSessionId: string }
+	| { code: "update_restarting" }
 	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId };
 
 export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";
@@ -1200,7 +1229,8 @@ export type DaemonOutbound =
 			meta?: DaemonEventMeta;
 	  };
 
-export const DAEMON_OUTBOUND_COMPATIBILITY = {
+// Compile-time only: forces every DaemonOutbound type to declare its compatibility.
+const _DAEMON_OUTBOUND_COMPATIBILITY = {
 	response: LEGACY_DAEMON_COMMAND,
 	session_list_progress: LEGACY_DAEMON_COMMAND,
 	session_list_item: LEGACY_DAEMON_COMMAND,
@@ -1260,6 +1290,26 @@ export function isDaemonCommandEnvelope(value: unknown): value is DaemonCommandE
 		(candidate.clientId === undefined || typeof candidate.clientId === "string") &&
 		typeof candidate.command === "object" &&
 		candidate.command !== null
+	);
+}
+
+export function isSessionSummary(value: unknown): value is SessionSummary {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const candidate = value as { id?: unknown; sessionId?: unknown; cwd?: unknown };
+	return (
+		typeof candidate.id === "string" && typeof candidate.sessionId === "string" && typeof candidate.cwd === "string"
+	);
+}
+
+export function isDaemonResponse(value: unknown): value is DaemonResponse {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const candidate = value as { type?: unknown; success?: unknown; command?: unknown };
+	return (
+		candidate.type === "response" && typeof candidate.success === "boolean" && typeof candidate.command === "string"
 	);
 }
 
@@ -1330,22 +1380,6 @@ export const UPDATE_RESTART_DRAIN_COMMANDS: ReadonlySet<DaemonCommand["type"]> =
 	"abort_compaction",
 	"abort_retry",
 ]);
-
-export function createDaemonEventEnvelope<TEvent extends DaemonOutbound>(
-	event: TEvent,
-	meta: DaemonEventMeta,
-): DaemonEventEnvelope<TEvent> {
-	return {
-		type: "event",
-		id: meta.id,
-		protocol: meta.protocol,
-		...(meta.activeSessionId ? { activeSessionId: meta.activeSessionId } : {}),
-		...(meta.sequence !== undefined ? { sequence: meta.sequence } : {}),
-		...(meta.cursor ? { cursor: meta.cursor } : {}),
-		emittedAt: meta.emittedAt,
-		event,
-	};
-}
 
 export function createDaemonEventMeta(
 	activeSessionId: string,

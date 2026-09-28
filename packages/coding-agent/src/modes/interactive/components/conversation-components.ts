@@ -6,9 +6,11 @@ import {
 	COMPACTION_OUTCOME_CUSTOM_TYPE,
 	type CustomMessage,
 	isCompactionOutcomeMessage,
+	isMcpConnectionOutcomeMessage,
 	isRefinementOutcomeMessage,
 	isSessionSlashCommandMessage,
 	isSessionSlashCommandResultMessage,
+	MCP_CONNECTION_OUTCOME_CUSTOM_TYPE,
 	REFINEMENT_OUTCOME_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
@@ -22,6 +24,10 @@ import {
 } from "./compaction-outcome-message.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./injected-prompt-message.js";
 import { IPythonCellComponent } from "./ipython-cell.js";
+import {
+	MalformedMcpConnectionOutcomeMessageComponent,
+	McpConnectionOutcomeMessageComponent,
+} from "./mcp-connection-outcome-message.js";
 import {
 	MalformedRefinementOutcomeMessageComponent,
 	RefinementOutcomeMessageComponent,
@@ -44,7 +50,6 @@ export interface ConversationComponentsOptions {
 	getToolDefinition: (name: string) => ToolExecutionDefinition | undefined;
 	markdownTheme?: MarkdownTheme;
 	hideThinkingBlock?: boolean;
-	toolsExpanded?: boolean;
 	editDiffsExpanded?: boolean;
 	isRecognizedSlashCommand?: (name: string) => boolean;
 }
@@ -155,14 +160,14 @@ export function createShellCompletionComponent(
 	return component;
 }
 
-/** Build conversation components from a message list, matching tool results to their calls. */
+/** Test-only transcript replay; production replays via InteractiveMode.renderSessionContext. */
 export function buildConversationComponents(
 	messages: readonly AgentMessage[],
 	options: ConversationComponentsOptions,
 ): Component[] {
 	const components: Component[] = [];
 	const pendingTools = new Map<string, ToolExecutionComponent>();
-	const expanded = options.toolsExpanded ?? false;
+	const expanded = false;
 	const editDiffsExpanded = options.editDiffsExpanded ?? false;
 
 	for (const message of messages) {
@@ -230,6 +235,13 @@ export function buildConversationComponents(
 					? new CompactionOutcomeMessageComponent(message)
 					: new MalformedCompactionOutcomeMessageComponent(),
 			);
+		} else if (message.role === "custom" && message.customType === MCP_CONNECTION_OUTCOME_CUSTOM_TYPE) {
+			if (!message.display) continue;
+			const component = isMcpConnectionOutcomeMessage(message)
+				? new McpConnectionOutcomeMessageComponent(message)
+				: new MalformedMcpConnectionOutcomeMessageComponent();
+			component.setExpanded(expanded);
+			components.push(component);
 		} else if (message.role === "custom" && message.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE) {
 			if (!message.display) continue;
 			const component = isRefinementOutcomeMessage(message)

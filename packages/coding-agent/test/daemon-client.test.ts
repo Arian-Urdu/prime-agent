@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { DaemonHello } from "../src/modes/daemon/daemon-client.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
 import {
 	DAEMON_COMMAND_COMPATIBILITY,
 	DAEMON_PROTOCOL_VERSION,
 	DAEMON_SCHEMA_REVISION,
 } from "../src/modes/daemon/daemon-protocol.js";
+import { DaemonWorkerClient } from "../src/modes/daemon/daemon-worker-client.js";
+import { listDaemonHeartbeats } from "../src/modes/daemon/heartbeat-catalog.js";
 
 const netMock = vi.hoisted(() => {
 	type Listener = (...args: unknown[]) => void;
@@ -1038,3 +1041,55 @@ async function captureRejection(promise: Promise<void>): Promise<Error> {
 	}
 	throw new Error("Expected daemon client connect attempt to reject");
 }
+
+describe("DaemonWorkerClient", () => {
+	it("drops the socket reference when the connect attempt fails, so the client can retry", async () => {
+		netMock.sockets.length = 0;
+		const client = new DaemonWorkerClient("/tmp/prime-agent-worker-missing.sock");
+
+		const firstAttempt = captureRejection(client.connect());
+		netMock.sockets[0]!.emit("error", new Error("worker connect failed"));
+		await expect(firstAttempt).resolves.toMatchObject({ message: "worker connect failed" });
+		expect(client.isConnected).toBe(false);
+
+		const secondAttempt = captureRejection(client.connect());
+		expect(netMock.sockets).toHaveLength(2);
+		netMock.sockets[1]!.emit("error", new Error("retry reached socket"));
+		await expect(secondAttempt).resolves.toMatchObject({ message: "retry reached socket" });
+	});
+});
+
+describe("daemon heartbeat catalog", () => {
+	it("waits for the daemon hello before checking heartbeat capabilities", async () => {
+		let greeted = false;
+		const heartbeat = { job: { id: "heartbeat" } };
+		const client = {
+			hello: undefined,
+			waitForHello: vi.fn(async (): Promise<DaemonHello> => {
+				greeted = true;
+				return {
+					type: "daemon_hello",
+					socketPath: "/tmp/daemon.sock",
+					protocol: { name: "prime-agent.daemon", version: DAEMON_PROTOCOL_VERSION },
+					schemaId: "test",
+					appVersion: "test",
+					runtime: { buildId: "test", executablePath: "node" },
+					clientId: "client",
+					serverCapabilities: ["heartbeat_catalog"],
+				};
+			}),
+			supportsServerCapability: vi.fn(() => greeted),
+			request: vi.fn(async () => ({
+				id: "request",
+				type: "response",
+				command: "heartbeats_list",
+				success: true,
+				data: { heartbeats: [heartbeat] },
+			})),
+		} as unknown as DaemonClient;
+
+		await expect(listDaemonHeartbeats(client)).resolves.toEqual([heartbeat]);
+		expect(client.waitForHello).toHaveBeenCalledOnce();
+		expect(client.request).toHaveBeenCalledWith({ type: "heartbeats_list" });
+	});
+});

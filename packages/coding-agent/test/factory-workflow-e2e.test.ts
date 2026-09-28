@@ -24,9 +24,10 @@
  * sessions run on. The shared venv is only pinned when the production
  * readiness probe (RUNTIME_READY_CHECK) passes for it, i.e. when the bootstrap
  * itself would accept it; a stale shared venv is not. Pinning the shared venv
- * also points PYTHONPATH at this checkout's runtime source (the venv's
- * installed runtime is not this checkout's), so the kernel runs the code under
- * test. Create the checkout-local venv once per checkout:
+ * also PREPENDS this checkout's runtime source on PYTHONPATH (the venv's
+ * installed runtime is not this checkout's), so the kernel always runs the
+ * code under test; caller PYTHONPATH entries are kept after it. Create the
+ * checkout-local venv once per checkout:
  *
  *   cd prime-agent-runtime
  *   uv venv .venv
@@ -43,7 +44,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import { Agent, type AgentMessage, type StreamFn } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
@@ -113,23 +114,30 @@ function resolveKernelPython(): ResolvedKernelPython | undefined {
 	for (const candidate of candidates) {
 		if (!existsSync(candidate.python)) continue;
 		// The shared venv's installed runtime is not this checkout's (the
-		// factory stack is not on main), so the kernel must import the
-		// checkout's runtime source through PYTHONPATH; a caller-provided
-		// PYTHONPATH wins. The repo-local venv is an editable install of this
-		// checkout already.
-		const pythonPath =
-			candidate.sharedVenv && !process.env.PYTHONPATH
-				? join(REPO_ROOT, "prime-agent-runtime", "src")
-				: process.env.PYTHONPATH;
+		// factory stack is not on main), so the kernel must import THIS
+		// checkout's runtime source: it is always prepended to PYTHONPATH so
+		// the suite provably runs the code under test, with any caller-provided
+		// entries kept after it. The repo-local venv is an editable install
+		// of this checkout already, so it needs no injected path.
+		const pythonPath = candidate.sharedVenv
+			? [join(REPO_ROOT, "prime-agent-runtime", "src"), process.env.PYTHONPATH]
+					.filter((entry): entry is string => Boolean(entry))
+					.join(delimiter)
+			: process.env.PYTHONPATH;
 		const env = pythonPath ? { ...process.env, PYTHONPATH: pythonPath } : process.env;
 		const check = spawnSync(candidate.python, ["-c", `import ${KERNEL_REQUIRED_IMPORTS}`], {
 			encoding: "utf8",
 			env,
+			timeout: 30_000,
 		});
 		if (check.status !== 0) continue;
 		if (candidate.sharedVenv) {
 			// Only a python the bootstrap itself would accept is safe to pin.
-			const ready = spawnSync(candidate.python, ["-c", RUNTIME_READY_CHECK], { encoding: "utf8", env });
+			const ready = spawnSync(candidate.python, ["-c", RUNTIME_READY_CHECK], {
+				encoding: "utf8",
+				env,
+				timeout: 30_000,
+			});
 			if (ready.status !== 0) continue;
 		}
 		return { ...candidate, pythonPath };

@@ -11097,8 +11097,8 @@ export class AgentSession {
 			"rlm.collect": createRlmCollectHostHandler((targets, timeoutMs) =>
 				this.collectRlmChildren(targets, timeoutMs),
 			),
-			"rlm.progress.note": createRlmProgressNoteHostHandler((message) => this.noteRlmProgress(message)),
 			"rlm.messaging_stats": async () => this.messagingStats() as unknown as Record<string, unknown>,
+			"rlm.progress.note": createRlmProgressNoteHostHandler((message) => this.noteRlmProgress(message)),
 			"rlm.inbox.list": async () =>
 				({
 					entries: this._agentMessageInbox.list(),

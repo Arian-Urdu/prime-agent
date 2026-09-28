@@ -31,6 +31,7 @@ import {
 	REVIEW_ISSUE_IDS,
 	renderMarkdownReport,
 	runReplayChecks,
+	serializeEvalReport,
 } from "../scripts/factory-eval.js";
 import { loadHarnessState } from "../src/core/refinement/refinement.js";
 
@@ -191,6 +192,21 @@ describe("prompt invariants", () => {
 			expect(prompt).not.toMatch(/rlm\.spawn/);
 			expect(prompt).not.toMatch(/rlm\.collect/);
 		}
+	});
+
+	it("baseline snippets await every settle_one call (the loop is executable as written)", () => {
+		for (const kind of ["review-sweep", "builder", "resident-watcher", "pr-manager"] as const) {
+			const prompt = buildBaselinePrompt(byKind(kind), "/tmp/ledger.json");
+			for (const line of prompt.split("\n")) {
+				if (!line.includes("settle_one(")) continue;
+				if (line.trim().startsWith("async def settle_one")) continue; // the definition
+				expect(line).toContain("await settle_one(");
+				// the awaited result is consumed through a parenthesized call
+				expect(line).toMatch(/\(await settle_one\(/);
+			}
+		}
+		// the pr-manager baseline is the one built on the settle_one helper
+		expect(buildBaselinePrompt(byKind("pr-manager"), "/tmp/ledger.json")).toMatch(/await settle_one\(/);
 	});
 
 	it("baseline prompts orchestrate manually and never touch rlm.factory", () => {
@@ -1201,9 +1217,22 @@ describe("replay checker", () => {
 				trial: 1,
 				ledger,
 			}) as FactoryDagEvalTrialResult;
-		const report = runReplayChecks({ trials: [trial(reviewSweepLedger()), trial(null)] });
-		expect(report.ok).toBe(true);
-		expect(report.ledgers).toHaveLength(1);
+		const config: EvalConfig = {
+			model: "prime-inference/internal/glm-5.2-fast",
+			factories: ["review-sweep"],
+			width: 4,
+			trials: 1,
+			timeoutMinutes: 20,
+			outDir: "out",
+		};
+		// The report replays in the exact shape serializeEvalReport writes.
+		const written = runReplayChecks(serializeEvalReport(config, [trial(reviewSweepLedger()), trial(null)]));
+		expect(written.ok).toBe(true);
+		expect(written.ledgers).toHaveLength(1);
+		expect(written.ledgers[0]?.id).toBe("review-sweep/factory/trial-1");
+		// The older hand-built trials key still replays.
+		const legacy = runReplayChecks({ trials: [trial(reviewSweepLedger())] });
+		expect(legacy.ok).toBe(true);
 		const bare = runReplayChecks(residentLedger());
 		expect(bare.ok).toBe(true);
 		expect(bare.ledgers[0]?.id).toBe("ledger");
@@ -1215,7 +1244,7 @@ describe("computeVerdicts", () => {
 		factory: "review-sweep",
 		arm: "factory",
 		trial: 1,
-		model: "internal/glm-5.2-fast",
+		model: "prime-inference/internal/glm-5.2-fast",
 		taskSuccess: true,
 		problems: [],
 		state: "done",
@@ -1298,7 +1327,7 @@ describe("computeVerdicts", () => {
 		expect(incorrect.contextPairs[0]!.bothCorrect).toBe(false);
 	});
 
-	it("keeps the static no-orchestration verdict asserted", () => {
+	it("keeps the no-orchestration verdict computed from the built prompts", () => {
 		expect(computeVerdicts([trial({ factory: "review-sweep" })]).noOrchestrationCode).toBe(true);
 	});
 });
@@ -1308,7 +1337,7 @@ describe("args and report rendering", () => {
 		const defaults = parseEvalArgs([]);
 		expect(defaults).not.toHaveProperty("error");
 		if ("error" in defaults) throw new Error("unreachable");
-		expect(defaults.model).toBe("internal/glm-5.2-fast");
+		expect(defaults.model).toBe("prime-inference/internal/glm-5.2-fast");
 		expect(defaults.factories).toEqual(["review-sweep", "builder", "resident-watcher"]);
 		expect(defaults.width).toBe(6);
 		expect(defaults.outDir).toContain("factory-dag-eval-reports/");
@@ -1324,11 +1353,29 @@ describe("args and report rendering", () => {
 		if ("error" in typo) expect(typo.error).toContain("Unknown factory in --factories: review-swep");
 		const mixed = parseEvalArgs(["--factories", "builder,review-swep"]);
 		expect("error" in mixed).toBe(true);
+		// Non-numeric and non-finite flags must fail instead of clamping into
+		// a vacuous width, zero trials, a 1ms timeout, or an unbounded loop.
+		for (const [flag, raw] of [
+			["--width", "abc"],
+			["--trials", "abc"],
+			["--timeout-minutes", "abc"],
+			["--width", "1e309"],
+			["--trials", "1e309"],
+			["--timeout-minutes", "1e309"],
+			["--trials", "Infinity"],
+			["--trials", "0"],
+			["--width", "1"],
+			["--width", "2.5"],
+		] as const) {
+			const parsed = parseEvalArgs([flag, raw]);
+			expect(`error` in parsed).toBe(true);
+			if ("error" in parsed) expect(parsed.error).toContain(`${flag} requires`);
+		}
 	});
 
 	it("renders the markdown table, pair comparison, and verdict rules", () => {
 		const config: EvalConfig = {
-			model: "internal/glm-5.2-fast",
+			model: "prime-inference/internal/glm-5.2-fast",
 			factories: ["review-sweep"],
 			width: 4,
 			trials: 1,
@@ -1375,7 +1422,7 @@ describe("args and report rendering", () => {
 		expect(markdown).toContain("| review-sweep | baseline | 1 | failed | done |");
 		expect(markdown).toContain("| review-sweep | 10000 | 20000 | yes | no |");
 		expect(markdown).toContain(
-			"no task-specific orchestration code in factory prompts (asserted statically, prompt invariant): PASS",
+			"no task-specific orchestration code in factory prompts (computed from the built prompts): PASS",
 		);
 		expect(markdown).toContain("declared failure policy matches observed behavior (escalation): (not run)");
 		expect(markdown).toContain("total budget overshoot (factory arms only): 0 ms (PASS)");

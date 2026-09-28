@@ -22,7 +22,7 @@
  *
  * Usage:
  *   npx tsx scripts/factory-eval.ts \
- *     --model internal/glm-5.2-fast --factories review-sweep,builder,resident-watcher,pr-manager \
+ *     --model prime-inference/internal/glm-5.2-fast --factories review-sweep,builder,resident-watcher,pr-manager \
  *     --width 6 --trials 1 --out ./factory-dag-eval-reports
  *   npx tsx scripts/factory-eval.ts --replay ./factory-dag-eval-reports/report.json
  */
@@ -172,7 +172,7 @@ export const RUN_BUDGET_MS = 900_000;
 export const REVIEW_FOREACH_MAX = 8;
 export const DEFAULT_WIDTH = 6;
 export const MAX_WIDTH = 12;
-export const DEFAULT_MODEL = "internal/glm-5.2-fast";
+export const DEFAULT_MODEL = "prime-inference/internal/glm-5.2-fast";
 export const RESIDENT_WATCHER_SLEEP_SECONDS = 900;
 
 export interface ReviewFile {
@@ -1016,7 +1016,7 @@ export function buildBaselinePrompt(factory: ReferenceFactory, ledgerPath: strin
 				'entry = await rlm.spawn("""',
 				`\t${buildPrEntryPrompt().replaceAll("\n", "\n\t")}`,
 				'\t""", name="pr-entry")',
-				"pr_url = settle_one(entry).answer_preview",
+				"pr_url = (await settle_one(entry)).answer_preview",
 				"",
 				"Step 2 — compose the reviewing and fixing prompts once by substitution (the reviewing prompt uses {pr_url} and {fix_report}; the fixing prompt uses {verdict}):",
 				"",
@@ -1036,14 +1036,14 @@ export function buildBaselinePrompt(factory: ReferenceFactory, ledgerPath: strin
 				"rounds = 1",
 				'fix_answers = []',
 				'reviewing = await rlm.spawn(reviewing_template.replace("{pr_url}", pr_url).replace("{fix_report}", "null"), name="pr-reviewing-1")',
-				"verdict = parse_verdict(settle_one(reviewing).answer_preview)",
+				"verdict = parse_verdict((await settle_one(reviewing)).answer_preview)",
 				"while verdict['approved'] is False and rounds < 3:",
 				'\tfixing = await rlm.spawn(fixing_template.replace("{verdict}", json.dumps(verdict)), name=f"pr-fixing-{rounds}")',
-				"\tfix_answer = settle_one(fixing).answer_preview",
+				"\tfix_answer = (await settle_one(fixing)).answer_preview",
 				"\tfix_answers.append(fix_answer)",
 				"\trounds += 1",
 				'\treviewing = await rlm.spawn(reviewing_template.replace("{pr_url}", pr_url).replace("{fix_report}", fix_answer), name=f"pr-reviewing-{rounds}")',
-				"\tverdict = parse_verdict(settle_one(reviewing).answer_preview)",
+				"\tverdict = parse_verdict((await settle_one(reviewing)).answer_preview)",
 				"",
 				"Step 4 — save the loop ledger, spawn the resident monitoring child with the exact prompt below, and tear it down:",
 				"",
@@ -1522,11 +1522,36 @@ export function checkReplayLedger(ledger: unknown): LedgerCheckResult {
 	return { ok: problems.length === 0, problems };
 }
 
-/** Run the replay check over a saved report.json or a single status ledger. */
+/** The exact object `report.json` is written from (see main). */
+export interface EvalReportFile {
+	config: EvalConfig;
+	generatedAt: string;
+	results: FactoryDagEvalTrialResult[];
+	verdicts: EvalVerdicts;
+}
+
+/** Build the report.json payload: the shape --replay reads back. */
+export function serializeEvalReport(config: EvalConfig, results: FactoryDagEvalTrialResult[]): EvalReportFile {
+	return {
+		config,
+		generatedAt: new Date().toISOString(),
+		results,
+		verdicts: computeVerdicts(results),
+	};
+}
+
+/**
+ * Run the replay check over a saved report.json or a single status ledger.
+ * A report written by serializeEvalReport carries its trials under
+ * ``results``; the older hand-built ``trials`` key is still accepted.
+ */
 export function runReplayChecks(data: unknown): { ok: boolean; ledgers: { id: string; result: LedgerCheckResult }[] } {
 	const ledgers: { id: string; result: LedgerCheckResult }[] = [];
-	if (isRecord(data) && Array.isArray(data.trials)) {
-		for (const trial of data.trials) {
+	const trials = isRecord(data)
+		? (Array.isArray(data.results) ? data.results : Array.isArray(data.trials) ? data.trials : null)
+		: null;
+	if (trials !== null) {
+		for (const trial of trials) {
 			if (!isRecord(trial)) continue;
 			if (trial.ledger === null || trial.ledger === undefined) continue;
 			ledgers.push({
@@ -1851,6 +1876,18 @@ export interface EvalVerdicts {
 	}[];
 }
 
+/**
+ * Static prompt invariant, computed (not assumed): every selected factory's
+ * parent prompt orchestrates only through rlm.factory.* — no rlm.spawn or
+ * rlm.collect call may leak into a factory parent prompt.
+ */
+export function checkNoOrchestrationCode(factories: ReferenceFactory[]): boolean {
+	return factories.every((factory) => {
+		const prompt = buildFactoryParentPrompt(factory, "/tmp/ledger.json");
+		return !/rlm\.spawn/.test(prompt) && !/rlm\.collect/.test(prompt);
+	});
+}
+
 export function computeVerdicts(results: FactoryDagEvalTrialResult[]): EvalVerdicts {
 	const factoryArms = results.filter((row) => row.arm === "factory" && row.factory !== "review-sweep-fail" && row.factory !== "dry-run-reject");
 	const escalation = results.find((row) => row.factory === "review-sweep-fail" && row.arm === "factory");
@@ -1874,7 +1911,8 @@ export function computeVerdicts(results: FactoryDagEvalTrialResult[]): EvalVerdi
 		});
 	}
 	return {
-		noOrchestrationCode: true, // Asserted statically: buildFactoryParentPrompt emits no spawn/collect calls (prompt invariant, unit-tested).
+		// Computed from the built prompts (checkNoOrchestrationCode), not a constant.
+		noOrchestrationCode: checkNoOrchestrationCode(buildReferenceFactories(DEFAULT_WIDTH)),
 		failurePolicyMatched: escalation ? escalation.verdict === "pass" : null,
 		dryRunRejected: dryRun ? dryRun.verdict === "pass" : null,
 		budgetOvershootMs,
@@ -1940,7 +1978,7 @@ export function renderMarkdownReport(results: FactoryDagEvalTrialResult[], confi
 		"",
 		"## Verdict rules (Notion spec, Proposed evaluation)",
 		"",
-		`- no task-specific orchestration code in factory prompts (asserted statically, prompt invariant): ${
+		`- no task-specific orchestration code in factory prompts (computed from the built prompts): ${
 			verdicts.noOrchestrationCode ? "PASS" : "FAIL"
 		}`,
 		`- declared failure policy matches observed behavior (escalation): ${renderVerdict(verdicts.failurePolicyMatched)}`,
@@ -2004,6 +2042,16 @@ export function parseEvalArgs(argv: string[], defaults = DEFAULT_EVAL_CONFIG): E
 			if (next === undefined) throw new Error(`Missing value for ${flag}`);
 			return next;
 		};
+		// Numeric flags must be finite integers before any clamping: NaN made
+		// --width vacuous, zeroed --trials, and a 1ms timeout; Infinity looped
+		// trials forever. A typo must fail before any token is spent.
+		const positiveInteger = (flag: string, raw: string): number | { error: string } => {
+			const parsed = Number(raw);
+			if (!Number.isInteger(parsed) || parsed < 1) {
+				return { error: `${flag} requires a positive integer, got ${raw}` };
+			}
+			return parsed;
+		};
 		switch (arg) {
 			case "--model":
 				args.model = value(arg);
@@ -2023,15 +2071,25 @@ export function parseEvalArgs(argv: string[], defaults = DEFAULT_EVAL_CONFIG): E
 				if (selected.length > 0) args.factories = selected;
 				break;
 			}
-			case "--width":
-				args.width = Math.min(MAX_WIDTH, Math.max(2, Number(value(arg))));
+			case "--width": {
+				const parsed = positiveInteger("--width", value(arg));
+				if (typeof parsed === "object") return parsed;
+				if (parsed < 2) return { error: "--width requires an integer >= 2" };
+				args.width = Math.min(MAX_WIDTH, parsed);
 				break;
-			case "--trials":
-				args.trials = Math.max(1, Number(value(arg)));
+			}
+			case "--trials": {
+				const parsed = positiveInteger("--trials", value(arg));
+				if (typeof parsed === "object") return parsed;
+				args.trials = parsed;
 				break;
-			case "--timeout-minutes":
-				args.timeoutMinutes = Math.max(1, Number(value(arg)));
+			}
+			case "--timeout-minutes": {
+				const parsed = positiveInteger("--timeout-minutes", value(arg));
+				if (typeof parsed === "object") return parsed;
+				args.timeoutMinutes = parsed;
 				break;
+			}
 			case "--out":
 				args.outDir = value(arg);
 				break;
@@ -2052,6 +2110,20 @@ interface SessionBundle {
 	tempRoot: string;
 }
 
+/** Build the model registry the eval resolves --model against. */
+function createEvalModelRegistry(): ModelRegistry {
+	const realAgentDir = getAgentDir();
+	const authStorage = AuthStorage.create(join(realAgentDir, "auth.json"));
+	return ModelRegistry.create(authStorage, join(realAgentDir, "models.json"));
+}
+
+/** Resolve a provider-qualified model id (e.g. prime-inference/internal/...). */
+function findEvalModel(modelId: string) {
+	const modelRegistry = createEvalModelRegistry();
+	const [provider, ...modelIdParts] = modelId.split("/");
+	return modelRegistry.find(provider, modelIdParts.join("/"));
+}
+
 async function createEvalSession(config: EvalConfig, label: string): Promise<SessionBundle> {
 	const realAgentDir = getAgentDir();
 	const tempRoot = join(
@@ -2060,7 +2132,7 @@ async function createEvalSession(config: EvalConfig, label: string): Promise<Ses
 	);
 	mkdirSync(tempRoot, { recursive: true });
 	const authStorage = AuthStorage.create(join(realAgentDir, "auth.json"));
-	const modelRegistry = ModelRegistry.create(authStorage, join(realAgentDir, "models.json"));
+	const modelRegistry = createEvalModelRegistry();
 	const settingsManager = SettingsManager.create(tempRoot, tempRoot);
 	const sessionManager = SessionManager.create(tempRoot, join(tempRoot, "sessions"));
 	const [provider, ...modelIdParts] = config.model.split("/");
@@ -2120,6 +2192,12 @@ function measureTeardownLatency(session: SessionBundle["session"], runId: string
 		break;
 	}
 	return finishedAt !== null && answerAt !== null ? Math.max(0, answerAt - finishedAt) : null;
+}
+
+/** True when the run parked at least one resident state (stop() had work). */
+function ledgerHasResidentNode(ledger: FactoryStatusLedger | null): boolean {
+	if (ledger === null) return false;
+	return ledger.nodes.some((node) => node.lifecycle === "resident");
 }
 
 function readLedger(ledgerPath: string): FactoryStatusLedger | null {
@@ -2182,8 +2260,11 @@ async function runFactoryTrial(
 		const contextTokens = lastAssistantContextTokens(bundle.session);
 		const stats = bundle.session.getSessionStats();
 		const elapsedMs = ledger?.elapsed_ms ?? null;
-		const teardownLatencyMs =
-			factory.kind === "resident-watcher" ? measureTeardownLatency(bundle.session, ledger?.run_id ?? null) : null;
+		// Every run that parks a resident state gets a teardown measurement
+		// (resident-watcher and pr-manager alike), not just one kind.
+		const teardownLatencyMs = ledgerHasResidentNode(ledger)
+			? measureTeardownLatency(bundle.session, ledger?.run_id ?? null)
+			: null;
 		const budgetOvershootMs = elapsedMs !== null ? Math.max(0, elapsedMs - factory.declaredBudgetMs) : 0;
 		const taskSuccess = check.ok;
 		return {
@@ -2301,6 +2382,14 @@ async function main(argv: string[] = process.argv.slice(2)): Promise<void> {
 		console.error(config.error === "help" ? "See the header of this file for usage." : config.error);
 		process.exit(config.error === "help" ? 0 : 1);
 	}
+	// The model must resolve before any token is spent; a bad --model used to
+	// surface as a per-trial failure and then "no trials completed".
+	if (!findEvalModel(config.model)) {
+		console.error(
+			`Model ${config.model} not found in the registry (ids are provider-qualified, e.g. ${DEFAULT_MODEL})`,
+		);
+		process.exit(1);
+	}
 	const referenceFactories = buildReferenceFactories(config.width);
 	const results: FactoryDagEvalTrialResult[] = [];
 	for (const selection of config.factories) {
@@ -2341,16 +2430,15 @@ async function main(argv: string[] = process.argv.slice(2)): Promise<void> {
 	const markdown = renderMarkdownReport(results, config);
 	mkdirSync(config.outDir, { recursive: true });
 	writeFileSync(join(config.outDir, "report.md"), markdown);
-	writeFileSync(
-		join(config.outDir, "report.json"),
-		JSON.stringify(
-			{ config, generatedAt: new Date().toISOString(), results, verdicts: computeVerdicts(results) },
-			null,
-			2,
-		),
-	);
+	writeFileSync(join(config.outDir, "report.json"), JSON.stringify(serializeEvalReport(config, results), null, 2));
 	console.log(markdown);
 	console.log(`reports written to ${config.outDir}`);
+	// Live mode must fail like --replay does: a failing trial verdict means
+	// the capability layer did not do what the report says it should.
+	if (results.some((row) => row.verdict === "fail")) {
+		console.error("eval finished with failing trial verdict(s); see the report");
+		process.exit(1);
+	}
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

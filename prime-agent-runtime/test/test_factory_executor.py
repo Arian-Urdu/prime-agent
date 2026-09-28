@@ -55,6 +55,20 @@ class SleepRecorder:
         self.sleeps.append(seconds)
 
 
+class GatedSleep:
+    """Injectable sleep that suspends in the backoff window until released."""
+
+    def __init__(self) -> None:
+        self.sleeps: list[float] = []
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.entered.set()
+        await self.release.wait()
+
+
 class FakeHost:
     """Deterministic async host_request fake that routes by request type.
 
@@ -63,7 +77,7 @@ class FakeHost:
     scripted per child id first (``child_outcomes``), then per node id
     (``outcomes``); a "running" outcome never settles. ``rate_limit_first``
     / ``rate_limit_forever`` make spawn admissions for a node fail with a
-    429-style RuntimeError. ``gate("rlm.collect"|"rlm.delete_subagent", n)``
+    429-style RuntimeError. ``gate("rlm.collect"|"rlm.delete_subagent"|"rlm.run", n)``
     suspends the n-th call of that type on an asyncio.Event so tests can
     reproduce races between the control loop and stop()/resume().
     """
@@ -80,13 +94,23 @@ class FakeHost:
         self.rate_limit_first: dict[str, int] = {}
         self.rate_limit_forever: set[str] = set()
         self.gates: dict[tuple[str, int], asyncio.Event] = {}
+        self.gate_entries: dict[tuple[str, int], asyncio.Event] = {}
         self._call_indices: dict[str, int] = {}
 
     def gate(self, request_type: str, call_number: int) -> asyncio.Event:
-        """Suspend the call_number-th collect/delete on a returned event."""
+        """Suspend the call_number-th collect/delete/spawn on a returned event.
+
+        The returned event releases the call; ``gate_entered`` fires when
+        the gated call has actually started (so tests can wait for a call
+        that is suspended mid-flight, e.g. a spawn during stop()).
+        """
         event = asyncio.Event()
         self.gates[(request_type, call_number)] = event
+        self.gate_entries[(request_type, call_number)] = asyncio.Event()
         return event
+
+    def gate_entered(self, request_type: str, call_number: int) -> asyncio.Event:
+        return self.gate_entries[(request_type, call_number)]
 
     def calls_of(self, request_type: str) -> list[dict[str, Any]]:
         return [payload for kind, payload in self.calls if kind == request_type]
@@ -128,10 +152,14 @@ class FakeHost:
     async def __call__(self, request_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = payload or {}
         gate = None
-        if request_type in ("rlm.collect", "rlm.delete_subagent"):
+        if request_type in ("rlm.collect", "rlm.delete_subagent", "rlm.run"):
             index = self._call_indices.get(request_type, 0) + 1
             self._call_indices[request_type] = index
             gate = self.gates.pop((request_type, index), None)
+            if gate is not None:
+                entry_event = self.gate_entries.pop((request_type, index), None)
+                if entry_event is not None:
+                    entry_event.set()
         if gate is not None:
             await gate.wait()
         if request_type == "rlm.run":
@@ -795,6 +823,42 @@ class FactoryExecutorTest(unittest.TestCase):
     # -- retries --------------------------------------------------------------------
 
     @async_test
+    async def test_repeated_pause_records_every_milestone_in_the_ledger(self) -> None:
+        # A run that pauses, resumes, and pauses again must record the second
+        # pause in the ledger even though the parent notice fires once per
+        # kind: status() is the only reader of the repeat.
+        self.host.outcomes["a"] = {"status": "error", "error": "a boom"}
+        self.host.outcomes["b"] = {"status": "error", "error": "b boom"}
+        self.store_machine(
+            {
+                "run": {"failure_policy": "escalate"},
+                "states": [
+                    {"id": "a", "entry": True, "subagent": "worker"},
+                    {"id": "b", "subagent": "worker"},
+                ],
+                "transitions": [{"from": "a", "to": "b"}],
+            }
+        )
+        result = await self.start()
+        first = await self.settle(result)
+        self.assertEqual(first["state"], "paused")
+        self.assertEqual(len(self.events_of(first, "milestone")), 1)  # one pause so far
+        await rlm_module.rlm.factory.resume(result["run_id"])
+        second = await self.settle(result)
+        self.assertEqual(second["state"], "paused")
+        self.assertEqual(self.executor._runs[result["run_id"]].pause_reason, "b boom")
+        # the second pause is in the ledger with its own event, notice-free
+        milestones = [event for event in second["events"] if event["kind"] == "milestone"]
+        self.assertEqual([event["milestone"] for event in milestones], ["paused", "paused"])
+        self.assertIn("a boom", milestones[0]["detail"])
+        self.assertIn("b boom", milestones[1]["detail"])
+        self.assertEqual(self.host.notice_kinds(), ["paused"])  # one notice per kind
+        # the announced pause keeps "shown"; the repeat (no second notice)
+        # was only ever read through status(), so it reads "delivered"
+        self.assertEqual(milestones[0]["stage"], "shown")
+        self.assertEqual(milestones[1]["stage"], "delivered")
+
+    @async_test
     async def test_retries_respawn_until_attempts_exhausted(self) -> None:
         self.host.outcomes["a"] = {"status": "error", "error": "boom"}
         self.store_factory(
@@ -934,6 +998,61 @@ class FactoryExecutorTest(unittest.TestCase):
         self.assertEqual(len(self.host.calls_of("rlm.run")), 2)
 
     @async_test
+    async def test_stop_during_in_flight_admission_deletes_the_child(self) -> None:
+        # run() admission is deferred by a 429, the control loop retries, and
+        # stop() lands while that retry is still in flight: the child the
+        # suspended spawn returns must be deleted and never registered running.
+        self.host.rate_limit_first["a"] = 1
+        spawn_gate = self.host.gate("rlm.run", 2)
+        gate_entered = self.host.gate_entered("rlm.run", 2)
+        self.store_factory({"nodes": [{"id": "a", "subagent": "worker"}]})
+        result = await self.start()
+        self.assertEqual(result["started"], [])
+        await gate_entered.wait()  # the loop is suspended mid-spawn
+        stopped = await rlm_module.rlm.factory.stop(result["run_id"])
+        self.assertEqual(stopped["cancelled"], ["a"])
+        spawn_gate.set()  # the admission returns a child into a stopped run
+        run = self.executor._runs[result["run_id"]]
+        await run.task
+        status = await rlm_module.rlm.factory.status(result["run_id"])
+        instance = self.node_status(status, "a")["instances"][0]
+        self.assertEqual(status["state"], "stopped")
+        self.assertEqual(instance["status"], "cancelled")
+        self.assertEqual(instance["child"], "child-1")
+        self.assertEqual(self.host.deleted_targets(), ["child-1"])  # retracted
+        self.assertEqual(status["usage"]["spawns"], 0)  # never registered
+        self.assertEqual(len(self.host.spawn_calls("a")), 2)  # no re-admission
+        # the retraction is recorded after run_stopped: a cancelled ledger
+        # entry for the retracted child, and no spawned event after it.
+        kinds = [event["kind"] for event in status["events"]]
+        self.assertEqual(kinds[kinds.index("run_stopped"):], ["run_stopped", "cancelled"])
+
+    @async_test
+    async def test_stop_during_admission_backoff_cancels_the_instance(self) -> None:
+        # stop() lands while an admission sleeps in its rate-limit backoff:
+        # waking must not retry the spawn; the instance is cancelled instead.
+        self.sleeps = GatedSleep()
+        self.executor = FactoryExecutor(now=self.clock, sleep=self.sleeps, harness=self.harness)
+        factory_module._DEFAULT_EXECUTOR = self.executor
+        self.host.rate_limit_first["a"] = 2
+        self.store_factory({"nodes": [{"id": "a", "subagent": "worker"}]})
+        result = await self.start()
+        self.assertEqual(result["started"], [])
+        await self.sleeps.entered.wait()  # the loop sleeps between retries
+        stopped = await rlm_module.rlm.factory.stop(result["run_id"])
+        self.assertEqual(stopped["cancelled"], ["a"])
+        self.sleeps.release.set()  # the backoff wakes into a stopped run
+        run = self.executor._runs[result["run_id"]]
+        await run.task
+        status = await rlm_module.rlm.factory.status(result["run_id"])
+        self.assertEqual(status["state"], "stopped")
+        self.assertEqual(self.node_status(status, "a")["instances"][0]["status"], "cancelled")
+        # the retry never happened: two admissions, both before the stop
+        self.assertEqual(len(self.host.spawn_calls("a")), 2)
+        self.assertEqual(self.host.deleted_targets(), [])  # no child existed
+        self.assertEqual(status["usage"]["spawns"], 0)
+
+    @async_test
     async def test_rate_limit_at_admission_defers_to_backoff(self) -> None:
         # First two admissions for a fail with a 429: one at run() admission
         # (deferred, no sleep), one inside the loop (backoff sleep), then success.
@@ -1016,8 +1135,13 @@ class FactoryExecutorTest(unittest.TestCase):
         self.assertEqual(stages["answer_captured"], "arrived")
         self.assertEqual(stages["milestone"], "shown")
         status = await rlm_module.rlm.factory.status(result["run_id"])
-        self.assertTrue(all(event["stage"] == "delivered" for event in status["events"]))
-        self.assertTrue(all(event["stage"] == "delivered" for event in run.events))
+        # Reading the ledger marks the unseen events delivered; the milestone
+        # keeps "shown" because its notice already reached the parent, so the
+        # stage taxonomy stays observable through status().
+        after = {event["kind"]: event["stage"] for event in run.events}
+        self.assertEqual(after["milestone"], "shown")
+        self.assertEqual(after["answer_captured"], "delivered")
+        self.assertEqual(status["events"][-1]["stage"], "shown")  # the milestone
         # EVENT_WINDOW is 200: a state-machine run's ledger grows fast
         # (the pr-manager happy path is ~43 events before any retry).
         self.assertLessEqual(len(status["events"]), 200)
@@ -1377,6 +1501,23 @@ class FactoryExecutorTest(unittest.TestCase):
         status = await self.settle(result)
         self.assertEqual(status["state"], "done")
         self.assertEqual(self.state_report(status, "notone")["status"], "done")
+
+    def test_json_output_binds_from_the_fence_that_carries_the_port(self) -> None:
+        from rlm.factory import _parse_json_output
+
+        # several fences: the port rides whichever block carries it, so a
+        # verdict fence followed by a summary fence still binds the port
+        two_fences = '```json\n{"o": 1}\n```\n\n```json\n{"summary": "s"}\n```'
+        self.assertEqual(_parse_json_output(two_fences, "o"), (1, None))
+        self.assertEqual(_parse_json_output(two_fences, "summary"), ("s", None))
+        # a port in several fences binds from the trailing block
+        both = '```json\n{"o": "first"}\n```\n\n```json\n{"o": "last"}\n```'
+        self.assertEqual(_parse_json_output(both, "o"), ("last", None))
+        # no fence carries the port: fall back to the whole answer, then fail
+        self.assertEqual(_parse_json_output('{"o": 2}', "o"), (2, None))
+        value, error = _parse_json_output(two_fences, "missing")
+        self.assertIsNone(value)
+        self.assertIn("no JSON object containing output 'missing'", error)
 
     def test_guard_primitives_json_strict_and_defensive(self) -> None:
         from rlm.factory import _guard_passes

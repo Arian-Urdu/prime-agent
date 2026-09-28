@@ -803,14 +803,13 @@ def _child_name(run_id: str, state_id: str, instance_index: int, attempt: int) -
 def _parse_json_output(answer: str, output_name: str) -> tuple[Any, str | None]:
     """Extract one named JSON output from an upstream answer.
 
-    Prefers the trailing fenced `````json`` block whose object contains the
-    output name, then falls back to parsing the whole answer. Returns
-    ``(value, None)`` or ``(None, error_sentence)``.
+    Prefers the fenced `````json`` block whose object contains the output
+    name, scanning trailing blocks first (an answer with several fences,
+    e.g. a verdict block followed by a summary block, binds from whichever
+    block carries the port), then falls back to parsing the whole answer.
+    Returns ``(value, None)`` or ``(None, error_sentence)``.
     """
-    candidates: list[str] = []
-    fenced = _FENCED_JSON_RE.findall(answer)
-    if fenced:
-        candidates.append(fenced[-1])
+    candidates: list[str] = list(reversed(_FENCED_JSON_RE.findall(answer)))
     candidates.append(answer.strip())
     for candidate in candidates:
         try:
@@ -934,7 +933,9 @@ class _NodeInstance:
     index: int  # per-state running counter; unique within the state
     prompt: str  # fully rendered; re-spawns reuse it verbatim
     status: str = "pending"  # pending | running | done | error | cancelled
-    attempt: int = 0  # spawn admissions tried for this instance
+    attempt: int = 0  # spawn admissions tried for this instance; a rate-limit
+    # deferral counts here too, and ``retries`` compares against this same
+    # counter, so one transient 429 admission consumes one declared retry.
     child_id: str | None = None
     spawned_at: float | None = None
     duration_ms: int | None = None
@@ -1122,8 +1123,11 @@ class FactoryExecutor:
     async def status(self, run_id: str) -> dict[str, Any]:
         """State states, the trailing event window, elapsed time, and usage.
 
-        Every call marks the whole ledger ``delivered`` (the parent read
-        it); the returned window is the last ``EVENT_WINDOW`` events.
+        Each call marks the events the parent has not seen yet
+        (``recorded``/``arrived``) ``delivered``; ``shown`` events keep their
+        stage because their notice already reached the parent conversation,
+        so the stage taxonomy stays observable. The returned window is the
+        last ``EVENT_WINDOW`` events.
         Raises ``ValueError`` for an unknown run id.
         """
         run = self._require_run(run_id)
@@ -1164,7 +1168,8 @@ class FactoryExecutor:
                 entry_report["error"] = state.error
             nodes.append(entry_report)
         for event in run.events:
-            event["stage"] = "delivered"
+            if event["stage"] in ("recorded", "arrived"):
+                event["stage"] = "delivered"
         return {
             "run_id": run.run_id,
             "spec_id": run.spec_id,
@@ -1356,11 +1361,16 @@ class FactoryExecutor:
         return event
 
     async def _milestone(self, run: FactoryRun, kind: str, detail: str, *, node: str | None = None) -> None:
-        """Record a run milestone and inject one quiet notice (one per kind)."""
-        if kind in run.milestones:
-            return
-        run.milestones.add(kind)
+        """Record a run milestone and inject one quiet notice (one per kind).
+
+        Every milestone lands in the ledger, repeats included: a run that
+        pauses twice must still show the second pause to the parent reading
+        ``status()``. Only the parent-visible notice is deduped per kind.
+        """
         event = self._event(run, "milestone", milestone=kind, detail=detail, node=node)
+        if kind in run.milestones:
+            return  # the kind was announced once; the ledger keeps this repeat
+        run.milestones.add(kind)
         try:
             from . import host_request
 
@@ -1471,6 +1481,8 @@ class FactoryExecutor:
             outcome = await self._admit(run, state, entry, instance, allow_backoff=allow_backoff)
             if outcome == "admitted" and state.state_id not in started:
                 started.append(state.state_id)
+            if outcome == "stopped":
+                break  # the run left "running" mid-admission; nothing to admit
             if outcome == "deferred":
                 # A rate limit is usually global, so stop admitting in this
                 # phase; the control loop retries with exponential backoff.
@@ -1586,7 +1598,8 @@ class FactoryExecutor:
     async def _admit(
         self, run: FactoryRun, state: _StateRun, entry: _StateEntry, instance: _NodeInstance, *, allow_backoff: bool
     ) -> str:
-        """Spawn one instance. Returns "admitted", "deferred", or "failed".
+        """Spawn one instance. Returns "admitted", "deferred", "failed", or
+        "stopped".
 
         Rate-limited admissions back off and retry: doubling delays capped
         at 60s, at most ``BACKOFF_MAX_ATTEMPTS`` admissions per call, then
@@ -1595,6 +1608,11 @@ class FactoryExecutor:
         ``run()``/``resume()``: the instance stays pending ("deferred") and
         the control loop retries it with backoff. Any other admission error
         fails the entry immediately.
+
+        Every await re-checks the run state: a spawn that lands after
+        ``stop()`` is retracted (deleted and cancelled) instead of
+        registered running, and a backoff that wakes in a non-running run
+        never retries; both return ``"stopped"``.
         """
         from . import spawn
 
@@ -1623,7 +1641,19 @@ class FactoryExecutor:
                     )
                     await self._sleep_fn(delay)
                     delay = min(delay * 2, BACKOFF_CAP_SECONDS)
+                    if run.state != "running":
+                        # stop() landed while this admission slept in backoff:
+                        # the run already cancelled the entry, so never spawn.
+                        instance.status = "cancelled"
+                        return "stopped"
                 continue
+            if run.state != "running":
+                # stop() ran while the spawn was in flight: its cancellation
+                # pass could not see this child yet, so retract it here or it
+                # would outlive the stopped run under the supervisor.
+                instance.child_id = handle.rlm_child_id
+                await self._retract_admission(run, state, entry, instance)
+                return "stopped"
             instance.child_id = handle.rlm_child_id
             instance.spawned_at = self._now_fn()
             instance.status = "running"
@@ -1853,6 +1883,30 @@ class FactoryExecutor:
                         entry.status = "cancelled"
                         self._event(run, "node_cancelled", node=state_id, entry=entry.index, detail=reason)
         return stopped
+
+    async def _retract_admission(
+        self, run: FactoryRun, state: _StateRun, entry: _StateEntry, instance: _NodeInstance
+    ) -> None:
+        """Cancel an admission that landed after the run left "running".
+
+        ``stop()`` cancels every child it can see before it returns; a spawn
+        that was still in flight during that pass is invisible to it, so the
+        just-returned child is deleted here and the instance is marked
+        cancelled instead of registered running. Without this the child
+        would keep running under the supervisor after a "stopped" run.
+        """
+        from . import delete_subagent
+
+        child_id = instance.child_id or ""
+        try:
+            await delete_subagent(child_id)
+        except Exception as exc:
+            self._event(run, "cancel_failed", node=state.state_id, entry=entry.index, instance=instance.index, child=child_id, error=str(exc))
+        else:
+            self._event(run, "cancelled", node=state.state_id, entry=entry.index, instance=instance.index, child=child_id)
+        # The child is supervisor-owned; a failed delete leaves it running
+        # there, but the executor treats its slot as released.
+        instance.status = "cancelled"
 
     async def _cancel_running(self, run: FactoryRun) -> None:
         from . import delete_subagent

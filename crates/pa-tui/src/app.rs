@@ -272,24 +272,30 @@ pub(crate) fn draw(
             crossterm::cursor::Hide
         )?;
     }
+    crate::echo_trace::mark("draw_enter", None);
     let area = terminal.size()?;
+    crate::echo_trace::mark("size", None);
     let frame_area = ratatui::layout::Rect::new(0, 0, area.width, area.height);
     let width = area.width as usize;
     let height = area.height as usize;
     let frame = view.render_frame(width, height);
+    crate::echo_trace::mark("frame_built", None);
     let cursor = view.frame_cursor();
     // The frame's embedded OSC 8 sequences drive the paint backend's
     // hyperlink injection; install the row/column ranges before the draw
     // (which strips the sequences from the painted cells).
     crate::hyperlinks::install_frame(&frame);
+    crate::echo_trace::mark("links", None);
     // Zone markers ride on the composed rows; plan their emission before
     // the cell paint (which strips them), then write the sequences at their
     // rows after the frame is painted.
     let emissions = view.take_osc_emissions(&frame);
+    crate::echo_trace::mark("osc", None);
     // TS fullscreen paint brackets the row diff in synchronized output so
     // terminals never display an intermediate, partly scrolled frame. A
     // terminal without mode 2026 support ignores the two escape sequences.
     crossterm::execute!(stdout(), terminal::BeginSynchronizedUpdate)?;
+    crate::echo_trace::mark("begin_w", None);
     // TS cursor control (tui.ts `renderFullscreen`): the hardware cursor
     // is positioned at the focused caret for IME on every frame, but is
     // only shown when `showHardwareCursor` is on (default off). ratatui's
@@ -311,6 +317,7 @@ pub(crate) fn draw(
             }
         }
     });
+    crate::echo_trace::mark("ratatui", None);
     // The hidden case still positions (TS's paint buffer ends with the
     // caret MoveTo before the synchronized-update release): IME
     // candidates anchor at the caret whether or not it is visible. The
@@ -323,13 +330,16 @@ pub(crate) fn draw(
             }
         }
     }
+    crate::echo_trace::mark("cursor_q", None);
     let markers = if painted.is_ok() {
         emit_zone_markers(&emissions, cursor)
     } else {
         Ok(())
     };
+    crate::echo_trace::mark("markers", None);
     // Always release the terminal's pending update, including on paint errors.
     crossterm::execute!(stdout(), terminal::EndSynchronizedUpdate)?;
+    crate::echo_trace::mark("end_w", None);
     painted?;
     markers
 }

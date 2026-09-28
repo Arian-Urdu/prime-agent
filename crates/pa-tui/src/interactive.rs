@@ -2330,6 +2330,7 @@ async fn run_interactive_surface(
                 session.dirty = true;
                 match input {
                     UiInput::Key(key) => {
+                        crate::echo_trace::mark("dispatch_start", crate::echo_trace::key_char(&key));
                         // TS stops the selection auto-scroll on every
                         // non-mouse input (`handleFullscreenInput`).
                         session.stop_selection_auto_scroll();
@@ -2355,6 +2356,7 @@ async fn run_interactive_surface(
                             // fatal.
                             Err(error) => return Err(error),
                         }
+                        crate::echo_trace::mark("dispatch_end", None);
                         // TS `handleCtrlZ` (`app.suspend`, default ctrl+z):
                         // hand the terminal to the shell and stop the process
                         // group; execution continues here once the user
@@ -2491,8 +2493,12 @@ async fn run_interactive_surface(
                         // reaches the frame gate, and the inline paint
                         // clears `dirty` — an idle terminal would
                         // otherwise never show the armed hint.
+                        crate::echo_trace::mark("tray_start", None);
                         view.chrome.tray_override = session.tray_override(&view);
+                        crate::echo_trace::mark("tray_end", None);
+                        crate::echo_trace::mark("draw_start", None);
                         crate::app::draw(renderer, &mut view)?;
+                        crate::echo_trace::mark("draw_end", None);
                         // The frame scheduler's bookkeeping follows the
                         // inline paint: the 16ms gate below now measures its
                         // interval from this frame, and a paint satisfied
@@ -2838,6 +2844,9 @@ async fn run_interactive_surface(
                 }
             } => {
                 if let Some(input) = maybe_input {
+                    if let UiInput::Key(key) = &input {
+                        crate::echo_trace::mark("loop_recv", crate::echo_trace::key_char(key));
+                    }
                     pending.push_back(input);
                 }
             }
@@ -3628,6 +3637,10 @@ impl Renderer {
                     }
                     crate::input::ReaderInput::Event(event) => match event {
                         crossterm::event::Event::Key(key) => {
+                            crate::echo_trace::mark(
+                                "reader_key",
+                                crate::echo_trace::key_char(&key),
+                            );
                             exit_guard.observe_key(&key);
                             ui_tx.send(UiInput::Key(key)).is_ok()
                         }

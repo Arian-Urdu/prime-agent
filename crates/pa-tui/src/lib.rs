@@ -35,6 +35,7 @@ pub mod custom_message;
 pub mod daemon_client;
 pub mod daemon_reconnect;
 pub mod direct_transport;
+pub mod echo_trace;
 pub mod editor;
 pub mod effort_picker;
 mod enhanced_keys;

@@ -170,6 +170,10 @@ where
                         }
                         match crossterm::event::read() {
                             Ok(event) => {
+                                crate::echo_trace::mark(
+                                    "reader_read",
+                                    crate::echo_trace::plain_char(&event),
+                                );
                                 events.push(event);
                                 match crossterm::event::poll(Duration::ZERO) {
                                     Ok(true) => {}

@@ -1882,6 +1882,21 @@ class FactoryExecutor:
                     if entry.status in ("pending", "running", "waiting"):
                         entry.status = "cancelled"
                         self._event(run, "node_cancelled", node=state_id, entry=entry.index, detail=reason)
+                        for instance in entry.instances:
+                            if instance.status == "pending":
+                                # Prepared but never admitted (or still in
+                                # flight inside _admit): the cancelled entry
+                                # owns it, so it reads cancelled, not pending,
+                                # in the stopped/failed ledger.
+                                instance.status = "cancelled"
+                                self._event(
+                                    run,
+                                    "cancelled",
+                                    node=state_id,
+                                    entry=entry.index,
+                                    instance=instance.index,
+                                    detail="cancelled before admission",
+                                )
         return stopped
 
     async def _retract_admission(

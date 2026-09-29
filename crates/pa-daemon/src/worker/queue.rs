@@ -312,7 +312,11 @@ pub(crate) fn checkpoint_queue_recovery(
     let Some(journal) = guard.as_mut() else {
         return;
     };
-    record_queue_checkpoint_locked(journal, core_lock, checkpoint, cloud_admission);
+    // The unkeyed local path keeps its pre-existing best-effort
+    // checkpoint policy: a failed append skips the checkpoint (the
+    // in-memory queue stays; the durable evidence simply did not land).
+    // Only the cloud-keyed path fails closed on the same error.
+    let _ = record_queue_checkpoint_locked(journal, core_lock, checkpoint, cloud_admission);
 }
 
 /// The checkpoint recorder for a caller already holding the recovery
@@ -329,7 +333,7 @@ pub(crate) fn record_queue_checkpoint_locked(
     core_lock: &std::sync::Mutex<SessionCore>,
     checkpoint: QueueCheckpoint,
     cloud_admission: Option<(&str, &Value)>,
-) {
+) -> anyhow::Result<()> {
     // The lanes are read under the recovery lock (a microsecond core
     // hold — never across the journal's fsyncs, which would block every
     // concurrent command behind the write): every queue mutation that
@@ -375,7 +379,7 @@ pub(crate) fn record_queue_checkpoint_locked(
     // verdict keeps appending the snapshot alone, exactly like the
     // sequential form); a failed batch lands neither record, so the
     // checkpoint is simply skipped.
-    let _ = journal.record_queue_checkpoint(
+    journal.record_queue_checkpoint(
         &active_session_id,
         &session_id,
         session_file.as_deref(),
@@ -384,7 +388,7 @@ pub(crate) fn record_queue_checkpoint_locked(
         &lanes.steering,
         &lanes.follow_up,
         cloud_admission,
-    );
+    )
 }
 
 pub(crate) fn queue_lanes(core: &SessionCore) -> QueueLanes {

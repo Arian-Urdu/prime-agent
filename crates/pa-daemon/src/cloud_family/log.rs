@@ -290,6 +290,23 @@ impl FamilyResultLog {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        // A crash-torn trailing append is repaired before any append can
+        // glue onto it (which would strand the record forever); mid-file
+        // corruption fails closed — the journal's history is never
+        // silently dropped.
+        let (valid_lines, tail) = crate::cloud_family::inbox::load_journal_lines(path)?;
+        match tail {
+            crate::cloud_family::inbox::JournalTail::Clean => {}
+            crate::cloud_family::inbox::JournalTail::TornTail => {
+                crate::cloud_family::inbox::repair_torn_tail(path, &valid_lines)?;
+            }
+            crate::cloud_family::inbox::JournalTail::MidFile => {
+                return Err(anyhow::anyhow!(
+                    "family result journal {} is corrupted mid-file; refusing to rewrite history",
+                    path.display()
+                ));
+            }
+        }
         let mut log = Self {
             path: path.to_path_buf(),
             slots: VecDeque::new(),
@@ -298,7 +315,7 @@ impl FamilyResultLog {
             // replayable request finds its journal state.
             max_remembered: DEFAULT_OUTBOX_RECORDS,
         };
-        log.load();
+        log.load_lines(&valid_lines);
         Ok(log)
     }
 
@@ -409,11 +426,8 @@ impl FamilyResultLog {
             crate::journal::rewrite_records(&self.path, &records, crate::journal::Finalize::Synced);
     }
 
-    fn load(&mut self) {
-        let Ok(content) = fs::read_to_string(&self.path) else {
-            return;
-        };
-        for line in content.lines() {
+    fn load_lines(&mut self, valid_lines: &[String]) {
+        for line in valid_lines {
             let Ok(record) = serde_json::from_str::<Value>(line) else {
                 // A crash may leave only the final append truncated.
                 continue;
@@ -443,5 +457,71 @@ impl FamilyResultLog {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The crash-torn trailing append: the tail is repaired (truncated to
+    /// its valid records) before any append can glue onto it, and the
+    /// post-repair append replays cleanly.
+    #[test]
+    fn torn_tail_is_repaired_and_never_glued() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("family-results.jsonl");
+        let mut log = FamilyResultLog::open(&path).unwrap();
+        log.admit("msgreq_t1").unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let first_line = content.lines().next().expect("the admitted record");
+        // The crash: a torn partial line at the tail.
+        std::fs::write(&path, format!("{first_line}\n{{\"torn")).unwrap();
+        let reloaded = FamilyResultLog::open(&path).unwrap();
+        assert_eq!(reloaded.uncertain(), vec!["msgreq_t1".to_string()]);
+        let repaired = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !repaired.contains("torn"),
+            "the torn fragment was truncated: {repaired}"
+        );
+        // The next append lands on the clean boundary and replays.
+        let mut reloaded = reloaded;
+        let command = pa_types::daemon::cloud::CloudFamilyCommand {
+            payload: pa_types::daemon::cloud::CloudFamilyCommandPayload::AgentMessageResult {
+                request_id: "msgreq_t1".to_string(),
+                ok: true,
+                receipt: None,
+                error: None,
+            },
+        };
+        reloaded.record(command).unwrap();
+        let reopened = FamilyResultLog::open(&path).unwrap();
+        assert!(
+            reopened.uncertain().is_empty(),
+            "the answer replays cleanly"
+        );
+    }
+
+    /// Mid-file corruption fails closed: the journal is never opened and
+    /// its history is never silently rewritten.
+    #[test]
+    fn mid_file_corruption_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("family-results.jsonl");
+        let mut log = FamilyResultLog::open(&path).unwrap();
+        log.admit("msgreq_m1").unwrap();
+        drop(log);
+        let valid = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{{garbage\n{valid}")).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            FamilyResultLog::open(&path).is_err(),
+            "mid-file corruption fails closed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "the corrupted file is never rewritten"
+        );
     }
 }

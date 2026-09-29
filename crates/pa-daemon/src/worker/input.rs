@@ -7,9 +7,15 @@ use super::{
     DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION, QUEUED_INPUT_SUSPENDED,
 };
 
+use std::path::Path;
+
 use serde_json::Value;
 
 use crate::protocol::{response_failure, DaemonResponse};
+
+/// The internal input-pause owner for the cloud-keyed delivery
+/// transaction (the runner gate held across the durable commit).
+const CLOUD_INBOX_PAUSE_OWNER: &str = "cloud-inbox";
 
 /// One admitted agent-message delivery: the checkpoint operation name
 /// (TS's steer/follow-up queue string), the queue-projection snapshot to
@@ -339,18 +345,36 @@ impl Worker {
         if let Some(receipt) = journal.cloud_inbox_receipt(request_id) {
             return response_success(None, "worker_deliver_message", Some(receipt.clone()));
         }
+        // The transaction gate: hold the runner's input-pause through the
+        // enqueue and the durable commit, so the turn runner cannot
+        // consume an item whose admission has not landed (a rollback
+        // would then be impossible). The runner reads the pause without
+        // holding the core lock, so this ordering cannot deadlock with
+        // the recovery -> core discipline the checkpoint shares.
+        let pause_id = self.input_pauses.acquire(
+            &self.config.active_session_id,
+            CLOUD_INBOX_PAUSE_OWNER,
+            request_id,
+        );
         let admission = match self.admit_agent_message_into_lane(payload) {
             Ok(admission) => admission,
-            Err(response) => return response,
+            Err(response) => {
+                // The release is idempotent against our own owner id; a
+                // `let _` keeps the private outcome type out of this
+                // module (an owner mismatch is impossible: the constant
+                // is ours).
+                let _ = self.input_pauses.release(
+                    &pause_id,
+                    CLOUD_INBOX_PAUSE_OWNER,
+                    &self.config.active_session_id,
+                );
+                return response;
+            }
         };
-        // The queued agent message is admitted live work (busy=true) and
-        // the cloud admission rides the checkpoint's single durable
-        // flush: the lanes snapshot, the busy verdict, and the request-id
-        // admission land together or not at all. A failed append skips
-        // the whole checkpoint, exactly like the local path's tolerance
-        // (the in-memory queue stays; the durable admission simply did
-        // not land).
-        crate::worker::record_queue_checkpoint_locked(
+        // The commit: the lanes snapshot, the busy verdict, and the
+        // request-id admission ride ONE digest-sealed transaction line.
+        // No receipt is published until it is durable.
+        let committed = crate::worker::record_queue_checkpoint_locked(
             journal,
             &self.core,
             QueueCheckpoint::Admitted {
@@ -358,8 +382,87 @@ impl Worker {
             },
             Some((request_id, &admission.receipt)),
         );
+        // The pause's job is done: the item is either durably admitted
+        // or being rolled back below (the runner must stay parked until
+        // the rollback completes).
+        let outcome = match committed.map_err(|error| error.to_string()) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // A failed fsync may still have landed the record: the
+                // commit outcome is UNCERTAIN, so recover the journal
+                // state from disk before answering — never contradict a
+                // write that landed, never publish a receipt for one that
+                // did not.
+                match recover_commit_outcome(
+                    &self.config.recovery_journal_path,
+                    request_id,
+                    &admission.receipt,
+                ) {
+                    // The transaction landed (or a later state already
+                    // carries this delivery's receipt): adopt the
+                    // recovered journal state and answer the receipt.
+                    Ok(Some(reloaded)) => {
+                        *recovery = Some(reloaded);
+                        Ok(())
+                    }
+                    // The write genuinely failed (or the recovery read
+                    // itself failed — the disk is broken): fail closed.
+                    // The rollback happens below, after the recovery
+                    // guard drops (the runner stays parked until the
+                    // pause release, so the not-yet-committed item cannot
+                    // be picked up meanwhile).
+                    _ => Err(format!("cloud inbox journal: {error:#}")),
+                }
+            }
+        };
         drop(recovery);
-        self.finish_agent_message_delivery(admission)
+        let _ = self.input_pauses.release(
+            &pause_id,
+            CLOUD_INBOX_PAUSE_OWNER,
+            &self.config.active_session_id,
+        );
+        match outcome {
+            Ok(()) => self.finish_agent_message_delivery(admission),
+            // The commit never landed: roll the enqueue back (exactly
+            // this delivery's item) and answer the failure — no
+            // receipt, no visible message, nothing durable.
+            Err(error) => {
+                self.rollback_agent_message_delivery(&admission);
+                response_failure(None, "worker_deliver_message", &error, None)
+            }
+        }
+    }
+
+    /// Roll back one not-yet-committed delivery admission: remove exactly
+    /// the item whose agent-message custom row carries this delivery's
+    /// receipt id, from the one lane it was enqueued on. Nothing else in
+    /// the lane is touched, and the order of the surviving items is
+    /// preserved.
+    fn rollback_agent_message_delivery(&self, admission: &AgentMessageAdmission) {
+        let Some(receipt_id) = admission.receipt.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        let lane = match admission.operation {
+            "steer_queued" => Lane::Steering,
+            _ => Lane::FollowUp,
+        };
+        let mut core = self.core.lock().unwrap();
+        let item_is_delivery = |item: &QueuedItem| {
+            item.custom_message.as_ref().is_some_and(|row| {
+                row.get("customType").and_then(Value::as_str)
+                    == Some(pa_core::session_engine::agent_messaging::AGENT_MESSAGE_CUSTOM_TYPE)
+                    && row.get("details").and_then(|details| details.get("id"))
+                        == Some(&json!(receipt_id))
+            })
+        };
+        match lane {
+            Lane::Steering => {
+                core.steering.retain(|item| !item_is_delivery(item));
+            }
+            Lane::FollowUp => {
+                core.follow_up.retain(|item| !item_is_delivery(item));
+            }
+        }
     }
 
     /// The shared delivery admission (TS `sendAgentSessionMessage` ->
@@ -567,4 +670,26 @@ impl Worker {
         self.work_notify.notify_one();
         response_success(None, "worker_deliver_message", Some(admission.receipt))
     }
+}
+
+/// The commit-outcome recovery for a failed checkpoint append: a failed
+/// fsync may still have landed the record, so the truth is what the
+/// journal on disk says. `Some(journal)` = the transaction carrying THIS
+/// delivery's receipt is on disk (adopt the recovered state — the
+/// caller answers the receipt); `None` = the write genuinely failed
+/// (roll back); `Err` = the recovery read itself failed (the disk is
+/// broken — roll back too, never answer success).
+pub(crate) fn recover_commit_outcome(
+    journal_path: &Path,
+    request_id: &str,
+    receipt: &Value,
+) -> std::result::Result<Option<crate::journal::WorkerRecoveryJournal>, ()> {
+    crate::journal::WorkerRecoveryJournal::open(journal_path)
+        .map(|reloaded| {
+            reloaded
+                .cloud_inbox_receipt(request_id)
+                .is_some_and(|recorded| recorded == receipt)
+                .then_some(reloaded)
+        })
+        .map_err(|_| ())
 }

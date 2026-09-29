@@ -41,24 +41,112 @@ pub struct CloudInboxLog {
     max_remembered: usize,
 }
 
+/// How a journal file's unparsable lines classified: a crash-torn
+/// trailing append (repairable) or mid-file corruption (fail closed —
+/// history is never silently dropped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JournalTail {
+    /// Every line parses (or the file is absent).
+    Clean,
+    /// The unparsable lines form a contiguous run at the end of the
+    /// file — the torn tail of one interrupted append.
+    TornTail,
+    /// An unparsable line sits before a valid one: real corruption.
+    MidFile,
+}
+
+/// One cloud family journal file's valid line texts plus its corruption
+/// verdict: the unified read every cloud journal loader goes through
+/// (the shared-tail contract with the worker journal in
+/// [`crate::journal`]). The valid ORIGINAL line strings are retained so
+/// the repair rewrite preserves them byte-for-byte.
+pub(crate) fn load_journal_lines(path: &Path) -> Result<(Vec<String>, JournalTail)> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), JournalTail::Clean));
+        }
+        Err(error) => return Err(anyhow::anyhow!("read journal {}: {error}", path.display())),
+    };
+    let mut valid = Vec::new();
+    let mut tail = JournalTail::Clean;
+    let mut malformed_seen = false;
+    for line in contents.split('\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if serde_json::from_str::<Value>(line).is_ok() {
+            if malformed_seen {
+                // A valid line after an unparsable one: the unparsable
+                // line was not the torn tail of an interrupted append.
+                tail = JournalTail::MidFile;
+                malformed_seen = false;
+            } else {
+                valid.push(line.to_string());
+            }
+        } else if malformed_seen {
+            tail = JournalTail::MidFile;
+            malformed_seen = false;
+        } else {
+            malformed_seen = true;
+        }
+    }
+    if tail == JournalTail::Clean && malformed_seen {
+        tail = JournalTail::TornTail;
+    }
+    Ok((valid, tail))
+}
+
+/// Repair a crash-torn trailing append: rewrite the journal with exactly
+/// its valid lines (the original bytes, in order), durably, BEFORE any
+/// subsequent append can glue a record onto the unparsable fragment.
+///
+/// # Errors
+///
+/// Returns an error when the rewrite cannot be written or renamed.
+pub(crate) fn repair_torn_tail(path: &Path, valid_lines: &[String]) -> Result<()> {
+    let mut records = Vec::with_capacity(valid_lines.len());
+    for line in valid_lines {
+        records.push(
+            serde_json::from_str::<Value>(line)
+                .map_err(|error| anyhow::anyhow!("repair parse: {error}"))?,
+        );
+    }
+    crate::journal::rewrite_records(path, &records, crate::journal::Finalize::Synced)
+}
+
 impl CloudInboxLog {
     /// Open (or create) the inbox journal at `path`, replaying the
-    /// admitted requests and their recorded receipts. A crash-truncated
-    /// or malformed tail is skipped, like the recovery journals.
+    /// admitted requests and their recorded receipts. A crash-torn
+    /// trailing append is REPAIRED (truncated to its valid records)
+    /// before any append can glue onto it; mid-file corruption fails
+    /// closed.
     ///
     /// # Errors
     ///
-    /// Returns an error when the parent directory cannot be created.
+    /// Returns an error when the parent directory cannot be created,
+    /// the file is corrupted mid-file, or the repair rewrite fails.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
+        }
+        let (valid_lines, tail) = load_journal_lines(path)?;
+        match tail {
+            JournalTail::Clean => {}
+            JournalTail::TornTail => repair_torn_tail(path, &valid_lines)?,
+            JournalTail::MidFile => {
+                return Err(anyhow::anyhow!(
+                    "cloud inbox journal {} is corrupted mid-file; refusing to rewrite history",
+                    path.display()
+                ));
+            }
         }
         let mut log = Self {
             path: path.to_path_buf(),
             slots: VecDeque::new(),
             max_remembered: DEFAULT_OUTBOX_RECORDS,
         };
-        log.load();
+        log.load_lines(&valid_lines);
         Ok(log)
     }
 
@@ -197,11 +285,8 @@ impl CloudInboxLog {
             crate::journal::rewrite_records(&self.path, &records, crate::journal::Finalize::Synced);
     }
 
-    fn load(&mut self) {
-        let Ok(content) = fs::read_to_string(&self.path) else {
-            return;
-        };
-        for line in content.lines() {
+    fn load_lines(&mut self, valid_lines: &[String]) {
+        for line in valid_lines {
             let Ok(record) = serde_json::from_str::<Value>(line) else {
                 // A crash may leave only the final append truncated.
                 continue;
@@ -346,6 +431,53 @@ mod tests {
         assert!(
             reloaded.receipt("msgreq_gap").is_none(),
             "the receipt record died with the crash"
+        );
+        // The repair: the torn fragment is truncated from the file, so
+        // the next append writes onto a clean boundary.
+        let repaired = fs::read_to_string(&path).unwrap();
+        assert!(
+            !repaired.contains("half"),
+            "the torn fragment was truncated: {repaired}"
+        );
+        assert!(
+            repaired.ends_with('\n'),
+            "the file ends on a record boundary"
+        );
+        let mut reloaded = reloaded;
+        reloaded
+            .record_receipt("msgreq_gap", receipt("agentmsg_after_repair"))
+            .unwrap();
+        let reopened = CloudInboxLog::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .receipt("msgreq_gap")
+                .expect("the post-repair append"),
+            receipt("agentmsg_after_repair"),
+            "no record glues onto the repaired tail"
+        );
+    }
+
+    /// Mid-file corruption (an unparsable line before a valid one) fails
+    /// closed: the journal is never opened and its history is never
+    /// silently rewritten.
+    #[test]
+    fn mid_file_corruption_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cloud-inbox.jsonl");
+        let mut log = CloudInboxLog::open(&path).unwrap();
+        log.admit(&message("msgreq_m1", "target")).unwrap();
+        drop(log);
+        let valid = fs::read_to_string(&path).unwrap();
+        fs::write(&path, format!("{{torn garbage\n{valid}")).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        assert!(
+            CloudInboxLog::open(&path).is_err(),
+            "mid-file corruption fails closed"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            before,
+            "the corrupted file is never rewritten"
         );
     }
 

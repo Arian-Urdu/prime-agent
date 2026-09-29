@@ -10,6 +10,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -338,21 +339,310 @@ pub struct WorkerRecoveryRecord {
     pub recorded_at: String,
 }
 
-fn parse_worker_records(path: &Path) -> Result<HashMap<String, WorkerRecoveryRecord>> {
-    let mut latest = HashMap::new();
-    let Ok(content) = fs::read_to_string(path) else {
-        return Ok(latest);
+/// One checkpoint transaction record (the cloud-keyed delivery path's
+/// durable commit unit): the queue snapshot, the optional busy verdict,
+/// and the optional request-id admission riding ONE NDJSON line, sealed
+/// with a digest over their canonical JSON. A torn or partial write
+/// leaves one unparsable line the scan drops all-or-nothing; a
+/// complete-but-corrupted line fails the digest and drops the same way.
+/// One line is the whole transaction — a crash can never leave the
+/// message visible without its request-id admission, or the admission
+/// without the queue row that made it visible.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerCheckpointTransactionRecord {
+    pub version: u32,
+    pub r#type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<WorkerRecoveryRecord>,
+    pub snapshot: WorkerQueueSnapshotRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_admission: Option<CloudInboxAdmissionRecord>,
+    pub digest: String,
+}
+
+/// The record-type tag of a checkpoint transaction line.
+const CHECKPOINT_TRANSACTION_RECORD_TYPE: &str = "queue_checkpoint_transaction";
+/// The checkpoint-transaction record version.
+const CHECKPOINT_TRANSACTION_VERSION: u32 = 1;
+
+/// The transaction digest: sha256 over the canonical JSON of the
+/// carried records, so a corrupted-but-parseable line drops instead of
+/// replaying half a transaction.
+///
+/// # Errors
+///
+/// Returns an error when the records cannot be canonicalized.
+fn checkpoint_transaction_digest(
+    verdict: &Option<WorkerRecoveryRecord>,
+    snapshot: &WorkerQueueSnapshotRecord,
+    cloud_admission: &Option<CloudInboxAdmissionRecord>,
+) -> Result<String> {
+    let payload = serde_json::json!({
+        "verdict": verdict,
+        "snapshot": snapshot,
+        "cloudAdmission": cloud_admission,
+    });
+    let canonical = pa_types::daemon::cloud::canonical_json(&payload)
+        .map_err(|reason| anyhow::anyhow!("canonical JSON: {reason}"))?;
+    Ok(Sha256::digest(canonical.as_bytes())
+        .iter()
+        .fold(String::new(), |mut key, byte| {
+            use std::fmt::Write;
+            write!(key, "{byte:02x}").expect("write to String");
+            key
+        }))
+}
+
+/// How the journal scan classified the file's unparsable lines: a torn
+/// trailing append (repairable by truncation) or mid-file corruption
+/// (fail closed — history is never silently dropped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JournalCorruption {
+    /// Every line parses (or the journal is absent).
+    Clean,
+    /// The unparsable lines form a contiguous run at the end of the
+    /// file — the crash-torn tail of one interrupted append. The
+    /// repair drops exactly that run and keeps every valid line.
+    TornTail,
+    /// An unparsable line sits before a valid one: not an interrupted
+    /// append but real corruption. The journal fails closed.
+    MidFile,
+}
+
+/// One classified journal line: a valid record (legacy or
+/// transaction-carried) or unparsable.
+#[allow(clippy::large_enum_variant)]
+enum ScannedLine {
+    /// A legacy busy/operation verdict record.
+    Verdict(WorkerRecoveryRecord),
+    /// A legacy queue-snapshot record.
+    Snapshot(WorkerQueueSnapshotRecord),
+    /// A legacy cloud inbox admission record.
+    Admission(CloudInboxAdmissionRecord),
+    /// One checkpoint transaction: its carried records, digest verified.
+    Transaction {
+        verdict: Option<WorkerRecoveryRecord>,
+        snapshot: WorkerQueueSnapshotRecord,
+        admission: Option<CloudInboxAdmissionRecord>,
+    },
+    /// A valid-JSON line of an unknown record type (a future
+    /// subsystem's records): skipped, not corruption.
+    UnknownType,
+    /// An unparsable line: torn, glued, or corrupted.
+    Malformed,
+}
+
+/// The unified ordered journal scan (the one parser every reader goes
+/// through): classifies each line once, decomposes checkpoint
+/// transactions into the same structures the legacy lines feed, and
+/// reports the corruption verdict. The valid original line strings are
+/// retained so the torn-tail repair can rewrite the file byte-for-byte
+/// without them.
+struct JournalScan {
+    lines: Vec<ScannedLine>,
+    /// The original text of every line that classified as a known valid
+    /// record or an unknown type (preserved for the repair rewrite).
+    valid_line_text: Vec<String>,
+    corruption: JournalCorruption,
+}
+
+fn scan_worker_journal(path: &Path) -> Result<JournalScan> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(JournalScan {
+                lines: Vec::new(),
+                valid_line_text: Vec::new(),
+                corruption: JournalCorruption::Clean,
+            });
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "read worker journal {}: {error}",
+                path.display()
+            ))
+        }
     };
-    for line in content.lines() {
+    let mut lines = Vec::new();
+    let mut valid_line_text = Vec::new();
+    let mut malformed_seen = false;
+    let mut corruption = JournalCorruption::Clean;
+    for line in contents.split('\n') {
         if line.is_empty() {
+            // The trailing newline (or padding): not a record, not
+            // corruption.
             continue;
         }
-        let Ok(record) = serde_json::from_str::<WorkerRecoveryRecord>(line) else {
-            continue;
-        };
-        latest.insert(record.active_session_id.clone(), record);
+        let classified = classify_journal_line(line);
+        let is_valid = !matches!(classified, ScannedLine::Malformed);
+        if !is_valid {
+            if malformed_seen {
+                // A second unparsable line after a valid one: mid-file
+                // corruption (an interrupted append tears only the LAST
+                // line, never two with a valid line between them).
+                corruption = JournalCorruption::MidFile;
+            } else {
+                malformed_seen = true;
+            }
+        } else if malformed_seen {
+            // A valid line after an unparsable one: the unparsable line
+            // was not the torn tail of an interrupted append.
+            corruption = JournalCorruption::MidFile;
+            malformed_seen = false;
+        } else {
+            valid_line_text.push(line.to_string());
+        }
+        lines.push(classified);
     }
-    Ok(latest)
+    if corruption == JournalCorruption::Clean && malformed_seen {
+        corruption = JournalCorruption::TornTail;
+    }
+    Ok(JournalScan {
+        lines,
+        valid_line_text,
+        corruption,
+    })
+}
+
+/// Classify one journal line. A `queue_checkpoint_transaction` line is
+/// verified against its digest; a digest mismatch reads as malformed
+/// (a corrupted transaction replays as nothing, never as half of one).
+/// The dispatch is by the line's JSON `type` tag first, so a record of
+/// one type carrying another's field names can never misparse as a
+/// different record (and the version-1 snapshot's bare-string lanes
+/// keep their legacy tolerance, exactly like the old single-purpose
+/// parser).
+fn classify_journal_line(line: &str) -> ScannedLine {
+    let Ok(record) = serde_json::from_str::<Value>(line) else {
+        return ScannedLine::Malformed;
+    };
+    let Some(record_type) = record.get("type").and_then(Value::as_str) else {
+        // Valid JSON without a type tag: the legacy busy/operation
+        // verdict record is a bare field shape — anything else is a
+        // foreign record the journal does not own.
+        return match serde_json::from_value::<WorkerRecoveryRecord>(record) {
+            Ok(verdict) => ScannedLine::Verdict(verdict),
+            Err(_) => ScannedLine::UnknownType,
+        };
+    };
+    match record_type {
+        CHECKPOINT_TRANSACTION_RECORD_TYPE => {
+            let Ok(transaction) =
+                serde_json::from_value::<WorkerCheckpointTransactionRecord>(record)
+            else {
+                return ScannedLine::Malformed;
+            };
+            if transaction.version != CHECKPOINT_TRANSACTION_VERSION
+                || checkpoint_transaction_digest(
+                    &transaction.verdict,
+                    &transaction.snapshot,
+                    &transaction.cloud_admission,
+                )
+                .is_ok_and(|digest| digest == transaction.digest)
+            {
+                return ScannedLine::Transaction {
+                    verdict: transaction.verdict,
+                    snapshot: transaction.snapshot,
+                    admission: transaction.cloud_admission,
+                };
+            }
+            // A transaction line that fails its own seal replays as
+            // nothing: half a transaction is never a transaction.
+            ScannedLine::Malformed
+        }
+        QUEUE_SNAPSHOT_RECORD_TYPE => {
+            let version = record.get("version").and_then(Value::as_u64);
+            if version != Some(1) && version != Some(u64::from(QUEUE_SNAPSHOT_VERSION)) {
+                return ScannedLine::UnknownType;
+            }
+            let Some(active_session_id) = record.get("active_session_id").and_then(Value::as_str)
+            else {
+                return ScannedLine::UnknownType;
+            };
+            ScannedLine::Snapshot(WorkerQueueSnapshotRecord {
+                version: QUEUE_SNAPSHOT_VERSION,
+                r#type: QUEUE_SNAPSHOT_RECORD_TYPE.to_string(),
+                active_session_id: active_session_id.to_string(),
+                steering: parse_snapshot_lane(record.get("steering")),
+                follow_up: parse_snapshot_lane(record.get("follow_up")),
+                recorded_at: record
+                    .get("recorded_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        }
+        CLOUD_INBOX_RECORD_TYPE => {
+            match serde_json::from_value::<CloudInboxAdmissionRecord>(record) {
+                Ok(admission) if admission.version == CLOUD_INBOX_VERSION => {
+                    ScannedLine::Admission(admission)
+                }
+                _ => ScannedLine::Malformed,
+            }
+        }
+        // Any other type tag: a foreign record the journal does not
+        // own — skipped, not corruption.
+        _ => ScannedLine::UnknownType,
+    }
+}
+
+/// The fold of one journal scan: the per-session busy verdicts, the
+/// per-session queue snapshots, and the request-id-keyed cloud inbox
+/// with its retention-window order.
+struct FoldedJournal {
+    latest: HashMap<String, WorkerRecoveryRecord>,
+    queue_snapshots: HashMap<String, WorkerQueueSnapshotRecord>,
+    cloud_inbox: HashMap<String, Value>,
+    cloud_inbox_order: std::collections::VecDeque<String>,
+}
+
+/// Fold the scanned lines into the journal's in-memory structures, in
+/// file order (the cloud inbox order needs it for the retention window).
+fn fold_journal_scan(scan: &JournalScan) -> FoldedJournal {
+    let mut latest = HashMap::new();
+    let mut queue_snapshots = HashMap::new();
+    let mut cloud_inbox = HashMap::new();
+    let mut cloud_inbox_order = std::collections::VecDeque::new();
+    for line in &scan.lines {
+        match line {
+            ScannedLine::Verdict(record) => {
+                latest.insert(record.active_session_id.clone(), record.clone());
+            }
+            ScannedLine::Snapshot(record) => {
+                queue_snapshots.insert(record.active_session_id.clone(), record.clone());
+            }
+            ScannedLine::Admission(record) => {
+                cloud_inbox_order.push_back(record.request_id.clone());
+                cloud_inbox.insert(record.request_id.clone(), record.receipt.clone());
+            }
+            ScannedLine::Transaction {
+                verdict,
+                snapshot,
+                admission,
+            } => {
+                if let Some(verdict) = verdict {
+                    latest.insert(verdict.active_session_id.clone(), verdict.clone());
+                }
+                queue_snapshots.insert(snapshot.active_session_id.clone(), snapshot.clone());
+                if let Some(admission) = admission {
+                    cloud_inbox_order.push_back(admission.request_id.clone());
+                    cloud_inbox.insert(admission.request_id.clone(), admission.receipt.clone());
+                }
+            }
+            ScannedLine::UnknownType | ScannedLine::Malformed => {}
+        }
+    }
+    while cloud_inbox_order.len() > CLOUD_INBOX_WINDOW {
+        if let Some(oldest) = cloud_inbox_order.pop_front() {
+            cloud_inbox.remove(&oldest);
+        }
+    }
+    FoldedJournal {
+        latest,
+        queue_snapshots,
+        cloud_inbox,
+        cloud_inbox_order,
+    }
 }
 
 /// One parked queue row in a worker queue snapshot: the delivery payload a
@@ -446,44 +736,6 @@ const CLOUD_INBOX_VERSION: u32 = 1;
 /// so the largest replay span always finds its receiver admission.
 const CLOUD_INBOX_WINDOW: usize = 50_000;
 
-fn parse_cloud_inbox_records(
-    path: &Path,
-) -> Result<(HashMap<String, Value>, std::collections::VecDeque<String>)> {
-    let mut inbox: HashMap<String, Value> = HashMap::new();
-    let mut order: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((inbox, order)),
-        Err(error) => {
-            return Err(anyhow::anyhow!(
-                "read worker journal {} for cloud inbox: {error}",
-                path.display()
-            ))
-        }
-    };
-    for line in contents.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(record) = serde_json::from_str::<CloudInboxAdmissionRecord>(line) else {
-            // A crash may leave only the final append truncated; unknown
-            // record types are other subsystems' lines.
-            continue;
-        };
-        if record.version != CLOUD_INBOX_VERSION || record.r#type != CLOUD_INBOX_RECORD_TYPE {
-            continue;
-        }
-        order.push_back(record.request_id.clone());
-        inbox.insert(record.request_id, record.receipt);
-    }
-    while order.len() > CLOUD_INBOX_WINDOW {
-        if let Some(oldest) = order.pop_front() {
-            inbox.remove(&oldest);
-        }
-    }
-    Ok((inbox, order))
-}
-
 /// Port of `WorkerRecoveryJournal`: latest busy/operation per active session,
 /// plus the latest queue snapshot per session, plus the request-id-keyed
 /// cloud inbox admissions (the cross-boundary receiver dedupe).
@@ -508,14 +760,32 @@ impl WorkerRecoveryJournal {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let queue_snapshots = parse_queue_snapshot_records(path)?;
-        let (cloud_inbox, cloud_inbox_order) = parse_cloud_inbox_records(path)?;
+        let scan = scan_worker_journal(path)?;
+        // The torn tail of an interrupted append is repaired BEFORE any
+        // subsequent append can glue a valid record onto the unparsable
+        // fragment (which would strand that record forever): the file is
+        // rewritten with exactly its valid lines, byte-for-byte. Mid-file
+        // corruption fails closed — the history is never silently
+        // dropped.
+        match scan.corruption {
+            JournalCorruption::Clean => {}
+            JournalCorruption::TornTail => {
+                repair_journal_tail(path, &scan)?;
+            }
+            JournalCorruption::MidFile => {
+                return Err(anyhow::anyhow!(
+                    "worker journal {} is corrupted mid-file; refusing to rewrite history",
+                    path.display()
+                ));
+            }
+        }
+        let folded = fold_journal_scan(&scan);
         Ok(WorkerRecoveryJournal {
             path: path.to_path_buf(),
-            latest: parse_worker_records(path)?,
-            queue_snapshots,
-            cloud_inbox,
-            cloud_inbox_order,
+            latest: folded.latest,
+            queue_snapshots: folded.queue_snapshots,
+            cloud_inbox: folded.cloud_inbox,
+            cloud_inbox_order: folded.cloud_inbox_order,
         })
     }
 
@@ -534,7 +804,14 @@ impl WorkerRecoveryJournal {
     /// Never errors: a missing or unreadable journal reads as an empty
     /// set (the `Result` wrapper keeps the reading seam uniform).
     pub fn read_latest(path: &Path) -> Result<Vec<WorkerRecoveryRecord>> {
-        Ok(parse_worker_records(path)?.into_values().collect())
+        let scan = scan_worker_journal(path)?;
+        if scan.corruption == JournalCorruption::MidFile {
+            return Err(anyhow::anyhow!(
+                "worker journal {} is corrupted mid-file",
+                path.display()
+            ));
+        }
+        Ok(fold_journal_scan(&scan).latest.into_values().collect())
     }
 
     /// Does the journal prove live work at the worker's last exit? A plain
@@ -728,20 +1005,32 @@ impl WorkerRecoveryJournal {
             receipt: receipt.clone(),
             recorded_at: crate::util::now_iso(),
         });
-        let mut batch = Vec::with_capacity(3);
-        batch.push(serde_json::to_value(&snapshot)?);
-        if let Some(record) = &record {
-            batch.push(serde_json::to_value(record)?);
+        // The cloud admission rides ONE digest-sealed transaction line with
+        // the queue snapshot and the busy verdict (the commit unit the
+        // scan replays all-or-nothing): a crash can never leave the
+        // message visible without its request-id admission (a duplicate
+        // would re-deliver) or the admission without visibility (the
+        // receipt would claim a message that never landed). The unkeyed
+        // local path keeps its two-line batch (its pre-existing
+        // verdict-ordering tolerance is unchanged).
+        if admission.is_some() {
+            let transaction = WorkerCheckpointTransactionRecord {
+                version: CHECKPOINT_TRANSACTION_VERSION,
+                r#type: CHECKPOINT_TRANSACTION_RECORD_TYPE.to_string(),
+                verdict: record.clone(),
+                snapshot: snapshot.clone(),
+                cloud_admission: admission.clone(),
+                digest: checkpoint_transaction_digest(&record, &snapshot, &admission)?,
+            };
+            append_record(&self.path, &serde_json::to_value(&transaction)?)?;
+        } else {
+            let mut batch = Vec::with_capacity(2);
+            batch.push(serde_json::to_value(&snapshot)?);
+            if let Some(record) = &record {
+                batch.push(serde_json::to_value(record)?);
+            }
+            append_records(&self.path, &batch)?;
         }
-        // The cloud admission rides the SAME durable batch as the queue
-        // snapshot it describes: a crash can never leave the message
-        // visible without its request-id admission (a duplicate would
-        // re-deliver) or the admission without visibility (the receipt
-        // would claim a message that never landed).
-        if let Some(admission) = &admission {
-            batch.push(serde_json::to_value(admission)?);
-        }
-        append_records(&self.path, &batch)?;
         if let Some(admission) = admission {
             self.cloud_inbox_order
                 .push_back(admission.request_id.clone());
@@ -790,7 +1079,15 @@ impl WorkerRecoveryJournal {
         path: &Path,
         active_session_id: &str,
     ) -> Result<Option<(Vec<WorkerQueueItemRecord>, Vec<WorkerQueueItemRecord>)>> {
-        Ok(parse_queue_snapshot_records(path)?
+        let scan = scan_worker_journal(path)?;
+        if scan.corruption == JournalCorruption::MidFile {
+            return Err(anyhow::anyhow!(
+                "worker journal {} is corrupted mid-file",
+                path.display()
+            ));
+        }
+        Ok(fold_journal_scan(&scan)
+            .queue_snapshots
             .remove(active_session_id)
             .map(|record| (record.steering, record.follow_up)))
     }
@@ -833,45 +1130,23 @@ const QUEUE_SNAPSHOT_RECORD_TYPE: &str = "queue_snapshot";
 /// item records.
 const QUEUE_SNAPSHOT_VERSION: u32 = 2;
 
-fn parse_queue_snapshot_records(path: &Path) -> Result<HashMap<String, WorkerQueueSnapshotRecord>> {
-    let mut latest: HashMap<String, WorkerQueueSnapshotRecord> = HashMap::new();
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(latest),
-        Err(error) => {
-            return Err(error).with_context(|| format!("read journal {}", path.display()))
-        }
-    };
-    for line in contents.split('\n').filter(|line| !line.is_empty()) {
-        let Ok(record) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if record.get("type").and_then(Value::as_str) != Some(QUEUE_SNAPSHOT_RECORD_TYPE) {
-            continue;
-        }
-        let version = record.get("version").and_then(Value::as_u64);
-        if version != Some(1) && version != Some(u64::from(QUEUE_SNAPSHOT_VERSION)) {
-            continue;
-        }
-        let Some(active_session_id) = record.get("active_session_id").and_then(Value::as_str)
-        else {
-            continue;
-        };
-        let entry = WorkerQueueSnapshotRecord {
-            version: QUEUE_SNAPSHOT_VERSION,
-            r#type: QUEUE_SNAPSHOT_RECORD_TYPE.to_string(),
-            active_session_id: active_session_id.to_string(),
-            steering: parse_snapshot_lane(record.get("steering")),
-            follow_up: parse_snapshot_lane(record.get("follow_up")),
-            recorded_at: record
-                .get("recorded_at")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        };
-        latest.insert(active_session_id.to_string(), entry);
+/// The torn-tail repair: rewrite the journal with exactly its valid
+/// lines (the original bytes, in order), durably (temp file, fsync,
+/// rename), so the next append writes onto a clean record boundary.
+///
+/// # Errors
+/// Returns an error when the rewrite cannot be written or renamed.
+fn repair_journal_tail(path: &Path, scan: &JournalScan) -> Result<()> {
+    let mut records: Vec<Value> = Vec::with_capacity(scan.valid_line_text.len());
+    for line in &scan.valid_line_text {
+        // The valid lines are byte-for-byte JSON; re-parse each so the
+        // rewrite path stays the one serialization.
+        records.push(
+            serde_json::from_str::<Value>(line)
+                .map_err(|error| anyhow::anyhow!("repair parse: {error}"))?,
+        );
     }
-    Ok(latest)
+    rewrite_records(path, &records, Finalize::Synced)
 }
 
 /// One snapshot lane: a version-2 entry is the full item record, while a
@@ -1285,5 +1560,208 @@ mod tests {
         std::fs::write(&path, "not json").unwrap();
         assert!(!WorkerRecoveryJournal::read_interrupted(&path));
         let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+    // -----------------------------------------------------------------------
+    // Checkpoint transactions (the cloud-keyed delivery's commit unit)
+    // -----------------------------------------------------------------------
+
+    /// One full keyed checkpoint: the transaction line carries the
+    /// snapshot, the busy verdict, and the cloud admission together, and
+    /// the reopen replays all three (the lane restore and the inbox key
+    /// land together or not at all).
+    #[test]
+    fn checkpoint_transaction_replays_snapshot_and_admission_together() {
+        let path = temp_path("transaction.jsonl");
+        let mut journal = WorkerRecoveryJournal::open(&path).unwrap();
+        let receipt = serde_json::json!({
+            "id": "agentmsg_tx1",
+            "deliveryStatus": "delivered",
+            "deliveryMode": "steer",
+        });
+        journal
+            .record_queue_checkpoint(
+                "sess-a",
+                "sess-a-file",
+                None,
+                true,
+                "steer_queued",
+                &[WorkerQueueItemRecord {
+                    message: "cloud note".to_string(),
+                    priority: None,
+                    preview: None,
+                    custom_message: None,
+                    queue_key: None,
+                    queue_visible: true,
+                    policy: "injected".to_string(),
+                }],
+                &[],
+                Some(("msgreq_tx1", &receipt)),
+            )
+            .unwrap();
+        let reloaded = WorkerRecoveryJournal::open(&path).unwrap();
+        assert_eq!(
+            reloaded.cloud_inbox_receipt("msgreq_tx1"),
+            Some(&receipt),
+            "the admission replays"
+        );
+        let (steering, _) = crate::worker::restore_queue_snapshot(&reloaded, "sess-a");
+        assert_eq!(
+            steering.len(),
+            1,
+            "the queue row replays with the admission"
+        );
+        assert_eq!(steering[0].message, "cloud note");
+        assert!(
+            reloaded
+                .latest
+                .get("sess-a")
+                .is_some_and(|record| record.busy),
+            "the busy verdict replays"
+        );
+        // One transaction line on disk, sealed with its digest.
+        let content = fs::read_to_string(&path).unwrap();
+        let transaction_lines = content
+            .lines()
+            .filter(|line| line.contains("queue_checkpoint_transaction"))
+            .count();
+        assert_eq!(transaction_lines, 1, "one transaction line: {content}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A crash-torn transaction append (the last line truncated mid-JSON)
+    /// drops the WHOLE transaction — the queue row never replays without
+    /// its request-id admission — and the repair truncates the fragment
+    /// so the next append cannot glue onto it.
+    #[test]
+    fn torn_transaction_tail_drops_all_of_it_and_repairs_the_file() {
+        let path = temp_path("torn-transaction.jsonl");
+        let mut journal = WorkerRecoveryJournal::open(&path).unwrap();
+        let receipt = serde_json::json!({ "id": "agentmsg_tx2", "deliveryStatus": "delivered" });
+        journal
+            .record_queue_checkpoint(
+                "sess-b",
+                "sess-b-file",
+                None,
+                true,
+                "steer_queued",
+                &[],
+                &[],
+                Some(("msgreq_tx2", &receipt)),
+            )
+            .unwrap();
+        // The crash: the final append lands only partially.
+        let content = fs::read_to_string(&path).unwrap();
+        let torn: String = content.lines().last().unwrap().chars().take(40).collect();
+        fs::write(&path, &torn).unwrap();
+        // The reload: the torn transaction replays as nothing (no
+        // snapshot, no key) and the file is repaired (the fragment gone).
+        let reloaded = WorkerRecoveryJournal::open(&path).unwrap();
+        assert!(
+            reloaded.cloud_inbox_receipt("msgreq_tx2").is_none(),
+            "a torn transaction never leaves its admission"
+        );
+        assert!(
+            reloaded.latest_queue_snapshot("sess-b").is_none(),
+            "a torn transaction never leaves its queue row"
+        );
+        let repaired = fs::read_to_string(&path).unwrap();
+        assert!(
+            !repaired.contains(&torn[..20]),
+            "the torn fragment was truncated: {repaired}"
+        );
+        // The next append writes onto the clean boundary and replays.
+        let mut journal = WorkerRecoveryJournal::open(&path).unwrap();
+        journal
+            .record_queue_checkpoint(
+                "sess-b",
+                "sess-b-file",
+                None,
+                true,
+                "steer_queued",
+                &[],
+                &[],
+                Some(("msgreq_tx3", &receipt)),
+            )
+            .unwrap();
+        let reloaded = WorkerRecoveryJournal::open(&path).unwrap();
+        assert_eq!(
+            reloaded.cloud_inbox_receipt("msgreq_tx3"),
+            Some(&receipt),
+            "the post-repair append replays cleanly"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Mid-file corruption (an unparsable line followed by a valid one)
+    /// fails closed: the open refuses, the revival evidence reads as
+    /// nothing, and the file is left byte-for-byte alone — history is
+    /// never silently dropped.
+    #[test]
+    fn mid_file_corruption_fails_closed_and_preserves_the_file() {
+        let path = temp_path("mid-file.jsonl");
+        let mut journal = WorkerRecoveryJournal::open(&path).unwrap();
+        journal
+            .record("sess-c", "sess-c-file", None, true, "prompt_accepted")
+            .unwrap();
+        let valid = fs::read_to_string(&path).unwrap();
+        // The corruption: a bad line, then a valid append after it.
+        fs::write(&path, format!("{{this is not json\n{valid}")).unwrap();
+        let content_before = fs::read_to_string(&path).unwrap();
+        assert!(
+            WorkerRecoveryJournal::open(&path).is_err(),
+            "mid-file corruption fails closed"
+        );
+        assert!(
+            !WorkerRecoveryJournal::read_interrupted(&path),
+            "corrupted evidence proves nothing (uncertainty must not revive)"
+        );
+        assert!(
+            WorkerRecoveryJournal::read_latest(&path).is_err(),
+            "the read seam fails closed too"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            content_before,
+            "the corrupted file is never rewritten"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A corrupted-but-parseable transaction line (the digest does not
+    /// match its records) replays as nothing — half a transaction is
+    /// never a transaction.
+    #[test]
+    fn a_digest_mismatched_transaction_replays_as_nothing() {
+        let path = temp_path("bad-digest.jsonl");
+        let mut journal = WorkerRecoveryJournal::open(&path).unwrap();
+        let receipt = serde_json::json!({ "id": "agentmsg_tx4", "deliveryStatus": "delivered" });
+        journal
+            .record_queue_checkpoint(
+                "sess-d",
+                "sess-d-file",
+                None,
+                true,
+                "steer_queued",
+                &[],
+                &[],
+                Some(("msgreq_tx4", &receipt)),
+            )
+            .unwrap();
+        // Corrupt the digest in place (a complete line, a wrong seal).
+        let content = fs::read_to_string(&path).unwrap();
+        let corrupted = content.replace("\"digest\":\"", "\"digest\":\"deadbeef");
+        assert_ne!(corrupted, content, "the digest must be corruptible");
+        fs::write(&path, corrupted).unwrap();
+        // The scan drops the whole transaction and repairs the tail.
+        let reloaded = WorkerRecoveryJournal::open(&path).unwrap();
+        assert!(
+            reloaded.cloud_inbox_receipt("msgreq_tx4").is_none(),
+            "a mismatched seal never replays its admission"
+        );
+        assert!(
+            reloaded.latest_queue_snapshot("sess-d").is_none(),
+            "a mismatched seal never replays its queue row"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

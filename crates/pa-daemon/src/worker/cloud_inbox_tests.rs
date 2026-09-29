@@ -262,3 +262,143 @@ async fn unkeyed_delivery_stays_untracked() {
         "the keyed delivery must write the admission record: {content}"
     );
 }
+
+/// Finding-1 contract: a keyed delivery whose durable commit fails
+/// fails CLOSED — no receipt, the enqueue rolled back (exactly this
+/// delivery's item, the neighboring queue work untouched), and the same
+/// request id still deliverable once the journal recovers.
+#[tokio::test]
+async fn keyed_delivery_fails_closed_and_rolls_back_when_the_append_fails() {
+    let worker = created_worker().await;
+    // Neighboring queue work: an unkeyed local delivery, plus one keyed
+    // delivery that committed cleanly.
+    let local = worker
+        .dispatch(
+            "worker_deliver_message",
+            &json!({
+                "targetActiveSessionId": "target-session",
+                "message": "local neighbor",
+                "sender": { "activeSessionId": "source-session" },
+            }),
+        )
+        .await;
+    assert!(local.success, "the local neighbor delivery: {local:?}");
+    let committed = worker
+        .dispatch(
+            "worker_deliver_message",
+            &keyed_payload("committed", "msgreq_f1"),
+        )
+        .await;
+    assert!(
+        committed.success,
+        "the committed keyed delivery: {committed:?}"
+    );
+    // Sabotage the journal path (a directory where the file was): the
+    // next append fails, and the recovery read fails the same way.
+    let journal_path = worker.config.recovery_journal_path.clone();
+    std::fs::remove_file(&journal_path).unwrap();
+    std::fs::create_dir(&journal_path).unwrap();
+    let refused = worker
+        .dispatch(
+            "worker_deliver_message",
+            &keyed_payload("while broken", "msgreq_f2"),
+        )
+        .await;
+    assert!(
+        !refused.success,
+        "the delivery must fail closed when the commit fails: {refused:?}"
+    );
+    assert!(
+        refused
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("cloud inbox journal")),
+        "the TS-honest failure names the journal: {refused:?}"
+    );
+    // Exactly the failed delivery's item is gone; the neighbors and
+    // their order survive.
+    assert_eq!(
+        queue_texts(&worker.core, Lane::Steering),
+        vec![
+            "[agent-message from source-session]\n\nlocal neighbor",
+            "[agent-message from cloud kid]\n\ncommitted",
+        ],
+        "the rollback removed exactly the failed delivery"
+    );
+    // The journal recovers: the SAME request id delivers once.
+    std::fs::remove_dir(&journal_path).unwrap();
+    let retried = worker
+        .dispatch(
+            "worker_deliver_message",
+            &keyed_payload("while broken", "msgreq_f2"),
+        )
+        .await;
+    assert!(retried.success, "the retry after the repair: {retried:?}");
+    assert_eq!(
+        queue_texts(&worker.core, Lane::Steering).len(),
+        3,
+        "the retry delivered exactly once"
+    );
+    // The retry's receipt is durable: a duplicate answers it.
+    let retried_receipt = retried.data.expect("receipt");
+    let duplicate = worker
+        .dispatch(
+            "worker_deliver_message",
+            &keyed_payload("while broken", "msgreq_f2"),
+        )
+        .await;
+    assert_eq!(duplicate.data.expect("receipt"), retried_receipt);
+    assert_eq!(queue_texts(&worker.core, Lane::Steering).len(), 3);
+}
+
+/// The commit-outcome recovery: a failed append whose record actually
+/// landed (the fsync error was advisory) is answered with the receipt —
+/// never contradicted, never rolled back. The decision reads the
+/// journal state from disk.
+#[tokio::test]
+async fn a_landed_write_behind_a_failed_commit_is_answered_not_rolled_back() {
+    let worker = created_worker().await;
+    // One committed keyed delivery establishes the journal.
+    let committed = worker
+        .dispatch(
+            "worker_deliver_message",
+            &keyed_payload("first", "msgreq_g1"),
+        )
+        .await;
+    assert!(committed.success);
+    let committed_receipt = committed.data.expect("receipt");
+    // The commit of a SECOND delivery reports failure, but its write
+    // landed on disk (the disk state carries the transaction). The
+    // recover decision reads the disk: the recorded receipt for the
+    // request id proves the transaction is THIS delivery's.
+    let reloaded =
+        crate::journal::WorkerRecoveryJournal::open(&worker.config.recovery_journal_path).unwrap();
+    assert_eq!(
+        reloaded.cloud_inbox_receipt("msgreq_g1"),
+        Some(&committed_receipt),
+        "the committed transaction is on disk"
+    );
+    let recovered = crate::worker::input::recover_commit_outcome(
+        &worker.config.recovery_journal_path,
+        "msgreq_g1",
+        &committed_receipt,
+    );
+    assert!(
+        recovered.is_ok_and(|journal| journal.is_some()),
+        "a landed write is recovered, not contradicted"
+    );
+    // A receipt that is NOT on disk answers None (the rollback arm).
+    let ghost = crate::worker::input::recover_commit_outcome(
+        &worker.config.recovery_journal_path,
+        "msgreq_g1",
+        &json!({ "id": "agentmsg_ghost", "deliveryStatus": "delivered" }),
+    );
+    assert!(ghost.is_ok_and(|journal| journal.is_none()));
+    // A request id the journal never heard of answers None too.
+    let unknown = crate::worker::input::recover_commit_outcome(
+        &worker.config.recovery_journal_path,
+        "msgreq_unknown",
+        &committed_receipt,
+    );
+    assert!(unknown.is_ok_and(|journal| journal.is_none()));
+}

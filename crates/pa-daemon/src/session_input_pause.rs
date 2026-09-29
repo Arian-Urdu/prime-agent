@@ -38,7 +38,8 @@ pub(crate) struct InputPauseTable {
 }
 
 /// The release outcome (TS error strings surface through the arm).
-enum ReleaseOutcome {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReleaseOutcome {
     Released,
     Unknown,
     /// A foreign owner or session (the TS arm answers the same ownership
@@ -63,8 +64,15 @@ impl InputPauseTable {
     /// `acquire_session_input_pause`: dedupe on (owner, session, lease
     /// key) - an identical lease answers its existing pause id (TS
     /// `existing[0]`), otherwise a fresh id is minted and the admission
-    /// gate engages.
-    fn acquire(&self, active_session_id: &str, owner_client_id: &str, lease_key: &str) -> String {
+    /// gate engages. The worker's cloud-keyed delivery transaction
+    /// holds this gate across its durable commit so the runner cannot
+    /// consume an item whose admission has not landed.
+    pub(crate) fn acquire(
+        &self,
+        active_session_id: &str,
+        owner_client_id: &str,
+        lease_key: &str,
+    ) -> String {
         let mut pauses = self
             .pauses
             .lock()
@@ -92,7 +100,7 @@ impl InputPauseTable {
     /// `release_session_input_pause`: `Unknown` answers the plain TS
     /// success (an idempotent release), a foreign owner or session
     /// answers the TS ownership error, `Released` lifts the gate.
-    fn release(
+    pub(crate) fn release(
         &self,
         pause_id: &str,
         owner_client_id: &str,

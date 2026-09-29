@@ -15,7 +15,7 @@ pub(crate) use config::WorkerConfig;
 // itself does not reference it directly, so allow the unused-import lint deliberately.
 #[allow(unused_imports)]
 use env::KillCloseReason;
-mod input;
+pub(crate) mod input;
 mod lifecycle;
 mod summary;
 

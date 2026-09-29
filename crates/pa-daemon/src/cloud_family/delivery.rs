@@ -263,9 +263,12 @@ impl CloudFamilyDelivery for LocalFamilyDelivery {
     /// `Admitted`; an admitted-without-receipt request (a crash
     /// interrupted the first handling) is re-driven — safe, because the
     /// receiver inbox dedupes by request id — and its fresh receipt
-    /// answers `Admitted`; a request this receiver never admitted
-    /// answers `Unknown` (the honest limit the responder surfaces as
-    /// uncertain).
+    /// answers `Admitted`; a request this seam never admitted answers
+    /// `Unknown` (provably never attempted — the seam admits durably
+    /// BEFORE any delivery); an admitted request whose outcome the
+    /// re-drive could not resolve answers `Uncertain` — the receiver
+    /// may already hold the message, so nothing downstream may record a
+    /// negative answer from that state.
     async fn lookup_agent_message(&self, request_id: &str) -> AgentMessageLookup {
         let (admission, receipt) = {
             let inbox = self.locked_inbox();
@@ -280,11 +283,13 @@ impl CloudFamilyDelivery for LocalFamilyDelivery {
         match self.deliver_idempotent(&message).await {
             Ok(receipt) => AgentMessageLookup::Admitted(receipt),
             // The re-drive failed (the target is gone, the reach is now
-            // refused): the request stays reconcilable — answer the
-            // honest Unknown so the responder leaves it uncertain for
-            // the wiring layer's next pass, never claiming a receipt
-            // that does not exist.
-            Err(_) => AgentMessageLookup::Unknown,
+            // refused): the request WAS durably admitted at this seam,
+            // so the receiver may already hold the message. Answer
+            // `Uncertain` — never `Unknown` (which reads as
+            // never-attempted and would let the wiring re-drive into a
+            // durable negative answer for a delivered message) and never
+            // a fabricated receipt.
+            Err(_) => AgentMessageLookup::Uncertain,
         }
     }
 
@@ -390,21 +395,33 @@ impl CloudFamilyDelivery for LocalFamilyDelivery {
 ///   safe — and the receiver inbox dedupes by request id, so even an
 ///   in-flight first attempt cannot double-deliver.
 ///
-/// Returns the request ids reconciled (their answers are durable; the
-/// next replay of the event re-submits them without delivery).
+/// Returns the reconcile outcome: the ids whose answers are now DURABLE
+/// (the next replay re-submits them without delivery) and the ids that
+/// stayed unanswered — an unresolvable seam state (the receiver may
+/// already hold the message: never converted to a negative answer), a
+/// missing event payload, or a failed answer append. The unanswered set
+/// stays uncertain for the next pass.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct UncertainReconcile {
+    /// Request ids whose answers are durably recorded.
+    pub reconciled: Vec<String>,
+    /// Request ids still admitted-without-answer (retry the next pass).
+    pub unanswered: Vec<String>,
+}
 pub async fn reconcile_uncertain<D: CloudFamilyDelivery>(
     responder: &crate::cloud_family::CloudFamilyResponder,
     delivery: &D,
     events: &[CloudFamilyEvent],
-) -> Vec<String> {
+) -> UncertainReconcile {
     use pa_types::daemon::cloud::{CloudFamilyCommand, CloudFamilyCommandPayload};
 
     let uncertain = responder.uncertain();
-    let mut reconciled = Vec::new();
+    let mut outcome = UncertainReconcile::default();
     for request_id in uncertain {
         // The replayed event carrying the payload (an id whose event is
         // not in this batch stays for the next pass).
         let Some(event) = events.iter().find(|event| event.request_id() == request_id) else {
+            outcome.unanswered.push(request_id);
             continue;
         };
         let CloudFamilyEventPayload::AgentMessageRequest {
@@ -414,6 +431,7 @@ pub async fn reconcile_uncertain<D: CloudFamilyDelivery>(
             message,
         } = &event.payload
         else {
+            outcome.unanswered.push(request_id);
             continue;
         };
         let incoming = IncomingCloudMessage {
@@ -422,17 +440,33 @@ pub async fn reconcile_uncertain<D: CloudFamilyDelivery>(
             target_selector: target_selector.clone(),
             message: message.clone(),
         };
-        let (ok, receipt, error) = match delivery.lookup_agent_message(request_id).await {
+        let answer = match delivery.lookup_agent_message(request_id).await {
             // The receiver admitted: its receipt is the delivery truth.
-            AgentMessageLookup::Admitted(receipt) => (true, Some(receipt), None),
+            AgentMessageLookup::Admitted(receipt) => Some((true, Some(receipt), None)),
             // The seam never admitted this id: no delivery was ever
-            // attempted through it — re-drive safely.
+            // attempted through it — re-drive safely. A failure of the
+            // fresh attempt is the honest negative (nothing was ever
+            // visible), exactly like the responder's own delivery-error
+            // arm (TS `handleAgentMessageRequest`'s catch).
             AgentMessageLookup::Unknown => match delivery.deliver_agent_message(incoming).await {
-                Ok(receipt) => (true, Some(receipt), None),
-                Err(error) => (false, None, Some(error)),
+                Ok(receipt) => Some((true, Some(receipt), None)),
+                Err(error) => Some((false, None, Some(error))),
             },
+            // The seam durably admitted but the outcome could not be
+            // resolved: the receiver may already hold the message, so
+            // NEVER a durable answer from this state — it stays
+            // uncertain for the next pass, until a verified receipt or
+            // rejection exists.
+            AgentMessageLookup::Uncertain => None,
         };
-        responder
+        let Some((ok, receipt, error)) = answer else {
+            outcome.unanswered.push(request_id.clone());
+            continue;
+        };
+        // Only a durably-recorded answer reconciles the request: a
+        // failed answer append leaves it admitted-without-answer for the
+        // next pass (never reported as reconciled).
+        if responder
             .record_answer(CloudFamilyCommand {
                 payload: CloudFamilyCommandPayload::AgentMessageResult {
                     request_id: request_id.clone(),
@@ -441,10 +475,14 @@ pub async fn reconcile_uncertain<D: CloudFamilyDelivery>(
                     error,
                 },
             })
-            .ok();
-        reconciled.push(request_id.clone());
+            .is_err()
+        {
+            outcome.unanswered.push(request_id.clone());
+            continue;
+        }
+        outcome.reconciled.push(request_id.clone());
     }
-    reconciled
+    outcome
 }
 
 #[cfg(test)]

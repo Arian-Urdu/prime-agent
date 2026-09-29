@@ -48,7 +48,7 @@ pub mod family;
 pub mod inbox;
 pub mod log;
 
-pub use delivery::{reconcile_uncertain, LocalFamilyDelivery};
+pub use delivery::{reconcile_uncertain, LocalFamilyDelivery, UncertainReconcile};
 pub use exchange::{
     AgentMessageLookup, CloudFamilyDelivery, CloudFamilyRequestError, CloudFamilyRequestOutcome,
     CloudFamilyRequester, CloudFamilyResponder, FamilyResultSubmitter, HandleOutcome,

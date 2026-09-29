@@ -350,7 +350,9 @@ async fn crash_after_receiver_admission_reconciles_without_a_duplicate() {
             reconciled, delivered,
             "the reconciled receipt is the receiver's recorded one"
         ),
-        AgentMessageLookup::Unknown => panic!("the lookup must reconcile, answered Unknown"),
+        AgentMessageLookup::Unknown | AgentMessageLookup::Uncertain => {
+            panic!("the lookup must reconcile, answered the non-admitted/unresolvable arm")
+        }
     }
     assert_eq!(
         visible_message_count(&harness),
@@ -384,8 +386,8 @@ async fn crash_before_receiver_admission_re_drives_exactly_once() {
                 "the re-drive delivered: {receipt:?}"
             );
         }
-        AgentMessageLookup::Unknown => {
-            panic!("the re-drive must answer Admitted, answered Unknown")
+        AgentMessageLookup::Unknown | AgentMessageLookup::Uncertain => {
+            panic!("the re-drive must answer Admitted, answered the non-admitted/unresolvable arm")
         }
     }
     assert_eq!(
@@ -575,13 +577,18 @@ async fn responder_crash_before_receiver_admission_reconciles_by_re_driving() {
         "nothing was delivered yet"
     );
     // The wiring reconcile: the re-drive delivers exactly once.
-    let reconciled = crate::cloud_family::delivery::reconcile_uncertain(
+    let outcome = crate::cloud_family::delivery::reconcile_uncertain(
         &responder,
         &delivery,
         std::slice::from_ref(&event),
     )
     .await;
-    assert_eq!(reconciled, vec!["msgreq_c1".to_string()]);
+    assert_eq!(
+        outcome.reconciled,
+        vec!["msgreq_c1".to_string()],
+        "the re-drive reconciled the request"
+    );
+    assert!(outcome.unanswered.is_empty(), "nothing stayed uncertain");
     assert_eq!(
         visible_message_count(&harness),
         1,
@@ -726,5 +733,187 @@ async fn responder_duplicate_with_a_journaled_answer_resubmits_without_delivery(
     assert_eq!(
         submitted[0].1, submitted[1].1,
         "the duplicate re-submits the same answer"
+    );
+}
+
+/// Finding-4 contract: a durably-admitted request whose outcome the
+/// re-drive cannot resolve (the target's roster row is gone) answers
+/// `Uncertain` — never `Unknown` (which would read as never-attempted)
+/// and never a durable negative. The reconcile leaves it unanswered,
+/// nothing is recorded, and the recovery — once the target is reachable
+/// again — resolves to the receiver's recorded receipt with no
+/// duplicate visible message.
+#[tokio::test]
+async fn an_unresolvable_admitted_request_stays_uncertain_never_negative() {
+    let harness = harness().await;
+    let delivery = seam(&harness);
+    // The delivery completed (the worker holds the inbox key and the
+    // visible item), then the crash: the seam's receipt record never
+    // landed.
+    let recorded = delivery
+        .deliver_agent_message(cloud_message("msgreq_u1", "target-root-1"))
+        .await
+        .expect("the delivery the dead pass drove")
+        .clone();
+    truncate_journal_tail(&harness);
+    let seam_process_died = seam(&harness);
+    // The target disappears from the roster: the re-drive cannot resolve.
+    {
+        let mut roster = harness
+            .supervisor
+            .roster
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        roster.delete("sess-target-1");
+    }
+    assert_eq!(
+        seam_process_died.lookup_agent_message("msgreq_u1").await,
+        AgentMessageLookup::Uncertain,
+        "an admitted-but-unresolvable request answers Uncertain, never Unknown"
+    );
+    // The responder holds the same crash-gap state: the reconcile must
+    // leave it uncertain and NEVER record a negative answer for a
+    // message the receiver already holds.
+    let responder_path = harness.dir.join("family-results.jsonl");
+    {
+        let mut results = FamilyResultLog::open(&responder_path).unwrap();
+        results.admit("msgreq_u1").unwrap();
+    }
+    let responder = CloudFamilyResponder::new(FamilyResultLog::open(&responder_path).unwrap());
+    let event = agent_message_event("msgreq_u1", "target-root-1");
+    let submitter = RecordingSubmitter {
+        submitted: std::sync::Mutex::new(Vec::new()),
+    };
+    // The replay surfaces Uncertain; the wiring reconcile cannot resolve
+    // it either — it stays unanswered, nothing recorded.
+    let outcome = responder
+        .handle_event(&event, &seam_process_died, &submitter)
+        .await
+        .expect("the replay");
+    assert_eq!(outcome, HandleOutcome::Uncertain);
+    let reconcile = crate::cloud_family::delivery::reconcile_uncertain(
+        &responder,
+        &seam_process_died,
+        std::slice::from_ref(&event),
+    )
+    .await;
+    assert!(
+        reconcile.reconciled.is_empty(),
+        "an unresolvable request is never reconciled"
+    );
+    assert_eq!(reconcile.unanswered, vec!["msgreq_u1".to_string()]);
+    assert!(
+        submitter.submitted.lock().unwrap().is_empty(),
+        "no answer was submitted for the uncertain request"
+    );
+    assert_eq!(responder.uncertain(), vec!["msgreq_u1".to_string()]);
+    // The target returns: the next resolve answers the receiver's
+    // recorded receipt (the worker's durable inbox key), one visible
+    // message, reconciled.
+    {
+        let mut roster = harness
+            .supervisor
+            .roster
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        roster.write_summary(
+            roster_summary(
+                "target-root-1",
+                "sess-target-1",
+                "target",
+                1,
+                Some(harness.dir.join("parent.jsonl").to_string_lossy().as_ref()),
+            ),
+            Some("target-root-1"),
+            None,
+        );
+    }
+    assert_eq!(
+        seam_process_died.lookup_agent_message("msgreq_u1").await,
+        AgentMessageLookup::Admitted(recorded.clone()),
+        "the recovery resolves to the receiver's recorded receipt"
+    );
+    let recovered = crate::cloud_family::delivery::reconcile_uncertain(
+        &responder,
+        &seam_process_died,
+        std::slice::from_ref(&event),
+    )
+    .await;
+    assert_eq!(recovered.reconciled, vec!["msgreq_u1".to_string()]);
+    assert!(recovered.unanswered.is_empty());
+    assert_eq!(
+        visible_message_count(&harness),
+        1,
+        "the recovery never duplicated the visible message"
+    );
+    // The answer is durable; the NEXT replay re-submits it through the
+    // submit seam without any delivery.
+    let replayed = responder
+        .handle_event(&event, &seam_process_died, &submitter)
+        .await
+        .expect("the post-reconcile replay");
+    assert_eq!(replayed, HandleOutcome::DuplicateResubmitted);
+    let submitted = submitter.submitted.lock().unwrap().clone();
+    let (_, command) = submitted.first().expect("the answer was submitted");
+    match &command.payload {
+        CloudFamilyCommandPayload::AgentMessageResult { ok, receipt, .. } => {
+            assert!(*ok, "the recovered answer is positive: {command:?}");
+            let receipt = receipt.as_ref().expect("the recorded receipt");
+            assert_eq!(receipt.id, recorded.id);
+        }
+        other => panic!("the answer must be an agent_message_result: {other:?}"),
+    }
+    assert_eq!(
+        visible_message_count(&harness),
+        1,
+        "the replay after the reconcile delivered nothing"
+    );
+}
+
+/// Finding-3 contract: only a durably-recorded answer reconciles a
+/// request. A failed answer append (the responder's journal is
+/// unwritable) leaves the id unanswered and uncertain — the wiring can
+/// retry the same pass once the disk recovers, and the retry reconciles.
+#[tokio::test]
+async fn a_failed_answer_append_leaves_the_request_unanswered_for_retry() {
+    let harness = harness().await;
+    let delivery = seam(&harness);
+    let responder_path = harness.dir.join("family-results.jsonl");
+    {
+        let mut results = FamilyResultLog::open(&responder_path).unwrap();
+        results.admit("msgreq_r1").unwrap();
+    }
+    let responder = CloudFamilyResponder::new(FamilyResultLog::open(&responder_path).unwrap());
+    let event = agent_message_event("msgreq_r1", "target-root-1");
+    // The resolve needs a durable answer target: sabotage the results
+    // journal path so the answer append fails (a directory at the path —
+    // the append opens for write and hits EISDIR/ENOTDIR).
+    std::fs::remove_file(&responder_path).unwrap();
+    std::fs::create_dir(&responder_path).unwrap();
+    let outcome = crate::cloud_family::delivery::reconcile_uncertain(
+        &responder,
+        &delivery,
+        std::slice::from_ref(&event),
+    )
+    .await;
+    assert!(
+        outcome.reconciled.is_empty(),
+        "a failed answer append never reports reconciled"
+    );
+    assert_eq!(outcome.unanswered, vec!["msgreq_r1".to_string()]);
+    assert_eq!(responder.uncertain(), vec!["msgreq_r1".to_string()]);
+    // The disk recovers: the retry reconciles the same request.
+    std::fs::remove_dir(&responder_path).unwrap();
+    let retry = crate::cloud_family::delivery::reconcile_uncertain(
+        &responder,
+        &delivery,
+        std::slice::from_ref(&event),
+    )
+    .await;
+    assert_eq!(retry.reconciled, vec!["msgreq_r1".to_string()]);
+    assert!(retry.unanswered.is_empty());
+    assert!(
+        responder.uncertain().is_empty(),
+        "the answer is durable now"
     );
 }

@@ -98,12 +98,13 @@ impl CloudFamilyResponder {
                                 error: None,
                             },
                         },
-                        // The receiver has no idempotent record: the
-                        // delivery outcome is unknowable without
-                        // re-delivering, so the request stays uncertain —
-                        // the honest release-gate limit, surfaced for the
-                        // wiring layer.
-                        AgentMessageLookup::Unknown => {
+                        // No idempotent record (provably never
+                        // attempted) or an unresolvable outcome (the
+                        // receiver may already hold the message): either
+                        // way the request stays uncertain — the wiring
+                        // layer reconciles it through the seam and
+                        // records the answer, never this substrate.
+                        AgentMessageLookup::Unknown | AgentMessageLookup::Uncertain => {
                             return Ok(HandleOutcome::Uncertain);
                         }
                     }

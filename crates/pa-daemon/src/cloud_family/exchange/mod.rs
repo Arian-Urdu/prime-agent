@@ -103,6 +103,14 @@ pub enum AgentMessageLookup {
     /// answers `Unknown` for the unknowable case too: then the request
     /// stays uncertain, never re-delivered.
     Unknown,
+    /// The receiver durably admitted this request id but its delivery
+    /// outcome could not be resolved: the receiver may already hold the
+    /// message (a crash interrupted the handling, and the resolve re-drive
+    /// failed — the target unreachable, the family reach now refused).
+    /// Nothing may record a negative answer from this state: the wiring
+    /// retries the resolve until a verified receipt or rejection exists,
+    /// and the request stays uncertain meanwhile.
+    Uncertain,
 }
 
 /// The local-side delivery seam for cross-boundary family traffic: the
@@ -122,8 +130,13 @@ pub trait CloudFamilyDelivery: Send + Sync {
     /// Receiver-side idempotent receipt lookup by request id — the
     /// reconciliation seam for an uncertain request (durably admitted,
     /// answer unknown because a crash interrupted the handling): the
-    /// receiver that recorded the admission answers it, and the responder
-    /// journals the answer without re-delivering.
+    /// receiver that recorded the admission answers it
+    /// ([`AgentMessageLookup::Admitted`]); a request the seam never
+    /// admitted answers [`AgentMessageLookup::Unknown`] (provably never
+    /// attempted — safe to re-drive); a durably-admitted request whose
+    /// outcome the lookup could not resolve answers
+    /// [`AgentMessageLookup::Uncertain`] (the receiver may already hold
+    /// the message — never a negative answer from that state).
     fn lookup_agent_message(
         &self,
         request_id: &str,

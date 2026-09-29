@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.9.8] - 2026-09-29
+
+- Fixed Codex subscription model discovery to claim the current stable Codex CLI release (0.159.0, up from 0.153.4): ChatGPT gates the discovery endpoint on `client_version`, and the stale pin hid GPT-6 Sol and Luna from `rlm` subagent delegation and `find_models()` while the `/model` picker kept offering them ([#2544](https://github.com/PrimeIntellect-ai/prime-agent/discussions/2544)).
+- Fixed the model picker showing a stale model list for up to a minute when opened without a search term (Ctrl+L or plain `/model`); it now always refreshes the catalog on open ([#2504](https://github.com/PrimeIntellect-ai/prime-agent/pull/2504) by [@sirouk](https://github.com/sirouk)).
+
 ## [0.9.7] - 2026-09-28
 
 - Changed the continual-harness kernel surface back to the twelve per-kind CRUD methods on `rlm.harness` (`create_memory`/`update_memory`/`delete_memory` plus the `*_skill`, `*_subagent`, and `*_prompt_note` methods), the `path` spelling of the harness entry grouping, and callable `rlm.harness.record_refinement`/`plan_refinement`, reverting #2154 and #2155 at the user's request.

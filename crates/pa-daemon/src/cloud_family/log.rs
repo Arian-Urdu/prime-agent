@@ -24,7 +24,7 @@ use pa_types::daemon::cloud::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::MAX_REMEMBERED_REQUESTS;
+use super::DEFAULT_OUTBOX_RECORDS;
 use crate::util::now_iso;
 
 /// Fixed event-log epoch for this slice (TS starts every outbox at
@@ -235,20 +235,53 @@ impl FamilyRequestLog {
     }
 }
 
-/// One durable answer record per remembered request id (the responder side).
-/// First writer wins: a repeat record is a no-op, so the journaled answer is
-/// exactly-once per request id even when the guest replays the request
-/// event.
+/// One durably-admitted request slot: the request id plus its journaled
+/// answer once one exists.
+struct ResultSlot {
+    request_id: String,
+    result: Option<CloudFamilyCommand>,
+}
+
+/// The responder's two-phase answer journal (the durable half of TS
+/// `markRemoteRequestProcessed` plus the crash-gap fix TS does not have):
+///
+/// 1. `admit` durably records that a request id is being processed —
+///    BEFORE any delivery — so a replay after a crash between delivery and
+///    the answer record can never re-deliver.
+/// 2. `record` durably records the answer for an admitted request.
+///
+/// A slot that is admitted without an answer is UNCERTAIN: the request may
+/// or may not have been delivered before the crash. The substrate never
+/// re-delivers an uncertain request; the wiring layer reconciles it (the
+/// receiver is idempotent by request id, or an answer is recorded
+/// explicitly via [`CloudFamilyResponder::record_answer`]) and only then
+/// does a replay re-submit the answer.
+///
+/// Both phases are append-only NDJSON with fsync; the newest
+/// [`DEFAULT_OUTBOX_RECORDS`] request slots survive. The window matches
+/// the request outbox's record cap — the largest replay span — so a
+/// replayed request always finds its journal state (TS's dedupe was 256
+/// ephemeral in-memory ids, crash-blind; the durable window closes that).
 pub struct FamilyResultLog {
     path: PathBuf,
-    remembered: VecDeque<CloudFamilyCommand>,
+    slots: VecDeque<ResultSlot>,
     max_remembered: usize,
 }
 
+/// What `admit` found on disk for one request id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// This call is the first durable admission: proceed.
+    First,
+    /// The request is already durably admitted: a duplicate, in flight, or
+    /// a crash-gap survivor — never re-deliver.
+    Already,
+}
+
 impl FamilyResultLog {
-    /// Open (or create) the result log at `path`, replaying the remembered
-    /// answers. A crash-truncated or malformed tail is skipped, like the
-    /// recovery journals.
+    /// Open (or create) the journal at `path`, replaying admitted requests
+    /// and their answers. A crash-truncated or malformed tail is skipped,
+    /// like the recovery journals.
     ///
     /// # Errors
     ///
@@ -259,8 +292,11 @@ impl FamilyResultLog {
         }
         let mut log = Self {
             path: path.to_path_buf(),
-            remembered: VecDeque::new(),
-            max_remembered: MAX_REMEMBERED_REQUESTS,
+            slots: VecDeque::new(),
+            // The dedupe window must cover the largest possible replay
+            // span — the request outbox's own record cap — so every
+            // replayable request finds its journal state.
+            max_remembered: DEFAULT_OUTBOX_RECORDS,
         };
         log.load();
         Ok(log)
@@ -268,46 +304,109 @@ impl FamilyResultLog {
 
     /// The journaled answer for `request_id`, newest first.
     #[must_use]
-    pub fn get(&self, request_id: &str) -> Option<CloudFamilyCommand> {
-        self.remembered
+    pub fn result(&self, request_id: &str) -> Option<CloudFamilyCommand> {
+        self.slots
             .iter()
             .rev()
-            .find(|command| command.request_id() == request_id)
-            .cloned()
+            .find(|slot| slot.request_id == request_id)
+            .and_then(|slot| slot.result.clone())
     }
 
-    /// Record one answer durably. An id that already has an answer is a
-    /// no-op (first writer wins). The oldest answer beyond
-    /// [`MAX_REMEMBERED_REQUESTS`] is evicted — a replayed request past the
-    /// window re-delivers (at-least-once, TS parity), and the guest's
-    /// journal still dedupes the answer command.
+    /// Durably admit one request id BEFORE delivery. The append is fsync'd
+    /// before `First` is returned, so a crash right after this call still
+    /// leaves the admission on disk.
     ///
     /// # Errors
     ///
-    /// Returns an error when the durable append or the post-append
-    /// compaction fails.
+    /// Returns an error when the durable admission append fails.
+    pub fn admit(&mut self, request_id: &str) -> Result<Admission> {
+        if self.slot(request_id).is_some() {
+            return Ok(Admission::Already);
+        }
+        crate::journal::append_record(
+            &self.path,
+            &json!({"version": 1, "type": "admitted", "requestId": request_id}),
+        )?;
+        self.push_slot(request_id.to_string(), None);
+        Ok(Admission::First)
+    }
+
+    /// Durably record the answer for an admitted request. First writer
+    /// wins: an id that already has an answer is a no-op. Recording an
+    /// answer for a request that was never admitted is a protocol error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request was never admitted or the durable
+    /// answer append or the post-append compaction fails.
     pub fn record(&mut self, command: CloudFamilyCommand) -> Result<()> {
-        if self.get(command.request_id()).is_some() {
+        let request_id = command.request_id().to_string();
+        if self.slot(&request_id).is_none() {
+            return Err(anyhow!(
+                "cannot record an answer before admitting {request_id}"
+            ));
+        }
+        if self.result(&request_id).is_some() {
             return Ok(());
         }
-        let record = json!({"version": 1, "command": command});
-        crate::journal::append_record(&self.path, &record)?;
-        self.remembered.push_back(command);
-        while self.remembered.len() > self.max_remembered {
-            self.remembered.pop_front();
-            self.compact()?;
+        crate::journal::append_record(
+            &self.path,
+            &json!({"version": 1, "type": "result", "requestId": request_id, "command": command}),
+        )?;
+        if let Some(slot) = self.slot_mut(&request_id) {
+            slot.result = Some(command);
         }
         Ok(())
     }
 
-    fn compact(&mut self) -> Result<()> {
-        let records: Vec<Value> = self
-            .remembered
+    /// Request ids durably admitted without a journaled answer — the
+    /// crash-gap set the wiring layer must reconcile before their events
+    /// may be replayed.
+    #[must_use]
+    pub fn uncertain(&self) -> Vec<String> {
+        self.slots
             .iter()
-            .map(|command| json!({"version": 1, "command": command}))
+            .filter(|slot| slot.result.is_none())
+            .map(|slot| slot.request_id.clone())
+            .collect()
+    }
+
+    fn slot(&self, request_id: &str) -> Option<usize> {
+        self.slots
+            .iter()
+            .rposition(|slot| slot.request_id == request_id)
+    }
+
+    fn slot_mut(&mut self, request_id: &str) -> Option<&mut ResultSlot> {
+        let index = self.slot(request_id)?;
+        self.slots.get_mut(index)
+    }
+
+    fn push_slot(&mut self, request_id: String, result: Option<CloudFamilyCommand>) {
+        self.slots.push_back(ResultSlot { request_id, result });
+        while self.slots.len() > self.max_remembered {
+            self.slots.pop_front();
+            self.compact();
+        }
+    }
+
+    /// Rewrite the journal to the live window, durably (temp file, fsync,
+    /// rename). Admits without answers survive compaction as admits, so a
+    /// compact can never strand an uncertain request.
+    fn compact(&mut self) {
+        let records: Vec<Value> = self
+            .slots
+            .iter()
+            .flat_map(|slot| {
+                let admitted = json!({"version": 1, "type": "admitted", "requestId": slot.request_id});
+                let result = slot.result.as_ref().map(|command| {
+                    json!({"version": 1, "type": "result", "requestId": slot.request_id, "command": command})
+                });
+                std::iter::once(admitted).chain(result)
+            })
             .collect();
-        crate::journal::rewrite_records(&self.path, &records, crate::journal::Finalize::Synced)?;
-        Ok(())
+        let _ =
+            crate::journal::rewrite_records(&self.path, &records, crate::journal::Finalize::Synced);
     }
 
     fn load(&mut self) {
@@ -322,14 +421,26 @@ impl FamilyResultLog {
             if record.get("version").and_then(Value::as_u64) != Some(1) {
                 continue;
             }
-            let Ok(command) = serde_json::from_value::<CloudFamilyCommand>(
-                record.get("command").cloned().unwrap_or(Value::Null),
-            ) else {
+            let Some(request_id) = record.get("requestId").and_then(Value::as_str) else {
                 continue;
             };
-            self.remembered.push_back(command);
-            while self.remembered.len() > self.max_remembered {
-                self.remembered.pop_front();
+            match record.get("type").and_then(Value::as_str) {
+                Some("admitted") => {
+                    if self.slot(request_id).is_none() {
+                        self.push_slot(request_id.to_string(), None);
+                    }
+                }
+                Some("result") => {
+                    let Ok(command) = serde_json::from_value::<CloudFamilyCommand>(
+                        record.get("command").cloned().unwrap_or(Value::Null),
+                    ) else {
+                        continue;
+                    };
+                    if let Some(slot) = self.slot_mut(request_id) {
+                        slot.result.get_or_insert(command);
+                    }
+                }
+                _ => {}
             }
         }
     }

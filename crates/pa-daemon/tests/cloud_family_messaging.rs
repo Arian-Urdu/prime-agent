@@ -2,8 +2,17 @@
 //! exchange over real durable logs, with the honesty contracts the design
 //! pins — a receipt exists only after receiver admission, `Pending` is
 //! durable-admitted-but-unanswered (never "queued"/"delivered"), a stalled
-//! log fails the send, duplicates and restarts never re-deliver, and the
-//! on-disk request envelope is the TS outbox record byte-for-byte.
+//! log fails the send, and the on-disk request envelope is the TS outbox
+//! record byte-for-byte.
+//!
+//! Crash-gap protocol: every request is durably admitted BEFORE delivery;
+//! an admitted-without-answer request is UNCERTAIN and never re-delivered —
+//! a replay reconciles it through the receiver's idempotent lookup seam
+//! (the test delivery records its admissions by request id, exactly what
+//! the production receiver must implement). Without a receiver-side
+//! idempotent record, the lookup answers `Unknown` and the request stays
+//! uncertain: that is the release blocker the wiring PR must close, and
+//! why nothing here claims reliable offline messaging.
 //!
 //! The delivery and submitter doubles implement the real seams; production
 //! wiring (cloud registry attachment) is a later PR — nothing here fakes a
@@ -14,14 +23,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::sync::oneshot;
+
 use pa_daemon::cloud_family::{
-    CloudFamilyDelivery, CloudFamilyRequestError, CloudFamilyRequestOutcome, CloudFamilyRequester,
-    CloudFamilyResponder, FamilyRequestLog, FamilyResultLog, FamilyResultSubmitter, HandleOutcome,
-    IncomingCloudMessage, ResolveOutcome,
+    AgentMessageLookup, CloudFamilyDelivery, CloudFamilyRequestError, CloudFamilyRequestOutcome,
+    CloudFamilyRequester, CloudFamilyResponder, FamilyRequestLog, FamilyResultLog,
+    FamilyResultSubmitter, HandleOutcome, IncomingCloudMessage, ResolveOutcome,
 };
 use pa_types::daemon::cloud::{
     canonical_json, CloudAgentMessageDeliveryStatus, CloudAgentMessageReceipt, CloudFamilyCommand,
-    CloudFamilyEventPayload, CloudFamilyRow,
+    CloudFamilyCommandPayload, CloudFamilyEventPayload, CloudFamilyRow,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -32,8 +43,27 @@ struct TestDelivery {
     admitted: Mutex<Vec<IncomingCloudMessage>>,
     roster_calls: Mutex<Vec<String>>,
     errors_for: Mutex<HashMap<String, String>>,
+    /// The receiver's idempotent record: request id -> admitted receipt.
+    /// Recorded exactly when the receiver admits a message, so a
+    /// post-admission crash still leaves the truth to reconcile from.
+    receiver_receipts: Mutex<HashMap<String, CloudAgentMessageReceipt>>,
     roster_error: Mutex<Option<String>>,
     rows: Vec<CloudFamilyRow>,
+    /// Panic inside `deliver_agent_message` AFTER the receiver recorded its
+    /// admission — simulates a process crash between the receiver's
+    /// idempotent admission and the responder's answer record.
+    panic_in_delivery: AtomicBool,
+    /// Panic inside `deliver_agent_message` BEFORE the receiver records —
+    /// the receiver never admitted, so its lookup answers `Unknown`.
+    panic_before_admission: AtomicBool,
+    /// Panic inside `family_roster` — the roster crash gap.
+    panic_in_roster: AtomicBool,
+    /// When set, the delivery waits on this gate before answering, so a
+    /// second handler can observe the in-flight state.
+    delivery_gate: Mutex<Option<oneshot::Receiver<()>>>,
+    /// When set, the delivery replaces this journal file with a directory
+    /// before answering, so the answer-record append fails (EISDIR).
+    sabotage_results_path: Mutex<Option<std::path::PathBuf>>,
 }
 
 impl TestDelivery {
@@ -42,7 +72,13 @@ impl TestDelivery {
             admitted: Mutex::new(Vec::new()),
             roster_calls: Mutex::new(Vec::new()),
             errors_for: Mutex::new(HashMap::new()),
+            receiver_receipts: Mutex::new(HashMap::new()),
             roster_error: Mutex::new(None),
+            panic_in_delivery: AtomicBool::new(false),
+            panic_before_admission: AtomicBool::new(false),
+            panic_in_roster: AtomicBool::new(false),
+            delivery_gate: Mutex::new(None),
+            sabotage_results_path: Mutex::new(None),
             rows: vec![CloudFamilyRow {
                 id: "sess_local_1".to_string(),
                 name: Some("local parent".to_string()),
@@ -66,10 +102,23 @@ impl CloudFamilyDelivery for TestDelivery {
         message: IncomingCloudMessage,
     ) -> Result<CloudAgentMessageReceipt, String> {
         self.admitted.lock().unwrap().push(message.clone());
+        let gate = self.delivery_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            let _ = gate.await;
+        }
+        if self.panic_before_admission.load(Ordering::SeqCst) {
+            std::panic::panic_any("simulated crash before the receiver admitted");
+        }
+        if let Some(path) = self.sabotage_results_path.lock().unwrap().take() {
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+        }
         if let Some(error) = self.errors_for.lock().unwrap().get(&message.request_id) {
             return Err(error.clone());
         }
-        Ok(CloudAgentMessageReceipt {
+        // The receiver admits idempotently by request id: the record is
+        // the reconciliation truth, and a later crash cannot undo it.
+        let receipt = CloudAgentMessageReceipt {
             id: format!("agentmsg_{}", message.request_id),
             delivery_status: CloudAgentMessageDeliveryStatus::Delivered,
             rest: {
@@ -78,7 +127,22 @@ impl CloudFamilyDelivery for TestDelivery {
                 map.insert("deliveryMode".to_string(), json!("steer"));
                 map
             },
-        })
+        };
+        self.receiver_receipts
+            .lock()
+            .unwrap()
+            .insert(message.request_id.clone(), receipt.clone());
+        if self.panic_in_delivery.load(Ordering::SeqCst) {
+            std::panic::panic_any("simulated crash between delivery and the answer record");
+        }
+        Ok(receipt)
+    }
+
+    async fn lookup_agent_message(&self, request_id: &str) -> AgentMessageLookup {
+        match self.receiver_receipts.lock().unwrap().get(request_id) {
+            Some(receipt) => AgentMessageLookup::Admitted(receipt.clone()),
+            None => AgentMessageLookup::Unknown,
+        }
     }
 
     async fn family_roster(
@@ -89,6 +153,9 @@ impl CloudFamilyDelivery for TestDelivery {
             .lock()
             .unwrap()
             .push(for_remote_session_id.to_string());
+        if self.panic_in_roster.load(Ordering::SeqCst) {
+            std::panic::panic_any("simulated crash during the roster read");
+        }
         if let Some(error) = self.roster_error.lock().unwrap().clone() {
             return Err(error);
         }
@@ -664,4 +731,409 @@ fn agent_message_event_payload(message: &str) -> CloudFamilyEventPayload {
         target_selector: "sibling".to_string(),
         message: message.to_string(),
     }
+}
+
+#[tokio::test]
+async fn crash_after_receiver_admission_reconciles_through_the_seam() {
+    let dir = tempfile::tempdir().unwrap();
+    let requester = requester(open_request_log(dir.path(), 50));
+    let task = tokio::spawn({
+        let sender = Arc::clone(&requester);
+        async move {
+            sender
+                .send_agent_message("remote_child", "sibling", "hello")
+                .await
+        }
+    });
+    let event = wait_for_event(&requester).await;
+
+    let results = dir.path().join("results.ndjson");
+    let delivery = Arc::new(TestDelivery::new());
+    let submitter = Arc::new(TestSubmitter::new());
+    let responder = Arc::new(CloudFamilyResponder::new(
+        FamilyResultLog::open(&results).unwrap(),
+    ));
+    // The process dies between the receiver's idempotent admission and the
+    // responder's answer record.
+    delivery.panic_in_delivery.store(true, Ordering::SeqCst);
+    let crashed = tokio::spawn({
+        let responder = Arc::clone(&responder);
+        let delivery = Arc::clone(&delivery);
+        let submitter = Arc::clone(&submitter);
+        let event = event.clone();
+        async move {
+            responder
+                .handle_event(&event, delivery.as_ref(), submitter.as_ref())
+                .await
+        }
+    });
+    assert!(crashed.await.unwrap_err().is_panic(), "delivery must crash");
+    assert_eq!(delivery.deliveries(), 1);
+    assert!(submitter.calls().is_empty());
+
+    // Restart over the same durable journal: the request is durably
+    // admitted with an unknown outcome, and the replay RECONCILES it
+    // through the receiver's idempotent lookup — the recorded admission
+    // becomes the journaled answer without any re-delivery.
+    delivery.panic_in_delivery.store(false, Ordering::SeqCst);
+    let restarted = CloudFamilyResponder::new(FamilyResultLog::open(&results).unwrap());
+    assert_eq!(restarted.uncertain(), vec![event.request_id().to_string()]);
+    let outcome = restarted
+        .handle_event(&event, delivery.as_ref(), submitter.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(outcome, HandleOutcome::Reconciled);
+    assert_eq!(delivery.deliveries(), 1, "reconciliation never re-delivers");
+    assert!(restarted.uncertain().is_empty());
+    assert_eq!(submitter.calls().len(), 1);
+    let (_, command) = submitter.calls()[0].clone();
+    assert_eq!(
+        command.payload,
+        CloudFamilyCommandPayload::AgentMessageResult {
+            request_id: event.request_id().to_string(),
+            ok: true,
+            receipt: Some(CloudAgentMessageReceipt {
+                id: format!("agentmsg_{}", event.request_id()),
+                delivery_status: CloudAgentMessageDeliveryStatus::Delivered,
+                rest: {
+                    let mut map = serde_json::Map::new();
+                    map.insert("message".to_string(), json!("hello"));
+                    map.insert("deliveryMode".to_string(), json!("steer"));
+                    map
+                },
+            }),
+            error: None,
+        }
+    );
+
+    requester.resolve_result(&command);
+    assert!(matches!(
+        task.await.unwrap().unwrap(),
+        CloudFamilyRequestOutcome::Answered(_)
+    ));
+}
+
+#[tokio::test]
+async fn unknown_lookup_keeps_the_request_uncertain_without_redelivery() {
+    let dir = tempfile::tempdir().unwrap();
+    let requester = requester(open_request_log(dir.path(), 50));
+    let task = tokio::spawn({
+        let sender = Arc::clone(&requester);
+        async move {
+            sender
+                .send_agent_message("remote_child", "sibling", "hello")
+                .await
+        }
+    });
+    let event = wait_for_event(&requester).await;
+
+    let results = dir.path().join("results.ndjson");
+    let delivery = Arc::new(TestDelivery::new());
+    let submitter = Arc::new(TestSubmitter::new());
+    let responder = Arc::new(CloudFamilyResponder::new(
+        FamilyResultLog::open(&results).unwrap(),
+    ));
+    // The process dies BEFORE the receiver recorded anything: the
+    // receiver's idempotent lookup answers Unknown.
+    delivery
+        .panic_before_admission
+        .store(true, Ordering::SeqCst);
+    let crashed = tokio::spawn({
+        let responder = Arc::clone(&responder);
+        let delivery = Arc::clone(&delivery);
+        let submitter = Arc::clone(&submitter);
+        let event = event.clone();
+        async move {
+            responder
+                .handle_event(&event, delivery.as_ref(), submitter.as_ref())
+                .await
+        }
+    });
+    assert!(crashed.await.unwrap_err().is_panic(), "delivery must crash");
+    assert_eq!(delivery.deliveries(), 1);
+
+    delivery
+        .panic_before_admission
+        .store(false, Ordering::SeqCst);
+    let restarted = CloudFamilyResponder::new(FamilyResultLog::open(&results).unwrap());
+    // The replay cannot decide: the receiver knows nothing, and
+    // re-delivering is exactly what the admission gate exists to prevent.
+    let outcome = restarted
+        .handle_event(&event, delivery.as_ref(), submitter.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(outcome, HandleOutcome::Uncertain);
+    assert_eq!(
+        delivery.deliveries(),
+        1,
+        "an uncertain request is never re-delivered"
+    );
+    assert_eq!(restarted.uncertain(), vec![event.request_id().to_string()]);
+    assert!(submitter.calls().is_empty());
+
+    // The requester is honestly unanswered: Pending, never a receipt.
+    assert!(matches!(
+        task.await.unwrap().unwrap(),
+        CloudFamilyRequestOutcome::Pending { .. }
+    ));
+}
+
+#[tokio::test]
+async fn roster_crash_replay_reruns_the_read_and_reconciles() {
+    let dir = tempfile::tempdir().unwrap();
+    let requester = requester(open_request_log(dir.path(), 50));
+    let task = tokio::spawn({
+        let sender = Arc::clone(&requester);
+        async move { sender.request_family_roster("remote_child").await }
+    });
+    let event = wait_for_event(&requester).await;
+
+    let results = dir.path().join("results.ndjson");
+    let delivery = Arc::new(TestDelivery::new());
+    let submitter = Arc::new(TestSubmitter::new());
+    let responder = Arc::new(CloudFamilyResponder::new(
+        FamilyResultLog::open(&results).unwrap(),
+    ));
+    // The process dies during the roster read.
+    delivery.panic_in_roster.store(true, Ordering::SeqCst);
+    let crashed = tokio::spawn({
+        let responder = Arc::clone(&responder);
+        let delivery = Arc::clone(&delivery);
+        let submitter = Arc::clone(&submitter);
+        let event = event.clone();
+        async move {
+            responder
+                .handle_event(&event, delivery.as_ref(), submitter.as_ref())
+                .await
+        }
+    });
+    assert!(crashed.await.unwrap_err().is_panic(), "roster must crash");
+    assert_eq!(delivery.roster_calls.lock().unwrap().len(), 1);
+    assert!(submitter.calls().is_empty());
+
+    // The roster read is idempotent: the replay re-runs it and answers —
+    // no message-style stranding for a pure read.
+    delivery.panic_in_roster.store(false, Ordering::SeqCst);
+    let restarted = CloudFamilyResponder::new(FamilyResultLog::open(&results).unwrap());
+    let outcome = restarted
+        .handle_event(&event, delivery.as_ref(), submitter.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(outcome, HandleOutcome::Reconciled);
+    assert_eq!(delivery.roster_calls.lock().unwrap().len(), 2);
+    assert!(restarted.uncertain().is_empty());
+
+    let (_, command) = submitter.calls()[0].clone();
+    requester.resolve_result(&command);
+    match task.await.unwrap().unwrap() {
+        CloudFamilyRequestOutcome::Answered(rows) => assert_eq!(rows, delivery.rows),
+        CloudFamilyRequestOutcome::Pending { request_id } => {
+            panic!("expected Answered, got Pending ({request_id})")
+        }
+    }
+}
+
+#[tokio::test]
+async fn reconciliation_records_the_answer_and_replay_resubmits() {
+    let dir = tempfile::tempdir().unwrap();
+    let requester = requester(open_request_log(dir.path(), 50));
+    let task = tokio::spawn({
+        let sender = Arc::clone(&requester);
+        async move {
+            sender
+                .send_agent_message("remote_child", "sibling", "hello")
+                .await
+        }
+    });
+    let event = wait_for_event(&requester).await;
+
+    let results = dir.path().join("results.ndjson");
+    let delivery = Arc::new(TestDelivery::new());
+    let submitter = Arc::new(TestSubmitter::new());
+    let responder = Arc::new(CloudFamilyResponder::new(
+        FamilyResultLog::open(&results).unwrap(),
+    ));
+    delivery.panic_in_delivery.store(true, Ordering::SeqCst);
+    let crashed = tokio::spawn({
+        let responder = Arc::clone(&responder);
+        let delivery = Arc::clone(&delivery);
+        let submitter = Arc::clone(&submitter);
+        let event = event.clone();
+        async move {
+            responder
+                .handle_event(&event, delivery.as_ref(), submitter.as_ref())
+                .await
+        }
+    });
+    assert!(crashed.await.unwrap_err().is_panic());
+
+    // Reconciliation: the wiring layer learns what the receiver did (it is
+    // idempotent by request id) and records the answer for the uncertain
+    // request. Only then may a replay proceed — and it re-submits, never
+    // re-delivers.
+    let reconciled: CloudFamilyCommand = serde_json::from_value(json!({
+        "kind": "agent_message_result",
+        "requestId": event.request_id(),
+        "ok": true,
+        "receipt": {"id": format!("agentmsg_{}", event.request_id()), "deliveryStatus": "delivered"},
+    }))
+    .unwrap();
+    responder.record_answer(reconciled.clone()).unwrap();
+    assert!(responder.uncertain().is_empty());
+    let outcome = responder
+        .handle_event(&event, delivery.as_ref(), submitter.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(outcome, HandleOutcome::DuplicateResubmitted);
+    assert_eq!(
+        delivery.deliveries(),
+        1,
+        "reconciliation must not re-deliver"
+    );
+
+    let (command_id, command) = submitter.calls()[0].clone();
+    assert_eq!(command_id, command.journal_command_id());
+    requester.resolve_result(&command);
+    assert!(matches!(
+        task.await.unwrap().unwrap(),
+        CloudFamilyRequestOutcome::Answered(_)
+    ));
+}
+
+#[tokio::test]
+async fn in_flight_duplicate_surfaces_uncertain_without_delivery() {
+    let dir = tempfile::tempdir().unwrap();
+    let requester = requester(open_request_log(dir.path(), 50));
+    let task = tokio::spawn({
+        let sender = Arc::clone(&requester);
+        async move {
+            sender
+                .send_agent_message("remote_child", "sibling", "hello")
+                .await
+        }
+    });
+    let event = wait_for_event(&requester).await;
+
+    let results = dir.path().join("results.ndjson");
+    let delivery = Arc::new(TestDelivery::new());
+    let (release, gate) = oneshot::channel::<()>();
+    *delivery.delivery_gate.lock().unwrap() = Some(gate);
+    let submitter = Arc::new(TestSubmitter::new());
+    let responder = Arc::new(CloudFamilyResponder::new(
+        FamilyResultLog::open(&results).unwrap(),
+    ));
+
+    let first = tokio::spawn({
+        let responder = Arc::clone(&responder);
+        let delivery = Arc::clone(&delivery);
+        let submitter = Arc::clone(&submitter);
+        let event = event.clone();
+        async move {
+            responder
+                .handle_event(&event, delivery.as_ref(), submitter.as_ref())
+                .await
+        }
+    });
+    // Let the first handler reach (and hold inside) delivery.
+    while delivery.deliveries() == 0 {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    // The duplicate racing the in-flight delivery is honestly uncertain —
+    // admitted, unanswered, and never re-delivered.
+    let second = responder
+        .handle_event(&event, delivery.as_ref(), submitter.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(second, HandleOutcome::Uncertain);
+    assert_eq!(delivery.deliveries(), 1);
+
+    release.send(()).unwrap();
+    assert_eq!(first.await.unwrap().unwrap(), HandleOutcome::Answered);
+    assert_eq!(delivery.deliveries(), 1);
+
+    let (_, command) = submitter.calls()[0].clone();
+    requester.resolve_result(&command);
+    assert!(matches!(
+        task.await.unwrap().unwrap(),
+        CloudFamilyRequestOutcome::Answered(_)
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn answer_record_failure_surfaces_uncertain_and_can_be_completed() {
+    let dir = tempfile::tempdir().unwrap();
+    let requester = requester(open_request_log(dir.path(), 50));
+    let task = tokio::spawn({
+        let sender = Arc::clone(&requester);
+        async move {
+            sender
+                .send_agent_message("remote_child", "sibling", "hello")
+                .await
+        }
+    });
+    let event = wait_for_event(&requester).await;
+
+    let results = dir.path().join("results.ndjson");
+    let delivery = Arc::new(TestDelivery::new());
+    *delivery.sabotage_results_path.lock().unwrap() = Some(results.clone());
+    let submitter = TestSubmitter::new();
+    let responder = CloudFamilyResponder::new(FamilyResultLog::open(&results).unwrap());
+
+    // The delivery succeeds but the answer-record fsync fails: the
+    // handling errors honestly, and the durable admission stands.
+    let outcome = responder
+        .handle_event(&event, delivery.as_ref(), &submitter)
+        .await;
+    assert!(
+        outcome.is_err(),
+        "a failed answer record must surface an error"
+    );
+    assert_eq!(delivery.deliveries(), 1);
+    assert!(submitter.calls().is_empty());
+
+    // The replay reconciles through the receiver's idempotent lookup (it
+    // recorded the admission), but the broken journal still refuses the
+    // record — the honest error again, and still no re-delivery.
+    let outcome = responder
+        .handle_event(&event, delivery.as_ref(), &submitter)
+        .await;
+    assert!(
+        outcome.is_err(),
+        "a still-broken journal must surface an error"
+    );
+    assert_eq!(
+        delivery.deliveries(),
+        1,
+        "a record failure must not re-deliver"
+    );
+    assert_eq!(responder.uncertain(), vec![event.request_id().to_string()]);
+
+    // Reconciliation completes the request: the journal file is writable
+    // again, the answer is recorded, and a replay re-submits it.
+    std::fs::remove_dir(&results).unwrap();
+    let reconciled: CloudFamilyCommand = serde_json::from_value(json!({
+        "kind": "agent_message_result",
+        "requestId": event.request_id(),
+        "ok": true,
+        "receipt": {"id": format!("agentmsg_{}", event.request_id()), "deliveryStatus": "delivered"},
+    }))
+    .unwrap();
+    responder.record_answer(reconciled).unwrap();
+    assert!(responder.uncertain().is_empty());
+    let outcome = responder
+        .handle_event(&event, delivery.as_ref(), &submitter)
+        .await
+        .unwrap();
+    assert_eq!(outcome, HandleOutcome::DuplicateResubmitted);
+    assert_eq!(delivery.deliveries(), 1);
+    assert_eq!(submitter.calls().len(), 1);
+
+    let (_, command) = submitter.calls()[0].clone();
+    requester.resolve_result(&command);
+    assert!(matches!(
+        task.await.unwrap().unwrap(),
+        CloudFamilyRequestOutcome::Answered(_)
+    ));
 }

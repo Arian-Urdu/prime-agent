@@ -8,8 +8,12 @@
 //!   allocation;
 //! - transport failures are already-typed [`SandboxError`]s carrying the
 //!   request method and URL; non-2xx statuses are returned to the caller,
-//!   which owns the error-body preview (the transport never parses).
-//! - redirects are followed, mirroring the TS global `fetch` default.
+//!   which owns the error-body preview (the transport never parses);
+//! - redirects are refused (`reqwest::redirect::Policy::none()`, a
+//!   reviewed deviation from the TS module's default-following `fetch`):
+//!   an authenticated platform call never hops origins, so the Bearer key
+//!   cannot leak toward a redirect target; a moved sandbox API is a
+//!   client configuration change, never a silent hop.
 
 use std::future::Future;
 use std::time::Duration;
@@ -91,6 +95,13 @@ impl ReqwestSandboxTransport {
     pub fn with_max_response_bytes(max_response_bytes: usize) -> Self {
         Self {
             client: reqwest::Client::builder()
+                // Redirects are refused (a reviewed deviation from the TS
+                // module, which relies on global `fetch` following them): a
+                // redirected platform call would forward the request with
+                // the Bearer key toward an unvalidated origin, and a moved
+                // sandbox API is a client configuration change, never a
+                // silent hop.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("sandbox reqwest client"),
             max_response_bytes,

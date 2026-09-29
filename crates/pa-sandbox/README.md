@@ -25,7 +25,8 @@ Port of the lifecycle half of `prime-sandbox-client.ts` (TS branch
   previews; no secret ever appears in a message, URL, or preview.
 - Transport: one injected `SandboxTransport` trait (RPITIT), a reqwest
   production implementation (rustls-tls, per-request deadlines, bounded
-  streaming response reads), everything injected — no environment
+  streaming response reads, redirects refused so an authenticated call
+  never hops origins), everything injected — no environment
   reads, no `~/.prime`.
 
 ## Non-goals

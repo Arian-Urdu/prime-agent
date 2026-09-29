@@ -338,6 +338,8 @@ fn require_delete_response(value: serde_json::Value) -> Result<(), SandboxError>
 }
 
 /// Map a non-2xx response onto the typed error contract (TS `httpError`):
+/// a 3xx is a refused redirect (the transport never follows one; the
+/// TS module rides the default-following `fetch`, a reviewed deviation),
 /// HTTP 408 is a `request_timeout`, HTTP 409 a `conflict`, and HTTP 502
 /// with `{ "error": "sandbox_not_found" }` a `sandbox_not_found`; anything
 /// else is a generic `http` error. `details` carries a bounded,
@@ -362,6 +364,15 @@ fn http_error(
                     .map(|error| error == "sandbox_not_found")
             })
             .unwrap_or(false);
+    if (300..400).contains(&status) {
+        // Refused redirect (the transport never follows): surfaced as its
+        // own message so the failure reads as configuration, not as a
+        // generic server error.
+        return SandboxError::http(format!(
+            "{context} refused a redirect (HTTP {status}); the sandbox API base URL is a client configuration change, not a silent hop"
+        ))
+        .with_http_context(method, url, Some(status), details);
+    }
     let error = if status == 408 {
         SandboxError::request_timeout(format!("{context} timed out on the server (HTTP 408)"))
     } else if status == 409 {

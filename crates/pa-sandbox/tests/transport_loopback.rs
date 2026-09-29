@@ -6,7 +6,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{json_response, oversized_stream, text_response, MockServer};
+use common::{json_response, oversized_stream, redirect_response, text_response, MockServer};
 use pa_sandbox::transport::{
     ReqwestSandboxTransport, SandboxTransport, TransportRequest, MAX_JSON_BODY_BYTES,
 };
@@ -154,6 +154,35 @@ async fn streamed_bodies_past_the_cap_fail_mid_read() {
     assert_eq!(
         error.to_string(),
         "Sandbox response exceeds the 1024 byte JSON body limit"
+    );
+}
+
+#[tokio::test]
+async fn redirects_are_refused_and_the_key_never_hops() {
+    // The redirect target is a live recording server: if the transport
+    // followed the 3xx, the request (with the Bearer key) would land there.
+    let target = MockServer::start(vec![text_response(200, "OK", "leaked")]).await;
+    let server = MockServer::start(vec![redirect_response(
+        301,
+        "Moved Permanently",
+        &target.url("/api/v1/sandbox/sb-1"),
+    )])
+    .await;
+    let client = loopback_client(&server);
+    let error = client.get_sandbox("sb-1").await.unwrap_err();
+    assert_eq!(error.code(), SandboxErrorCode::Http);
+    assert_eq!(error.status(), Some(301));
+    let rendered = error.to_string();
+    assert!(rendered.contains("refused a redirect"), "{rendered}");
+    assert_eq!(
+        server.request_count(),
+        1,
+        "exactly one request to the platform"
+    );
+    assert_eq!(
+        target.request_count(),
+        0,
+        "the redirect target saw nothing - no redirected key"
     );
 }
 

@@ -471,6 +471,22 @@ async fn wait_rejects_bad_ids_and_options() {
 }
 
 #[tokio::test]
+async fn redirects_surface_as_refused_not_followed() {
+    let transport = ScriptedTransport::new(vec![status_reply(302, json!({}))]);
+    let client = test_client(&transport);
+    let error = client.get_sandbox("sb-1").await.unwrap_err();
+    assert_eq!(error.code(), SandboxErrorCode::Http);
+    assert_eq!(error.status(), Some(302));
+    let rendered = error.to_string();
+    assert!(rendered.contains("refused a redirect"), "{rendered}");
+    assert_eq!(
+        transport.recorded().len(),
+        1,
+        "no follow-up request is made"
+    );
+}
+
+#[tokio::test]
 async fn error_details_never_leak_the_api_key() {
     let transport = ScriptedTransport::new(vec![status_reply(
         403,

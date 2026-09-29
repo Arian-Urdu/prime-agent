@@ -126,6 +126,12 @@ pub fn text_response(status: u16, reason: &str, body: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// A redirect response (the transport must refuse it, not follow it).
+pub fn redirect_response(status: u16, reason: &str, location: &str) -> Vec<u8> {
+    format!("HTTP/1.1 {status} {reason}\r\nlocation: {location}\r\ncontent-length: 0\r\n\r\n")
+        .into_bytes()
+}
+
 /// A chunked 200 whose streamed body exceeds a small transport cap.
 pub fn oversized_stream() -> Vec<u8> {
     let mut response = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n".to_vec();

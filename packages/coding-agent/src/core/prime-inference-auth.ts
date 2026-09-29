@@ -1,8 +1,8 @@
 import { Buffer } from "node:buffer";
 import { constants, generateKeyPairSync, privateDecrypt } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { OAuthAuthInfo } from "@earendil-works/pi-ai";
 import { fetchWithTimeout, isRecord, numberField, readResponseMessage, stringEnv, stringField } from "./prime-http.js";
 
@@ -125,6 +125,87 @@ function loadProductionPrimeCliConfig(configPath?: string): PrimeCliConfig | und
 		teamId: stringField(data, "team_id"),
 		teamName: stringField(data, "team_name"),
 		teamRole: stringField(data, "team_role"),
+	};
+}
+
+export type PrimeDirectoryTeam = {
+	teamId: string | null;
+	name?: string;
+	source: string;
+};
+
+const PRIME_CONTEXT_NAME = /^[A-Za-z0-9_-]+$/;
+
+function realpathOrSelf(path: string): string {
+	try {
+		return realpathSync(path);
+	} catch {
+		return path;
+	}
+}
+
+// Mirrors the prime CLI: nearest `.prime/context.json` at or above `cwd`, stopping at the
+// directory that holds the global `.prime`, skipping symlinks and files owned by another user.
+export function findPrimeContextFile(cwd: string, homeDir: string): string | undefined {
+	const home = realpathOrSelf(homeDir);
+	const uid = process.getuid?.();
+	let directory = realpathOrSelf(cwd);
+	while (directory !== home) {
+		const candidate = join(directory, ".prime", "context.json");
+		try {
+			const stat = lstatSync(candidate);
+			if (
+				!lstatSync(dirname(candidate)).isSymbolicLink() &&
+				stat.isFile() &&
+				(uid === undefined || stat.uid === uid)
+			) {
+				return candidate;
+			}
+		} catch {}
+		const parent = dirname(directory);
+		if (parent === directory) return undefined;
+		directory = parent;
+	}
+	return undefined;
+}
+
+function readJsonFile(path: string): Record<string, unknown> {
+	const parsed = JSON.parse(readFileSync(path, "utf-8")) as unknown;
+	if (!isRecord(parsed)) throw new Error(`Invalid ${path}: expected a JSON object`);
+	return parsed;
+}
+
+/**
+ * The team the prime CLI selects for `cwd` through `PRIME_CONTEXT` or a directory's
+ * `.prime/context.json`, or undefined when neither applies. `teamId: null` is the personal
+ * account. Saved contexts that target a non-production API are ignored, since Prime Inference
+ * is production-only. Throws for a malformed pin or a missing context.
+ */
+export function resolvePrimeDirectoryTeam(cwd: string, primeDir: string): PrimeDirectoryTeam | undefined {
+	let context = process.env.PRIME_CONTEXT?.trim();
+	let source = "PRIME_CONTEXT";
+	if (!context) {
+		const file = findPrimeContextFile(cwd, dirname(primeDir));
+		if (!file) return undefined;
+		const pin = readJsonFile(file);
+		source = file;
+		if ("team_id" in pin) {
+			if (pin.team_id !== null && typeof pin.team_id !== "string") {
+				throw new Error(`Invalid ${file}: team_id must be a string or null`);
+			}
+			return { teamId: pin.team_id || null, name: stringField(pin, "team_name"), source };
+		}
+		if (pin.context === undefined) return undefined;
+		context = typeof pin.context === "string" ? pin.context : "";
+	}
+	if (!PRIME_CONTEXT_NAME.test(context)) throw new Error(`Invalid Prime context name (from ${source})`);
+	if (context.toLowerCase() === "production") return { teamId: null, source };
+	const environment = readJsonFile(join(primeDir, "environments", `${context}.json`));
+	if (normalizeBaseUrl(stringField(environment, "base_url")) !== DEFAULT_PRIME_API_BASE_URL) return undefined;
+	return {
+		teamId: stringField(environment, "team_id") ?? null,
+		name: stringField(environment, "team_name"),
+		source,
 	};
 }
 

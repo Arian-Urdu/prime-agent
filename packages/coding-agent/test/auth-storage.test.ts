@@ -245,6 +245,50 @@ describe("AuthStorage", () => {
 				}
 			});
 
+			const prod = "https://api.primeintellect.ai";
+			test.each([
+				["team pin", { team_id: "pinned-team" }, {}, "pinned-team", false],
+				["personal pin", { team_id: null }, {}, undefined, false],
+				["context pin", { context: "customer" }, {}, "customer-team", false],
+				["non-production context", { context: "dev" }, {}, "agent-team", false],
+				["PRIME_TEAM_ID over pin", { team_id: "pinned-team" }, { PRIME_TEAM_ID: "env-team" }, "env-team", false],
+				[
+					"PRIME_CONTEXT over pin",
+					{ team_id: "pinned-team" },
+					{ PRIME_CONTEXT: "customer" },
+					"customer-team",
+					false,
+				],
+				["symlinked pin", "symlink", {}, "agent-team", false],
+				["malformed pin", "[]", {}, "agent-team", true],
+			])("directory context selects the team: %s", (_name, pin, env, expected, errors) => {
+				writeAuthJson({ "prime-inference": { type: "api_key", key: "agent-key", primeTeam: team } });
+				const repo = join(tempDir, "repo");
+				mkdirSync(join(repo, ".prime"), { recursive: true });
+				mkdirSync(join(repo, "src"));
+				mkdirSync(join(tempDir, "environments"));
+				const envs = {
+					customer: { base_url: prod, team_id: "customer-team" },
+					dev: { base_url: "http://x", team_id: "d" },
+				};
+				for (const [name, value] of Object.entries(envs)) {
+					writeFileSync(join(tempDir, "environments", `${name}.json`), JSON.stringify(value));
+				}
+				const pinPath = join(repo, ".prime", "context.json");
+				if (pin === "symlink") symlinkSync(primeConfigPath, pinPath);
+				else writeFileSync(pinPath, typeof pin === "string" ? pin : JSON.stringify(pin));
+				for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
+				authStorage = AuthStorage.create(authJsonPath, {
+					primeCliConfigPath: primeConfigPath,
+					usePrimeCliConfig: true,
+					cwd: join(repo, "src"),
+				});
+				const header = authStorage.getProviderHeaders("prime-inference");
+				expect(header?.["X-Prime-Team-ID"]).toBe(expected);
+				expect(authStorage.drainErrors().length > 0).toBe(errors);
+				expect(authStorage.get("prime-inference")).toEqual({ type: "api_key", key: "agent-key", primeTeam: team });
+			});
+
 			test("runtime, environment, stored, and models fallback resolve in order without CLI", async () => {
 				writeAuthJson({ "prime-inference": { type: "api_key", key: "agent-key", primeTeam: team } });
 				authStorage = createStorage();

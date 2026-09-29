@@ -20,7 +20,13 @@ import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { getAgentDir } from "../config.js";
 import { realpathIfPresentSync, writeFileAtomicSync } from "../utils/atomic-file.js";
-import { getPrimeCliConfigPath, PRIME_INFERENCE_PROVIDER_ID, type PrimeTeam } from "./prime-inference-auth.js";
+import {
+	getPrimeCliConfigPath,
+	PRIME_INFERENCE_PROVIDER_ID,
+	type PrimeDirectoryTeam,
+	type PrimeTeam,
+	resolvePrimeDirectoryTeam,
+} from "./prime-inference-auth.js";
 import { resolveConfigValue, resolveConfigValueUncached } from "./resolve-config-value.js";
 
 export type PrimeTeamCredential = {
@@ -83,6 +89,8 @@ export type AuthStatus = {
 export type AuthStorageOptions = {
 	primeCliConfigPath?: string;
 	usePrimeCliConfig?: boolean;
+	/** Working directory whose prime CLI directory context selects the Prime Inference team. */
+	cwd?: string;
 };
 
 type LockResult<T> = {
@@ -290,6 +298,7 @@ export class AuthStorage {
 	private fallbackResolver?: (provider: string) => string | undefined;
 	private loadError: Error | null = null;
 	private errors: Error[] = [];
+	private lastPrimeDirectoryError: string | undefined;
 	private changeListeners = new Set<() => void>();
 
 	private constructor(
@@ -1252,9 +1261,29 @@ export class AuthStorage {
 		return credential?.type === "api_key" ? credential.primeTeam : undefined;
 	}
 
+	getPrimeDirectoryTeam(): PrimeDirectoryTeam | undefined {
+		const configPath = this.getPrimeCliConfigPath();
+		if (!configPath) return undefined;
+		try {
+			const team = resolvePrimeDirectoryTeam(this.options.cwd ?? process.cwd(), dirname(configPath));
+			this.lastPrimeDirectoryError = undefined;
+			return team;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (message !== this.lastPrimeDirectoryError) {
+				this.lastPrimeDirectoryError = message;
+				this.recordError(new Error(`Ignoring Prime directory context: ${message}`));
+			}
+			return undefined;
+		}
+	}
+
 	getProviderHeaders(providerId: string): Record<string, string> | undefined {
 		if (providerId !== PRIME_INFERENCE_PROVIDER_ID) return undefined;
-		const teamId = process.env.PRIME_TEAM_ID?.trim() || this.getPrimeInferenceTeamSelection()?.teamId;
+		const envTeamId = process.env.PRIME_TEAM_ID?.trim();
+		if (envTeamId) return { "X-Prime-Team-ID": envTeamId };
+		const directoryTeam = this.getPrimeDirectoryTeam();
+		const teamId = directoryTeam ? directoryTeam.teamId : this.getPrimeInferenceTeamSelection()?.teamId;
 		return teamId ? { "X-Prime-Team-ID": teamId } : undefined;
 	}
 

@@ -515,6 +515,13 @@ export class ProviderAuthFlows {
 
 	private getPrimeInferenceDefaultTeamStatus(): string {
 		if (process.env.PRIME_TEAM_ID?.trim()) return "Using team from PRIME_TEAM_ID.";
+		const directoryTeam = this.host.modelRegistry.authStorage.getPrimeDirectoryTeam();
+		if (directoryTeam) {
+			const account = directoryTeam.teamId
+				? `team "${directoryTeam.name ?? directoryTeam.teamId}"`
+				: "personal account";
+			return `Using ${account} from ${directoryTeam.source}.`;
+		}
 		const storedTeam = this.host.modelRegistry.authStorage.getPrimeInferenceTeamSelection();
 		if (storedTeam) {
 			return `Using team "${storedTeam.name}".`;

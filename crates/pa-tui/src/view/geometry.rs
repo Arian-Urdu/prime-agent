@@ -29,14 +29,20 @@ impl AgentView {
                         width,
                     )
             }
-            ChatEntry::Assistant(message) => crate::chat::assistant_row_count(
-                message,
-                self.detail,
-                &self.theme,
-                &self.code_block_indent,
-                width,
-                preceded_by_tool,
-            ),
+            ChatEntry::Assistant(message) => {
+                // Settled blocks replay from the entry's render cache.
+                let caches = self.md_caches.borrow();
+                let empty = crate::markdown::MarkdownBlockCache::default();
+                crate::chat::assistant_row_count(
+                    message,
+                    self.detail,
+                    &self.theme,
+                    &self.code_block_indent,
+                    width,
+                    preceded_by_tool,
+                    caches.get(&index).unwrap_or(&empty),
+                )
+            }
             ChatEntry::SlashCommand { text } => {
                 usize::from(spacing)
                     + crate::chat_slash::slash_command_row_count(text, &self.theme, width)

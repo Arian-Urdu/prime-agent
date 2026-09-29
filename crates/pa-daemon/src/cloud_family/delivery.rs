@@ -141,9 +141,11 @@ impl LocalFamilyDelivery {
             .and_then(Value::as_str)
             .or_else(|| source_summary.get("id").and_then(Value::as_str))
             .unwrap_or_default();
+        // TS `target.summary.activeSessionId ?? target.summary.id`.
         let target_active = target_summary
             .get("activeSessionId")
             .and_then(Value::as_str)
+            .or_else(|| target_summary.get("id").and_then(Value::as_str))
             .unwrap_or_default();
         if source_active == target_active {
             return Err("Agent messaging cannot target the sending session".to_string());

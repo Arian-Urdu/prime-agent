@@ -328,16 +328,6 @@ impl Worker {
                 }
             }
         }
-        if let Some(receipt) = recovery
-            .as_ref()
-            .and_then(|journal| journal.cloud_inbox_receipt(request_id))
-        {
-            return response_success(None, "worker_deliver_message", Some(receipt.clone()));
-        }
-        let admission = match self.admit_agent_message_into_lane(payload) {
-            Ok(admission) => admission,
-            Err(response) => return response,
-        };
         let Some(journal) = recovery.as_mut() else {
             return response_failure(
                 None,
@@ -346,10 +336,20 @@ impl Worker {
                 None,
             );
         };
+        if let Some(receipt) = journal.cloud_inbox_receipt(request_id) {
+            return response_success(None, "worker_deliver_message", Some(receipt.clone()));
+        }
+        let admission = match self.admit_agent_message_into_lane(payload) {
+            Ok(admission) => admission,
+            Err(response) => return response,
+        };
         // The queued agent message is admitted live work (busy=true) and
         // the cloud admission rides the checkpoint's single durable
         // flush: the lanes snapshot, the busy verdict, and the request-id
-        // admission land together or not at all.
+        // admission land together or not at all. A failed append skips
+        // the whole checkpoint, exactly like the local path's tolerance
+        // (the in-memory queue stays; the durable admission simply did
+        // not land).
         crate::worker::record_queue_checkpoint_locked(
             journal,
             &self.core,

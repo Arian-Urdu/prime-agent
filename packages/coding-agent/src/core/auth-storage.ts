@@ -89,7 +89,6 @@ export type AuthStatus = {
 export type AuthStorageOptions = {
 	primeCliConfigPath?: string;
 	usePrimeCliConfig?: boolean;
-	/** Working directory whose prime CLI directory context selects the Prime Inference team. */
 	cwd?: string;
 };
 

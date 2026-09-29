@@ -1262,9 +1262,10 @@ export class AuthStorage {
 
 	getPrimeDirectoryTeam(): PrimeDirectoryTeam | undefined {
 		const configPath = this.getPrimeCliConfigPath();
-		if (!configPath) return undefined;
+		// Only a session's own cwd selects the team; never guess from the host process.
+		if (!configPath || !this.options.cwd) return undefined;
 		try {
-			const team = resolvePrimeDirectoryTeam(this.options.cwd ?? process.cwd(), dirname(configPath));
+			const team = resolvePrimeDirectoryTeam(this.options.cwd, dirname(configPath));
 			this.lastPrimeDirectoryError = undefined;
 			return team;
 		} catch (error) {

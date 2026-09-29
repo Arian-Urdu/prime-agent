@@ -261,7 +261,8 @@ describe("AuthStorage", () => {
 				],
 				["symlinked pin", "symlink", {}, "agent-team", false],
 				["malformed pin", "[]", {}, "agent-team", true],
-			])("directory context selects the team: %s", (_name, pin, env, expected, errors) => {
+				["no session cwd", { team_id: "pinned-team" }, {}, "agent-team", false],
+			])("directory context selects the team: %s", (name, pin, env, expected, errors) => {
 				writeAuthJson({ "prime-inference": { type: "api_key", key: "agent-key", primeTeam: team } });
 				const repo = join(tempDir, "repo");
 				mkdirSync(join(repo, ".prime"), { recursive: true });
@@ -278,10 +279,11 @@ describe("AuthStorage", () => {
 				if (pin === "symlink") symlinkSync(primeConfigPath, pinPath);
 				else writeFileSync(pinPath, typeof pin === "string" ? pin : JSON.stringify(pin));
 				for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
+				vi.spyOn(process, "cwd").mockReturnValue(join(repo, "src"));
 				authStorage = AuthStorage.create(authJsonPath, {
 					primeCliConfigPath: primeConfigPath,
 					usePrimeCliConfig: true,
-					cwd: join(repo, "src"),
+					cwd: name === "no session cwd" ? undefined : join(repo, "src"),
 				});
 				const header = authStorage.getProviderHeaders("prime-inference");
 				expect(header?.["X-Prime-Team-ID"]).toBe(expected);

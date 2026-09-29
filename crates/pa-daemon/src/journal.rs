@@ -419,12 +419,80 @@ pub struct WorkerQueueSnapshotRecord {
     pub recorded_at: String,
 }
 
+/// One request-id-keyed cloud inbox admission: the receipt the receiver
+/// answered when a cross-boundary agent message became visible in this
+/// session's inbox, durably recorded in the SAME flush as the queue
+/// snapshot that made it visible (a crash can never split "visible" from
+/// "admitted", so an idempotent replay answers this receipt instead of
+/// enqueueing a second visible message). The family exchange keys
+/// deliveries by the guest request id; the dedupe window matches the
+/// request outbox's record cap so every replayable request finds its
+/// admission.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudInboxAdmissionRecord {
+    pub version: u32,
+    pub r#type: String,
+    pub request_id: String,
+    pub receipt: Value,
+    pub recorded_at: String,
+}
+
+/// The record-type tag of a cloud inbox admission line.
+const CLOUD_INBOX_RECORD_TYPE: &str = "cloud_inbox_admission";
+/// The cloud-inbox record version.
+const CLOUD_INBOX_VERSION: u32 = 1;
+/// The newest cloud inbox admissions retained across compaction, aligned
+/// with the family request outbox's record cap (`DEFAULT_OUTBOX_RECORDS`)
+/// so the largest replay span always finds its receiver admission.
+const CLOUD_INBOX_WINDOW: usize = 50_000;
+
+fn parse_cloud_inbox_records(
+    path: &Path,
+) -> Result<(HashMap<String, Value>, std::collections::VecDeque<String>)> {
+    let mut inbox: HashMap<String, Value> = HashMap::new();
+    let mut order: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((inbox, order)),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "read worker journal {} for cloud inbox: {error}",
+                path.display()
+            ))
+        }
+    };
+    for line in contents.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<CloudInboxAdmissionRecord>(line) else {
+            // A crash may leave only the final append truncated; unknown
+            // record types are other subsystems' lines.
+            continue;
+        };
+        if record.version != CLOUD_INBOX_VERSION || record.r#type != CLOUD_INBOX_RECORD_TYPE {
+            continue;
+        }
+        order.push_back(record.request_id.clone());
+        inbox.insert(record.request_id, record.receipt);
+    }
+    while order.len() > CLOUD_INBOX_WINDOW {
+        if let Some(oldest) = order.pop_front() {
+            inbox.remove(&oldest);
+        }
+    }
+    Ok((inbox, order))
+}
+
 /// Port of `WorkerRecoveryJournal`: latest busy/operation per active session,
-/// plus the latest queue snapshot per session.
+/// plus the latest queue snapshot per session, plus the request-id-keyed
+/// cloud inbox admissions (the cross-boundary receiver dedupe).
 pub struct WorkerRecoveryJournal {
     path: std::path::PathBuf,
     latest: HashMap<String, WorkerRecoveryRecord>,
     queue_snapshots: HashMap<String, WorkerQueueSnapshotRecord>,
+    cloud_inbox: HashMap<String, Value>,
+    cloud_inbox_order: std::collections::VecDeque<String>,
 }
 
 impl WorkerRecoveryJournal {
@@ -441,11 +509,21 @@ impl WorkerRecoveryJournal {
             fs::create_dir_all(parent)?;
         }
         let queue_snapshots = parse_queue_snapshot_records(path)?;
+        let (cloud_inbox, cloud_inbox_order) = parse_cloud_inbox_records(path)?;
         Ok(WorkerRecoveryJournal {
             path: path.to_path_buf(),
             latest: parse_worker_records(path)?,
             queue_snapshots,
+            cloud_inbox,
+            cloud_inbox_order,
         })
+    }
+
+    /// The receipt recorded when the cloud inbox admitted `request_id`
+    /// (the idempotent duplicate answer), when one exists.
+    #[must_use]
+    pub fn cloud_inbox_receipt(&self, request_id: &str) -> Option<&Value> {
+        self.cloud_inbox.get(request_id)
     }
 
     /// Read the latest worker record per active session straight from a
@@ -616,6 +694,7 @@ impl WorkerRecoveryJournal {
         operation: &str,
         steering: &[WorkerQueueItemRecord],
         follow_up: &[WorkerQueueItemRecord],
+        cloud_admission: Option<(&str, &Value)>,
     ) -> Result<()> {
         let snapshot = WorkerQueueSnapshotRecord {
             version: QUEUE_SNAPSHOT_VERSION,
@@ -642,12 +721,38 @@ impl WorkerRecoveryJournal {
                 recorded_at: crate::util::now_iso(),
             })
         };
-        let mut batch = Vec::with_capacity(2);
+        let admission = cloud_admission.map(|(request_id, receipt)| CloudInboxAdmissionRecord {
+            version: CLOUD_INBOX_VERSION,
+            r#type: CLOUD_INBOX_RECORD_TYPE.to_string(),
+            request_id: request_id.to_string(),
+            receipt: receipt.clone(),
+            recorded_at: crate::util::now_iso(),
+        });
+        let mut batch = Vec::with_capacity(3);
         batch.push(serde_json::to_value(&snapshot)?);
         if let Some(record) = &record {
             batch.push(serde_json::to_value(record)?);
         }
+        // The cloud admission rides the SAME durable batch as the queue
+        // snapshot it describes: a crash can never leave the message
+        // visible without its request-id admission (a duplicate would
+        // re-deliver) or the admission without visibility (the receipt
+        // would claim a message that never landed).
+        if let Some(admission) = &admission {
+            batch.push(serde_json::to_value(admission)?);
+        }
         append_records(&self.path, &batch)?;
+        if let Some(admission) = admission {
+            self.cloud_inbox_order
+                .push_back(admission.request_id.clone());
+            self.cloud_inbox
+                .insert(admission.request_id, admission.receipt);
+            while self.cloud_inbox_order.len() > CLOUD_INBOX_WINDOW {
+                if let Some(oldest) = self.cloud_inbox_order.pop_front() {
+                    self.cloud_inbox.remove(&oldest);
+                }
+            }
+        }
         self.queue_snapshots
             .insert(active_session_id.to_string(), snapshot);
         if let Some(record) = record {
@@ -702,6 +807,22 @@ impl WorkerRecoveryJournal {
             .map(serde_json::to_value)
             .collect::<std::result::Result<_, _>>()?;
         records.extend(snapshots);
+        // The cloud inbox admissions survive compaction (their newest
+        // window): a settled journal must never strand a delivered cloud
+        // message's dedupe key, or a replayed request would re-deliver a
+        // visible message.
+        for request_id in &self.cloud_inbox_order {
+            if let Some(receipt) = self.cloud_inbox.get(request_id) {
+                let admission = CloudInboxAdmissionRecord {
+                    version: CLOUD_INBOX_VERSION,
+                    r#type: CLOUD_INBOX_RECORD_TYPE.to_string(),
+                    request_id: request_id.clone(),
+                    receipt: receipt.clone(),
+                    recorded_at: crate::util::now_iso(),
+                };
+                records.push(serde_json::to_value(&admission)?);
+            }
+        }
         rewrite_records(&self.path, &records, Finalize::Bare)
     }
 }
@@ -898,13 +1019,32 @@ mod tests {
                 "prompt_accepted",
                 std::slice::from_ref(&item),
                 &[],
+                None,
             )
             .unwrap();
         batched
-            .record_queue_checkpoint("s1", "sess1", Some("/a.jsonl"), false, "turn_end", &[], &[])
+            .record_queue_checkpoint(
+                "s1",
+                "sess1",
+                Some("/a.jsonl"),
+                false,
+                "turn_end",
+                &[],
+                &[],
+                None,
+            )
             .unwrap();
         batched
-            .record_queue_checkpoint("s1", "sess1", Some("/a.jsonl"), false, "turn_end", &[], &[])
+            .record_queue_checkpoint(
+                "s1",
+                "sess1",
+                Some("/a.jsonl"),
+                false,
+                "turn_end",
+                &[],
+                &[],
+                None,
+            )
             .unwrap();
 
         let strip_stamps = |path: &std::path::Path| -> Vec<Value> {
@@ -951,8 +1091,16 @@ mod tests {
         // fails, so the checkpoint cannot land either record.
         fs::remove_file(&path).unwrap();
         fs::create_dir(&path).unwrap();
-        let result =
-            journal.record_queue_checkpoint("s1", "sess1", None, true, "prompt_accepted", &[], &[]);
+        let result = journal.record_queue_checkpoint(
+            "s1",
+            "sess1",
+            None,
+            true,
+            "prompt_accepted",
+            &[],
+            &[],
+            None,
+        );
         assert!(result.is_err());
         // The in-memory verdict did not advance over the failed append.
         assert!(journal.latest.get("s1").is_some_and(|record| !record.busy));
@@ -1039,10 +1187,20 @@ mod tests {
                 "prompt_accepted",
                 std::slice::from_ref(&item),
                 &[],
+                None,
             )
             .unwrap();
         journal
-            .record_queue_checkpoint("s1", "sess1", Some("/a.jsonl"), false, "turn_end", &[], &[])
+            .record_queue_checkpoint(
+                "s1",
+                "sess1",
+                Some("/a.jsonl"),
+                false,
+                "turn_end",
+                &[],
+                &[],
+                None,
+            )
             .unwrap();
         let after_first_settle = fs::read_to_string(&path).unwrap().lines().count();
         journal
@@ -1054,11 +1212,21 @@ mod tests {
                 "prompt_accepted",
                 std::slice::from_ref(&item),
                 &[],
+                None,
             )
             .unwrap();
         let after_second_admission = fs::read_to_string(&path).unwrap().lines().count();
         journal
-            .record_queue_checkpoint("s1", "sess1", Some("/a.jsonl"), false, "turn_end", &[], &[])
+            .record_queue_checkpoint(
+                "s1",
+                "sess1",
+                Some("/a.jsonl"),
+                false,
+                "turn_end",
+                &[],
+                &[],
+                None,
+            )
             .unwrap();
         let content = fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -1093,16 +1261,16 @@ mod tests {
         let path = temp_path("unchanged-nocompact.recovery.jsonl");
         let mut journal = WorkerRecoveryJournal::open(&path).unwrap();
         journal
-            .record_queue_checkpoint("s1", "sess1", None, true, "prompt_accepted", &[], &[])
+            .record_queue_checkpoint("s1", "sess1", None, true, "prompt_accepted", &[], &[], None)
             .unwrap();
         journal
-            .record_queue_checkpoint("s1", "sess1", None, false, "turn_end", &[], &[])
+            .record_queue_checkpoint("s1", "sess1", None, false, "turn_end", &[], &[], None)
             .unwrap();
         let lines_after_settle = fs::read_to_string(&path).unwrap().lines().count();
         // The unchanged settle: the snapshot lands, the verdict does not,
         // and no compaction runs (the map never changed).
         journal
-            .record_queue_checkpoint("s1", "sess1", None, false, "turn_end", &[], &[])
+            .record_queue_checkpoint("s1", "sess1", None, false, "turn_end", &[], &[], None)
             .unwrap();
         let lines_after_unchanged = fs::read_to_string(&path).unwrap().lines().count();
         assert_eq!(lines_after_unchanged, lines_after_settle + 1);

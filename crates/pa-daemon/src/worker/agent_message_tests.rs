@@ -1,7 +1,7 @@
 //! Agent-message command tests (moved with the commands concern).
 use super::*;
 
-fn test_worker() -> Arc<Worker> {
+pub(super) fn test_worker() -> Arc<Worker> {
     let dir = std::env::temp_dir().join(format!("pa-worker-am-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let config = WorkerConfig {
@@ -18,7 +18,7 @@ fn test_worker() -> Arc<Worker> {
     Arc::new(Worker::new(config, None))
 }
 
-async fn created_worker() -> Arc<Worker> {
+pub(super) async fn created_worker() -> Arc<Worker> {
     let worker = test_worker();
     let created = worker
         .dispatch(
@@ -30,7 +30,7 @@ async fn created_worker() -> Arc<Worker> {
     worker
 }
 
-fn queue_texts(core: &Mutex<SessionCore>, lane: Lane) -> Vec<String> {
+pub(super) fn queue_texts(core: &Mutex<SessionCore>, lane: Lane) -> Vec<String> {
     let core = core.lock().unwrap();
     match lane {
         Lane::Steering => &core.steering,

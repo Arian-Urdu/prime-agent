@@ -306,11 +306,30 @@ pub(crate) fn checkpoint_queue_recovery(
     recovery: &std::sync::Mutex<Option<WorkerRecoveryJournal>>,
     core_lock: &std::sync::Mutex<SessionCore>,
     checkpoint: QueueCheckpoint,
+    cloud_admission: Option<(&str, &Value)>,
 ) {
     let mut guard = recovery.lock().unwrap();
     let Some(journal) = guard.as_mut() else {
         return;
     };
+    record_queue_checkpoint_locked(journal, core_lock, checkpoint, cloud_admission);
+}
+
+/// The checkpoint recorder for a caller already holding the recovery
+/// lock: the cloud-keyed agent-message delivery admits its request id in
+/// the same locked section as the enqueue, so two concurrent deliveries
+/// under one key cannot both become visible.
+///
+/// # Panics
+///
+/// Panics when the core lock is poisoned (a holder panicked while holding
+/// it).
+pub(crate) fn record_queue_checkpoint_locked(
+    journal: &mut WorkerRecoveryJournal,
+    core_lock: &std::sync::Mutex<SessionCore>,
+    checkpoint: QueueCheckpoint,
+    cloud_admission: Option<(&str, &Value)>,
+) {
     // The lanes are read under the recovery lock (a microsecond core
     // hold — never across the journal's fsyncs, which would block every
     // concurrent command behind the write): every queue mutation that
@@ -364,6 +383,7 @@ pub(crate) fn checkpoint_queue_recovery(
         operation,
         &lanes.steering,
         &lanes.follow_up,
+        cloud_admission,
     );
 }
 
@@ -553,6 +573,7 @@ pub(crate) fn admit_autonomous_follow_up(
         QueueCheckpoint::Admitted {
             operation: "follow_up_queued",
         },
+        None,
     );
     work_notify.notify_waiters();
 }
@@ -617,6 +638,7 @@ pub(crate) fn admit_goal_follow_up(
                 Lane::FollowUp => "follow_up_queued",
             },
         },
+        None,
     );
     // `resumeIfIdle`: the runner re-checks the queue at its loop head, so
     // the minted turn runs as the next admitted turn.
@@ -702,6 +724,7 @@ pub(crate) fn admit_bash_completion_notice(
         QueueCheckpoint::Admitted {
             operation: "steer_queued",
         },
+        None,
     );
     // `resumeIfIdle`: the runner re-checks the queue at its loop head.
     work_notify.notify_one();
@@ -748,6 +771,7 @@ pub(crate) fn withdraw_bash_completion_notice(
             QueueCheckpoint::Settle {
                 operation: "queue_purged",
             },
+            None,
         );
     }
 }

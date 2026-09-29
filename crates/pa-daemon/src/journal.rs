@@ -870,6 +870,8 @@ pub struct WorkerRecoveryJournal {
     pending_sync_fd: Option<File>,
     #[cfg(test)]
     fail_next_cloud_sync: bool,
+    #[cfg(test)]
+    pub(crate) before_failed_cloud_sync: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl WorkerRecoveryJournal {
@@ -952,6 +954,8 @@ impl WorkerRecoveryJournal {
             pending_sync_fd: None,
             #[cfg(test)]
             fail_next_cloud_sync: false,
+            #[cfg(test)]
+            before_failed_cloud_sync: None,
         })
     }
 
@@ -1016,6 +1020,9 @@ impl WorkerRecoveryJournal {
             }
             #[cfg(test)]
             if std::mem::take(&mut self.fail_next_cloud_sync) {
+                if let Some(before_failure) = self.before_failed_cloud_sync.take() {
+                    before_failure();
+                }
                 self.pending_sync_fd = Some(file);
                 anyhow::bail!("injected cloud journal fsync failure after complete write");
             }

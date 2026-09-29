@@ -11,10 +11,6 @@ use serde_json::Value;
 
 use crate::protocol::{response_failure, DaemonResponse};
 
-/// The internal input-pause owner for the cloud-keyed delivery
-/// transaction (the runner gate held across the durable commit).
-const CLOUD_INBOX_PAUSE_OWNER: &str = "cloud-inbox";
-
 /// One admitted agent-message delivery: the checkpoint operation name
 /// (TS's steer/follow-up queue string), the queue-projection snapshot to
 /// push, and the receipt the caller answers with (and, for cloud-keyed
@@ -364,22 +360,16 @@ impl Worker {
         // would then be impossible). The runner reads the pause without
         // holding the core lock, so this ordering cannot deadlock with
         // the recovery -> core discipline the checkpoint shares.
-        let pause_id = self.input_pauses.acquire(
-            &self.config.active_session_id,
-            CLOUD_INBOX_PAUSE_OWNER,
-            request_id,
-        );
+        let pause_id = self
+            .input_pauses
+            .acquire_internal(&self.config.active_session_id, request_id);
         let admission = match self.admit_agent_message_into_lane(payload) {
             Ok(admission) => admission,
             Err(response) => {
-                // The release is idempotent against our own owner id; a
-                // `let _` keeps the private outcome type out of this
-                // module (an owner mismatch is impossible: the constant
-                // is ours).
-                let _ = self.input_pauses.release(
+                self.input_pauses.release_internal(
                     &pause_id,
-                    CLOUD_INBOX_PAUSE_OWNER,
                     &self.config.active_session_id,
+                    request_id,
                 );
                 return response;
             }
@@ -399,10 +389,10 @@ impl Worker {
         ) {
             Ok(()) => {
                 drop(recovery);
-                let _ = self.input_pauses.release(
+                self.input_pauses.release_internal(
                     &pause_id,
-                    CLOUD_INBOX_PAUSE_OWNER,
                     &self.config.active_session_id,
+                    request_id,
                 );
                 // The reply mark is post-commit: a delivery that
                 // committed is a real reply; one that rolls back never

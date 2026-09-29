@@ -34,6 +34,10 @@ async fn keyed_delivery_records_the_admission_in_one_flush() {
         )
         .await;
     assert!(response.success, "deliver failed: {response:?}");
+    assert!(
+        !worker.input_pauses.paused(),
+        "the committed internal pause must release"
+    );
     let data = response.data.expect("receipt");
     let id = data["id"].as_str().expect("receipt id").to_string();
     assert!(id.starts_with("agentmsg_"), "receipt id: {data}");
@@ -265,6 +269,113 @@ async fn unkeyed_delivery_stays_untracked() {
         content.contains("cloud_inbox_admission"),
         "the keyed delivery must write the admission record: {content}"
     );
+}
+
+/// A client using the old "cloud-inbox" owner string cannot detach or
+/// directly release the worker's internal transaction pause while the
+/// complete transaction bytes await fsync. The failed sync rolls the
+/// transient row back without giving the runner a dequeue window.
+#[tokio::test]
+async fn detach_and_wire_release_cannot_unpause_a_failing_cloud_commit() {
+    let worker = created_worker().await;
+    worker.core.lock().unwrap().busy = true;
+    let config = worker.config.clone();
+    {
+        let observing_worker = Arc::clone(&worker);
+        let mut recovery = worker.recovery.lock().unwrap();
+        if recovery.is_none() {
+            *recovery = Some(
+                crate::journal::WorkerRecoveryJournal::open(&config.recovery_journal_path).unwrap(),
+            );
+        }
+        let journal = recovery.as_mut().unwrap();
+        journal.fail_next_cloud_sync();
+        journal.before_failed_cloud_sync = Some(Box::new(move || {
+            let pause_id = observing_worker
+                .input_pauses
+                .internal_pause_id()
+                .expect("transaction holds an internal pause");
+            assert_eq!(
+                queue_texts(&observing_worker.core, Lane::Steering).len(),
+                1,
+                "the row is transient while the append is in progress"
+            );
+            let release = observing_worker.handle_release_session_input_pause(&json!({
+                "pauseId": pause_id,
+                "clientId": "cloud-inbox",
+                "activeSessionId": "target-session",
+            }));
+            assert!(
+                !release.success,
+                "the wire cannot release an internal lease: {release:?}"
+            );
+            let detached = observing_worker.handle_detach(&json!({"clientId": "cloud-inbox"}));
+            assert!(
+                detached.success,
+                "the detach itself still succeeds: {detached:?}"
+            );
+            assert!(
+                observing_worker.input_pauses.paused(),
+                "the runner gate survives detach and forged release"
+            );
+        }));
+    }
+    let failed = worker
+        .dispatch(
+            "worker_deliver_message",
+            &keyed_payload("paused during failed sync", "msgreq_detach"),
+        )
+        .await;
+    assert!(!failed.success, "no receipt after failed sync: {failed:?}");
+    assert!(failed
+        .error
+        .as_deref()
+        .unwrap()
+        .starts_with(crate::cloud_family::CLOUD_COMMIT_UNCERTAIN));
+    assert!(worker.input_pauses.paused());
+    assert!(queue_texts(&worker.core, Lane::Steering).is_empty());
+    assert!(worker
+        .recovery
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .cloud_inbox_receipt("msgreq_detach")
+        .is_none());
+    worker.core.lock().unwrap().busy = false;
+    worker.work_notify.notify_one();
+    tokio::task::yield_now().await;
+    assert!(queue_texts(&worker.core, Lane::Steering).is_empty());
+    drop(worker);
+
+    let respawned = Arc::new(Worker::new(config.clone(), None));
+    *respawned.recovery.lock().unwrap() =
+        Some(crate::journal::WorkerRecoveryJournal::open(&config.recovery_journal_path).unwrap());
+    let created = respawned
+        .dispatch(
+            "create",
+            &json!({
+                "noSession": true, "cwd": "/tmp", "name": "target",
+            }),
+        )
+        .await;
+    assert!(
+        created.success,
+        "safe reopen restores the transaction: {created:?}"
+    );
+    assert_eq!(queue_texts(&respawned.core, Lane::Steering).len(), 1);
+    let duplicate = respawned
+        .dispatch(
+            "worker_deliver_message",
+            &keyed_payload("paused during failed sync", "msgreq_detach"),
+        )
+        .await;
+    assert!(
+        duplicate.success,
+        "safe replay returns the key: {duplicate:?}"
+    );
+    assert_eq!(queue_texts(&respawned.core, Lane::Steering).len(), 1);
+    let _ = std::fs::remove_dir_all(config.recovery_journal_path.parent().unwrap());
 }
 
 /// Inject a complete transaction write followed by a failed sync. The

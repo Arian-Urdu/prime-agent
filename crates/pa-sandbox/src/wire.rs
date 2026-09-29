@@ -75,8 +75,31 @@ fn is_ipv4_cidr(value: &str) -> bool {
     prefix.parse::<u8>().is_ok_and(|prefix| prefix <= 32) && is_ipv4_address(address)
 }
 
+/// A canonical RFC 1123 hostname label: letters, digits, or hyphens, no
+/// leading or trailing hyphen, at most 63 bytes.
+fn is_hostname_label(label: &str) -> bool {
+    let bytes = label.as_bytes();
+    if bytes.is_empty() || bytes.len() > 63 {
+        return false;
+    }
+    if bytes[0] == b'-' || bytes[bytes.len() - 1] == b'-' {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+}
+
+/// The total-domain cap the platform enforces (RFC 1123): 253 bytes.
+const MAX_DOMAIN_BYTES: usize = 253;
+
 /// Hostname or leftmost-label wildcard such as `example.com` or
-/// `*.example.com` (TS `isHostnameEntry`).
+/// `*.example.com` (TS `isHostnameEntry`, hardened to the platform's
+/// canonical contract): RFC 1123 labels, at most 253 bytes total. The TS
+/// reference only checks labels for non-emptiness, which lets malformed
+/// entries (`a_b`, `-bad`, over-length domains) reach the API and fail
+/// with a server-side 422; the platform rejects them, so the client fails
+/// fast locally instead.
 fn is_hostname_entry(value: &str) -> bool {
     if let Some(rest) = value.strip_prefix("*.") {
         return is_hostname_entry(rest);
@@ -85,7 +108,10 @@ fn is_hostname_entry(value: &str) -> bool {
         return false;
     }
     let domain = value.trim_end_matches('.');
-    !domain.is_empty() && !domain.contains('*') && domain.split('.').all(|label| !label.is_empty())
+    !domain.is_empty()
+        && !domain.contains('*')
+        && domain.len() <= MAX_DOMAIN_BYTES
+        && domain.split('.').all(is_hostname_label)
 }
 
 /// Mirror the platform egress entry contract: an exact hostname, a
@@ -479,6 +505,55 @@ mod tests {
                 "{entry:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn egress_hostname_entries_follow_the_platform_canonical_contract() {
+        // The reviewer's three platform-422 cases (the TS reference
+        // accepted them by checking only label non-emptiness).
+        for entry in [
+            "a_b.example.com".to_string(),      // underscore in a label
+            "-bad.example.com".to_string(),     // leading hyphen
+            format!("{}.com", "a".repeat(250)), // >253-byte domain
+        ] {
+            assert!(
+                validate_egress_list(std::slice::from_ref(&entry), "networkAllowlist").is_err(),
+                "{entry:?} must be rejected"
+            );
+        }
+        // Canonical edges that stay valid.
+        for entry in [
+            "example.com".to_string(),
+            "*.example.com".to_string(),
+            "localhost".to_string(),
+            "a-b.example.com".to_string(),
+            "example.com.".to_string(),
+            // exactly 253 bytes: 63 + 63 + 61 labels plus ".com"
+            format!(
+                "{}.{}.{}.com",
+                "a".repeat(63),
+                "b".repeat(63),
+                "c".repeat(61)
+            ),
+        ] {
+            assert!(
+                validate_egress_list(std::slice::from_ref(&entry), "networkAllowlist").is_ok(),
+                "{entry:?} must be accepted"
+            );
+        }
+        // A 64-byte label and a trailing hyphen are also invalid.
+        assert!(validate_egress_list(
+            &[format!("{}.example.com", "a".repeat(64))],
+            "networkAllowlist"
+        )
+        .is_err());
+        assert!(
+            validate_egress_list(&["bad-.example.com".to_string()], "networkAllowlist").is_err()
+        );
+        // The wildcard applies to the hostname rules underneath it.
+        assert!(
+            validate_egress_list(&["*.a_b.example.com".to_string()], "networkAllowlist").is_err()
+        );
     }
 
     #[test]

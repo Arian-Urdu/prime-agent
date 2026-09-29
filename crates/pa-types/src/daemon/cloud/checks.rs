@@ -77,3 +77,28 @@ pub(super) fn string_utf16_units(text: &str) -> usize {
 pub(super) fn record_field<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
     value.get(key)
 }
+
+/// TS inline `typeof value === "boolean"` checks.
+pub(super) fn expect_boolean(value: Option<&Value>, label: &str) -> Option<String> {
+    match value.and_then(Value::as_bool) {
+        Some(_) => None,
+        None => Some(format!("{label} must be a boolean")),
+    }
+}
+
+/// TS inline `value === undefined || typeof value === "boolean"` checks
+/// (`queueIfBusy`-style optional flags).
+pub(super) fn optional_boolean(value: Option<&Value>, label: &str) -> Option<String> {
+    match value {
+        None | Some(Value::Bool(_)) => None,
+        Some(_) => Some(format!("{label} must be a boolean when present")),
+    }
+}
+
+/// TS `expectDigest` via `isCloudDigest`.
+pub(super) fn expect_digest(value: Option<&Value>, label: &str) -> Option<String> {
+    match value.and_then(Value::as_str) {
+        Some(text) if super::frames::is_cloud_digest(text) => None,
+        _ => Some(format!("{label} must be a sha256:<64 hex> digest")),
+    }
+}

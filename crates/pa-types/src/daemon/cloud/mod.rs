@@ -1,25 +1,30 @@
-//! Cross-boundary family wire types: the v3 family surface of the cloud
-//! session protocol.
+//! Cloud session wire vocabulary: the bounded JSON protocol a gateway,
+//! a remote client, and a session executor speak over any reliable
+//! transport (TS `protocol.ts`, protocol v3, ported field-for-field from
+//! `origin/feat/direct-cloud-sandbox @ 193d42bf`).
 //!
-//! Port of the family-messaging slice of
-//! `packages/coding-agent/src/core/cloud/protocol.ts` (protocol v3, TS
-//! `origin/feat/direct-cloud-sandbox @ 193d42bf`): `CloudFamilyInfo`,
-//! `CloudAgentMessageSender`, `CloudFamilyRow`, the guest-to-local
-//! `family_roster_request` / `agent_message_request` events, the
-//! local-to-guest `family_roster_result` / `agent_message_result` commands,
-//! the `send_message` cloud command, and the terminal receipt payload. Field
-//! names, kind discriminants, bounds, and problem strings match the TS wire
-//! exactly, so a Rust endpoint serializes byte-identical frames and rejects
-//! malformed ones with the TS messages.
+//! Layout: [`base`] holds the base wire types (statuses, cursors,
+//! receipts, roster rows, session state, model metadata, the full
+//! command-request and event unions), [`frames`] holds the frame types,
+//! the `CloudMessage` union, digests, and the parse/serialize codec, and
+//! [`family`] holds the cross-boundary family slice (PR #3145's typed
+//! surface). The validators live in [`request_validation`],
+//! [`event_validation`], [`shapes_validation`], [`message_validation`],
+//! and [`validation`] (family), sharing the TS-exact checks in [`checks`]:
+//! exact problem strings, exact check order, UTF-16-unit string bounds
+//! (TS `.length` semantics), and canonical JSON rendered with JavaScript
+//! number semantics so digests match the TS bytes.
 //!
-//! String bounds count UTF-16 code units (TS `.length` semantics), including
-//! the astral plane, so an id or selector valid here is valid in TS and vice
-//! versa.
+//! This module is vocabulary only: no transport, gateway, journal, or
+//! capability advertising is implemented here. The family kinds of the
+//! unions embed the family slice's value types and validate through its
+//! validators, so the family surface stays owned by one place.
 //!
-//! Receipts never claim delivery on this surface: a `CloudAgentMessageReceipt`
-//! exists only after the receiving side admitted the message (the journaled
-//! `agent_message_result` carries it), so "durably admitted but unanswered"
-//! is a request state, never a receipt state.
+//! Receipts never claim delivery on the family surface: a
+//! `CloudAgentMessageReceipt` exists only after the receiving side
+//! admitted the message (the journaled `agent_message_result` carries
+//! it), so "durably admitted but unanswered" is a request state, never a
+//! receipt state.
 
 use serde_json::Value;
 
@@ -45,6 +50,27 @@ pub const CLOUD_MAX_FAMILY_ROWS: usize = 64;
 pub const CLOUD_MAX_RECEIPT_RESULT_CHARS: usize = 2_048;
 /// Bound on an agent-message request id and a remote target selector.
 pub const CLOUD_MAX_SELECTOR_CHARS: usize = 128;
+pub const CLOUD_MAX_REQUEST_JSON_CHARS: usize = 131_072;
+pub const CLOUD_MAX_MODEL_ID_CHARS: usize = 256;
+pub const CLOUD_MAX_CAPABILITIES: usize = 16;
+pub const CLOUD_MAX_QUEUED_COMMANDS: usize = 64;
+pub const CLOUD_MAX_SNAPSHOT_EVENTS: usize = 256;
+pub const CLOUD_MAX_TOKEN_CHARS: usize = 256;
+pub const CLOUD_MAX_OUTPUT_CHARS: usize = 65_536;
+/// Bound on one ephemeral `session_event` frame's encoded JSON.
+pub const CLOUD_MAX_SESSION_EVENT_BYTES: usize = 131_072;
+/// Bound on brokered inference request conversation length.
+pub const CLOUD_MAX_INFERENCE_MESSAGES: usize = 2_048;
+/// Bound on one inline `session_entry`'s encoded JSON; larger entries
+/// travel as artifact refs.
+pub const CLOUD_MAX_ENTRY_JSON_CHARS: usize = 262_144;
+pub const CLOUD_MAX_THINKING_CHARS: usize = 64;
+pub const CLOUD_MAX_EXTENSION_RESPONSE_CHARS: usize = 8_192;
+pub const CLOUD_MAX_META_CHARS: usize = 4_096;
+pub const CLOUD_MAX_PREVIEW_CHARS: usize = 4_096;
+pub const CLOUD_MAX_ROSTER_ROWS: usize = 256;
+/// Bound on artifact refs attached to one `session_entry`.
+pub const CLOUD_MAX_ARTIFACT_REFS: usize = 32;
 
 /// TS `CloudEvent.kind` one-of list, joined exactly as the TS validator
 /// reports it (used for the problem string; only the family kinds have typed
@@ -160,13 +186,38 @@ fn canonicalize_into(out: &mut String, value: &Value, depth: usize) -> Result<()
 // Module layout
 // ---------------------------------------------------------------------------
 
+mod base;
+#[cfg(test)]
+mod base_tests;
 mod checks;
+mod event_validation;
 mod family;
+mod frames;
+mod message_validation;
+mod request_validation;
+mod shapes_validation;
 #[cfg(test)]
 mod tests;
 mod validation;
 
+pub use base::{
+    canonical_cloud_model_selector, split_cloud_model_selector, CloudArtifactRef, CloudChildStatus,
+    CloudClientId, CloudCommandId, CloudCommandReceipt, CloudCommandRequest, CloudCommandState,
+    CloudCursor, CloudEvent, CloudModelMetadata, CloudOutputStream, CloudRosterRow, CloudSessionId,
+    CloudSessionState, CloudSessionStatus, CloudTaskId, CloudTaskState, CloudUsageTotals,
+    CLOUD_CAPABILITY_KINDS, CLOUD_COMMAND_STATES, CLOUD_SESSION_STATUSES,
+};
+pub use event_validation::cloud_event_problem;
 pub use family::*;
+pub use frames::{
+    cloud_digest, cloud_request_digest, is_cloud_digest, parse_cloud_message,
+    serialize_cloud_message, CloudAck, CloudCommand, CloudEventsFrame, CloudGetCommand, CloudHello,
+    CloudInferenceEnd, CloudInferenceError, CloudInferenceEvent, CloudInferenceModel,
+    CloudInferencePayload, CloudInferenceRequest, CloudMessage, CloudSnapshot, CloudSubmit,
+    CloudSubscribe, CLOUD_MESSAGE_TYPES, CLOUD_REQUEST_DIGEST_DOMAIN,
+};
+pub use message_validation::cloud_message_problem;
+pub use request_validation::{cloud_id_problem, cloud_request_json_problem, cloud_request_problem};
 pub use validation::{
     cloud_agent_message_sender_problem, cloud_family_command_problem, cloud_family_event_problem,
     cloud_family_info_problem, cloud_family_rows_problem, cloud_send_message_problem,

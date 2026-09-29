@@ -38,12 +38,19 @@ const EVENTS_FILE: &str = "outbox-events.ndjson";
 /// NDJSON envelope per request event, fsync'd on append before admission is
 /// reported. A crash may leave only the final append truncated; the reload
 /// repairs it by dropping the partial line.
+#[derive(Debug)]
 pub struct FamilyRequestLog {
     directory: PathBuf,
     session_id: String,
     events: Vec<CloudFamilyEvent>,
     max_records: usize,
     max_event_bytes: usize,
+    /// The validated parent's unix identity (device, inode), captured at
+    /// open and revalidated before every append: a parent swapped
+    /// through a writable ancestor refuses the append instead of
+    /// redirecting it.
+    #[cfg(unix)]
+    parent_identity: (u64, u64),
 }
 
 impl FamilyRequestLog {
@@ -56,9 +63,11 @@ impl FamilyRequestLog {
     /// verified handle, and a symlink or foreign-owned parent is
     /// rejected — the envelope stores the message body in plaintext, and
     /// a parent writable by others could redirect the appends.
-    /// Platforms without the owner/mode probes defer to the caller's
-    /// placement invariant (the wiring PR owns placement; revisit with
-    /// the platform ACL proof).
+    /// Platforms without the owner/mode probes FAIL CLOSED (keyed-journal
+    /// parity) until the platform ACL proof exists. The validated
+    /// parent's identity is captured for revalidation at every append:
+    /// a parent swapped through a writable ancestor refuses the append
+    /// instead of receiving the write.
     ///
     /// # Errors
     ///
@@ -66,14 +75,20 @@ impl FamilyRequestLog {
     /// owner-private, the log is corrupt (digest, envelope, or sequence
     /// gap), or the repair write of a crash-truncated tail fails.
     pub fn open(directory: &Path, session_id: &str, max_records: usize) -> Result<Self> {
+        let events_path = directory.join(EVENTS_FILE);
+        crate::journal::ensure_private_journal_parent(&events_path)?;
+        crate::journal::validate_private_journal_parent(&events_path)?;
+        #[cfg(unix)]
+        let parent_identity = crate::journal::private_parent_identity(&events_path)?;
         let mut log = Self {
             directory: directory.to_path_buf(),
             session_id: session_id.to_string(),
             events: Vec::new(),
             max_records,
             max_event_bytes: pa_types::daemon::cloud::CLOUD_MAX_MESSAGE_BYTES,
+            #[cfg(unix)]
+            parent_identity,
         };
-        crate::journal::ensure_private_journal_parent(&log.events_path())?;
         // Private from its first write (the creation mode below); a file
         // left at the umask-default mode by an older build moves to a
         // fresh private inode HERE.
@@ -113,6 +128,11 @@ impl FamilyRequestLog {
         }
         let mut line = envelope;
         line.push('\n');
+        #[cfg(unix)]
+        crate::journal::revalidate_private_journal_parent(
+            &self.events_path(),
+            self.parent_identity,
+        )?;
         // Nofollow discipline (the keyed append's contract): the path is
         // lstat'd as a regular non-symlink file, and the opened inode is
         // proven to be that same object before ANY plaintext is written —
@@ -258,6 +278,8 @@ impl FamilyRequestLog {
     /// (temp file, fsync, rename), repairing a truncated tail in place.
     fn rewrite(&mut self, lines: Vec<String>) -> Result<()> {
         let path = self.events_path();
+        #[cfg(unix)]
+        crate::journal::revalidate_private_journal_parent(&path, self.parent_identity)?;
         let temp = path.with_extension("ndjson.tmp");
         {
             let mut options = OpenOptions::new();
@@ -281,6 +303,7 @@ impl FamilyRequestLog {
 
 /// One durably-admitted request slot: the request id plus its journaled
 /// answer once one exists.
+#[derive(Debug)]
 struct ResultSlot {
     request_id: String,
     result: Option<CloudFamilyCommand>,
@@ -306,10 +329,17 @@ struct ResultSlot {
 /// the request outbox's record cap — the largest replay span — so a
 /// replayed request always finds its journal state (TS's dedupe was 256
 /// ephemeral in-memory ids, crash-blind; the durable window closes that).
+#[derive(Debug)]
 pub struct FamilyResultLog {
     path: PathBuf,
     slots: VecDeque<ResultSlot>,
     max_remembered: usize,
+    /// The validated parent's unix identity (device, inode), captured at
+    /// open and revalidated before every append: a parent swapped
+    /// through a writable ancestor refuses the append instead of
+    /// redirecting it.
+    #[cfg(unix)]
+    parent_identity: (u64, u64),
 }
 
 /// What `admit` found on disk for one request id.
@@ -331,9 +361,9 @@ impl FamilyResultLog {
     /// invariant as the request log: a missing chain is created private,
     /// a pre-existing own parent is tightened through a verified handle,
     /// and a symlink or foreign-owned parent is rejected. Platforms
-    /// without the owner/mode probes defer to the caller's placement
-    /// invariant (the wiring PR owns placement; revisit with the
-    /// platform ACL proof).
+    /// without the owner/mode probes FAIL CLOSED (keyed-journal parity)
+    /// until the platform ACL proof exists. The validated parent's
+    /// identity is captured for revalidation at every append.
     ///
     /// # Errors
     ///
@@ -341,6 +371,9 @@ impl FamilyResultLog {
     /// as owner-private.
     pub fn open(path: &Path) -> Result<Self> {
         crate::journal::ensure_private_journal_parent(path)?;
+        crate::journal::validate_private_journal_parent(path)?;
+        #[cfg(unix)]
+        let parent_identity = crate::journal::private_parent_identity(path)?;
         // Private from its first write (the creation mode in
         // journal::append_record); a file left at the umask-default mode
         // by an older build moves to a fresh private inode HERE.
@@ -370,6 +403,8 @@ impl FamilyResultLog {
             // span — the request outbox's own record cap — so every
             // replayable request finds its journal state.
             max_remembered: DEFAULT_OUTBOX_RECORDS,
+            #[cfg(unix)]
+            parent_identity,
         };
         log.load_lines(&valid_lines);
         Ok(log)
@@ -396,6 +431,8 @@ impl FamilyResultLog {
         if self.slot(request_id).is_some() {
             return Ok(Admission::Already);
         }
+        #[cfg(unix)]
+        crate::journal::revalidate_private_journal_parent(&self.path, self.parent_identity)?;
         crate::journal::append_record(
             &self.path,
             &json!({"version": 1, "type": "admitted", "requestId": request_id}),
@@ -422,6 +459,8 @@ impl FamilyResultLog {
         if self.result(&request_id).is_some() {
             return Ok(());
         }
+        #[cfg(unix)]
+        crate::journal::revalidate_private_journal_parent(&self.path, self.parent_identity)?;
         crate::journal::append_record(
             &self.path,
             &json!({"version": 1, "type": "result", "requestId": request_id, "command": command}),
@@ -516,7 +555,7 @@ impl FamilyResultLog {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -660,16 +699,14 @@ mod tests {
         let link = root.path().join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let request_error = FamilyRequestLog::open(&link, "sess_priv", 50)
-            .err()
-            .expect("the symlinked parent is rejected")
+            .expect_err("the symlinked parent is rejected")
             .to_string();
         assert!(
             request_error.contains("must be a real private directory"),
             "the symlinked parent is rejected: {request_error}"
         );
         let result_error = FamilyResultLog::open(&link.join("family-results.jsonl"))
-            .err()
-            .expect("the symlinked parent is rejected")
+            .expect_err("the symlinked parent is rejected")
             .to_string();
         assert!(
             result_error.contains("must be a real private directory"),
@@ -721,6 +758,55 @@ mod tests {
             fs::read_to_string(&sink).unwrap(),
             "",
             "no plaintext is written through the replaced path"
+        );
+    }
+
+    /// The residual swap (the follow-up review): a writable ancestor
+    /// can replace the VALIDATED parent between the open and the append.
+    /// The replacement is a perfectly valid private directory — but not
+    /// the validated inode, so the append-time revalidation refuses.
+    #[test]
+    fn outbox_append_refuses_a_swapped_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let outbox = root.path().join("outbox");
+        let mut log = FamilyRequestLog::open(&outbox, "sess_priv", 50).unwrap();
+        fs::rename(&outbox, root.path().join("moved")).unwrap();
+        fs::create_dir_all(&outbox).unwrap();
+        fs::set_permissions(&outbox, fs::Permissions::from_mode(0o700)).unwrap();
+        let error = log
+            .append(CloudFamilyEventPayload::AgentMessageRequest {
+                request_id: "msgreq_priv".to_string(),
+                from_remote_session_id: "remote_child".to_string(),
+                target_selector: "sibling".to_string(),
+                message: "the plaintext body".to_string(),
+            })
+            .expect_err("the swapped parent refuses the append");
+        assert!(
+            error.to_string().contains("was replaced after open"),
+            "the identity check refuses: {error:#}"
+        );
+    }
+
+    /// The result journal's appends revalidate the same identity: a
+    /// swapped parent refuses the admission instead of receiving it.
+    #[test]
+    fn result_journal_append_refuses_a_swapped_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("results-dir");
+        fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("family-results.jsonl");
+        let mut log = FamilyResultLog::open(&path).unwrap();
+        fs::rename(&parent, root.path().join("moved")).unwrap();
+        fs::create_dir_all(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let error = log
+            .admit("msgreq_swap")
+            .expect_err("the swapped parent refuses the append");
+        assert!(
+            error.to_string().contains("was replaced after open"),
+            "the identity check refuses: {error:#}"
         );
     }
 
@@ -783,5 +869,27 @@ mod tests {
             before,
             "the corrupted file is never rewritten"
         );
+    }
+}
+
+/// Platforms without the owner/mode probes fail closed: the family logs
+/// never open on inherited ACLs alone (keyed-journal parity).
+#[cfg(all(test, not(unix)))]
+mod off_unix_tests {
+    use super::*;
+
+    #[test]
+    fn family_logs_fail_closed_off_unix() {
+        let dir = std::env::temp_dir().join(format!("pa-family-off-unix-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(
+            FamilyRequestLog::open(&dir, "sess_off", 10).is_err(),
+            "the request outbox fails closed off unix"
+        );
+        assert!(
+            FamilyResultLog::open(&dir.join("family-results.jsonl")).is_err(),
+            "the result journal fails closed off unix"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -263,4 +263,69 @@ mod windows_tests {
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_dir(&dir);
     }
+
+    /// The ownership probes fail closed: no ownership is claimed from
+    /// inherited ACLs, and there is no uid-style probe on this platform.
+    #[test]
+    fn ownership_probes_fail_closed() {
+        let dir = std::env::temp_dir().join(format!("pa-perms-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        assert_eq!(effective_uid(), None);
+        assert!(
+            !owned_by_effective_user(&dir),
+            "inherited ACLs are not an ownership proof"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+
+    /// The exact surface the private-journal contract enforces with: the
+    /// effective-uid probe, the ownership probe (own paths true,
+    /// unreadable paths false), the mode probe, private recursive
+    /// creation, the tighten, and the private file-creation mode.
+    #[test]
+    fn ownership_mode_and_private_creation_probes() {
+        let dir = std::env::temp_dir().join(format!("pa-perms-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        assert!(effective_uid().is_some(), "unix has the uid probe");
+        assert!(owned_by_effective_user(&dir), "an own directory is owned");
+        assert!(
+            !owned_by_effective_user(&dir.join("missing")),
+            "an unreadable path answers false"
+        );
+
+        create_dir_all_private(&dir.join("nested/inner")).expect("create private");
+        assert_eq!(
+            file_mode(&dir.join("nested/inner")),
+            Some(PRIVATE_DIR_MODE),
+            "the created chain is private"
+        );
+        assert_eq!(file_mode(&dir.join("nested")), Some(PRIVATE_DIR_MODE));
+
+        restrict_dir(&dir).expect("restrict");
+        assert_eq!(file_mode(&dir), Some(PRIVATE_DIR_MODE));
+
+        let file = dir.join("probe.ndjson");
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        set_private_mode(&mut options);
+        options
+            .open(&file)
+            .expect("open private")
+            .sync_all()
+            .expect("sync");
+        assert_eq!(
+            file_mode(&file),
+            Some(PRIVATE_FILE_MODE),
+            "the created file is private"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

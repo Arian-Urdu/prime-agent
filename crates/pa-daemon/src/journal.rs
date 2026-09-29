@@ -139,6 +139,51 @@ pub(crate) fn ensure_private_journal_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The validated parent directory's unix identity (device, inode),
+/// captured at open for the append-time revalidation. Call only after
+/// the parent passed [`validate_private_journal_parent`].
+///
+/// # Errors
+///
+/// Returns an error when the parent cannot be inspected or is not a
+/// real private directory.
+#[cfg(unix)]
+pub(crate) fn private_parent_identity(path: &Path) -> Result<(u64, u64)> {
+    let parent = path.parent().context("journal has no parent directory")?;
+    let metadata = fs::symlink_metadata(parent)?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "journal parent {} must be a real private directory",
+        parent.display()
+    );
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// Revalidate the private-parent contract at APPEND time against the
+/// identity captured at open: the parent must still be a real
+/// owner-private directory AND the same inode — a parent swapped through
+/// a writable ancestor between the open and this append is refused
+/// instead of receiving the write. (The check-to-open window remains;
+/// closing it fully needs an openat dir handle, which is platform
+/// machinery outside this scope.)
+///
+/// # Errors
+///
+/// Returns the validator's error, an inspect failure, or the identity
+/// mismatch.
+#[cfg(unix)]
+pub(crate) fn revalidate_private_journal_parent(path: &Path, identity: (u64, u64)) -> Result<()> {
+    validate_private_journal_parent(path)?;
+    let parent = path.parent().context("journal has no parent directory")?;
+    let metadata = fs::symlink_metadata(parent)?;
+    anyhow::ensure!(
+        (metadata.dev(), metadata.ino()) == identity,
+        "journal parent {} was replaced after open",
+        parent.display()
+    );
+    Ok(())
+}
+
 /// Move an existing journal file to a fresh, privately created inode when
 /// its mode is not the private file mode: the bytes are copied verbatim
 /// into a 0600 temp file (synced) and renamed over the path, so a

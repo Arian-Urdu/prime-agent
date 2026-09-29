@@ -1,3 +1,8 @@
+// Unix-only while the private-journal contract has no platform ACL
+// proof: the family logs' private-parent validator fails closed on
+// platforms without the owner/mode probes.
+#![cfg(unix)]
+
 //! Cloud family messaging substrate verifier: the journaled request/response
 //! exchange over real durable logs, with the honesty contracts the design
 //! pins — a receipt exists only after receiver admission, `Pending` is

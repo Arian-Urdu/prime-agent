@@ -281,6 +281,10 @@ const TOP_LEVEL_OPTION_GROUPS: &[OptionGroup] = &[
             ),
             ("--cwd <dir>", "Use a specific working directory"),
             ("--offline", "Disable startup network operations"),
+            (
+                "--no-harness",
+                "Start without the continual harness (same as PRIME_AGENT_NO_HARNESS=1)",
+            ),
             ("--verbose", "Force verbose startup"),
             ("--daemon-socket <path>", "Use a specific daemon socket"),
         ],

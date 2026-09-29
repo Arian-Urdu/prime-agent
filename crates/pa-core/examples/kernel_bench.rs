@@ -87,6 +87,7 @@ fn manager_options(
         }),
         bootstrap_code: Some(pa_core::kernel::bootstrap::build_rlm_bootstrap_code(
             &bench_python_skills(),
+            pa_types::harness_switch::HarnessMode::Enabled,
         )),
         stderr_log_path: None,
     }

@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::anyhow;
+use pa_types::harness_switch::HarnessMode;
 
 use crate::kernel::bootstrap::{
     build_rlm_bootstrap_code, parse_unavailable_python_skills, KernelBootstrapProgressHandler,
@@ -670,7 +671,7 @@ async fn start_kernel_impl(
         gate().await;
     }
     let snapshot_dir = options.snapshot_dir.clone();
-    let bootstrap_code = build_rlm_bootstrap_code(&options.python_skills);
+    let bootstrap_code = build_rlm_bootstrap_code(&options.python_skills, HarnessMode::from_env());
     let mut env = options.env.clone();
     if let Some(shell_path) = &options.shell_path {
         env.insert(

@@ -17,6 +17,7 @@ use pa_core::prompts::system_prompt::{
     system_prompt_breakdown, BuildSystemPromptOptions, SegmentKind,
 };
 use pa_core::skills::load_skills_from_dir;
+use pa_types::harness_switch::HarnessMode;
 
 /// The workspace bundled skills directory (source-checkout layout):
 /// pa-core lives at `<root>/crates/pa-core`.
@@ -283,7 +284,7 @@ fn all_string_literals(text: &str) -> Vec<String> {
 /// Kernel-bound REPL names from the real bootstrap code (`rlm`, `bash`,
 /// `mcp`), derived from `build_rlm_bootstrap_code`.
 fn kernel_bound_names() -> BTreeSet<String> {
-    let code = pa_core::kernel::bootstrap::build_rlm_bootstrap_code(&[]);
+    let code = pa_core::kernel::bootstrap::build_rlm_bootstrap_code(&[], HarnessMode::Enabled);
     let mut names = BTreeSet::new();
     for line in code.lines() {
         let line = line.trim_start();

@@ -17,6 +17,7 @@ use super::{
 };
 use crate::settings::Settings;
 use crate::skills::diagnostics::ResourceDiagnostic;
+use pa_types::harness_switch::HarnessMode;
 
 fn home_dir() -> PathBuf {
     pa_types::platform::home_dir().unwrap_or_else(|| PathBuf::from("."))
@@ -161,6 +162,11 @@ impl PackageManager {
                 if !self.bundled_websearch_enabled() {
                     // Web search stays disabled until explicitly enabled.
                     builtin_skill_overrides.push("-websearch/SKILL.md".to_string());
+                }
+                if HarnessMode::from_env() == HarnessMode::Disabled {
+                    // Without the continual harness there is no refinement
+                    // trigger, so its skill goes too.
+                    builtin_skill_overrides.push("-refine/SKILL.md".to_string());
                 }
                 builtin_skill_overrides
                     .extend(self.extra_builtin_skill_overrides().iter().cloned());

@@ -3,6 +3,7 @@
 //! Python skill (from `core/tools/ipython.ts`'s `buildRlmBootstrapCode`).
 
 use super::KernelPythonSkill;
+use pa_types::harness_switch::HarnessMode;
 
 /// Line the runtime bootstrap prints (once, after the skill import loop) when
 /// one or more pre-imported Python skills failed to import. The host scans
@@ -38,10 +39,31 @@ pub fn parse_unavailable_python_skills(stdout: &str) -> Option<UnavailablePython
 const RLM_BOOTSTRAP_HEADER_CODE: &str =
     "import asyncio\nimport os as _prime_agent_os\n\n_prime_agent_os.environ[\"NO_COLOR\"] = \"1\"";
 
-const RLM_BOOTSTRAP_RUNTIME_CODE: &str = r#"
+/// The code the session injects right after kernel start/restore: binds the
+/// `rlm`, `bash`, and MCP surfaces, imports every Python skill (wrapping
+/// callable ones, replacing broken imports with a stub that raises), and —
+/// when any import failed — ends by printing
+/// [`PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER`] plus the errors as JSON so
+/// the host can tell the model, matching the TS `buildRlmBootstrapCode`.
+///
+/// In [`HarnessMode::Disabled`] the bound `rlm` is the runtime's core
+/// namespace, so the harness surface is absent instead of inert.
+// One generated Python cell: the template is the content, not logic to
+// split by size.
+#[allow(clippy::too_many_lines)]
+pub fn build_rlm_bootstrap_code(
+    python_skills: &[KernelPythonSkill],
+    harness: HarnessMode,
+) -> String {
+    let rlm_binding = match harness {
+        HarnessMode::Enabled => "_prime_agent_rlm_module.rlm",
+        HarnessMode::Disabled => "_prime_agent_rlm_module._RLMCoreNamespace()",
+    };
+    let runtime_code = format!(
+        r#"
 try:
     import rlm as _prime_agent_rlm_module
-    rlm = _prime_agent_rlm_module.rlm
+    rlm = {rlm_binding}
     bash = _prime_agent_rlm_module.bash
     import rlm.mcp as mcp
 except Exception as _prime_agent_rlm_error:
@@ -53,7 +75,7 @@ except Exception as _prime_agent_rlm_error:
                 "prime-agent-runtime is not installed in this kernel. "
                 "Remove ~/.prime/agent/kernel-venv so prime-agent can rebuild it, or set "
                 "PRIME_AGENT_KERNEL_PYTHON to a kernel environment with prime-agent-runtime installed. "
-                f"Import error: {_PRIME_AGENT_RLM_IMPORT_ERROR}"
+                f"Import error: {{_PRIME_AGENT_RLM_IMPORT_ERROR}}"
             )
 
         async def spawn(self, prompt, **kwargs):
@@ -75,16 +97,9 @@ except Exception as _prime_agent_rlm_error:
 
     def bash(command):
         rlm._raise_missing()
-"#;
-
-/// The code the session injects right after kernel start/restore: binds the
-/// `rlm`, `bash`, and MCP surfaces, imports every Python skill (wrapping
-/// callable ones, replacing broken imports with a stub that raises), and —
-/// when any import failed — ends by printing
-/// [`PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER`] plus the errors as JSON so
-/// the host can tell the model, matching the TS `buildRlmBootstrapCode`.
-pub fn build_rlm_bootstrap_code(python_skills: &[KernelPythonSkill]) -> String {
-    let base_code = format!("{RLM_BOOTSTRAP_HEADER_CODE}\n\n{RLM_BOOTSTRAP_RUNTIME_CODE}");
+"#
+    );
+    let base_code = format!("{RLM_BOOTSTRAP_HEADER_CODE}\n\n{runtime_code}");
     let mut import_names: Vec<&str> = python_skills
         .iter()
         .map(|s| s.import_name.as_str())
@@ -185,7 +200,7 @@ mod tests {
 
     #[test]
     fn bootstrap_code_without_skills_binds_rlm() {
-        let code = build_rlm_bootstrap_code(&[]);
+        let code = build_rlm_bootstrap_code(&[], HarnessMode::Enabled);
         assert!(code.contains("import rlm as _prime_agent_rlm_module"));
         assert!(!code.contains("_PrimeAgentUnavailableSkill"));
     }
@@ -198,7 +213,7 @@ mod tests {
             package_path: PathBuf::from("/pkg/edit"),
             pyproject_path: PathBuf::from("/pkg/edit/pyproject.toml"),
         }];
-        let code = build_rlm_bootstrap_code(&skills);
+        let code = build_rlm_bootstrap_code(&skills, HarnessMode::Enabled);
         assert!(code.contains(r#"for _prime_agent_skill_name in ["edit"]"#));
         assert!(code.contains("_PrimeAgentUnavailableSkill"));
     }

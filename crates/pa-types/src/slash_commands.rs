@@ -10,6 +10,8 @@
 
 use std::collections::HashMap;
 
+use crate::harness_switch::HarnessMode;
+
 /// Session-executed commands (their behavior lives in the session engine).
 pub const SESSION_SLASH_COMMAND_NAMES: [&str; 4] = ["compact", "refine", "goal", "autonomous"];
 
@@ -91,23 +93,28 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: &[BuiltinSlashCommand] = &[
 
 /// The registry with alias resolution maps prebuilt.
 pub struct SlashCommandRegistry {
-    commands: &'static [BuiltinSlashCommand],
+    commands: Vec<&'static BuiltinSlashCommand>,
     by_name: HashMap<&'static str, &'static BuiltinSlashCommand>,
     alias_to_name: HashMap<&'static str, &'static str>,
 }
 
 impl SlashCommandRegistry {
     pub fn builtin() -> Self {
+        let harness = HarnessMode::from_env();
+        let commands: Vec<&'static BuiltinSlashCommand> = CANONICAL_BUILTIN_SLASH_COMMANDS
+            .iter()
+            .filter(|command| command.name != "refine" || harness == HarnessMode::Enabled)
+            .collect();
         let mut by_name = HashMap::new();
         let mut alias_to_name = HashMap::new();
-        for command in CANONICAL_BUILTIN_SLASH_COMMANDS {
-            by_name.insert(command.name, command);
+        for command in &commands {
+            by_name.insert(command.name, *command);
             for alias in command.aliases {
                 alias_to_name.insert(*alias, command.name);
             }
         }
         Self {
-            commands: CANONICAL_BUILTIN_SLASH_COMMANDS,
+            commands,
             by_name,
             alias_to_name,
         }
@@ -120,8 +127,8 @@ impl SlashCommandRegistry {
         REGISTRY.get_or_init(Self::builtin)
     }
 
-    pub fn all(&self) -> &'static [BuiltinSlashCommand] {
-        self.commands
+    pub fn all(&self) -> &[&'static BuiltinSlashCommand] {
+        &self.commands
     }
 
     /// Resolve an alias to its canonical name.
@@ -171,7 +178,7 @@ impl SlashCommandRegistry {
     /// core/slash-commands.ts searches this list).
     pub fn suggestion_candidates(&self) -> Vec<&'static str> {
         let mut candidates = Vec::new();
-        for command in self.commands {
+        for command in &self.commands {
             candidates.push(command.name);
             candidates.extend(command.aliases.iter().copied());
         }

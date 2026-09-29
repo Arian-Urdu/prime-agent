@@ -71,7 +71,7 @@ pub fn main_with_runtime(args: Vec<String>, runtime: &dyn mode::Runtime) -> i32 
     }
 }
 
-fn main_impl(args: Vec<String>, runtime: &dyn mode::Runtime) -> Result<i32, String> {
+fn main_impl(mut args: Vec<String>, runtime: &dyn mode::Runtime) -> Result<i32, String> {
     use std::io::IsTerminal;
 
     let offline_mode = args.iter().any(|arg| arg == "--offline")
@@ -80,6 +80,12 @@ fn main_impl(args: Vec<String>, runtime: &dyn mode::Runtime) -> Result<i32, Stri
         );
     if offline_mode {
         std::env::set_var(crate::config::ENV_OFFLINE, "1");
+    }
+    // `--no-harness` is the CLI alias of `PRIME_AGENT_NO_HARNESS=1`: it is
+    // stripped before any routing, so no parser ever sees it.
+    if args.iter().any(|arg| arg == "--no-harness") {
+        args.retain(|arg| arg != "--no-harness");
+        std::env::set_var(pa_types::harness_switch::NO_HARNESS_ENV, "1");
     }
 
     // Install-time kernel preparation (TS cli-main.ts): the installer invokes

@@ -22,6 +22,7 @@ use pa_core::kernel::shared::{
     KernelShutdownOptions, KernelSnapshotConfig,
 };
 use pa_core::kernel::state_snapshot::{manifest_path_in, snapshot_path_in};
+use pa_types::harness_switch::HarnessMode;
 
 /// The kernel Python with prime-agent-runtime installed. The TS product's
 /// auto-bootstrapped kernel venv is the ground-truth environment; this is
@@ -77,7 +78,7 @@ fn test_options(snapshot_dir: Option<&std::path::Path>) -> Option<KernelManagerO
         }),
         // The TS provisioner (ipython.ts) always builds and executes the RLM
         // bootstrap after start; tests match that contract.
-        bootstrap_code: Some(build_rlm_bootstrap_code(&[])),
+        bootstrap_code: Some(build_rlm_bootstrap_code(&[], HarnessMode::Enabled)),
         stderr_log_path: None,
     })
 }
@@ -203,32 +204,43 @@ async fn rlm_bootstrap_injects_the_kernel_surface() {
     let Some(base) = test_options(None) else {
         return;
     };
-    let options = KernelManagerOptions {
-        bootstrap_code: Some(build_rlm_bootstrap_code(&[])),
-        ..base
-    };
-    let manager = started_manager(options).await;
+    // Both modes through the real bootstrap and runtime: the full
+    // namespace by default, the harness-free core namespace without the
+    // continual harness.
+    let cases = [
+        (
+            HarnessMode::Enabled,
+            "callable(rlm.spawn) and callable(rlm.find_models) and hasattr(rlm, 'harness') and callable(bash) and hasattr(rlm, 'get_harness_state')",
+        ),
+        (
+            HarnessMode::Disabled,
+            "callable(rlm.spawn) and callable(bash) and not hasattr(rlm, 'harness') and not hasattr(rlm, 'get_harness_state')",
+        ),
+    ];
+    for (harness, probe) in cases {
+        let options = KernelManagerOptions {
+            bootstrap_code: Some(build_rlm_bootstrap_code(&[], harness)),
+            ..base.clone()
+        };
+        let manager = started_manager(options).await;
 
-    let result = execute(
-        &manager,
-        "callable(rlm.spawn) and callable(rlm.find_models) and hasattr(rlm, 'harness') and callable(bash) and hasattr(rlm, 'get_harness_state')",
-    )
-    .await;
-    assert_eq!(
-        result.status,
-        ExecuteStatus::Ok,
-        "bootstrap must bind the RLM surface"
-    );
-    assert_eq!(
-        result.result.as_deref(),
-        Some("True"),
-        "rlm/bash/harness must be usable"
-    );
+        let result = execute(&manager, probe).await;
+        assert_eq!(
+            result.status,
+            ExecuteStatus::Ok,
+            "bootstrap must bind the RLM surface ({harness:?})"
+        );
+        assert_eq!(
+            result.result.as_deref(),
+            Some("True"),
+            "the {harness:?} bootstrap surface must match its probe"
+        );
 
-    manager
-        .shutdown(KernelShutdownOptions::default())
-        .await
-        .expect("shutdown");
+        manager
+            .shutdown(KernelShutdownOptions::default())
+            .await
+            .expect("shutdown");
+    }
 }
 
 #[tokio::test]
@@ -251,7 +263,7 @@ async fn host_requests_round_trip_to_registered_handlers() {
     };
     let options = KernelManagerOptions {
         host_handlers: handlers,
-        bootstrap_code: Some(build_rlm_bootstrap_code(&[])),
+        bootstrap_code: Some(build_rlm_bootstrap_code(&[], HarnessMode::Enabled)),
         ..base
     };
     let manager = started_manager(options).await;

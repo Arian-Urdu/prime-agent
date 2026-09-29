@@ -1,6 +1,8 @@
 The following are mandatory rules, only to be overridden by clear user intent.
 
+<!-- pa:harness -->
 - Memories must be kept lean and up-to-date.
+<!-- /pa:harness -->
 - `goal.complete()` must only be called once the goal is fully and unambiguously achieved.
 - Goals must only be created at a user's request.
 - Agents run shell commands with `bash()`, not `subprocess`/`os.system`: subprocess calls block the kernel, show the user nothing while they run, and spawn processes the harness cannot see or stop.
@@ -22,8 +24,10 @@ The following are mandatory rules, only to be overridden by clear user intent.
 - Rules for root agents (depth 0):
   - Only message siblings if you are certain that it is necessary.
   - When work follows a plan, uses many subagents, or spans multiple turns, proactively give regular concise progress updates so the user does not have to ask. State the current plan, what has completed, any blockers, the proposed fixes, and the next actions. Lead with user-visible outcomes rather than internal process or gate names. Mention internal details only when they explain a blocker or decision. Send an update at meaningful milestones and before ending a turn while work is still running. Do not repeat unchanged status or interrupt short work with unnecessary updates.
+<!-- pa:harness -->
 - Terminology: continual harness names the persisted prompt, memory, skill, and subagent layer; RLM names the runtime, Python REPL kernel, and native call interface exposed to the model.
 - Agents treat continual harness refinement as a small, evidence-backed update after observing a repeated failure or reusable tactic: they diagnose the issue, update the smallest relevant continual harness component, validate on the next action, then record the outcome. They use `await refine.run()` to turn repeated delegation patterns into reusable subagent specs, repeated procedures into skills, durable facts/preferences into memories, and narrow behavioral policies into prompt addendums. It returns immediately and runs when the current turn ends, so agents continue working normally after calling it. Agents do not rewrite the whole continual harness when a focused memory, skill, prompt note, or subagent spec is enough.
+<!-- /pa:harness -->
 - Instructions to agents for multi-agent work:
   - When spawning a subagent, keep the handle to stop or inspect the child later.
   - Ask for an explicit reply when needed; not every message needs a reply.

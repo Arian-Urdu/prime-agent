@@ -16,6 +16,7 @@ use crate::session::manager::SessionManager;
 use crate::skills::PromptTemplate;
 
 use pa_telemetry::base_properties;
+use pa_types::harness_switch::HarnessMode;
 
 use super::{AgentSession, PromptOptions, PromptOutcome};
 
@@ -234,6 +235,7 @@ fn mcp_gating_blocking(
 /// reporting.
 pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<SessionEngine> {
     let cwd = config.cwd.clone();
+    let harness = HarnessMode::from_env();
     // Session persistence first: the conversation-log path and the resume
     // context both come from the session manager (TS `_rebuildSystemPrompt`
     // reads `sessionManager.getSessionFile()`).
@@ -388,11 +390,13 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         });
     let local_harness_dir =
         crate::refinement::get_local_harness_state_dir(session_artifact_dir.as_deref());
-    // The refine surface gate (TS `_autoRefineAllowedForSession`): depth 0
-    // with a local harness state dir — the sessions whose `refine.*` host
-    // requests register, and the only sessions the compact-trigger
-    // auto-refine may run for.
-    let auto_refine_allowed = config.rlm_depth.unwrap_or(0) == 0 && local_harness_dir.is_some();
+    // The refine surface gate (TS `_autoRefineAllowedForSession`): the
+    // continual harness on, depth 0 with a local harness state dir — the
+    // sessions whose `refine.*` host requests register, and the only
+    // sessions the compact-trigger auto-refine may run for.
+    let auto_refine_allowed = harness == HarnessMode::Enabled
+        && config.rlm_depth.unwrap_or(0) == 0
+        && local_harness_dir.is_some();
     if auto_refine_allowed {
         turn_boundary.register_refine_handlers(&mut handlers);
     }
@@ -602,23 +606,26 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             rlm_depth: config.rlm_depth,
             generic_mcp_servers,
             prompt_guidelines: Some(prompt_guidelines),
+            harness,
             ..Default::default()
         },
     );
 
     // Harness digest inputs: global state from the agent dir, local state
     // from the session artifacts (or the daemon-owned conversation log), and
-    // the interfaces the digest may reference.
-    let digest_context = super::harness_digest::HarnessDigestContext {
-        global_dir: crate::refinement::get_global_harness_state_dir(&config.agent_dir),
-        local_dir: local_harness_dir,
-        include_ipython: active_tool_names.iter().any(|name| name == "ipython"),
-        include_shell_examples: active_tool_names.iter().any(|name| name == "bash"),
-        include_refine: resources.skills.iter().any(|skill| {
-            !skill.disable_model_invocation
-                && skill.name == crate::prompts::system_prompt::REFINE_SKILL_NAME
-        }),
-    };
+    // the interfaces the digest may reference. No context without the
+    // continual harness: no digest row is ever built or delivered.
+    let digest_context =
+        (harness == HarnessMode::Enabled).then(|| super::harness_digest::HarnessDigestContext {
+            global_dir: crate::refinement::get_global_harness_state_dir(&config.agent_dir),
+            local_dir: local_harness_dir,
+            include_ipython: active_tool_names.iter().any(|name| name == "ipython"),
+            include_shell_examples: active_tool_names.iter().any(|name| name == "bash"),
+            include_refine: resources.skills.iter().any(|skill| {
+                !skill.disable_model_invocation
+                    && skill.name == crate::prompts::system_prompt::REFINE_SKILL_NAME
+            }),
+        });
     // sdk.ts `createAgentSession` parity: a session manager that already
     // holds messages is a resume — the loop starts from the persisted
     // context. Fresh sessions record the creation prefix (model_change +
@@ -728,7 +735,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         agent.clone(),
         wiring.session.clone(),
         resources.prompts.clone(),
-        Some(digest_context),
+        digest_context,
     )
     .await?;
     session.set_auto_refine(auto_refine_allowed, auto_refine_gates);

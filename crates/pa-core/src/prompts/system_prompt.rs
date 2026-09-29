@@ -1,6 +1,8 @@
 //! Layered system-prompt assembly: static layer files first (cacheable),
 //! every session-specific value last. See the parent module docs.
 
+use pa_types::harness_switch::HarnessMode;
+
 use crate::skills::{format_skills_for_prompt, Skill};
 
 use super::layers;
@@ -93,6 +95,8 @@ pub struct BuildSystemPromptOptions<'a> {
     pub rlm_parent_agent: Option<&'a str>,
     /// Enabled user-configured generic MCP servers.
     pub generic_mcp_servers: Vec<String>,
+    /// Whether the continual-harness prompt sections are assembled.
+    pub harness: HarnessMode,
 }
 
 /// Build the system prompt (assembled text only).
@@ -117,17 +121,17 @@ pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemProm
             segments.push(PromptSegment::static_segment(
                 "core",
                 layers::layer_source("core").unwrap_or_default(),
-                layers::CORE_LAYER.trim().to_string(),
+                layers::layer_text(layers::CORE_LAYER, options.harness),
             ));
             segments.push(PromptSegment::static_segment(
                 "usage",
                 layers::layer_source("usage").unwrap_or_default(),
-                layers::USAGE_LAYER.trim().to_string(),
+                layers::layer_text(layers::USAGE_LAYER, options.harness),
             ));
             segments.push(PromptSegment::static_segment(
                 "opinionated",
                 layers::layer_source("opinionated").unwrap_or_default(),
-                layers::OPINIONATED_LAYER.trim().to_string(),
+                layers::layer_text(layers::OPINIONATED_LAYER, options.harness),
             ));
             let per_model = layers::per_model_text(options.model);
             if !per_model.is_empty() {
@@ -528,6 +532,35 @@ mod tests {
         assert!(breakdown
             .assembled
             .contains("# Additional Guidance\n\n- be careful"));
+    }
+
+    #[test]
+    fn no_harness_prompt_drops_the_continual_harness() {
+        let mut options = base_options();
+        options.harness = HarnessMode::Disabled;
+        // Refine's removal is the resource loader's job (the builtin-skill
+        // override), not the prompt builder's.
+        options
+            .skills
+            .retain(|skill| skill.name != REFINE_SKILL_NAME);
+        let breakdown = system_prompt_breakdown(&options);
+        let prompt = &breakdown.assembled;
+        for absent in [
+            "refine",
+            "rlm.harness",
+            "get_harness_state",
+            "ontinual harness",
+            "emor",
+            "pa:harness",
+        ] {
+            assert!(
+                !prompt.contains(absent),
+                "no-harness prompt contains {absent:?}"
+            );
+        }
+        // The neighbors survive the removed sections.
+        assert!(prompt.contains("## Compaction"));
+        assert!(prompt.contains("- `goal.complete()`"));
     }
 
     #[test]

@@ -29,6 +29,7 @@ use pa_core::kernel::shared::{
     KernelShutdownOptions, KernelSnapshotConfig,
 };
 use pa_core::kernel::state_snapshot::{manifest_path_in, snapshot_path_in};
+use pa_types::harness_switch::HarnessMode;
 
 fn kernel_python() -> Option<PathBuf> {
     if let Some(explicit) = std::env::var_os("PA_CORE_KERNEL_PYTHON") {
@@ -75,7 +76,7 @@ fn test_options(
             max_variable_bytes: None,
             debounce_ms,
         }),
-        bootstrap_code: Some(build_rlm_bootstrap_code(&[])),
+        bootstrap_code: Some(build_rlm_bootstrap_code(&[], HarnessMode::Enabled)),
         stderr_log_path: None,
         on_background_work_settled: None,
     })
@@ -207,7 +208,7 @@ async fn post_restore_auto_snapshot_skips_until_a_real_cell_changes_the_namespac
     let restore = reader.restore_state().await.expect("restore");
     assert!(restore.restored.iter().any(|name| name == "restored_var"));
 
-    let bootstrap_code = build_rlm_bootstrap_code(&[]);
+    let bootstrap_code = build_rlm_bootstrap_code(&[], HarnessMode::Enabled);
     let bootstrap = reader
         .execute(&bootstrap_code, ExecuteOptions::default())
         .await

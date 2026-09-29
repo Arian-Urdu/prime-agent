@@ -527,10 +527,7 @@ class _HarnessProxy:
 _harness_state = _HarnessProxy()
 
 
-class _RLMNamespace:
-    harness = _harness_state
-    get_harness_state = staticmethod(get_harness_state)
-
+class _RLMCoreNamespace:
     async def spawn(
         self,
         prompt: str,
@@ -574,6 +571,13 @@ class _RLMNamespace:
         if name == "run":
             raise AttributeError(_RENAMED_RUN_MESSAGE)
         raise AttributeError(f"'rlm' object has no attribute {name!r}")
+
+
+class _RLMNamespace(_RLMCoreNamespace):
+    """The full REPL namespace: the core surface plus the harness state."""
+
+    harness = _harness_state
+    get_harness_state = staticmethod(get_harness_state)
 
 
 rlm = _RLMNamespace()

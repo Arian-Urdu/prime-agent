@@ -69,6 +69,7 @@ The following programmatic tools are available in the REPL for a2a communication
 - `agent_observe.get_agent(target: str) -> dict`: one agent's status detail
 - `agent_observe.recent_messages(target: str, limit: int = 8, max_chars: int = 800) -> dict`: transcript preview; `limit` errors outside [1-50], `max_chars` outside [80-2000]
 
+<!-- pa:harness -->
 ## Continual Harness
 
 prime-agent is a continual harness. During a session, persistent memories can be written and read. These stay available even after multiple compactions.
@@ -133,6 +134,7 @@ Memories are created by two mechanisms:
     - `outcome: str`
     - `created_at: str`
 
+<!-- /pa:harness -->
 ## Compaction
 
 prime-agent compacts automatically when there is only a given number of tokens left in the context window (default: 16384), when the user triggers compaction, or when the agent triggers compaction. REPL state persists across compactions, but compaction removes individual variables whose serialized form exceeds 16 MiB.

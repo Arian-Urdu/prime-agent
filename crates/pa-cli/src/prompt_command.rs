@@ -121,6 +121,7 @@ fn assemble_breakdown(
             allow_recursion: Some(true),
             generic_mcp_servers: generic_servers,
             rlm_depth: Some(0),
+            harness: pa_types::harness_switch::HarnessMode::from_env(),
             ..Default::default()
         },
     ))

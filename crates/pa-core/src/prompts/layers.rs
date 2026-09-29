@@ -11,6 +11,15 @@
 //! Layer files must never contain session-specific values: the cached
 //! prefix ends where the dynamic tail (`system_prompt.rs`) begins, and the
 //! cache-safety guard test pins that boundary.
+//!
+//! `<!-- pa:harness -->` ... `<!-- /pa:harness -->` marker lines wrap the
+//! continual-harness text in a layer file; [`layer_text`] strips the
+//! markers (and their blocks in [`HarnessMode::Disabled`]) before assembly.
+
+use pa_types::harness_switch::HarnessMode;
+
+const HARNESS_BLOCK_OPEN: &str = "<!-- pa:harness -->";
+const HARNESS_BLOCK_CLOSE: &str = "<!-- /pa:harness -->";
 
 /// The core harness layer (file `layers/core.md`).
 pub const CORE_LAYER: &str = include_str!("layers/core.md");
@@ -144,14 +153,45 @@ pub fn per_model_text(model: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+/// One layer's prompt text: the marker lines stripped, and their blocks
+/// removed in [`HarnessMode::Disabled`] mode. `Enabled` output is the file
+/// content minus the marker lines.
+///
+/// # Panics
+///
+/// Panics when a `pa:harness` block is unclosed or unmatched.
+#[must_use]
+pub(crate) fn layer_text(layer: &str, harness: HarnessMode) -> String {
+    let mut out = String::with_capacity(layer.len());
+    let mut in_block = false;
+    for line in layer.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        if content == HARNESS_BLOCK_OPEN {
+            in_block = true;
+            continue;
+        }
+        if content == HARNESS_BLOCK_CLOSE {
+            assert!(in_block, "pa:harness blocks are closed");
+            in_block = false;
+            continue;
+        }
+        if in_block && harness == HarnessMode::Disabled {
+            continue;
+        }
+        out.push_str(line);
+    }
+    assert!(!in_block, "pa:harness blocks are closed");
+    out.trim().to_string()
+}
+
 /// The cache-stable static prefix for `model`: the three constant layers plus
 /// any matching per-model blocks, joined with blank lines. This is exactly
 /// what a provider may cache; everything after it is session-specific.
 pub fn static_prefix(model: Option<&str>) -> String {
     let mut parts: Vec<String> = vec![
-        CORE_LAYER.trim().to_string(),
-        USAGE_LAYER.trim().to_string(),
-        OPINIONATED_LAYER.trim().to_string(),
+        layer_text(CORE_LAYER, HarnessMode::Enabled),
+        layer_text(USAGE_LAYER, HarnessMode::Enabled),
+        layer_text(OPINIONATED_LAYER, HarnessMode::Enabled),
     ];
     parts.extend(per_model_text(model));
     parts.join("\n\n")
@@ -198,15 +238,9 @@ mod tests {
         assert!(prefix.starts_with("# prime-agent harness"));
         assert!(prefix.contains("The following are mandatory rules"));
         assert!(prefix.contains("guidelines to agents have been shown"));
-        // Exact composition: the three constant layers, no per-model text.
-        assert_eq!(
-            prefix,
-            format!(
-                "{}\n\n{}\n\n{}",
-                CORE_LAYER.trim(),
-                USAGE_LAYER.trim(),
-                OPINIONATED_LAYER.trim()
-            )
-        );
+        // Enabled mode keeps the harness blocks and strips only the markers.
+        assert!(prefix.contains("## Continual Harness"));
+        assert!(prefix.contains("## Compaction"));
+        assert!(!prefix.contains("pa:harness"));
     }
 }

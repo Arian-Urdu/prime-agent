@@ -14,13 +14,16 @@
 # No credentials are baked into the image.
 FROM us-central1-docker.pkg.dev/prime-intellect-platform/prod-sandbox/cmodl2lat001h4xo52tkp3f9m/icarus-prime-agent-slack-test@sha256:ee65460493c6f9597105d5960a92d96d831720652feccbc641397c46971801c4
 
-# `prime-agent-0.9.7-linux-x64.tar.gz` is the v0.9.7 Rust release tarball
-# (GitHub release, matching the release SHA256SUMS entry; files at the
-# tarball root: the `prime-agent` binary, `prime-agent-runtime/` kernel
-# sidecar, `skills/`, bundled catalog assets).
+# `prime-agent-release.tar.gz` is the Rust release tarball prepare.sh
+# fetched and verified (default: v0.9.7 linux-x64; files at the tarball
+# root: the `prime-agent` binary, `prime-agent-runtime/` kernel sidecar,
+# `skills/`, bundled catalog assets).
+# checksums.sha256 pins only frp (the version-stable artifact); the agent
+# tarball is verified against the RELEASE_SHA256 build arg (the deployment-time
+# pin; default: the validated v0.9.7 release).
 # `frp_0.66.0_linux_amd64.tar.gz` is the frp v0.66.0 release tarball
 # (https://github.com/fatedier/frp/releases/tag/v0.66.0).
-COPY checksums.sha256 prime-agent-0.9.7-linux-x64.tar.gz frp_0.66.0_linux_amd64.tar.gz /tmp/
+COPY checksums.sha256 prime-agent-release.tar.gz frp_0.66.0_linux_amd64.tar.gz /tmp/
 
 # The base was prepared for the TS prime-agent 0.2.9 and carries stale agent
 # overrides (a PRIME_AGENT_KERNEL_PYTHON pointing at its removed 0.2.9-era
@@ -39,19 +42,19 @@ RUN set -eux; \
     rm -rf /root/.prime/agent /root/.config/pi; \
     cd /tmp; \
     sha256sum -c checksums.sha256; \
-    test "$(sha256sum prime-agent-0.9.7-linux-x64.tar.gz | cut -d' ' -f1)" = "$RELEASE_SHA256"; \
+    test "$(sha256sum prime-agent-release.tar.gz | cut -d' ' -f1)" = "$RELEASE_SHA256"; \
     tar -xzf frp_0.66.0_linux_amd64.tar.gz -C /tmp; \
     echo "2fb1a9cf50f5d0872be868edd0c5f438e211f221b7edfff3615b149d89b94524  /tmp/frp_0.66.0_linux_amd64/frpc" | sha256sum -c -; \
     install -m 0755 /tmp/frp_0.66.0_linux_amd64/frpc /usr/local/bin/frpc; \
     root=/root/.local/share/prime-agent; \
     release="${RELEASE_VERSION}-${RELEASE_PLATFORM}-${RELEASE_SHA256}"; \
     mkdir -p "$root/releases/$release" "$root/bin" /root/.local/bin; \
-    tar -xzf /tmp/prime-agent-0.9.7-linux-x64.tar.gz -C "$root/releases/$release"; \
+    tar -xzf /tmp/prime-agent-release.tar.gz -C "$root/releases/$release"; \
     chmod 0755 "$root/releases/$release/prime-agent"; \
     printf 'prime-agent-native-v1\n' > "$root/.managed"; \
     ln -sfn "../releases/$release/prime-agent" "$root/bin/prime-agent"; \
     ln -sfn "$root/bin/prime-agent" /root/.local/bin/prime-agent; \
-    rm -rf /tmp/checksums.sha256 /tmp/prime-agent-0.9.7-linux-x64.tar.gz /tmp/frp_0.66.0_linux_amd64 /tmp/frp_0.66.0_linux_amd64.tar.gz; \
+    rm -rf /tmp/checksums.sha256 /tmp/prime-agent-release.tar.gz /tmp/frp_0.66.0_linux_amd64 /tmp/frp_0.66.0_linux_amd64.tar.gz; \
     hash -r; \
     command -v frpc git tar bash python3 uv; \
     PATH="/root/.local/bin:$PATH" command -v prime-agent; \

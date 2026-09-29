@@ -26,18 +26,35 @@
 //! Nothing in this module fabricates delivery: no fake transport, no local
 //! fallback for cloud targets, and no receipt before receiver admission.
 //!
+//! The production receiver-side seam ([`delivery::LocalFamilyDelivery`])
+//! implements [`exchange::CloudFamilyDelivery`] over the real supervisor:
+//! the registry, the roster (the family-reach assert over the durable
+//! parent edges, [`family::agent_family_relationship`]), and the worker
+//! route — with the request-id keyed durable receiver admission (the
+//! worker inbox's `cloud_inbox_admission` and the seam's
+//! [`inbox::CloudInboxLog`]) that reconciles a crash before or after the
+//! delivery without ever duplicating a visible message.
+//! [`delivery::reconcile_uncertain`] is the wiring pass that closes the
+//! responder's uncertain set through that seam. The cloud registry
+//! attachment (tunnel, roster rows, spawn records) wires these against
+//! the live cloud rows; nothing here fabricates a transport.
+//!
 //! Local family messaging (`agent_messaging.rs`, supervisor `send_message`)
 //! is untouched; the existing e2e harnesses stay the regression gate.
 
+pub mod delivery;
 pub mod exchange;
 pub mod family;
+pub mod inbox;
 pub mod log;
 
+pub use delivery::{reconcile_uncertain, LocalFamilyDelivery};
 pub use exchange::{
     AgentMessageLookup, CloudFamilyDelivery, CloudFamilyRequestError, CloudFamilyRequestOutcome,
     CloudFamilyRequester, CloudFamilyResponder, FamilyResultSubmitter, HandleOutcome,
     IncomingCloudMessage, ResolveOutcome,
 };
+pub use inbox::CloudInboxLog;
 pub use log::{Admission, FamilyRequestLog, FamilyResultLog};
 
 /// Pending-request window before a send surfaces `Pending` (TS

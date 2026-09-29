@@ -94,11 +94,14 @@ pub enum AgentMessageLookup {
     /// The receiver recorded this request id's admission: the receipt is
     /// its delivery truth, and an uncertain request reconciles to it.
     Admitted(CloudAgentMessageReceipt),
-    /// The receiver has no idempotent record for this request id. The
-    /// delivery outcome is unknowable here: the request stays uncertain
-    /// (never re-delivered) until the wiring resolves it. A receiver whose
-    /// inbox is not idempotent by request id answers `Unknown` — that is
-    /// the documented release blocker, not a license to re-deliver.
+    /// The receiver has no idempotent record for this request id. For a
+    /// receiver whose inbox is keyed by request id (the production
+    /// [`crate::cloud_family::LocalFamilyDelivery`]: the seam admits
+    /// durably BEFORE any delivery), `Unknown` proves no delivery was
+    /// ever attempted — which is what makes the wiring reconcile's
+    /// re-drive safe. A receiver whose inbox is not keyed by request id
+    /// answers `Unknown` for the unknowable case too: then the request
+    /// stays uncertain, never re-delivered.
     Unknown,
 }
 

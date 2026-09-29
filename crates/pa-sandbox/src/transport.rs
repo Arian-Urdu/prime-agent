@@ -1,0 +1,175 @@
+//! The sandbox HTTP transport: one injectable trait, one reqwest production
+//! implementation. Port of the `fetchWithTimeout` + `boundedBodyText` half
+//! of `prime-sandbox-client.ts` (TS branch `feat/direct-cloud-sandbox`):
+//! - a per-request deadline raced against the request (the timeout wins
+//!   even when the server never answers);
+//! - response bodies are read through a streaming cap (32 MiB default), so
+//!   an unbounded body is a typed `too_large` error, never an unbounded
+//!   allocation;
+//! - transport failures are already-typed [`SandboxError`]s carrying the
+//!   request method and URL; non-2xx statuses are returned to the caller,
+//!   which owns the error-body preview (the transport never parses).
+//! - redirects are followed, mirroring the TS global `fetch` default.
+
+use std::future::Future;
+use std::time::Duration;
+
+use crate::error::SandboxError;
+use crate::types::Method;
+
+/// Default response body cap (TS `MAX_JSON_BODY_BYTES` = 32 MiB).
+pub const MAX_JSON_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// One outbound HTTP request.
+#[derive(Debug, Clone)]
+pub struct TransportRequest {
+    /// The request method.
+    pub method: Method,
+    /// The absolute request URL (already validated by the caller).
+    pub url: String,
+    /// The request headers, in send order.
+    pub headers: Vec<(String, String)>,
+    /// The request body; `None` sends no body.
+    pub body: Option<String>,
+    /// The per-request deadline.
+    pub timeout: Duration,
+}
+
+/// One inbound HTTP response, for every status.
+#[derive(Debug, Clone)]
+pub struct TransportResponse {
+    /// The response status.
+    pub status: u16,
+    /// The response body, read under the transport's byte cap.
+    pub body: Vec<u8>,
+}
+
+/// The sandbox HTTP transport. Implementations execute one request and
+/// return typed errors; they never parse bodies or map statuses, which
+/// stays in the client so error previews keep a single redaction path.
+pub trait SandboxTransport: Send + Sync {
+    /// Execute `request`; `Err` carries the request method and URL.
+    fn execute(
+        &self,
+        request: TransportRequest,
+    ) -> impl Future<Output = Result<TransportResponse, SandboxError>> + Send;
+}
+
+/// The production transport: reqwest with rustls-tls, per-request
+/// deadlines, and bounded response reads.
+#[derive(Debug)]
+pub struct ReqwestSandboxTransport {
+    client: reqwest::Client,
+    max_response_bytes: usize,
+}
+
+impl Default for ReqwestSandboxTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReqwestSandboxTransport {
+    /// The production transport: 32 MiB response cap.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the reqwest client fails to build (a TLS backend failure
+    /// is not recoverable at runtime).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_max_response_bytes(MAX_JSON_BODY_BYTES)
+    }
+
+    /// A transport with an explicit response cap (tests use a small cap to
+    /// prove the streaming limit).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the reqwest client fails to build.
+    #[must_use]
+    pub fn with_max_response_bytes(max_response_bytes: usize) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .build()
+                .expect("sandbox reqwest client"),
+            max_response_bytes,
+        }
+    }
+}
+
+impl SandboxTransport for ReqwestSandboxTransport {
+    async fn execute(&self, request: TransportRequest) -> Result<TransportResponse, SandboxError> {
+        let method = request.method;
+        let url = request.url.clone();
+        let call = async {
+            // The deadline is raced in tokio (below), never delegated to
+            // reqwest: the TS contract types a lost race as `timeout`, not
+            // as reqwest's transport error.
+            let mut builder = self.client.request(reqwest_method(method), &url);
+            for (name, value) in &request.headers {
+                builder = builder.header(name, value);
+            }
+            if let Some(body) = request.body.as_deref() {
+                builder = builder.body(body.to_string());
+            }
+            let response = builder.send().await.map_err(|error| {
+                SandboxError::network(format!("Request failed: {method} {url}: {error}"))
+                    .with_http_context(method, url.clone(), None, None)
+            })?;
+            let status = response.status().as_u16();
+            let mut response = response;
+            let mut body = Vec::new();
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => {
+                        if body.len() + chunk.len() > self.max_response_bytes {
+                            return Err(SandboxError::too_large(format!(
+                                "Sandbox response exceeds the {} byte JSON body limit",
+                                self.max_response_bytes
+                            ))
+                            .with_http_context(
+                                method,
+                                url.clone(),
+                                None,
+                                None,
+                            ));
+                        }
+                        body.extend_from_slice(&chunk);
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        return Err(SandboxError::network(format!(
+                            "Request failed: {method} {url}: {error}"
+                        ))
+                        .with_http_context(
+                            method,
+                            url.clone(),
+                            None,
+                            None,
+                        ));
+                    }
+                }
+            }
+            Ok(TransportResponse { status, body })
+        };
+        // The deadline is raced against the call: an unresponsive server
+        // loses even though reqwest never resolves (TS fetchWithTimeout).
+        match tokio::time::timeout(request.timeout, call).await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(SandboxError::timeout(format!(
+                "Request timed out after {}ms: {method} {url}",
+                request.timeout.as_millis()
+            ))
+            .with_http_context(method, url.clone(), None, None)),
+        }
+    }
+}
+
+fn reqwest_method(method: Method) -> reqwest::Method {
+    match method {
+        Method::Get => reqwest::Method::GET,
+        Method::Post => reqwest::Method::POST,
+        Method::Delete => reqwest::Method::DELETE,
+    }
+}

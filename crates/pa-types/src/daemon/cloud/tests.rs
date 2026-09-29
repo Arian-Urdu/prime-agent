@@ -110,6 +110,35 @@ fn canonical_json_sorts_keys_and_preserves_array_order() {
 }
 
 #[test]
+fn canonical_json_renders_numbers_like_javascript() {
+    // TS digests are computed over `String(number)` bytes; serde_json's own
+    // rendering diverges on integral floats, -0, and plain-decimal-range
+    // magnitudes, so the parity cases here pin the JS-exact rendering.
+    let cases = [
+        ("2.0", "2"),
+        ("0.5", "0.5"),
+        ("-0", "0"),
+        ("1e21", "1e+21"),
+        ("1e-7", "1e-7"),
+        ("1e20", "100000000000000000000"),
+        // JSON integers beyond 2^53 round through f64, exactly like JS
+        // JSON.parse.
+        ("9007199254740993", "9007199254740992"),
+        ("-9007199254740993", "-9007199254740992"),
+        ("2.5", "2.5"),
+        ("3.14159", "3.14159"),
+    ];
+    for (source, expected) in cases {
+        let value: Value = serde_json::from_str(&format!("{{\"n\":{source}}}")).unwrap();
+        assert_eq!(
+            canonical_json(&value).unwrap(),
+            format!("{{\"n\":{expected}}}"),
+            "source {source}"
+        );
+    }
+}
+
+#[test]
 fn canonical_json_depth_bound() {
     let mut value = json!(1);
     for _ in 0..(CLOUD_MAX_JSON_DEPTH + 2) {

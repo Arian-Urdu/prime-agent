@@ -73,6 +73,38 @@ pub fn canonical_json(value: &Value) -> Result<String, String> {
     Ok(out)
 }
 
+/// Renders one JSON number exactly as the TS canonicalizer does, i.e. as
+/// JavaScript `String(number)`: shortest round-trip digits, integral floats
+/// without a trailing `.0`, plain decimal form inside `[1e-6, 1e21)`, and
+/// `1e+21` (with the sign) above it. `serde_json`'s own rendering diverges
+/// from JS on all three (e.g. `2.0`, `-0`, `1e20`), and digests are computed
+/// over these bytes, so parity is load-bearing. JSON integers beyond ±2^53
+/// parse as floats in JS (rounding to the nearest f64), so they normalize
+/// through f64 here too.
+// The rounding of integers beyond ±2^53 through f64 is the whole point: JS
+// `JSON.parse` produces the same rounded double, and the canonical bytes
+// must match the TS side's.
+#[allow(clippy::cast_precision_loss)]
+fn canonical_number(number: &serde_json::Number) -> String {
+    const JS_SAFE_INTEGER: u64 = 9_007_199_254_740_992; // 2^53
+    let mut buffer = ryu_js::Buffer::new();
+    if let Some(value) = number.as_u64() {
+        if value <= JS_SAFE_INTEGER {
+            return value.to_string();
+        }
+        return buffer.format(value as f64).to_string();
+    }
+    if let Some(value) = number.as_i64() {
+        if value.unsigned_abs() <= JS_SAFE_INTEGER {
+            return value.to_string();
+        }
+        return buffer.format(value as f64).to_string();
+    }
+    buffer
+        .format(number.as_f64().unwrap_or_default())
+        .to_string()
+}
+
 fn json_string(out: &mut String, text: &str) -> Result<(), String> {
     let encoded = serde_json::to_string(text).map_err(|error| error.to_string())?;
     out.push_str(&encoded);
@@ -90,14 +122,7 @@ fn canonicalize_into(out: &mut String, value: &Value, depth: usize) -> Result<()
         Value::Bool(true) => out.push_str("true"),
         Value::Bool(false) => out.push_str("false"),
         Value::Number(number) => {
-            // serde_json only holds finite numbers; Display renders the JSON
-            // form, and TS normalizes -0 to 0.
-            let rendered = number.to_string();
-            if rendered == "-0.0" {
-                out.push('0');
-            } else {
-                out.push_str(&rendered);
-            }
+            out.push_str(&canonical_number(number));
         }
         Value::String(text) => json_string(out, text)?,
         Value::Array(items) => {

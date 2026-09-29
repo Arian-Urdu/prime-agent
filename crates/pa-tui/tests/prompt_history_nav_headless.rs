@@ -346,10 +346,9 @@ fn escape() -> KeyEvent {
     KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
 }
 
-/// Right: the dock's group-traversal arrow (the focused row's
-/// `left`/`right` arms).
-fn right() -> KeyEvent {
-    KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)
+/// Tab: the dock's group cycle (the focused row's `tab` arm).
+fn tab() -> KeyEvent {
+    KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
 }
 
 fn wait_render(needle: &str) -> HeadlessStep {
@@ -427,23 +426,23 @@ fn a_heartbeats_only_dock_never_takes_the_prompts_down() {
 }
 
 /// Coexistence: the dock's own shortcut still focuses the row (the
-/// operator's direct-navigation redesign), the right arrow walks to the
-/// heartbeats group (the 2026-09-26 dock-arrows directive — every
-/// rendered group is traversable, empty ones included), Enter opens the
-/// focused group's view, and Escape closes the panel onto the dock's own
-/// Heartbeates item (the 2026-09-26 panel-exit ruling — leaving a panel
-/// lands on its dock item, never the prompt bar): the cancel Escape
-/// hands the editor back, and the history recall works right after the
-/// round trip.
+/// operator's direct-navigation redesign), Tab walks to the heartbeats
+/// group (the 2026-09-28 dock keyboard model — every rendered group is
+/// traversable, empty ones included), Enter opens the focused group's
+/// view, and Escape closes the panel onto the dock's own Heartbeats
+/// item (the 2026-09-26 panel-exit ruling — leaving a panel lands on
+/// its dock item, never the prompt bar): the cancel Escape hands the
+/// editor back, and the history recall works right after the round
+/// trip.
 #[test]
-fn alt_a_arrows_and_enter_still_open_the_dock_group_view_and_recall_survives_it() {
+fn alt_a_tab_and_enter_still_open_the_dock_group_view_and_recall_survives_it() {
     let mut steps = Vec::new();
     steps.push(wait_render("heartbeat"));
     steps.extend(submit("first prompt"));
     steps.push(HeadlessStep::Key(alt_a()));
-    // The dock's row starts the focus on the subagents group; one right
-    // arrow steps to heartbeats (the rendered-group cycle).
-    steps.push(HeadlessStep::Key(right()));
+    // The dock's row starts the focus on the subagents group; one Tab
+    // steps to heartbeats (the rendered-group cycle).
+    steps.push(HeadlessStep::Key(tab()));
     steps.push(HeadlessStep::Key(enter()));
     steps.push(wait_render("Heartbeats"));
     steps.push(HeadlessStep::Key(escape()));

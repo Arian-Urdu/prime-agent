@@ -216,13 +216,18 @@ impl pa_tui::interactive::InteractionTelemetry for CliInteractionTelemetry {
         })
     }
 
-    fn activity_opened(&self, kind: &'static str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn activity_opened(
+        &self,
+        kind: &'static str,
+        source: &'static str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             let Some(client) = self.client() else {
                 return;
             };
             let mut properties = pa_telemetry::base_properties("interactive");
             properties.set("kind", serde_json::Value::from(kind));
+            properties.set("source", serde_json::Value::from(source));
             client.track("tui activity opened", properties);
             let _ = client.shutdown().await;
         })

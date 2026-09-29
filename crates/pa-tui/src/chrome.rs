@@ -101,7 +101,7 @@ pub struct ChromeState {
 }
 
 /// Which actionable group owns the activity-dock selection. Every
-/// group is arrow-traversable whether or not it has rows (the
+/// group is Tab-traversable whether or not it has rows (the
 /// operator's 2026-09-26 muscle-memory directive): emptiness never
 /// removes a group from the cycle.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -116,12 +116,12 @@ pub enum ActivityGroup {
     Goal,
 }
 
-/// Which way an arrow key steps along the dock's rendered groups.
+/// Which way Tab steps along the dock's rendered groups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityDirection {
-    /// The left arrow: the previous group, wrapping past the first.
+    /// Shift+Tab: the previous group, wrapping past the first.
     Prev,
-    /// The right arrow: the next group, wrapping past the last.
+    /// Tab: the next group, wrapping past the last.
     Next,
 }
 
@@ -158,7 +158,7 @@ pub struct ActivityDock {
 }
 
 impl ActivityDock {
-    /// The groups this dock renders, left to right — the arrow
+    /// The groups this dock renders, left to right — the Tab
     /// traversal order. The subagents, heartbeats, and shells groups
     /// always render (an empty one reads its zero count and stays
     /// traversable); the goal group renders exactly while a live goal
@@ -176,7 +176,7 @@ impl ActivityDock {
         groups
     }
 
-    /// One arrow step along the rendered groups: the neighbor in
+    /// One Tab step along the rendered groups: the neighbor in
     /// `direction`, wrapping at the row's ends. A group's emptiness
     /// never skips it, so the cycle is deterministic — N rendered
     /// groups take N presses to return to the start. A `current` that
@@ -694,7 +694,9 @@ fn land_marker(out: &mut Vec<crate::Span>, width: usize) {
 /// is above zero (subagents, heartbeats, shells, the active goal) and
 /// stays neutral at zero. The subagents segment is one consolidated
 /// item — `◆ x subagents` (the operator's 2026-09-25 consolidation:
-/// the separate running cluster was redundant).
+/// the separate running cluster was redundant). The focused row alone
+/// carries the right-aligned `⇥ switch · → open` hint; the unfocused
+/// row is hint-free.
 #[must_use]
 pub fn render_activity_dock(dock: &ActivityDock, theme: &Theme, width: usize) -> Vec<Line> {
     render_activity_dock_segments(dock, theme, width).0
@@ -749,7 +751,7 @@ pub fn render_activity_dock_segments(
         }
     };
     let running = dock.subagents_running_direct + dock.subagents_running_nested;
-    // The row and the arrows share one group order (`groups()`): a
+    // The row and Tab share one group order (`groups()`): a
     // group renders exactly when it stays traversable, so the focused
     // selection never binds to a hidden segment and no group can be
     // skipped by its emptiness.
@@ -819,20 +821,33 @@ pub fn render_activity_dock_segments(
             // style every activity surface's selected row paints);
             // each span keeps its own status color, so the selection
             // never repaints the text.
-            let band = theme.selection_row_style();
-            for span in spans {
-                line.push(Span::styled(span.content.clone(), span.style.patch(band)));
-            }
+            line.extend(theme.selection_paint(spans));
         } else {
-            for span in spans {
-                line.push(span);
-            }
+            line.extend(spans);
         }
         let end = line.iter().map(|s| str_width(&s.content)).sum();
         segments.push(ActivityDockSegment {
             group,
             cols: start..end,
         });
+    }
+    if dock.focused {
+        let hint = [
+            theme.fg_span(ThemeColor::Dim, "\u{21e5}"),
+            theme.fg_span(ThemeColor::Muted, " switch"),
+            theme.fg_span(ThemeColor::Dim, " \u{b7} "),
+            theme.fg_span(ThemeColor::Dim, "\u{2192}"),
+            theme.fg_span(ThemeColor::Muted, " open"),
+        ];
+        let used = crate::width::spans_width(&line);
+        let hint_width = crate::width::spans_width(&hint);
+        // The hint yields to the groups: it renders only with a
+        // two-column gap to spare and drops whole otherwise — the
+        // groups never truncate to make room for it.
+        if used + 2 + hint_width <= width {
+            line.push(Span::raw(" ".repeat(width - used - hint_width)));
+            line.extend(hint);
+        }
     }
     let row = truncate_spans_to_width(&line, width);
     let rendered = row

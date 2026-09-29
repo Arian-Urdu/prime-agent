@@ -80,6 +80,17 @@ pub fn hotkeys_guide(kb: &KeybindingsManager) -> String {
     let select_doc_start = key_display(kb, "tui.editor.selectDocStart");
     let select_doc_end = key_display(kb, "tui.editor.selectDocEnd");
     let browse_queue_newer = key_display(kb, "app.message.navigateNewer");
+    let dock_open = format!(
+        "{}/{}",
+        key_display(kb, "app.agents.open"),
+        key_display(kb, "tui.select.confirm")
+    );
+    let dock_back = format!(
+        "{}/{}/{}",
+        key_display(kb, "app.agents.back"),
+        key_display(kb, "tui.select.up"),
+        key_display(kb, "tui.select.cancel")
+    );
 
     let mut hotkeys = format!(
         r"
@@ -143,7 +154,7 @@ pub fn hotkeys_guide(kb: &KeybindingsManager) -> String {
     );
     let _ = writeln!(
         hotkeys,
-        r"| `{focus_subagents}` | Focus activity (←/→ select group, Enter open) |
+        r"| `{focus_subagents}` | Focus activity (Tab/Shift+Tab switch group, {dock_open} open, {dock_back} back) |
 | `{external_editor}` | Edit message in external editor |
 | `{prompt_stash}` | Stash or restore draft prompt |
 | `{follow_up}` | Queue follow-up message |
@@ -208,6 +219,15 @@ mod tests {
         assert!(guide.contains("Select to start / end of text"), "{guide}");
         assert!(
             guide.contains("| `Alt+\u{2191}` / `Alt+\u{2193}` | Browse and edit queued messages |"),
+            "{guide}"
+        );
+        // The dock row names its cycle keys literally (the handler
+        // hard-codes Tab/Shift+Tab) and its open/leave keys from the
+        // effective bindings.
+        assert!(
+            guide.contains(
+                "Focus activity (Tab/Shift+Tab switch group, \u{2192}/Enter open, \u{2190}/\u{2191}/Esc/Ctrl+C back)"
+            ),
             "{guide}"
         );
     }

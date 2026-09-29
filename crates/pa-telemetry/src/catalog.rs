@@ -1478,10 +1478,16 @@ const TUI_EVENTS: &[EventRule] = &[
     EventRule {
         name: "tui activity opened",
         since: 1,
-        properties: &[(
-            "kind",
-            required(enum_rule(&["subagents", "heartbeats", "bash"], "subagents")),
-        )],
+        properties: &[
+            (
+                "kind",
+                required(enum_rule(&["subagents", "heartbeats", "bash"], "subagents")),
+            ),
+            (
+                "source",
+                required(enum_rule(&["enter", "right", "shortcut"], "enter")),
+            ),
+        ],
     },
     EventRule {
         name: "tui menu opened",
@@ -1912,6 +1918,30 @@ mod tests {
             "unknown key dropped"
         );
         assert_eq!(adjusted, 2, "one fallback + one dropped key");
+    }
+
+    #[test]
+    fn tui_activity_opened_source_is_a_required_enum_with_enter_fallback() {
+        // The dock-keys adoption signal: `source` names the binding
+        // whose press opened the group ("enter", "right" via
+        // `app.agents.open`, "shortcut" — a second Alt+A), a required
+        // property following the menu-opened precedent; an
+        // out-of-vocabulary value sanitizes to "enter", the dock's
+        // original open key.
+        let rule = lookup("tui activity opened").expect("catalogued");
+        let (_, source) = rule
+            .properties
+            .iter()
+            .find(|(name, _)| name == &"source")
+            .expect("the source property is catalogued");
+        assert!(source.required, "the source property is required");
+        let mut properties = Properties::new();
+        properties.set("kind", json!("heartbeats"));
+        properties.set("source", json!("middle-click")); // out of vocabulary
+        let adjusted = sanitize("tui activity opened", &mut properties);
+        assert_eq!(properties.get("source"), Some(&json!("enter")));
+        assert_eq!(properties.get("kind"), Some(&json!("heartbeats")));
+        assert_eq!(adjusted, 1, "one enum fallback");
     }
 
     #[test]

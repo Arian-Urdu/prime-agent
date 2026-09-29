@@ -337,7 +337,7 @@ fn wait_gone(needle: &str) -> HeadlessStep {
 }
 
 /// Enter the dock's Heartbeats panel (the shortcut lands on the default
-/// subagents section; one right steps onto Heartbeates), leave it with the
+/// subagents section; one Tab steps onto Heartbeats), leave it with the
 /// exit key, and prove the restored
 /// focus: the next Enter re-opens the Heartbeats panel, and the run never
 /// hands off to the agents view.
@@ -350,8 +350,8 @@ fn heartbeats_exit_plan(exit: KeyCode) -> Vec<HeadlessStep> {
         alt_a(),
         HeadlessStep::WaitMs(150),
         // The dock's focus starts on the subagents section (the default
-        // selection): one right steps onto the Heartbeates item.
-        key(KeyCode::Right),
+        // selection): one Tab steps onto the Heartbeats item.
+        key(KeyCode::Tab),
         HeadlessStep::WaitMs(150),
         key(KeyCode::Enter),
         wait_render("Workspace tidy"),
@@ -362,8 +362,8 @@ fn heartbeats_exit_plan(exit: KeyCode) -> Vec<HeadlessStep> {
     ]
 }
 
-/// Enter the dock's Shells panel (the shortcut, then right twice:
-/// subagents, Heartbeates, then the Shells item), leave it, and prove
+/// Enter the dock's Shells panel (the shortcut, then Tab twice:
+/// subagents, Heartbeats, then the Shells item), leave it, and prove
 /// the restored focus the same way.
 fn shells_exit_plan(exit: KeyCode) -> Vec<HeadlessStep> {
     vec![
@@ -372,11 +372,11 @@ fn shells_exit_plan(exit: KeyCode) -> Vec<HeadlessStep> {
         wait_render("\u{25b8} 1 shell"),
         alt_a(),
         HeadlessStep::WaitMs(150),
-        // Subagents -> Heartbeates -> the Shells item: one press, one
+        // Subagents -> Heartbeats -> the Shells item: one press, one
         // rendered group.
-        key(KeyCode::Right),
+        key(KeyCode::Tab),
         HeadlessStep::WaitMs(150),
-        key(KeyCode::Right),
+        key(KeyCode::Tab),
         HeadlessStep::WaitMs(150),
         key(KeyCode::Enter),
         wait_render("render the frames"),
@@ -387,7 +387,7 @@ fn shells_exit_plan(exit: KeyCode) -> Vec<HeadlessStep> {
     ]
 }
 
-/// Enter the dock's goal panel (the shortcut, then three rights: it is
+/// Enter the dock's goal panel (the shortcut, then three Tabs: it is
 /// the row's last group), leave it, and prove the restored focus the
 /// same way.
 fn goal_exit_plan(exit: KeyCode) -> Vec<HeadlessStep> {
@@ -399,11 +399,11 @@ fn goal_exit_plan(exit: KeyCode) -> Vec<HeadlessStep> {
         HeadlessStep::WaitMs(150),
         // Subagents -> Heartbeates -> Shells -> the goal row: one
         // press, one rendered group.
-        key(KeyCode::Right),
+        key(KeyCode::Tab),
         HeadlessStep::WaitMs(150),
-        key(KeyCode::Right),
+        key(KeyCode::Tab),
         HeadlessStep::WaitMs(150),
-        key(KeyCode::Right),
+        key(KeyCode::Tab),
         HeadlessStep::WaitMs(150),
         key(KeyCode::Enter),
         wait_render("land the dock exit focus"),
@@ -445,11 +445,11 @@ fn heartbeats_command_path_esc_returns_to_the_dock_item() {
         wait_render("Pursuing goal (0s)"),
         alt_a(),
         HeadlessStep::WaitMs(150),
-        key(KeyCode::Right),
+        key(KeyCode::Tab),
         HeadlessStep::WaitMs(150),
-        key(KeyCode::Right),
+        key(KeyCode::Tab),
         HeadlessStep::WaitMs(150),
-        key(KeyCode::Right),
+        key(KeyCode::Tab),
         HeadlessStep::WaitMs(150),
         HeadlessStep::Submit("/heartbeats".to_string()),
         wait_render("Workspace tidy"),

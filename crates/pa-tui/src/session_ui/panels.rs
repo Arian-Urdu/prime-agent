@@ -107,7 +107,7 @@ impl SessionUi {
 
     /// The dock's feed state: the live counts, the goal row's label, and
     /// the selection/focus the caller owns. The row render, the focus
-    /// hand-off, and the arrows' traversal all read this one mapping —
+    /// hand-off, and Tab's traversal all read this one mapping —
     /// a group renders exactly when it stays traversable.
     pub(super) fn activity_dock_state(&self) -> crate::chrome::ActivityDock {
         // The dock is the goal's one chrome surface (the operator's
@@ -205,10 +205,10 @@ impl SessionUi {
         self.dirty = true;
     }
 
-    fn emit_activity_opened(&self, kind: &'static str) {
+    fn emit_activity_opened(&self, kind: &'static str, source: &'static str) {
         if let Some(telemetry) = self.telemetry.clone() {
             tokio::spawn(async move {
-                telemetry.activity_opened(kind).await;
+                telemetry.activity_opened(kind, source).await;
             });
         }
     }
@@ -226,7 +226,9 @@ impl SessionUi {
         self.activity_group = group;
         self.subagents_focused = true;
         self.update_subagent_summary(view);
-        self.open_dock_group_view(view);
+        // The click IS the dock's Enter route: its telemetry source is
+        // "enter", the focused Enter's own value.
+        self.open_dock_group_view(view, "enter");
     }
 
     /// The tray's `← manage` hint click performs the hinted action
@@ -249,14 +251,15 @@ impl SessionUi {
         self.dirty = true;
     }
 
-    /// The dock's Enter hand-off (the operator's direct-navigation
-    /// redesign): the focused group opens its own view directly — the
-    /// scoped agents view for subagents, the heartbeats view, or the
-    /// bash view — with no intermediate grouped list.
-    pub(super) fn open_dock_group_view(&mut self, view: &mut AgentView) {
+    /// The dock's open hand-off (the operator's direct-navigation
+    /// redesign): Enter, →, or a second Alt+A opens the focused
+    /// group's own view directly — the scoped agents view for
+    /// subagents, the heartbeats view, or the bash view — with no
+    /// intermediate grouped list.
+    pub(super) fn open_dock_group_view(&mut self, view: &mut AgentView, source: &'static str) {
         match self.activity_group {
             crate::chrome::ActivityGroup::Subagents => {
-                self.emit_activity_opened("subagents");
+                self.emit_activity_opened("subagents", source);
                 // The same gate as before: a run that cannot open the
                 // scoped agents view shows the note instead of leaving
                 // the session view.
@@ -271,15 +274,15 @@ impl SessionUi {
                 }
             }
             crate::chrome::ActivityGroup::Heartbeats => {
-                self.emit_activity_opened("heartbeats");
+                self.emit_activity_opened("heartbeats", source);
                 self.open_heartbeats_view(view);
             }
             crate::chrome::ActivityGroup::Bash => {
-                self.emit_activity_opened("bash");
+                self.emit_activity_opened("bash", source);
                 self.open_bash_view(view);
             }
             crate::chrome::ActivityGroup::Goal => {
-                self.emit_activity_opened("goal");
+                self.emit_activity_opened("goal", source);
                 self.open_goal_panel(view);
             }
         }

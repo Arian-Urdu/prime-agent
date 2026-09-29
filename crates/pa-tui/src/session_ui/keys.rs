@@ -536,44 +536,38 @@ impl SessionUi {
             self.dirty = true;
             return Ok(());
         }
-        // The activity dock owns focus while focused: Enter (and a second
-        // Alt+A) opens the focused group's own view directly (the
-        // operator's direct-navigation redesign), left/right step the
-        // dock's groups — except left from the subagents selection,
-        // which opens the agents view (the operator's 2026-09-28 ask) —
-        // up/cancel/back returns to the editor, expand cycles the
-        // conversation detail and KEEPS the focus, and every other key
-        // falls through after releasing the focus (TS `onChatAction` ->
-        // `focusEditor` -> the editor handles it).
+        // The activity dock owns focus while focused: Enter, →, or a
+        // second Alt+A opens the selected group's view; Tab/Shift+Tab
+        // cycle the groups (wrapping, never leaving the dock);
+        // ←/↑/cancel/back return to the editor (the operator's
+        // 2026-09-28 keyboard model: → drills in, ← backs out, as
+        // everywhere else), expand cycles the conversation detail and
+        // KEEPS the focus, and every other key falls through after
+        // releasing the focus (TS `onChatAction` -> `focusEditor` ->
+        // the editor handles it).
         if self.subagents_focused {
             let kb = view.editor.keybindings();
-            if kb.matches(&id, "tui.select.confirm") || kb.matches(&id, "app.subagents.focus") {
-                // The dock is the direct launcher: Enter opens the
-                // focused group's own view (the operator's redesign —
-                // the grouped activity panel is gone).
-                self.open_dock_group_view(view);
+            let open_source = if kb.matches(&id, "tui.select.confirm") {
+                Some("enter")
+            } else if kb.matches(&id, "app.agents.open") {
+                Some("right")
+            } else if kb.matches(&id, "app.subagents.focus") {
+                Some("shortcut")
+            } else {
+                None
+            };
+            if let Some(source) = open_source {
+                self.open_dock_group_view(view, source);
                 return Ok(());
             }
-            if id == "left" && self.activity_group == crate::chrome::ActivityGroup::Subagents {
-                // Left from the subagents selection opens the agents
-                // view (the operator's 2026-09-28 muscle-memory ask —
-                // the same route as Enter and clicking the group): the
-                // dock's subagents item is the row's own entry into
-                // the scoped agents view, and left reads as `agents
-                // back` everywhere else on this surface (the empty
-                // editor's `app.agents.back` hands the pane to the
-                // agents view the same way).
-                self.open_dock_group_view(view);
-                return Ok(());
-            }
-            if id == "left" || id == "right" {
+            if id == "tab" || id == "shift+tab" {
                 // One press, one group: the step lands on the
                 // neighboring rendered group and wraps at the row's
                 // ends, so an empty group is still visited (the
                 // operator's 2026-09-26 muscle-memory directive — an
                 // empty group never skips) and N groups take N
                 // presses to cycle.
-                let direction = if id == "left" {
+                let direction = if id == "shift+tab" {
                     crate::chrome::ActivityDirection::Prev
                 } else {
                     crate::chrome::ActivityDirection::Next

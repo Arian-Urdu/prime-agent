@@ -192,8 +192,16 @@ pub trait InteractionTelemetry: Send + Sync {
         &self,
         children_total: u64,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
-    /// An actionable activity group was opened; never includes command or goal text.
-    fn activity_opened(&self, kind: &'static str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// An actionable activity group was opened (event `tui activity
+    /// opened`): `kind` is the group (`subagents`/`heartbeats`/`bash`/
+    /// `goal`), `source` how it opened (`enter`, `right`, `shortcut` —
+    /// named by the matched binding's default key); never includes
+    /// command or goal text.
+    fn activity_opened(
+        &self,
+        kind: &'static str,
+        source: &'static str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
     /// A menu surface opened (event `tui menu opened`): `menu` names the
     /// surface (`model`, `mcp`, `settings`, or a read-only info panel
     /// command — `context`, `session`, `system-prompt`, `logs`,

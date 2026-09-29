@@ -1,9 +1,9 @@
-//! Headless e2e for the activity dock's arrow traversal (the operator's
-//! 2026-09-26 muscle-memory directive): a mock supervisor mounts the
-//! dock's live goal row and scripted heartbeat rows when the plan asks
-//! for them, and the plan drives the dock with the same key path a
-//! user's arrows take (alt+a to focus, left/right to step, enter to open
-//! the focused section's view).
+//! Headless e2e for the activity dock's key model (the operator's
+//! 2026-09-28 keyboard directive): a mock supervisor mounts the dock's
+//! live goal row and scripted heartbeat rows when the plan asks for
+//! them, and the plan drives the dock with the same key path a user
+//! takes (alt+a to focus, Tab/Shift+Tab to cycle the groups, Enter or
+//! → to open the focused group's view, ←/↑ to leave the dock).
 //!
 //! Verifies the contract: every rendered section is exactly one press
 //! away in both directions — an empty section (0 subagents, 0 heartbeats,
@@ -48,8 +48,8 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use pa_tui::agents_view::AgentsViewScope;
 use pa_tui::interactive::{
-    run_interactive, HeadlessPlan, HeadlessStep, InteractiveOptions, ModelSelection,
-    SessionSelection, UiMode,
+    run_interactive, HeadlessPlan, HeadlessStep, InteractiveOptions, InteractiveOutcome,
+    ModelSelection, SessionSelection, UiMode,
 };
 use serde_json::{json, Value};
 
@@ -226,8 +226,8 @@ fn attach_data(id: &str) -> Value {
 }
 
 /// The dock's live goal row: the session has no subagents, heartbeats,
-/// or shells, so every other section renders empty and the arrows must
-/// still visit them.
+/// or shells, so every other section renders empty and Tab must still
+/// visit them.
 fn live_goal() -> Value {
     json!({
         "type": "goal_update",
@@ -306,14 +306,30 @@ fn alt_a() -> KeyEvent {
     KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT)
 }
 
-/// One right-arrow key event (the dock's next-section step).
+/// One right-arrow key event (the dock's open key, `app.agents.open`).
 fn right() -> KeyEvent {
     KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)
 }
 
-/// One left-arrow key event (the dock's previous-section step).
+/// One left-arrow key event (the dock's leave key, `app.agents.back`).
 fn left() -> KeyEvent {
     KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)
+}
+
+/// One Tab key event (the dock's next-group cycle, the id `tab`).
+fn tab() -> KeyEvent {
+    KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
+}
+
+/// One Shift+Tab key event (the dock's previous-group cycle; the
+/// terminal's `BackTab` arrives as the id `shift+tab`).
+fn shift_tab() -> KeyEvent {
+    KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)
+}
+
+/// One up-arrow key event (`tui.select.up`: the dock's other leave key).
+fn up() -> KeyEvent {
+    KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)
 }
 
 /// One plain Enter key event (the focused section's open).
@@ -358,21 +374,28 @@ fn run_plan(
     outcome
 }
 
-/// The dock's arrow traversal with every section empty: the goal row
+/// Every step's condition wait must have been satisfied: a barrier that
+/// timed out renders its note, and the note would name the broken step.
+fn assert_no_barrier_timeouts(outcome: &InteractiveOutcome) {
+    let all = outcome.frames.join("\n");
+    assert!(
+        !all.contains("timed out waiting"),
+        "a plan barrier timed out (the step's condition never rendered):\n{all}"
+    );
+}
+
+/// The dock's Tab traversal with every section empty: the goal row
 /// adds the goal section beside the zero-count ones (0 subagents,
-/// 0 heartbeats, 0 shells) and the arrows still visit each section in
-/// order — right through the empty
-/// heartbeats and shells sections to the goal section, then left back
-/// through them to the subagents section. Each visited section opens
-/// its own view, whose existing empty state reads the pane grammar.
-/// The panel-exit ruling (2026-09-26) keeps the dock focused on the
-/// closed section's own item, so the walk needs no re-grab press
-/// between the sections. Left from the subagents section no longer
-/// wraps to the row's last section (the operator's 2026-09-28 ask): it
-/// opens the scoped agents view — the run hands the pane to the agents
-/// surface and ends (the pure `step` tests keep pinning the wrap).
+/// 0 heartbeats, 0 shells) and Tab still visits each section in
+/// order — forward through the empty heartbeats and shells sections to
+/// the goal section, then Shift+Tab back
+/// through them, with the wrap landing on the row's last section. Each
+/// visited section opens its own view, whose existing empty state reads
+/// the pane grammar. The panel-exit ruling (2026-09-26) keeps the dock
+/// focused on the closed section's own item, so the walk needs no
+/// re-grab press between the sections.
 #[test]
-fn dock_arrows_visit_each_empty_section_in_order_both_directions() {
+fn dock_tab_visits_each_empty_section_in_order_both_directions() {
     let steps = vec![
         // The goal row adds the goal section; the other three sections
         // render their zero counts.
@@ -382,64 +405,56 @@ fn dock_arrows_visit_each_empty_section_in_order_both_directions() {
         },
         // Focus the dock: the selection starts on the subagents section.
         HeadlessStep::Key(alt_a()),
-        HeadlessStep::WaitMs(100),
-        // One right press lands on the EMPTY heartbeats section — the
+        // One Tab press lands on the EMPTY heartbeats section — the
         // old skip stepped straight over it.
-        HeadlessStep::Key(right()),
-        HeadlessStep::WaitMs(100),
+        HeadlessStep::Key(tab()),
         HeadlessStep::Key(enter()),
         HeadlessStep::WaitRender {
             needle: "No running or paused heartbeats".to_string(),
             timeout_ms: 5_000,
         },
         HeadlessStep::Key(escape()),
-        HeadlessStep::WaitMs(100),
         // The next press in order: the empty shells section.
-        HeadlessStep::Key(right()),
-        HeadlessStep::WaitMs(100),
+        HeadlessStep::Key(tab()),
         HeadlessStep::Key(enter()),
         HeadlessStep::WaitRender {
             needle: "No background commands".to_string(),
             timeout_ms: 5_000,
         },
         HeadlessStep::Key(escape()),
-        HeadlessStep::WaitMs(100),
         // The third press in order: the goal section, one press past
         // the empty shells section.
-        HeadlessStep::Key(right()),
-        HeadlessStep::WaitMs(100),
+        HeadlessStep::Key(tab()),
         HeadlessStep::Key(enter()),
         HeadlessStep::WaitRender {
             needle: "status   active".to_string(),
             timeout_ms: 5_000,
         },
         HeadlessStep::Key(escape()),
-        HeadlessStep::WaitMs(100),
-        // Left walks the same sections in reverse: goal -> shells ->
+        // Shift+Tab walks the same sections in reverse: goal -> shells ->
         // heartbeats.
-        HeadlessStep::Key(left()),
-        HeadlessStep::WaitMs(100),
-        HeadlessStep::Key(left()),
-        HeadlessStep::WaitMs(100),
+        HeadlessStep::Key(shift_tab()),
+        HeadlessStep::Key(shift_tab()),
         HeadlessStep::Key(enter()),
         HeadlessStep::WaitRender {
             needle: "No running or paused heartbeats".to_string(),
             timeout_ms: 5_000,
         },
         HeadlessStep::Key(escape()),
-        HeadlessStep::WaitMs(100),
-        // Left from the heartbeats section lands on the subagents section —
-        // the reverse walk's last stop before the row's first section.
-        HeadlessStep::Key(left()),
-        HeadlessStep::WaitMs(100),
-        // Left from the subagents selection no longer wraps to the
-        // row's last section: it opens the scoped agents view (the
-        // operator's 2026-09-28 ask), the run hands the pane to the
-        // agents surface, and the plan ends there.
-        HeadlessStep::Key(left()),
-        HeadlessStep::WaitMs(300),
+        // Shift+Tab wraps past the row's first section: two presses from
+        // the heartbeats section land on the row's last section (the
+        // goal).
+        HeadlessStep::Key(shift_tab()),
+        HeadlessStep::Key(shift_tab()),
+        HeadlessStep::Key(enter()),
+        HeadlessStep::WaitRender {
+            needle: "status   active".to_string(),
+            timeout_ms: 5_000,
+        },
+        HeadlessStep::Key(escape()),
     ];
     let outcome = run_plan(steps, None, Some(live_goal()));
+    assert_no_barrier_timeouts(&outcome);
     let all = outcome.frames.join("\n");
     // The dock row itself: every section renders, empty ones included,
     // with its live count.
@@ -459,22 +474,22 @@ fn dock_arrows_visit_each_empty_section_in_order_both_directions() {
         all.contains("No background commands"),
         "the empty shells section opens its view's empty state:\n{all}"
     );
-    // The left handoff from the subagents section reached the scoped
+    // The run never left the session view: no press opened the scoped
     // agents view (the subagents section's destination).
     assert!(
-        outcome.return_to_agents_view,
-        "left from the subagents selection hands the pane to the agents view"
+        !outcome.return_to_agents_view,
+        "the empty traversal stays in the session view"
     );
 }
 
 /// The same traversal with a section carrying rows: the heartbeats
-/// section lists its heartbeat and the arrows take the identical press
+/// section lists its heartbeat and Tab takes the identical press
 /// count in the identical order — filling a section never moves another.
 /// The panel-exit ruling (2026-09-26) keeps the dock focused on the
 /// closed section's own item, so the walk needs no re-grab press
 /// between the sections.
 #[test]
-fn dock_arrows_visit_the_same_sections_when_one_has_rows() {
+fn dock_tab_visits_the_same_sections_when_one_has_rows() {
     let steps = vec![
         // The dock row shows the filled section's live count beside the
         // other sections' zeros.
@@ -482,54 +497,45 @@ fn dock_arrows_visit_the_same_sections_when_one_has_rows() {
             needle: "\u{25f7} 1 heartbeat".to_string(),
             timeout_ms: 5_000,
         },
-        // The identical right-walk: one press to the heartbeats section.
+        // The identical Tab walk: one press to the heartbeats section.
         HeadlessStep::Key(alt_a()),
-        HeadlessStep::WaitMs(100),
-        HeadlessStep::Key(right()),
-        HeadlessStep::WaitMs(100),
+        HeadlessStep::Key(tab()),
         HeadlessStep::Key(enter()),
         HeadlessStep::WaitRender {
             needle: "lane canary".to_string(),
             timeout_ms: 5_000,
         },
         HeadlessStep::Key(escape()),
-        HeadlessStep::WaitMs(100),
         // The second press: the empty shells section — the row-bearing
         // section never shifts the cycle.
-        HeadlessStep::Key(right()),
-        HeadlessStep::WaitMs(100),
+        HeadlessStep::Key(tab()),
         HeadlessStep::Key(enter()),
         HeadlessStep::WaitRender {
             needle: "No background commands".to_string(),
             timeout_ms: 5_000,
         },
         HeadlessStep::Key(escape()),
-        HeadlessStep::WaitMs(100),
         // The third press: the goal section.
-        HeadlessStep::Key(right()),
-        HeadlessStep::WaitMs(100),
+        HeadlessStep::Key(tab()),
         HeadlessStep::Key(enter()),
         HeadlessStep::WaitRender {
             needle: "status   active".to_string(),
             timeout_ms: 5_000,
         },
         HeadlessStep::Key(escape()),
-        HeadlessStep::WaitMs(100),
-        // The identical left-walk: two presses back to the row-bearing
-        // heartbeats section.
-        HeadlessStep::Key(left()),
-        HeadlessStep::WaitMs(100),
-        HeadlessStep::Key(left()),
-        HeadlessStep::WaitMs(100),
+        // The identical Shift+Tab walk: two presses back to the
+        // row-bearing heartbeats section.
+        HeadlessStep::Key(shift_tab()),
+        HeadlessStep::Key(shift_tab()),
         HeadlessStep::Key(enter()),
         HeadlessStep::WaitRender {
             needle: "lane canary".to_string(),
             timeout_ms: 5_000,
         },
         HeadlessStep::Key(escape()),
-        HeadlessStep::WaitMs(100),
     ];
     let outcome = run_plan(steps, Some(canary_heartbeats()), Some(live_goal()));
+    assert_no_barrier_timeouts(&outcome);
     let all = outcome.frames.join("\n");
     assert!(
         all.contains(
@@ -544,42 +550,86 @@ fn dock_arrows_visit_the_same_sections_when_one_has_rows() {
     assert!(!outcome.return_to_agents_view);
 }
 
-/// Left from the subagents selection opens the agents view (the
-/// operator's 2026-09-28 ask, reported as "right now nothing
-/// happens"): with the dock focused and the selection on the subagents
-/// section — its landing spot — one left press takes the same route as
-/// Enter and clicking the group (the scoped agents view handoff), so
-/// the pane leaves the session for the agents surface. The TS dock has
-/// no left/right handling at all (`subagent-summary-line.ts` handles
-/// confirm/cancel only), so this is the documented Rust divergence;
-/// the editor's `agents back` (left on an empty draft) is the same
-/// muscle-memory rule on the adjacent surface.
+/// The open and leave keys (the operator's 2026-09-28 keyboard model,
+/// superseding #3031's left-opens-subagents arm by the operator's
+/// 2026-09-29 ruling): ← and ↑ leave the dock back to the editor from
+/// EVERY group — the subagents selection included — and → opens the
+/// selected group, the same drill-in binding as the agents view.
+/// Phase 1 pins the leave keys from the SUBAGENTS selection (the exact
+/// case #3031's arm handled): the run stays in the session view.
+/// Phase 2 pins the open keys: the walk ends at the scoped agents view.
 #[test]
-fn left_from_the_subagents_selection_opens_the_agents_view() {
+fn right_opens_the_selected_group_and_left_or_up_leave_the_dock() {
     let steps = vec![
-        // The goal row adds the goal section; the other three sections
-        // render their zero counts.
+        // The goal row mounts the dock: ← must leave it, not wrap onto
+        // the goal group.
         HeadlessStep::WaitRender {
             needle: "Pursuing goal (0s)".to_string(),
             timeout_ms: 5_000,
         },
-        // Focus the dock: the selection starts on the subagents
-        // section.
+        // ← leaves the dock: the Enter on the empty draft submits
+        // nothing (with the old stepping, it opened the goal panel;
+        // with #3031's arm, it handed the pane to the agents view and
+        // the run ended there).
         HeadlessStep::Key(alt_a()),
-        HeadlessStep::WaitMs(100),
-        // The operator's left: one press, the agents view.
         HeadlessStep::Key(left()),
-        HeadlessStep::WaitMs(300),
+        HeadlessStep::Key(enter()),
+        // ↑ leaves the dock the same way.
+        HeadlessStep::Key(alt_a()),
+        HeadlessStep::Key(up()),
+        HeadlessStep::Key(enter()),
     ];
-    let outcome = run_plan(steps, None, Some(live_goal()));
+    let leaves = run_plan(steps, None, Some(live_goal()));
+    assert_no_barrier_timeouts(&leaves);
+    let all = leaves.frames.join("\n");
+    // The goal panel never opened: ← left the dock instead of wrapping
+    // onto the goal group, so both empty-draft Enters submitted
+    // nothing.
     assert!(
-        outcome.return_to_agents_view,
-        "left from the subagents selection hands the pane to the agents view"
+        !all.contains("status   active"),
+        "the goal panel never opened after ← and ↑:\n{all}"
     );
-    let all = outcome.frames.join("\n");
     assert!(
-        all.contains("\u{25c6} 0 subagents"),
-        "the dock row mounted before the handoff:\n{all}"
+        !leaves.return_to_agents_view,
+        "← and ↑ from the subagents selection leave the dock, they never hand the pane to the agents view"
+    );
+
+    // The open keys: one Tab steps to the empty heartbeats group and →
+    // opens its view (with the old stepping, → only stepped).
+    let steps = vec![
+        HeadlessStep::WaitRender {
+            needle: "Pursuing goal (0s)".to_string(),
+            timeout_ms: 5_000,
+        },
+        HeadlessStep::Key(alt_a()),
+        HeadlessStep::Key(tab()),
+        HeadlessStep::Key(right()),
+        HeadlessStep::WaitRender {
+            needle: "No running or paused heartbeats".to_string(),
+            timeout_ms: 5_000,
+        },
+        // The panel's exit restores the dock focus on its Heartbeats
+        // item: Shift+Tab steps back to subagents and → opens the
+        // scoped agents view — the run ends there.
+        HeadlessStep::Key(escape()),
+        HeadlessStep::WaitGone {
+            needle: "No running or paused heartbeats".to_string(),
+            timeout_ms: 5_000,
+        },
+        HeadlessStep::Key(shift_tab()),
+        HeadlessStep::Key(right()),
+    ];
+    let opens = run_plan(steps, None, Some(live_goal()));
+    assert_no_barrier_timeouts(&opens);
+    // The last → opened the scoped agents view scoped to this session.
+    assert!(opens.return_to_agents_view, "→ opened the selected group");
+    assert_eq!(
+        opens.agents_view_scope,
+        Some(AgentsViewScope {
+            session_id: Some("sess-1".to_string()),
+            active_session_id: Some("s1".to_string()),
+            session_name: Some("dock arrows session".to_string()),
+        })
     );
 }
 

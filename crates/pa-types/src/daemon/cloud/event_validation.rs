@@ -311,7 +311,7 @@ fn session_event_problem(value: &Value, label: &str) -> Option<String> {
     }
     if record_field(event, "type")
         .and_then(Value::as_str)
-        .is_none()
+        .is_none_or(str::is_empty)
     {
         return Some(format!("{label}.event.type must be a non-empty string"));
     }

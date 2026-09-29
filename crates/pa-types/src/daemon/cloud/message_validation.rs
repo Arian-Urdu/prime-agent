@@ -135,7 +135,7 @@ fn session_state_problem(value: Option<&Value>) -> Option<String> {
             record_field(value, "modelId"),
             "snapshot.state.modelId",
             CLOUD_MAX_MODEL_ID_CHARS,
-            0,
+            1,
         ),
         record_field(value, "activeCommandId")
             .and_then(|id| cloud_id_problem(Some(id), "snapshot.state.activeCommandId")),

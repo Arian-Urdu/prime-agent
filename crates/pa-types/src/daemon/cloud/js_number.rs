@@ -4,7 +4,10 @@
 //! like `JSON.parse`. The typed fields are `u64`, so deserialization
 //! normalizes the JS-parsed number into it; an integral JS number above
 //! 2^64 - 2^11 (the largest double `u64` holds) has no typed home and
-//! fails the typed parse — the TS side keeps it as a plain number.
+//! fails the typed parse with [`TYPED_U64_DOMAIN_EXPECTED`] — the TS side
+//! keeps it as a plain number. The value is never saturated or wrapped;
+//! the corpus records the TS side accepting these (`divergentParses`) and
+//! the golden test pins this exact rejection.
 
 use serde::Deserialize;
 use serde_json::Number;
@@ -31,6 +34,11 @@ pub(super) fn js_u64(number: &Number) -> Option<u64> {
     Some(value as u64)
 }
 
+/// The stable expected-phrase of the typed rejection: integral JS numbers
+/// above the `u64` wire domain fail the typed parse with this message,
+/// never a TS problem string, so the port's own bound is unmistakable.
+pub(super) const TYPED_U64_DOMAIN_EXPECTED: &str = "an integer within the u64 wire domain";
+
 /// Fails a typed parse with one problem for every JS number the `u64`
 /// wire fields cannot hold.
 fn expect_js_u64<E>(number: &Number) -> Result<u64, E>
@@ -40,7 +48,7 @@ where
     js_u64(number).ok_or_else(|| {
         E::invalid_value(
             serde::de::Unexpected::Other("a non-integer or u64-overflowing JavaScript number"),
-            &"an integer the u64 wire fields hold",
+            &TYPED_U64_DOMAIN_EXPECTED,
         )
     })
 }

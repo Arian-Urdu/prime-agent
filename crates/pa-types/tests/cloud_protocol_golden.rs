@@ -228,6 +228,38 @@ fn invalid_cases_reproduce_the_ts_problem_strings() {
     }
 }
 
+/// The exact typed-layer rejection for the corpus's `divergentParses`:
+/// integral JS numbers above the u64 wire domain. Validators stay
+/// byte-exact with TS (the frames ARE valid there), the typed layer
+/// refuses instead of saturating or wrapping, and the message is
+/// deliberately not a TS problem string.
+#[test]
+fn ts_valid_numbers_beyond_the_u64_domain_fail_only_the_typed_parse() {
+    const TYPED_U64_DOMAIN_PROBLEM: &str = concat!(
+        "invalid value: a non-integer or u64-overflowing JavaScript number, ",
+        "expected an integer within the u64 wire domain"
+    );
+    for case in corpus()["divergentParses"]
+        .as_array()
+        .expect("divergentParses")
+    {
+        let name = case["name"].as_str().expect("name");
+        let raw = case["rawJson"].as_str().expect("rawJson");
+        assert_eq!(case["divergence"], "rust-typed-u64-domain", "case {name}");
+        let value: Value = serde_json::from_str(raw).expect("divergent case JSON");
+        assert_eq!(
+            cloud_message_problem(&value),
+            None,
+            "TS accepts {name}; Rust validation must match"
+        );
+        assert_eq!(
+            parse_cloud_message(raw).expect_err("typed layer must refuse {name}"),
+            TYPED_U64_DOMAIN_PROBLEM,
+            "typed rejection of {name} is the pinned domain message"
+        );
+    }
+}
+
 #[test]
 fn size_boundaries_reproduce_the_ts_strings() {
     // Corpus-coverable boundaries ride the corpus; these construct frames

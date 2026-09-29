@@ -385,6 +385,20 @@ const rawParses = [
 	{ name: "session_meta_floats", rawJson: '{"type":"events","sessionId":"s","generation":1,"events":[{"sequence":1.0,"kind":"session_meta","recordedAt":"t","sessionId":"r","streaming":true,"runningTools":2.0,"queue":-0.0}]}' },
 ];
 
+// TS accepts every integral JS number the validators see; the Rust typed
+// layer holds u64 and refuses (never saturates or wraps) integral doubles
+// above 2^64 - 2^11. Recorded as the DOCUMENTED typed-domain divergence:
+// the TS side's ok + serialized bytes are the runtime evidence, and the
+// Rust golden test pins the exact Rust rejection separately.
+const divergentParses = [
+	{ name: "hello_generation_1e20", rawJson: '{"type":"hello","protocolVersion":3,"generation":1e20,"clientId":"c","sessionId":"s"}' },
+	{ name: "hello_generation_1e21", rawJson: '{"type":"hello","protocolVersion":3,"generation":1e21,"clientId":"c","sessionId":"s"}' },
+	{
+		name: "session_meta_running_tools_1e20",
+		rawJson: '{"type":"events","sessionId":"s","generation":1,"events":[{"sequence":1,"kind":"session_meta","recordedAt":"t","sessionId":"r","streaming":true,"runningTools":1e20,"queue":0}]}',
+	},
+];
+
 // ---------------------------------------------------------------- valid events
 
 const events = [
@@ -568,6 +582,14 @@ caseAt("event", { sequence: 1, recordedAt: "t", kind: "session_entry", sessionId
 // check catches the frame)
 caseAt("message", { type: "submit", sessionId: "s", generation: 1, commandId: "c", digest: protocol.cloudDigest("null") });
 
+// terminal newline is NOT a JS `$` edge: the ECMAScript `$` (no flags)
+// matches only at InputLength, so an LF/CR-suffixed digest is a length-65
+// digest and fails the shape check exactly like any other non-hex string
+caseAt("message", { type: "command", sessionId: "s", generation: 1, receipt: { ...RECEIPT, digest: RECEIPT.digest + "\n" } });
+caseAt("message", { type: "command", sessionId: "s", generation: 1, receipt: { ...RECEIPT, digest: RECEIPT.digest + "\r" } });
+caseAt("message", { type: "submit", sessionId: "s", generation: 1, commandId: "c", request: { kind: "prompt", text: "hi" }, digest: protocol.cloudRequestDigest({ kind: "prompt", text: "hi" }) + "\n" });
+caseAt("event", { sequence: 1, recordedAt: "t", kind: "session_entry", sessionId: "r", entryId: "e", entry: { type: "message", id: "m", timestamp: "t" }, artifacts: [{ path: "p", sha256: RECEIPT.digest + "\n", bytes: 1 }] });
+
 // unexpected-field order: Object.keys yields array indices ascending
 // first, then the remaining keys in insertion order (never sorted)
 caseAt("message", { type: "hello", protocolVersion: 3, generation: 1, clientId: "c", sessionId: "s", zz: 1, aa: 2 });
@@ -607,6 +629,7 @@ const corpus = {
 	events: [],
 	numbers: [],
 	rawParses: [],
+	divergentParses: [],
 	invalid: [],
 };
 
@@ -643,6 +666,17 @@ for (const { name, rawJson } of rawParses) {
 	const parsed = protocol.parseCloudMessage(rawJson);
 	if (!parsed.ok) throw new Error(`raw parse case ${name} rejected by TS: ${parsed.error}`);
 	corpus.rawParses.push({ name, rawJson, serialized: protocol.serializeCloudMessage(parsed.message) });
+}
+
+for (const { name, rawJson } of divergentParses) {
+	const parsed = protocol.parseCloudMessage(rawJson);
+	if (!parsed.ok) throw new Error(`divergent parse case ${name} unexpectedly rejected by TS: ${parsed.error}`);
+	corpus.divergentParses.push({
+		name,
+		rawJson,
+		divergence: "rust-typed-u64-domain",
+		serialized: protocol.serializeCloudMessage(parsed.message),
+	});
 }
 
 for (const event of events) {
@@ -705,5 +739,5 @@ for (const { validator, value, rawJson } of invalid) {
 
 fs.writeFileSync(outPath, JSON.stringify(corpus, null, "\t") + "\n");
 console.log(
-	`corpus: ${corpus.frames.length} frames, ${corpus.requests.length} requests, ${corpus.events.length} events, ${corpus.numbers.length} number cases, ${corpus.rawParses.length} raw parse cases, ${corpus.invalid.length} invalid cases (ts source sha256 ${tsSourceSha256}) -> ${outPath}`,
+	`corpus: ${corpus.frames.length} frames, ${corpus.requests.length} requests, ${corpus.events.length} events, ${corpus.numbers.length} number cases, ${corpus.rawParses.length} raw parse cases, ${corpus.divergentParses.length} divergent parse cases, ${corpus.invalid.length} invalid cases (ts source sha256 ${tsSourceSha256}) -> ${outPath}`,
 );

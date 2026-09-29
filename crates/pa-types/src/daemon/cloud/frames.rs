@@ -330,7 +330,11 @@ pub fn parse_cloud_message(frame: &str) -> Result<CloudMessage, String> {
     // Integer fields normalize through JavaScript number semantics
     // (`1.0`, `1e0`, and >2^53 literals round through `f64` like
     // `JSON.parse`); an integral JS number above 2^64 - 2^11 has no `u64`
-    // home, so the typed parse reports it there.
+    // home, so the typed parse reports it there with the stable
+    // `js_number` domain message (the corpus records the TS side
+    // accepting such frames under `divergentParses`, and the golden test
+    // pins the exact Rust rejection — the value is never saturated or
+    // wrapped).
     serde_json::from_value(value).map_err(|error| error.to_string())
 }
 

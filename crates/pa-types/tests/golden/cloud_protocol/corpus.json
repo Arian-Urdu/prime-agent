@@ -1003,6 +1003,26 @@
 			"serialized": "{\"events\":[{\"kind\":\"session_meta\",\"queue\":0,\"recordedAt\":\"t\",\"runningTools\":2,\"sequence\":1,\"sessionId\":\"r\",\"streaming\":true}],\"generation\":1,\"sessionId\":\"s\",\"type\":\"events\"}"
 		}
 	],
+	"divergentParses": [
+		{
+			"name": "hello_generation_1e20",
+			"rawJson": "{\"type\":\"hello\",\"protocolVersion\":3,\"generation\":1e20,\"clientId\":\"c\",\"sessionId\":\"s\"}",
+			"divergence": "rust-typed-u64-domain",
+			"serialized": "{\"clientId\":\"c\",\"generation\":100000000000000000000,\"protocolVersion\":3,\"sessionId\":\"s\",\"type\":\"hello\"}"
+		},
+		{
+			"name": "hello_generation_1e21",
+			"rawJson": "{\"type\":\"hello\",\"protocolVersion\":3,\"generation\":1e21,\"clientId\":\"c\",\"sessionId\":\"s\"}",
+			"divergence": "rust-typed-u64-domain",
+			"serialized": "{\"clientId\":\"c\",\"generation\":1e+21,\"protocolVersion\":3,\"sessionId\":\"s\",\"type\":\"hello\"}"
+		},
+		{
+			"name": "session_meta_running_tools_1e20",
+			"rawJson": "{\"type\":\"events\",\"sessionId\":\"s\",\"generation\":1,\"events\":[{\"sequence\":1,\"kind\":\"session_meta\",\"recordedAt\":\"t\",\"sessionId\":\"r\",\"streaming\":true,\"runningTools\":1e20,\"queue\":0}]}",
+			"divergence": "rust-typed-u64-domain",
+			"serialized": "{\"events\":[{\"kind\":\"session_meta\",\"queue\":0,\"recordedAt\":\"t\",\"runningTools\":100000000000000000000,\"sequence\":1,\"sessionId\":\"r\",\"streaming\":true}],\"generation\":1,\"sessionId\":\"s\",\"type\":\"events\"}"
+		}
+	],
 	"invalid": [
 		{
 			"validator": "message",
@@ -2656,6 +2676,78 @@
 				"digest": "sha256:3987933c2e79489e6e9e1a47ec34c6ac29aeea7d0c70dc4053c604a0cce59de0"
 			},
 			"problem": "request must be a JSON object"
+		},
+		{
+			"validator": "message",
+			"value": {
+				"type": "command",
+				"sessionId": "s",
+				"generation": 1,
+				"receipt": {
+					"commandId": "cmd_1",
+					"digest": "sha256:e7dfe480c4463263a93755ec83d15829b19df0698e8b764baa4b5e9a3d7bc727\n",
+					"state": "accepted",
+					"submittedAt": "2026-09-29T00:00:00.000Z",
+					"updatedAt": "2026-09-29T00:00:00.001Z",
+					"uncertain": false
+				}
+			},
+			"problem": "command.receipt.digest must be a sha256:<64 hex> digest"
+		},
+		{
+			"validator": "message",
+			"value": {
+				"type": "command",
+				"sessionId": "s",
+				"generation": 1,
+				"receipt": {
+					"commandId": "cmd_1",
+					"digest": "sha256:e7dfe480c4463263a93755ec83d15829b19df0698e8b764baa4b5e9a3d7bc727\r",
+					"state": "accepted",
+					"submittedAt": "2026-09-29T00:00:00.000Z",
+					"updatedAt": "2026-09-29T00:00:00.001Z",
+					"uncertain": false
+				}
+			},
+			"problem": "command.receipt.digest must be a sha256:<64 hex> digest"
+		},
+		{
+			"validator": "message",
+			"value": {
+				"type": "submit",
+				"sessionId": "s",
+				"generation": 1,
+				"commandId": "c",
+				"request": {
+					"kind": "prompt",
+					"text": "hi"
+				},
+				"digest": "sha256:e7dfe480c4463263a93755ec83d15829b19df0698e8b764baa4b5e9a3d7bc727\n"
+			},
+			"problem": "submit.digest must be a sha256:<64 hex> digest"
+		},
+		{
+			"validator": "event",
+			"value": {
+				"sequence": 1,
+				"recordedAt": "t",
+				"kind": "session_entry",
+				"sessionId": "r",
+				"entryId": "e",
+				"entry": {
+					"type": "message",
+					"id": "m",
+					"timestamp": "t"
+				},
+				"artifacts": [
+					{
+						"path": "p",
+						"sha256": "sha256:e7dfe480c4463263a93755ec83d15829b19df0698e8b764baa4b5e9a3d7bc727\n",
+						"bytes": 1
+					}
+				]
+			},
+			"problem": "event.artifacts[0].sha256 must be a sha256:<64 hex> digest"
 		},
 		{
 			"validator": "message",

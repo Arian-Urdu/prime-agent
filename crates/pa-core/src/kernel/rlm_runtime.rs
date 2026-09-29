@@ -169,7 +169,7 @@ pub fn normalize_requested_rlm_spawn_target(
         _ => {
             return Err(error(
                 operation,
-                format!("target must be one of: {}", RLM_SPAWN_TARGETS.join(", ")),
+                &format!("target must be one of: {}", RLM_SPAWN_TARGETS.join(", ")),
             ));
         }
     };

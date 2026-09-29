@@ -402,3 +402,110 @@ async fn a_landed_write_behind_a_failed_commit_is_answered_not_rolled_back() {
     );
     assert!(unknown.is_ok_and(|journal| journal.is_none()));
 }
+
+/// The full injected-failure cycle with a RESTART: the append fails and
+/// rolls back, the journal recovers, the retry delivers once, and a
+/// respawned worker over the same journal restores the lane and the
+/// dedupe keys together.
+#[tokio::test]
+async fn the_failure_cycle_survives_a_restart_with_the_lane_and_keys() {
+    let dir = std::env::temp_dir().join(format!("pa-worker-cloud-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = WorkerConfig {
+        socket_path: dir.join("worker.sock"),
+        supervisor_socket_path: PathBuf::new(),
+        token: "token".to_string(),
+        worker_instance_id: String::new(),
+        active_session_id: "target-session".to_string(),
+        agent_dir: dir.join("agent"),
+        recovery_journal_path: dir.join("recovery.jsonl"),
+        telemetry_disabled: None,
+        script: Some(json!({ "responses": ["ack"] })),
+    };
+    let first_worker = Arc::new(Worker::new(config.clone(), None));
+    let created = first_worker
+        .dispatch(
+            "create",
+            &json!({ "noSession": true, "cwd": "/tmp", "name": "target" }),
+        )
+        .await;
+    assert!(created.success, "create failed: {created:?}");
+    first_worker.core.lock().unwrap().busy = true;
+    let committed = first_worker
+        .dispatch(
+            "worker_deliver_message",
+            &keyed_payload("before the failure", "msgreq_h1"),
+        )
+        .await;
+    assert!(committed.success, "the committed delivery: {committed:?}");
+    // The injected failure: the journal path is broken; the delivery
+    // fails closed and rolls back.
+    std::fs::remove_file(&config.recovery_journal_path).unwrap();
+    std::fs::create_dir(&config.recovery_journal_path).unwrap();
+    let refused = first_worker
+        .dispatch(
+            "worker_deliver_message",
+            &keyed_payload("during the failure", "msgreq_h2"),
+        )
+        .await;
+    assert!(
+        !refused.success,
+        "the failed commit fails closed: {refused:?}"
+    );
+    assert_eq!(
+        queue_texts(&first_worker.core, Lane::Steering).len(),
+        1,
+        "only the committed item is in the lane"
+    );
+    // The journal recovers; the same request id delivers once.
+    std::fs::remove_dir(&config.recovery_journal_path).unwrap();
+    let retried = first_worker
+        .dispatch(
+            "worker_deliver_message",
+            &keyed_payload("during the failure", "msgreq_h2"),
+        )
+        .await;
+    assert!(retried.success, "the retry delivers: {retried:?}");
+    let retried_receipt = retried.data.expect("receipt");
+    // The restart: a fresh worker over the same journal.
+    drop(first_worker);
+    let respawned = Arc::new(Worker::new(config, None));
+    *respawned.recovery.lock().unwrap() = Some(
+        crate::journal::WorkerRecoveryJournal::open(&respawned.config.recovery_journal_path)
+            .unwrap(),
+    );
+    let re_created = respawned
+        .dispatch(
+            "create",
+            &json!({ "noSession": true, "cwd": "/tmp", "name": "target" }),
+        )
+        .await;
+    assert!(re_created.success, "re-create failed: {re_created:?}");
+    // Both keys restored with their lanes: exactly two visible items,
+    // and each duplicate answers its recorded receipt.
+    assert_eq!(
+        queue_texts(&respawned.core, Lane::Steering)
+            .iter()
+            .filter(|text| text.contains("the failure"))
+            .count(),
+        2,
+        "both committed deliveries restored"
+    );
+    let duplicate = respawned
+        .dispatch(
+            "worker_deliver_message",
+            &keyed_payload("during the failure", "msgreq_h2"),
+        )
+        .await;
+    assert_eq!(
+        duplicate.data.expect("receipt"),
+        retried_receipt,
+        "the restart answers the recorded receipt"
+    );
+    assert_eq!(
+        queue_texts(&respawned.core, Lane::Steering).len(),
+        2,
+        "no duplicate visible message"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

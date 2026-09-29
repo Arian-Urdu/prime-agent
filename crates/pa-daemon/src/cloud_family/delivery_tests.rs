@@ -861,7 +861,9 @@ async fn an_unresolvable_admitted_request_stays_uncertain_never_negative() {
             let receipt = receipt.as_ref().expect("the recorded receipt");
             assert_eq!(receipt.id, recorded.id);
         }
-        other => panic!("the answer must be an agent_message_result: {other:?}"),
+        CloudFamilyCommandPayload::FamilyRosterResult { .. } => {
+            panic!("the answer must be an agent_message_result")
+        }
     }
     assert_eq!(
         visible_message_count(&harness),

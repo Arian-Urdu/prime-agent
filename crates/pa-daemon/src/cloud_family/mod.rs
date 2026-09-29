@@ -30,6 +30,7 @@
 //! is untouched; the existing e2e harnesses stay the regression gate.
 
 pub mod exchange;
+pub mod family;
 pub mod log;
 
 pub use exchange::{

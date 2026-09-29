@@ -37,6 +37,12 @@ interface TailscaleStatusJson {
 	BackendState?: string;
 }
 
+interface ServeStatus {
+	TCP?: Record<string, { TCPForward?: string }>;
+	Web?: Record<string, { Handlers?: Record<string, { Proxy?: string; Path?: string; Text?: string }> }>;
+	AllowFunnel?: Record<string, boolean>;
+}
+
 /**
  * spawnSync's default 1 MiB maxBuffer truncates `status --json` (it carries every peer, ~1 KB
  * of JSON per peer) and fails the run with ENOBUFS on a tailnet of roughly a thousand nodes;
@@ -56,6 +62,17 @@ function runTailscale(args: string[]): { code: number; stdout: string; stderr: s
 		return { code: -1, stdout: "", stderr: result.error.message };
 	}
 	return { code: result.status ?? -1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+}
+
+/**
+ * Parse `tailscale serve status --json`. A tailnet with nothing served answers a bare
+ * `null` (valid JSON and the common empty-config encoding), so normalize a null payload
+ * to an empty serve config before any property access; otherwise the status command and
+ * post-serve verification read a valid empty config as unparseable output.
+ */
+function parseServeStatus(stdout: string): ServeStatus {
+	const parsed = JSON.parse(stdout) as ServeStatus | null;
+	return parsed ?? {};
 }
 
 /**
@@ -254,10 +271,7 @@ export function runTailscaleStatus(json = false): number {
 		return 0;
 	}
 	try {
-		const parsed = JSON.parse(serve.stdout) as {
-			TCP?: Record<string, { TCPForward?: string }>;
-			Web?: Record<string, { Handlers?: Record<string, { Proxy?: string; Path?: string; Text?: string }> }>;
-		};
+		const parsed = parseServeStatus(serve.stdout);
 		const rows: string[] = [];
 		for (const [listen, entry] of Object.entries(parsed.TCP ?? {})) {
 			// An HTTPS/HTTP listener lands here with no TCPForward (upstream keeps them
@@ -361,11 +375,7 @@ export function runTailscaleServe(port: number, funnel: boolean): number {
 	let servedExactly = false;
 	let funnelEnabled = false;
 	try {
-		const parsedVerify = JSON.parse(verify.stdout) as {
-			TCP?: Record<string, { TCPForward?: string }>;
-			Web?: Record<string, { Handlers?: Record<string, { Proxy?: string }> }>;
-			AllowFunnel?: Record<string, boolean>;
-		};
+		const parsedVerify = parseServeStatus(verify.stdout);
 		for (const entry of Object.values(parsedVerify.TCP ?? {})) {
 			if (entry.TCPForward === `127.0.0.1:${port}` || entry.TCPForward === `localhost:${port}`) {
 				servedExactly = true;

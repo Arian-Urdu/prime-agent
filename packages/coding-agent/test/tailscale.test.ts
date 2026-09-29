@@ -211,6 +211,16 @@ describe("runTailscaleStatus", () => {
 		expect(logged).toContain("milk.tailnet.ts.net:443/ -> http://127.0.0.1:3000");
 		expect(logged).not.toContain("-> tcp"); // the HTTPS listener must not read as a TCP forward
 	});
+	it("reads a null serve-status payload as nothing served, not unparseable output", () => {
+		// `tailscale serve status --json` answers a bare `null` when nothing is served.
+		const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+		process.env.PATH = `${shimTailscale(ONLINE, "null").dir}:${process.env.PATH}`;
+		expect(runTailscaleStatus()).toBe(0);
+		const logged = spy.mock.calls.map((call) => call.join(" ")).join("\n");
+		spy.mockRestore();
+		expect(logged).toContain("nothing");
+		expect(logged).not.toContain("unparseable");
+	});
 });
 
 describe("runTailscaleServe", () => {
@@ -310,6 +320,17 @@ describe("post-serve verification", () => {
 		const served = shimTailscale(ONLINE, serveStatusFor(3000));
 		process.env.PATH = `${served.dir}:${process.env.PATH}`;
 		expect(runTailscaleServe(3000, false)).toBe(0);
+	});
+	it("treats a null serve-status payload as nothing served, not a parse failure", () => {
+		// A null payload is a valid empty config, so verification must fall through to
+		// the pending-enable path instead of reporting the output as unparseable.
+		const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+		process.env.PATH = `${shimTailscale(ONLINE, "null").dir}:${process.env.PATH}`;
+		expect(runTailscaleServe(3000, false)).toBe(1);
+		const logged = spy.mock.calls.map((call) => call.join(" ")).join("\n");
+		spy.mockRestore();
+		expect(logged).toContain("interactive enable flow");
+		expect(logged).not.toContain("unparseable");
 	});
 });
 

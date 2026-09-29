@@ -190,13 +190,30 @@ pub fn owned_by_effective_user(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.uid() == nix::unistd::Uid::effective().as_raw())
 }
 
-/// Windows arm of [`owned_by_effective_user`]: inherited ACLs carry the
-/// access decision, so ownership is not a separate gate.
+/// Windows arm of [`owned_by_effective_user`]: ownership cannot be
+/// established here (inherited ACLs are not an ownership proof), so the
+/// probe answers false and callers fail closed.
 #[cfg(not(unix))]
 #[must_use]
 pub fn owned_by_effective_user(_path: &Path) -> bool {
-    // Windows: inherited ACLs apply; see the ACL note above.
-    true
+    // Callers fail closed until a platform-proven private-ACL check exists.
+    false
+}
+
+/// The effective user id (Unix); None where the probe does not exist, so
+/// callers fail closed.
+#[cfg(unix)]
+#[must_use]
+pub fn effective_uid() -> Option<u32> {
+    Some(nix::unistd::Uid::effective().as_raw())
+}
+
+/// Windows arm of [`effective_uid`]: no uid-style owner probe exists, so
+/// callers fail closed.
+#[cfg(not(unix))]
+#[must_use]
+pub fn effective_uid() -> Option<u32> {
+    None
 }
 
 /// Create directories recursively with the private dir mode on platforms with

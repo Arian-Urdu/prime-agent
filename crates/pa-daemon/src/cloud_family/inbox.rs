@@ -183,6 +183,10 @@ impl CloudInboxLog {
                 return Err(error).with_context(|| format!("open cloud inbox {}", path.display()))
             }
         }
+        // Private from its first write (the creation mode); a file left at
+        // the umask-default mode moves to a fresh private inode HERE.
+        #[cfg(unix)]
+        crate::journal::ensure_private_journal_file(path)?;
         let (valid_lines, tail) = load_journal_lines(path)?;
         match tail {
             JournalTail::Clean => {}
@@ -474,6 +478,46 @@ mod tests {
             pa_core::platform::perms::file_mode(&nested),
             Some(0o700),
             "the created parent chain is private"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The inbox FILE is private from its first write, and a file left at
+    /// the umask-default mode (an older version's shape) moves to a fresh
+    /// private inode at open with its admissions intact.
+    #[cfg(unix)]
+    #[test]
+    fn inbox_file_is_private_from_its_first_write_and_swaps_when_legacy_loose() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("pa-cloud-inbox-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.join("cloud-inbox.jsonl");
+        let mut log = CloudInboxLog::open(&path).unwrap();
+        assert_eq!(
+            log.admit(&message("msgreq_p", "target-a")).unwrap(),
+            Admission::First
+        );
+        assert_eq!(
+            pa_core::platform::perms::file_mode(&path),
+            Some(0o600),
+            "the inbox inode is private from its first write"
+        );
+        // The old shape: the same file at the umask-default 0644.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let before = fs::symlink_metadata(&path).unwrap();
+        let mut reopened = CloudInboxLog::open(&path).unwrap();
+        let after = fs::symlink_metadata(&path).unwrap();
+        assert_ne!(
+            (after.dev(), after.ino()),
+            (before.dev(), before.ino()),
+            "the legacy loose file moves to a fresh private inode"
+        );
+        assert_eq!(pa_core::platform::perms::file_mode(&path), Some(0o600));
+        assert_eq!(
+            reopened.admit(&message("msgreq_p", "target-a")).unwrap(),
+            Admission::Already,
+            "the swapped-inode journal keeps the admission"
         );
         let _ = fs::remove_dir_all(&dir);
     }

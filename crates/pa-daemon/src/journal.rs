@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 const COMPACT_AFTER_RECORDS: usize = 4096;
@@ -36,13 +36,14 @@ pub(crate) fn validate_journal_file(path: &Path) -> Result<()> {
 /// The privacy contract a keyed (cloud) journal commit demands of its
 /// parent: a real (non-symlink) directory, owner-only mode bits where the
 /// platform has them, and ownership by the effective user. The checks ride
-/// the platform wall (`pa_core::platform::perms`): on Windows inherited
-/// ACLs govern, so the mode and owner checks are no-ops there.
+/// the platform wall (`pa_core::platform::perms`). Platforms without the
+/// owner/mode probes FAIL CLOSED — inherited ACLs alone are not an
+/// owner-private proof.
 ///
 /// # Errors
 ///
 /// Returns an error when the parent cannot be inspected or violates the
-/// contract.
+/// contract, or on platforms where privacy cannot be proven.
 pub(crate) fn validate_private_journal_parent(path: &Path) -> Result<()> {
     let parent = path
         .parent()
@@ -53,45 +54,124 @@ pub(crate) fn validate_private_journal_parent(path: &Path) -> Result<()> {
         "worker journal parent {} must be a real private directory",
         parent.display()
     );
-    if let Some(mode) = pa_core::platform::perms::file_mode(parent) {
+    #[cfg(unix)]
+    {
+        if let Some(mode) = pa_core::platform::perms::file_mode(parent) {
+            anyhow::ensure!(
+                mode == pa_core::platform::perms::PRIVATE_DIR_MODE,
+                "worker journal parent {} must have mode 0700",
+                parent.display()
+            );
+        }
         anyhow::ensure!(
-            mode == pa_core::platform::perms::PRIVATE_DIR_MODE,
-            "worker journal parent {} must have mode 0700",
+            pa_core::platform::perms::owned_by_effective_user(parent),
+            "worker journal parent {} must be owned by the current user",
             parent.display()
         );
+        Ok(())
     }
-    anyhow::ensure!(
-        pa_core::platform::perms::owned_by_effective_user(parent),
-        "worker journal parent {} must be owned by the current user",
-        parent.display()
-    );
-    Ok(())
+    #[cfg(not(unix))]
+    Err(anyhow::anyhow!(
+        "owner-private cloud journals need a platform-proven private parent; \
+         unsupported on this platform until the ACL check is proven"
+    ))
 }
 
 /// Create or tighten the journal's parent to the private mode a keyed
 /// (cloud) commit requires: a missing parent chain is created private, and
 /// a pre-existing parent owned by the effective user is tightened to 0700
 /// (a normal `create_dir_all` parent is 0755 under the usual umask — the
-/// commit must work against it, not quarantine over it). A parent owned by
-/// anyone else is left untouched and fails the validation that follows:
-/// privacy is never assumed from a directory this process does not
-/// control.
+/// commit must work against it, not quarantine over it). The mode change
+/// applies to a VERIFIED OPEN DIRECTORY HANDLE, never the re-resolved
+/// path, and every rejection — a symlink parent, a replaced parent, a
+/// parent owned by anyone else — happens before the first chmod, so a
+/// same-user symlink can never tighten its target before the validator
+/// refuses it and a swapped parent cannot redirect the change. A parent
+/// owned by anyone else is left untouched and fails the validation that
+/// follows: privacy is never assumed from a directory this process does
+/// not control.
 ///
 /// # Errors
 ///
-/// Returns an error when the parent cannot be created or tightened.
+/// Returns an error when the parent cannot be created, opened, verified,
+/// or tightened.
 pub(crate) fn ensure_private_journal_parent(path: &Path) -> Result<()> {
     let parent = path
         .parent()
         .context("worker journal has no parent directory")?;
     pa_core::platform::perms::create_dir_all_private(parent)
         .with_context(|| format!("create private {}", parent.display()))?;
-    if pa_core::platform::perms::file_mode(parent)
-        .is_some_and(|mode| mode != pa_core::platform::perms::PRIVATE_DIR_MODE)
-        && pa_core::platform::perms::owned_by_effective_user(parent)
+    #[cfg(unix)]
     {
-        pa_core::platform::perms::restrict_dir(parent)
-            .with_context(|| format!("tighten {}", parent.display()))?;
+        let handle = File::open(parent).with_context(|| format!("open {}", parent.display()))?;
+        let path_metadata = fs::symlink_metadata(parent)?;
+        anyhow::ensure!(
+            path_metadata.is_dir() && !path_metadata.file_type().is_symlink(),
+            "worker journal parent {} must be a real private directory",
+            parent.display()
+        );
+        let opened = handle.metadata()?;
+        anyhow::ensure!(
+            opened.is_dir(),
+            "worker journal parent {} is not a directory",
+            parent.display()
+        );
+        anyhow::ensure!(
+            (opened.dev(), opened.ino()) == (path_metadata.dev(), path_metadata.ino()),
+            "worker journal parent {} was replaced while opening it",
+            parent.display()
+        );
+        let owner = pa_core::platform::perms::effective_uid()
+            .context("the effective-uid probe is required for a private journal parent")?;
+        anyhow::ensure!(
+            opened.uid() == owner,
+            "worker journal parent {} must be owned by the current user",
+            parent.display()
+        );
+        if opened.mode() & 0o777 != pa_core::platform::perms::PRIVATE_DIR_MODE {
+            handle
+                .set_permissions(std::fs::Permissions::from_mode(
+                    pa_core::platform::perms::PRIVATE_DIR_MODE,
+                ))
+                .with_context(|| format!("tighten {}", parent.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Move an existing journal file to a fresh, privately created inode when
+/// its mode is not the private file mode: the bytes are copied verbatim
+/// into a 0600 temp file (synced) and renamed over the path, so a
+/// descriptor another user opened against the old loose mode keeps
+/// reading only the pre-swap bytes while every later append lands in the
+/// private inode. Files written by this version are 0600 from their first
+/// write (every journal open uses the private creation mode); this closes
+/// the window for journals written by older versions.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read, copied, synced, or
+/// renamed.
+#[cfg(unix)]
+pub(crate) fn ensure_private_journal_file(path: &Path) -> Result<()> {
+    if pa_core::platform::perms::file_mode(path)
+        .is_some_and(|mode| mode != pa_core::platform::perms::PRIVATE_FILE_MODE)
+    {
+        let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        let temp = path.with_extension(format!("jsonl.private-{}", std::process::id()));
+        let mut options = OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        pa_core::platform::perms::set_private_mode(&mut options);
+        let mut file = options
+            .open(&temp)
+            .with_context(|| format!("create {}", temp.display()))?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        pa_core::platform::rename_onto(&temp, path)
+            .with_context(|| format!("persist {}", path.display()))?;
+        if let Some(parent) = path.parent() {
+            File::open(parent)?.sync_all()?;
+        }
     }
     Ok(())
 }
@@ -100,9 +180,10 @@ pub(crate) fn append_record(path: &Path, record: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    pa_core::platform::perms::set_private_mode(&mut options);
+    let mut file = options
         .open(path)
         .with_context(|| format!("open journal {}", path.display()))?;
     let mut line = serde_json::to_string(record)?;
@@ -128,9 +209,10 @@ pub(crate) fn append_records(path: &Path, records: &[Value]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    pa_core::platform::perms::set_private_mode(&mut options);
+    let mut file = options
         .open(path)
         .with_context(|| format!("open journal {}", path.display()))?;
     let mut lines = Vec::new();
@@ -160,7 +242,12 @@ pub(crate) enum Finalize {
 pub(crate) fn rewrite_records(path: &Path, records: &[Value], finalize: Finalize) -> Result<()> {
     let temp = path.with_extension(format!("jsonl.tmp-{}", std::process::id()));
     {
-        let file = File::create(&temp).with_context(|| format!("create {}", temp.display()))?;
+        let mut options = OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        pa_core::platform::perms::set_private_mode(&mut options);
+        let file = options
+            .open(&temp)
+            .with_context(|| format!("create {}", temp.display()))?;
         let mut writer = BufWriter::new(file);
         for record in records {
             let mut line = serde_json::to_string(record)?;
@@ -907,8 +994,9 @@ pub struct WorkerRecoveryJournal {
 }
 
 impl WorkerRecoveryJournal {
-    /// Open the worker journal at `path` (creating the parent directory as
-    /// needed) and load the latest busy records and queue snapshots.
+    /// Open the worker journal at `path` (creating the parent directory
+    /// privately as needed) and load the latest busy records and queue
+    /// snapshots.
     ///
     /// # Errors
     ///
@@ -924,7 +1012,7 @@ impl WorkerRecoveryJournal {
         sync: impl FnOnce(&File) -> std::io::Result<()>,
     ) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            pa_core::platform::perms::create_dir_all_private(parent)?;
         }
         validate_journal_file(path)?;
         // A failed append may have left complete bytes in the OS page cache.
@@ -953,6 +1041,12 @@ impl WorkerRecoveryJournal {
                 return Err(error).with_context(|| format!("open {} before replay", path.display()))
             }
         }
+        // The file itself is private from its first write (the creation
+        // mode); a journal written by an older version at the umask-default
+        // mode moves to a fresh private inode HERE, cutting any descriptor
+        // another user opened against the old loose mode.
+        #[cfg(unix)]
+        ensure_private_journal_file(path)?;
         let scan = scan_worker_journal(path)?;
         let folded = fold_journal_scan(&scan);
         if !folded.cloud_inbox.is_empty() {
@@ -1025,10 +1119,10 @@ impl WorkerRecoveryJournal {
             ensure_private_journal_parent(&self.path)?;
             validate_private_journal_parent(&self.path)?;
             validate_journal_file(&self.path)?;
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)?;
+            let mut options = OpenOptions::new();
+            options.create(true).append(true);
+            pa_core::platform::perms::set_private_mode(&mut options);
+            let mut file = options.open(&self.path)?;
             validate_journal_file(&self.path)?;
             #[cfg(unix)]
             {
@@ -1471,7 +1565,7 @@ fn parse_snapshot_lane(value: Option<&Value>) -> Vec<WorkerQueueItemRecord> {
 mod tests {
     use super::*;
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("pa-daemon-journal-{}", uuid::Uuid::new_v4()));
@@ -2165,6 +2259,145 @@ mod tests {
             Some(&serde_json::json!({"id": "receipt-normal"}))
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The journal FILE is private from its first write (the review's 0644
+    /// window): the unkeyed create lands 0600, and a missing parent chain
+    /// is created private at open.
+    #[cfg(unix)]
+    #[test]
+    fn unkeyed_first_write_creates_the_journal_privately() {
+        let dir = std::env::temp_dir().join(format!("pa-daemon-journal-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        // The umask-independent normal shape: what create_dir_all makes
+        // on the usual 022 umask.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.join("recovery.jsonl");
+        let mut journal = WorkerRecoveryJournal::open(&path).unwrap();
+        journal
+            .record("sess-p", "sess-p-file", None, true, "prompt_accepted")
+            .unwrap();
+        assert_eq!(
+            pa_core::platform::perms::file_mode(&path),
+            Some(0o600),
+            "the journal inode is private from its first write"
+        );
+        // A missing parent chain is created private.
+        let nested_path = dir.join("nested").join("recovery.jsonl");
+        let mut nested = WorkerRecoveryJournal::open(&nested_path).unwrap();
+        nested
+            .record("sess-q", "sess-q-file", None, true, "prompt_accepted")
+            .unwrap();
+        assert_eq!(
+            pa_core::platform::perms::file_mode(&dir.join("nested")),
+            Some(0o700),
+            "the created parent chain is private"
+        );
+        assert_eq!(
+            pa_core::platform::perms::file_mode(&nested_path),
+            Some(0o600)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A journal written by an older version (the umask-default 0644
+    /// inode) moves to a fresh private inode at open: the bytes are
+    /// preserved verbatim, the mode becomes 0600, the inode changes, and
+    /// appends after the swap keep landing in the private inode.
+    #[cfg(unix)]
+    #[test]
+    fn legacy_loose_journal_moves_to_a_fresh_private_inode() {
+        let dir = std::env::temp_dir().join(format!("pa-daemon-journal-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("recovery.jsonl");
+        let mut journal = WorkerRecoveryJournal::open(&path).unwrap();
+        journal
+            .record("sess-l", "sess-l-file", None, true, "prompt_accepted")
+            .unwrap();
+        // The old version's shape: the same journal at the umask-default
+        // 0644, with another user's descriptor conceptually already open.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let before = fs::symlink_metadata(&path).unwrap();
+        let bytes = fs::read(&path).unwrap();
+
+        let reopened = WorkerRecoveryJournal::open(&path).unwrap();
+
+        let after = fs::symlink_metadata(&path).unwrap();
+        assert_ne!(
+            (after.dev(), after.ino()),
+            (before.dev(), before.ino()),
+            "the journal moves to a fresh private inode"
+        );
+        assert_eq!(pa_core::platform::perms::file_mode(&path), Some(0o600));
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "history is preserved byte-for-byte"
+        );
+        // The private inode keeps serving: an append after the swap
+        // survives a reopen.
+        let mut journal = reopened;
+        journal
+            .record("sess-m", "sess-m-file", None, true, "prompt_accepted")
+            .unwrap();
+        assert!(
+            WorkerRecoveryJournal::read_interrupted(&path),
+            "the post-swap append lands and replays"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A symlink parent is rejected BEFORE any chmod: the target of a
+    /// same-user symlink keeps its mode, and the keyed commit fails
+    /// closed instead (the review's redirect scenario).
+    #[cfg(unix)]
+    #[test]
+    fn keyed_commit_on_a_symlinked_parent_rejects_without_touching_the_target() {
+        let root = std::env::temp_dir().join(format!("pa-daemon-journal-{}", uuid::Uuid::new_v4()));
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut journal = WorkerRecoveryJournal::open(&link.join("recovery.jsonl")).unwrap();
+        let error = journal
+            .record_queue_checkpoint(
+                "sess-s",
+                "sess-s-file",
+                None,
+                true,
+                "steer_queued",
+                &[],
+                &[],
+                Some(("msgreq_link", &serde_json::json!({"id":"receipt"}))),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must be a real private directory"),
+            "the symlink parent is rejected: {error:#}"
+        );
+        assert!(journal.is_quarantined());
+        assert_eq!(
+            pa_core::platform::perms::file_mode(&target),
+            Some(0o755),
+            "the symlink target is never tightened"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Platforms without the owner/mode probes fail closed: keyed journal
+    /// privacy is never assumed from inherited ACLs.
+    #[cfg(not(unix))]
+    #[test]
+    fn keyed_journal_privacy_fails_closed_off_unix() {
+        let dir = std::env::temp_dir().join(format!("pa-daemon-journal-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("recovery.jsonl");
+        assert!(validate_private_journal_parent(&path).is_err());
+        assert!(crate::cloud_family::CloudInboxLog::open(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Mid-file corruption (an unparsable line followed by a valid one)

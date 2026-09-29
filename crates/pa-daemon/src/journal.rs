@@ -14,9 +14,55 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 const COMPACT_AFTER_RECORDS: usize = 4096;
+
+pub(crate) fn validate_journal_file(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "worker journal {} is not a regular, non-symlink file",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_private_journal_parent(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("worker journal has no parent directory")?;
+    let metadata = fs::symlink_metadata(parent)?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "worker journal parent {} must be a real private directory",
+        parent.display()
+    );
+    #[cfg(unix)]
+    {
+        anyhow::ensure!(
+            metadata.permissions().mode() & 0o777 == 0o700,
+            "worker journal parent {} must have mode 0700",
+            parent.display()
+        );
+        let owner = rustix::process::geteuid().as_raw();
+        anyhow::ensure!(
+            metadata.uid() == owner,
+            "worker journal parent {} must be owned by the current user",
+            parent.display()
+        );
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    Err(anyhow::anyhow!(
+        "owner-private cloud journals are unsupported on this platform"
+    ))
+}
 
 pub(crate) fn append_record(path: &Path, record: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -65,9 +111,8 @@ pub(crate) fn append_records(path: &Path, records: &[Value]) -> Result<()> {
     Ok(())
 }
 
-/// How the temp journal lands on its path, and whether its data rides a
-/// full sync before the swap: the two are one seam — each variant is the
-/// sync class its TS counterpart (or Rust-native owner) carries.
+/// Both rewrite modes sync the temp file before replacing the journal.
+/// They differ only in whether destination-busy rename retries.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Finalize {
     /// Rename through `rename_onto`: the bounded win32 destination-busy
@@ -78,14 +123,6 @@ pub(crate) enum Finalize {
     /// failure surfaces immediately. The Rust-native terminal-compaction
     /// journal (no TS counterpart) keeps its belt.
     Synced,
-    /// Bare rename with an UNSYNCED temp (TS
-    /// `worker-recovery-journal.ts` compact: `writeFileSync` + plain
-    /// `renameSync` — no retry, no temp fsync): the OS carries the temp
-    /// data to the rename. Durability is owned by the append path — the
-    /// compacted form holds only records the append path already made
-    /// durable, so a lost compact falls back to the append-only history,
-    /// which replays identically.
-    Bare,
 }
 
 pub(crate) fn rewrite_records(path: &Path, records: &[Value], finalize: Finalize) -> Result<()> {
@@ -99,15 +136,20 @@ pub(crate) fn rewrite_records(path: &Path, records: &[Value], finalize: Finalize
             writer.write_all(line.as_bytes())?;
         }
         writer.flush()?;
-        if !matches!(finalize, Finalize::Bare) {
-            writer.get_ref().sync_all()?;
-        }
+        writer.get_ref().sync_all()?;
     }
     let rename = match finalize {
         Finalize::RetryBusy => pa_core::platform::rename_onto(&temp, path),
-        Finalize::Synced | Finalize::Bare => fs::rename(&temp, path),
+        Finalize::Synced => fs::rename(&temp, path),
     };
     rename.with_context(|| format!("persist {}", path.display()))?;
+    // The replacement file was synced before rename. Sync the directory as
+    // well so the replacement name survives a crash before the old journal
+    // can be forgotten. This matters for the worker's durable inbox keys.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -428,6 +470,9 @@ enum ScannedLine {
     /// A valid-JSON line of an unknown record type (a future
     /// subsystem's records): skipped, not corruption.
     UnknownType,
+    /// A transaction with a version this reader cannot authenticate.
+    /// Never skip it: a future transaction could own an admission key.
+    UnsupportedVersion,
     /// An unparsable line: torn, glued, or corrupted.
     Malformed,
 }
@@ -447,7 +492,7 @@ struct JournalScan {
 }
 
 fn scan_worker_journal(path: &Path) -> Result<JournalScan> {
-    let contents = match fs::read_to_string(path) {
+    let contents = match fs::read(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(JournalScan {
@@ -463,18 +508,34 @@ fn scan_worker_journal(path: &Path) -> Result<JournalScan> {
             ))
         }
     };
+    // Byte-boundary scan: a crash-torn append can end mid multi-byte
+    // UTF-8 character, which a whole-file string read would reject
+    // BEFORE the tail classification could repair it. Split at the
+    // record delimiter boundaries instead; the undelimited trailing
+    // fragment is the interrupted append's tail candidate.
+    let (complete_lines, undelimited_tail) = split_ndjson_boundaries(&contents);
     let mut lines = Vec::new();
     let mut valid_line_text = Vec::new();
     let mut malformed_seen = false;
     let mut corruption = JournalCorruption::Clean;
-    for line in contents.split('\n') {
+    for line in complete_lines {
         if line.is_empty() {
-            // The trailing newline (or padding): not a record, not
-            // corruption.
             continue;
         }
-        let classified = classify_journal_line(line);
-        let is_valid = !matches!(classified, ScannedLine::Malformed);
+        let text = std::str::from_utf8(line).map_err(|error| {
+            anyhow::anyhow!(
+                "worker journal {} is corrupted mid-file: {error}",
+                path.display()
+            )
+        })?;
+        let classified = classify_journal_line(text);
+        if matches!(classified, ScannedLine::UnsupportedVersion) {
+            corruption = JournalCorruption::MidFile;
+        }
+        let is_valid = !matches!(
+            classified,
+            ScannedLine::Malformed | ScannedLine::UnsupportedVersion
+        );
         if !is_valid {
             if malformed_seen {
                 // A second unparsable line after a valid one: mid-file
@@ -490,9 +551,42 @@ fn scan_worker_journal(path: &Path) -> Result<JournalScan> {
             corruption = JournalCorruption::MidFile;
             malformed_seen = false;
         } else {
-            valid_line_text.push(line.to_string());
+            valid_line_text.push(text.to_string());
         }
         lines.push(classified);
+    }
+    // The undelimited trailing fragment: a complete record that lost
+    // only its delimiter byte is KEPT (the repair rewrite re-delimits
+    // it — the record is not lost); anything else is the torn tail.
+    if let Some(fragment) = undelimited_tail {
+        if !fragment.is_empty() {
+            let valid = std::str::from_utf8(fragment)
+                .ok()
+                .filter(|text| !matches!(classify_journal_line(text), ScannedLine::Malformed));
+            match valid {
+                Some(text) => {
+                    if malformed_seen
+                        || matches!(classify_journal_line(text), ScannedLine::UnsupportedVersion)
+                    {
+                        corruption = JournalCorruption::MidFile;
+                    } else {
+                        // A valid record on an unterminated boundary:
+                        // the file needs the delimiter repair before any
+                        // append can glue onto it.
+                        valid_line_text.push(text.to_string());
+                        lines.push(classify_journal_line(text));
+                        corruption = JournalCorruption::TornTail;
+                    }
+                }
+                None => {
+                    if malformed_seen {
+                        corruption = JournalCorruption::MidFile;
+                    } else {
+                        malformed_seen = true;
+                    }
+                }
+            }
+        }
     }
     if corruption == JournalCorruption::Clean && malformed_seen {
         corruption = JournalCorruption::TornTail;
@@ -502,6 +596,23 @@ fn scan_worker_journal(path: &Path) -> Result<JournalScan> {
         valid_line_text,
         corruption,
     })
+}
+
+/// Split raw journal bytes at NDJSON record boundaries: the complete
+/// (newline-terminated) line slices and the trailing fragment after the
+/// last delimiter (the interrupted append's tail candidate — None when
+/// the file ends on a record boundary).
+pub(crate) fn split_ndjson_boundaries(contents: &[u8]) -> (Vec<&[u8]>, Option<&[u8]>) {
+    let mut complete = Vec::new();
+    let mut start = 0;
+    for (index, byte) in contents.iter().enumerate() {
+        if *byte == b'\n' {
+            complete.push(&contents[start..index]);
+            start = index + 1;
+        }
+    }
+    let tail = (start < contents.len()).then_some(&contents[start..]);
+    (complete, tail)
 }
 
 /// Classify one journal line. A `queue_checkpoint_transaction` line is
@@ -532,13 +643,17 @@ fn classify_journal_line(line: &str) -> ScannedLine {
             else {
                 return ScannedLine::Malformed;
             };
-            if transaction.version != CHECKPOINT_TRANSACTION_VERSION
-                || checkpoint_transaction_digest(
-                    &transaction.verdict,
-                    &transaction.snapshot,
-                    &transaction.cloud_admission,
-                )
-                .is_ok_and(|digest| digest == transaction.digest)
+            if transaction.version != CHECKPOINT_TRANSACTION_VERSION {
+                // A future format might carry admission keys we cannot
+                // verify. Fail closed instead of skipping its evidence.
+                return ScannedLine::UnsupportedVersion;
+            }
+            if checkpoint_transaction_digest(
+                &transaction.verdict,
+                &transaction.snapshot,
+                &transaction.cloud_admission,
+            )
+            .is_ok_and(|digest| digest == transaction.digest)
             {
                 return ScannedLine::Transaction {
                     verdict: transaction.verdict,
@@ -546,8 +661,9 @@ fn classify_journal_line(line: &str) -> ScannedLine {
                     admission: transaction.cloud_admission,
                 };
             }
-            // A transaction line that fails its own seal replays as
-            // nothing: half a transaction is never a transaction.
+            // A transaction of OUR version that fails its own seal
+            // replays as nothing: half a transaction is never a
+            // transaction.
             ScannedLine::Malformed
         }
         QUEUE_SNAPSHOT_RECORD_TYPE => {
@@ -629,7 +745,8 @@ fn fold_journal_scan(scan: &JournalScan) -> FoldedJournal {
                     cloud_inbox.insert(admission.request_id.clone(), admission.receipt.clone());
                 }
             }
-            ScannedLine::UnknownType | ScannedLine::Malformed => {}
+            ScannedLine::UnknownType | ScannedLine::UnsupportedVersion | ScannedLine::Malformed => {
+            }
         }
     }
     while cloud_inbox_order.len() > CLOUD_INBOX_WINDOW {
@@ -745,6 +862,14 @@ pub struct WorkerRecoveryJournal {
     queue_snapshots: HashMap<String, WorkerQueueSnapshotRecord>,
     cloud_inbox: HashMap<String, Value>,
     cloud_inbox_order: std::collections::VecDeque<String>,
+    // A failed keyed append might have written complete but UNSYNCED bytes.
+    // Never append or compact past them; only a fresh open after a successful
+    // sync may replay the file and resolve the pending transaction.
+    quarantined: bool,
+    // Keep the actual append descriptor alive while this worker is parked.
+    pending_sync_fd: Option<File>,
+    #[cfg(test)]
+    fail_next_cloud_sync: bool,
 }
 
 impl WorkerRecoveryJournal {
@@ -757,10 +882,48 @@ impl WorkerRecoveryJournal {
     /// when the journal exists but the queue-snapshot pass cannot read it
     /// (a missing journal loads as empty).
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_sync(path, File::sync_all)
+    }
+
+    fn open_with_sync(
+        path: &Path,
+        sync: impl FnOnce(&File) -> std::io::Result<()>,
+    ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        validate_journal_file(path)?;
+        // A failed append may have left complete bytes in the OS page cache.
+        // Sync the journal before trusting ANY bytes on reopen, including a
+        // process restart that cannot retain the previous process's fd.
+        // A sync failure keeps the worker unopened and unable to reply.
+        match File::open(path) {
+            Ok(file) => {
+                sync(&file).with_context(|| format!("sync {} before replay", path.display()))?;
+                validate_journal_file(path)?;
+                #[cfg(unix)]
+                {
+                    File::open(path.parent().context("worker journal has no parent")?)?
+                        .sync_all()?;
+                    let opened = file.metadata()?;
+                    let current = fs::symlink_metadata(path)?;
+                    anyhow::ensure!(
+                        (opened.dev(), opened.ino()) == (current.dev(), current.ino()),
+                        "worker journal {} was replaced during replay sync",
+                        path.display()
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("open {} before replay", path.display()))
+            }
+        }
         let scan = scan_worker_journal(path)?;
+        let folded = fold_journal_scan(&scan);
+        if !folded.cloud_inbox.is_empty() {
+            validate_private_journal_parent(path)?;
+        }
         // The torn tail of an interrupted append is repaired BEFORE any
         // subsequent append can glue a valid record onto the unparsable
         // fragment (which would strand that record forever): the file is
@@ -779,13 +942,16 @@ impl WorkerRecoveryJournal {
                 ));
             }
         }
-        let folded = fold_journal_scan(&scan);
         Ok(WorkerRecoveryJournal {
             path: path.to_path_buf(),
             latest: folded.latest,
             queue_snapshots: folded.queue_snapshots,
             cloud_inbox: folded.cloud_inbox,
             cloud_inbox_order: folded.cloud_inbox_order,
+            quarantined: false,
+            pending_sync_fd: None,
+            #[cfg(test)]
+            fail_next_cloud_sync: false,
         })
     }
 
@@ -794,6 +960,84 @@ impl WorkerRecoveryJournal {
     #[must_use]
     pub fn cloud_inbox_receipt(&self, request_id: &str) -> Option<&Value> {
         self.cloud_inbox.get(request_id)
+    }
+
+    #[must_use]
+    pub(crate) fn is_quarantined(&self) -> bool {
+        self.quarantined || self.pending_sync_fd.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_cloud_sync(&mut self) {
+        self.fail_next_cloud_sync = true;
+    }
+
+    fn require_writable(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.quarantined,
+            "worker journal quarantined after unresolved cloud append"
+        );
+        Ok(())
+    }
+
+    fn append_cloud_transaction(
+        &mut self,
+        transaction: &WorkerCheckpointTransactionRecord,
+    ) -> Result<()> {
+        let result = (|| {
+            if let Some(parent) = self.path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            validate_private_journal_parent(&self.path)?;
+            validate_journal_file(&self.path)?;
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)?;
+            validate_journal_file(&self.path)?;
+            #[cfg(unix)]
+            {
+                let opened = file.metadata()?;
+                let current = fs::symlink_metadata(&self.path)?;
+                anyhow::ensure!(
+                    (opened.dev(), opened.ino()) == (current.dev(), current.ino()),
+                    "worker journal {} was replaced before keyed append",
+                    self.path.display()
+                );
+            }
+            // Save the descriptor even if write_all or sync fails. Until a
+            // fresh process reopens this journal, the same inode must stay
+            // reachable; no replacement is allowed while quarantined.
+            let mut line = serde_json::to_vec(transaction)?;
+            line.push(b'\n');
+            if let Err(error) = file.write_all(&line) {
+                self.pending_sync_fd = Some(file);
+                return Err(error.into());
+            }
+            #[cfg(test)]
+            if std::mem::take(&mut self.fail_next_cloud_sync) {
+                self.pending_sync_fd = Some(file);
+                anyhow::bail!("injected cloud journal fsync failure after complete write");
+            }
+            if let Err(error) = file.sync_all() {
+                self.pending_sync_fd = Some(file);
+                return Err(error.into());
+            }
+            // Even a pre-existing journal path might not have had its
+            // directory entry synced before this first keyed admission.
+            #[cfg(unix)]
+            if let Err(error) =
+                File::open(self.path.parent().context("worker journal has no parent")?)?.sync_all()
+            {
+                self.pending_sync_fd = Some(file);
+                return Err(error.into());
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.quarantined = true;
+        }
+        result
     }
 
     /// Read the latest worker record per active session straight from a
@@ -884,6 +1128,7 @@ impl WorkerRecoveryJournal {
         busy: bool,
         operation: &str,
     ) -> Result<()> {
+        self.require_writable()?;
         if let Some(previous) = self.latest.get(active_session_id) {
             if previous.busy == busy
                 && previous.operation == operation
@@ -932,6 +1177,7 @@ impl WorkerRecoveryJournal {
         steering: &[WorkerQueueItemRecord],
         follow_up: &[WorkerQueueItemRecord],
     ) -> Result<()> {
+        self.require_writable()?;
         let record = WorkerQueueSnapshotRecord {
             version: QUEUE_SNAPSHOT_VERSION,
             r#type: QUEUE_SNAPSHOT_RECORD_TYPE.to_string(),
@@ -973,6 +1219,7 @@ impl WorkerRecoveryJournal {
         follow_up: &[WorkerQueueItemRecord],
         cloud_admission: Option<(&str, &Value)>,
     ) -> Result<()> {
+        self.require_writable()?;
         let snapshot = WorkerQueueSnapshotRecord {
             version: QUEUE_SNAPSHOT_VERSION,
             r#type: QUEUE_SNAPSHOT_RECORD_TYPE.to_string(),
@@ -1022,7 +1269,7 @@ impl WorkerRecoveryJournal {
                 cloud_admission: admission.clone(),
                 digest: checkpoint_transaction_digest(&record, &snapshot, &admission)?,
             };
-            append_record(&self.path, &serde_json::to_value(&transaction)?)?;
+            self.append_cloud_transaction(&transaction)?;
         } else {
             let mut batch = Vec::with_capacity(2);
             batch.push(serde_json::to_value(&snapshot)?);
@@ -1120,7 +1367,13 @@ impl WorkerRecoveryJournal {
                 records.push(serde_json::to_value(&admission)?);
             }
         }
-        rewrite_records(&self.path, &records, Finalize::Bare)
+        // The compacted replacement must be durable BEFORE it replaces
+        // the journal: the file now carries the cloud inbox dedupe keys,
+        // so an unsynced rename must never substitute for a synced
+        // journal (a crash would lose the keys the appends made
+        // durable). TS's bare compact is knowingly deviated from here —
+        // the Rust journal's durable-key contract is the reason.
+        rewrite_records(&self.path, &records, Finalize::Synced)
     }
 }
 
@@ -1179,10 +1432,14 @@ fn parse_snapshot_lane(value: Option<&Value>) -> Vec<WorkerQueueItemRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("pa-daemon-journal-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         dir.join(name)
     }
 
@@ -1690,6 +1947,135 @@ mod tests {
             "the post-repair append replays cleanly"
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn failed_replay_sync_refuses_readable_admission_then_compaction_keeps_it() {
+        let path = temp_path("replay-sync.jsonl");
+        let receipt = serde_json::json!({ "id": "agentmsg_sync", "deliveryStatus": "delivered" });
+        let mut journal = WorkerRecoveryJournal::open(&path).unwrap();
+        journal.fail_next_cloud_sync();
+        assert!(journal
+            .record_queue_checkpoint(
+                "sess-a",
+                "sess-a-file",
+                None,
+                true,
+                "steer_queued",
+                &[],
+                &[],
+                Some(("msgreq_sync", &receipt)),
+            )
+            .is_err());
+        assert!(journal.is_quarantined());
+        assert!(fs::read_to_string(&path).unwrap().contains("msgreq_sync"));
+        assert!(journal
+            .record("sess-a", "sess-a-file", None, false, "turn_end")
+            .is_err());
+        let before = fs::read(&path).unwrap();
+        // Even a readable complete line is not admissible if the restart
+        // cannot successfully sync the journal before replaying it.
+        assert!(WorkerRecoveryJournal::open_with_sync(&path, |_| {
+            Err(std::io::Error::other("injected reopen fsync failure"))
+        })
+        .is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        drop(journal);
+        let mut reopened = WorkerRecoveryJournal::open(&path).unwrap();
+        assert_eq!(reopened.cloud_inbox_receipt("msgreq_sync"), Some(&receipt));
+        // Settling all sessions compacts via synced replacement + parent
+        // directory sync. The inbox key survives the atomic replacement.
+        reopened
+            .record("sess-a", "sess-a-file", None, false, "turn_end")
+            .unwrap();
+        let settled = WorkerRecoveryJournal::open(&path).unwrap();
+        assert_eq!(settled.cloud_inbox_receipt("msgreq_sync"), Some(&receipt));
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 3);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn undelimited_transaction_repairs_before_append_and_unknown_version_fails_closed() {
+        let path = temp_path("delimiter-version.jsonl");
+        let receipt = serde_json::json!({ "id": "agentmsg_v", "deliveryStatus": "delivered" });
+        let mut journal = WorkerRecoveryJournal::open(&path).unwrap();
+        journal
+            .record_queue_checkpoint(
+                "sess-a",
+                "sess-a-file",
+                None,
+                true,
+                "steer_queued",
+                &[],
+                &[],
+                Some(("msgreq_v", &receipt)),
+            )
+            .unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.pop(); // valid complete transaction without newline
+        fs::write(&path, bytes).unwrap();
+        let mut journal = WorkerRecoveryJournal::open(&path).unwrap();
+        assert_eq!(journal.cloud_inbox_receipt("msgreq_v"), Some(&receipt));
+        journal
+            .record("sess-a", "sess-a-file", None, false, "turn_end")
+            .unwrap();
+        assert_eq!(
+            WorkerRecoveryJournal::open(&path)
+                .unwrap()
+                .cloud_inbox_receipt("msgreq_v"),
+            Some(&receipt)
+        );
+        // Compaction has replaced the original transaction. Append another
+        // keyed checkpoint to test a future-format transaction.
+        journal
+            .record_queue_checkpoint(
+                "sess-a",
+                "sess-a-file",
+                None,
+                true,
+                "steer_queued",
+                &[],
+                &[],
+                Some(("msgreq_v2", &receipt)),
+            )
+            .unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        let last = content.lines().last().unwrap();
+        let mut value: Value = serde_json::from_str(last).unwrap();
+        value["version"] = serde_json::json!(CHECKPOINT_TRANSACTION_VERSION + 1);
+        let replaced = content.replacen(last, &serde_json::to_string(&value).unwrap(), 1);
+        fs::write(&path, &replaced).unwrap();
+        assert!(WorkerRecoveryJournal::open(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), replaced);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cloud_journal_rejects_symlink_and_nonprivate_parent() {
+        let path = temp_path("safe.jsonl");
+        let linked = path.with_file_name("linked.jsonl");
+        fs::write(&path, "").unwrap();
+        std::os::unix::fs::symlink(&path, &linked).unwrap();
+        assert!(WorkerRecoveryJournal::open(&linked).is_err());
+        let mut journal = WorkerRecoveryJournal::open(&path).unwrap();
+        let parent = path.parent().unwrap();
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(journal
+            .record_queue_checkpoint(
+                "sess-a",
+                "sess-a-file",
+                None,
+                true,
+                "steer_queued",
+                &[],
+                &[],
+                Some(("msgreq_private", &serde_json::json!({"id":"receipt"}))),
+            )
+            .is_err());
+        assert!(journal.is_quarantined());
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = fs::remove_dir_all(parent);
     }
 
     /// Mid-file corruption (an unparsable line followed by a valid one)

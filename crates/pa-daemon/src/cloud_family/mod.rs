@@ -50,9 +50,9 @@ pub mod log;
 
 pub use delivery::{reconcile_uncertain, LocalFamilyDelivery, UncertainReconcile};
 pub use exchange::{
-    AgentMessageLookup, CloudFamilyDelivery, CloudFamilyRequestError, CloudFamilyRequestOutcome,
-    CloudFamilyRequester, CloudFamilyResponder, FamilyResultSubmitter, HandleOutcome,
-    IncomingCloudMessage, ResolveOutcome,
+    AgentMessageLookup, CloudDeliveryError, CloudFamilyDelivery, CloudFamilyRequestError,
+    CloudFamilyRequestOutcome, CloudFamilyRequester, CloudFamilyResponder, FamilyResultSubmitter,
+    HandleOutcome, IncomingCloudMessage, ResolveOutcome,
 };
 pub use inbox::CloudInboxLog;
 pub use log::{Admission, FamilyRequestLog, FamilyResultLog};
@@ -67,7 +67,7 @@ pub const DEFAULT_OUTBOX_RECORDS: usize = 50_000;
 /// delivery answers when its durable checkpoint fsync failed): the
 /// delivery was ATTEMPTED and its durable outcome is UNKNOWABLE — the
 /// delivery seam classifies the answer as post-dispatch
-/// [`crate::cloud_family::CloudFamilyDeliveryError::Unresolved`], never a
+/// [`crate::cloud_family::CloudDeliveryError::Unresolved`], never a
 /// durable negative. Rust-internal (the worker response error text),
 /// not wire.
 pub const CLOUD_COMMIT_UNCERTAIN: &str = "cloud inbox commit uncertain";

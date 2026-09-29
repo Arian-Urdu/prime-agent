@@ -113,6 +113,14 @@ pub enum AgentMessageLookup {
     Uncertain,
 }
 
+/// A definite pre-dispatch rejection versus an attempted delivery whose
+/// outcome is not yet known. Only `Rejected` may become durable `ok:false`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloudDeliveryError {
+    Rejected(String),
+    Unresolved(String),
+}
+
 /// The local-side delivery seam for cross-boundary family traffic: the
 /// cloud registry attachment wires this once cloud rows join the roster.
 /// The implementation owns the nuclear-family reach assert and the durable
@@ -120,12 +128,12 @@ pub enum AgentMessageLookup {
 /// nothing in this substrate can claim delivery on its behalf.
 pub trait CloudFamilyDelivery: Send + Sync {
     /// Deliver one guest agent message into the local family. The returned
-    /// error is reported to the requester verbatim (TS slices it to 2000
-    /// UTF-16 units in the answer).
+    /// definite rejection is reported to the requester verbatim (TS slices
+    /// it to 2000 UTF-16 units). An unresolved attempt is NOT an answer.
     fn deliver_agent_message(
         &self,
         message: IncomingCloudMessage,
-    ) -> impl Future<Output = Result<CloudAgentMessageReceipt, String>> + Send;
+    ) -> impl Future<Output = Result<CloudAgentMessageReceipt, CloudDeliveryError>> + Send;
 
     /// Receiver-side idempotent receipt lookup by request id — the
     /// reconciliation seam for an uncertain request (durably admitted,

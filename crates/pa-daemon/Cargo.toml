@@ -20,6 +20,7 @@ tokio = { workspace = true }
 tokio-util = "0.7"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4", "v7"] }
+rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
 filetime = "0.2"

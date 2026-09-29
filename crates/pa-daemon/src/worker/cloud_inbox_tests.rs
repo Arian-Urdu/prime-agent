@@ -4,6 +4,8 @@
 //! dedupe key and the visible lane.
 use super::agent_message_tests::{created_worker, queue_texts};
 use super::*;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 fn keyed_payload(message: &str, request_id: &str) -> Value {
     json!({
@@ -134,6 +136,8 @@ async fn duplicate_request_answers_the_recorded_receipt_without_re_delivering() 
 async fn restart_restores_the_lane_and_the_inbox_key() {
     let dir = std::env::temp_dir().join(format!("pa-worker-cloud-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let config = WorkerConfig {
         socket_path: dir.join("worker.sock"),
         supervisor_socket_path: PathBuf::new(),
@@ -263,197 +267,180 @@ async fn unkeyed_delivery_stays_untracked() {
     );
 }
 
-/// Finding-1 contract: a keyed delivery whose durable commit fails
-/// fails CLOSED — no receipt, the enqueue rolled back (exactly this
-/// delivery's item, the neighboring queue work untouched), and the same
-/// request id still deliverable once the journal recovers.
+/// Inject a complete transaction write followed by a failed sync. The
+/// worker cannot claim success, consume queued work, or append another
+/// checkpoint. On restart, the disk can retain either the complete line or
+/// only a torn tail; both outcomes preserve older unrelated queued work.
 #[tokio::test]
-async fn keyed_delivery_fails_closed_and_rolls_back_when_the_append_fails() {
-    let worker = created_worker().await;
-    // Neighboring queue work: an unkeyed local delivery, plus one keyed
-    // delivery that committed cleanly.
-    let local = worker
-        .dispatch(
-            "worker_deliver_message",
-            &json!({
-                "targetActiveSessionId": "target-session",
-                "message": "local neighbor",
-                "sender": { "activeSessionId": "source-session" },
-            }),
-        )
-        .await;
-    assert!(local.success, "the local neighbor delivery: {local:?}");
-    let committed = worker
-        .dispatch(
-            "worker_deliver_message",
-            &keyed_payload("committed", "msgreq_f1"),
-        )
-        .await;
-    assert!(
-        committed.success,
-        "the committed keyed delivery: {committed:?}"
-    );
-    // Sabotage the journal path (a directory where the file was): the
-    // next append fails, and the recovery read fails the same way.
-    let journal_path = worker.config.recovery_journal_path.clone();
-    std::fs::remove_file(&journal_path).unwrap();
-    std::fs::create_dir(&journal_path).unwrap();
-    let refused = worker
-        .dispatch(
-            "worker_deliver_message",
-            &keyed_payload("while broken", "msgreq_f2"),
-        )
-        .await;
-    assert!(
-        !refused.success,
-        "the delivery must fail closed when the commit fails: {refused:?}"
-    );
-    assert!(
-        refused.error.as_deref().is_some_and(|error| {
-            error.starts_with(crate::cloud_family::CLOUD_COMMIT_UNCERTAIN)
-                && error.contains("cloud inbox journal")
-        }),
-        "the failed commit answers the uncertainty marker, never a receipt: {refused:?}"
-    );
-    // Exactly the failed delivery's item is gone; the neighbors and
-    // their order survive.
-    assert_eq!(
-        queue_texts(&worker.core, Lane::Steering),
-        vec![
-            "[agent-message from source-session]\n\nlocal neighbor",
-            "[agent-message from cloud kid]\n\ncommitted",
-        ],
-        "the rollback removed exactly the failed delivery"
-    );
-    // The journal recovers: the SAME request id delivers once.
-    std::fs::remove_dir(&journal_path).unwrap();
-    let retried = worker
-        .dispatch(
-            "worker_deliver_message",
-            &keyed_payload("while broken", "msgreq_f2"),
-        )
-        .await;
-    assert!(retried.success, "the retry after the repair: {retried:?}");
-    assert_eq!(
-        queue_texts(&worker.core, Lane::Steering).len(),
-        3,
-        "the retry delivered exactly once"
-    );
-    // The retry's receipt is durable: a duplicate answers it.
-    let retried_receipt = retried.data.expect("receipt");
-    let duplicate = worker
-        .dispatch(
-            "worker_deliver_message",
-            &keyed_payload("while broken", "msgreq_f2"),
-        )
-        .await;
-    assert_eq!(duplicate.data.expect("receipt"), retried_receipt);
-    assert_eq!(queue_texts(&worker.core, Lane::Steering).len(), 3);
-}
+async fn failed_fsync_quarantines_until_restart_and_reconciles_both_disk_outcomes() {
+    for lost in [false, true] {
+        let worker = created_worker().await;
+        worker.core.lock().unwrap().busy = true;
+        let config = worker.config.clone();
+        let neighbor = worker
+            .dispatch(
+                "worker_deliver_message",
+                &keyed_payload("neighbor", "msgreq_prior"),
+            )
+            .await;
+        assert!(neighbor.success, "durable neighbor: {neighbor:?}");
+        let neighbor_receipt = neighbor.data.unwrap();
+        worker
+            .recovery
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .fail_next_cloud_sync();
+        let failed = worker
+            .dispatch(
+                "worker_deliver_message",
+                &keyed_payload("failed 夜 delivery", "msgreq_failed"),
+            )
+            .await;
+        assert!(
+            !failed.success,
+            "a failed fsync cannot acknowledge: {failed:?}"
+        );
+        assert!(failed
+            .error
+            .as_deref()
+            .unwrap()
+            .starts_with(crate::cloud_family::CLOUD_COMMIT_UNCERTAIN));
+        assert!(worker.input_pauses.paused(), "keep the runner parked");
+        assert_eq!(
+            queue_texts(&worker.core, Lane::Steering),
+            vec!["[agent-message from cloud kid]\n\nneighbor"]
+        );
+        let journal_path = &config.recovery_journal_path;
+        let written = std::fs::read(journal_path).unwrap();
+        assert!(written
+            .windows(b"msgreq_failed".len())
+            .any(|w| w == b"msgreq_failed"));
+        // No later local (unkeyed) command or direct checkpoint is allowed
+        // to advance the snapshot past the unresolved transaction.
+        let blocked = worker
+            .dispatch(
+                "worker_deliver_message",
+                &json!({
+                    "targetActiveSessionId": "target-session",
+                    "message": "must stay parked",
+                    "sender": { "activeSessionId": "source-session" },
+                }),
+            )
+            .await;
+        assert!(!blocked.success);
+        assert!(
+            !worker
+                .dispatch("follow_up", &json!({"message":"blocked"}))
+                .await
+                .success
+        );
+        assert!(
+            worker.record_recovery(false, "turn_end").is_err(),
+            "the idle/background settle must not compact"
+        );
+        assert!(worker
+            .recovery
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .record_queue_snapshot("target-session", &[], &[],)
+            .is_err());
+        assert!(worker
+            .recovery
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .record_queue_checkpoint(
+                "target-session",
+                "",
+                None,
+                false,
+                "turn_end",
+                &[],
+                &[],
+                None,
+            )
+            .is_err());
+        assert_eq!(std::fs::read(journal_path).unwrap(), written);
+        worker.core.lock().unwrap().busy = false;
+        worker.work_notify.notify_one();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            queue_texts(&worker.core, Lane::Steering).len(),
+            1,
+            "the held pause blocks the runner"
+        );
+        drop(worker);
 
-/// The full injected-failure cycle with a RESTART: the append fails and
-/// rolls back, the journal recovers, the retry delivers once, and a
-/// respawned worker over the same journal restores the lane and the
-/// dedupe keys together.
-#[tokio::test]
-async fn the_failure_cycle_survives_a_restart_with_the_lane_and_keys() {
-    let dir = std::env::temp_dir().join(format!("pa-worker-cloud-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let config = WorkerConfig {
-        socket_path: dir.join("worker.sock"),
-        supervisor_socket_path: PathBuf::new(),
-        token: "token".to_string(),
-        worker_instance_id: String::new(),
-        active_session_id: "target-session".to_string(),
-        agent_dir: dir.join("agent"),
-        recovery_journal_path: dir.join("recovery.jsonl"),
-        telemetry_disabled: None,
-        script: Some(json!({ "responses": ["ack"] })),
-    };
-    let first_worker = Arc::new(Worker::new(config.clone(), None));
-    let created = first_worker
-        .dispatch(
-            "create",
-            &json!({ "noSession": true, "cwd": "/tmp", "name": "target" }),
-        )
-        .await;
-    assert!(created.success, "create failed: {created:?}");
-    first_worker.core.lock().unwrap().busy = true;
-    let committed = first_worker
-        .dispatch(
-            "worker_deliver_message",
-            &keyed_payload("before the failure", "msgreq_h1"),
-        )
-        .await;
-    assert!(committed.success, "the committed delivery: {committed:?}");
-    // The injected failure: the journal path is broken; the delivery
-    // fails closed and rolls back.
-    std::fs::remove_file(&config.recovery_journal_path).unwrap();
-    std::fs::create_dir(&config.recovery_journal_path).unwrap();
-    let refused = first_worker
-        .dispatch(
-            "worker_deliver_message",
-            &keyed_payload("during the failure", "msgreq_h2"),
-        )
-        .await;
-    assert!(
-        !refused.success,
-        "the failed commit fails closed: {refused:?}"
-    );
-    assert_eq!(
-        queue_texts(&first_worker.core, Lane::Steering).len(),
-        1,
-        "only the committed item is in the lane"
-    );
-    // The journal recovers; the same request id delivers once.
-    std::fs::remove_dir(&config.recovery_journal_path).unwrap();
-    let retried = first_worker
-        .dispatch(
-            "worker_deliver_message",
-            &keyed_payload("during the failure", "msgreq_h2"),
-        )
-        .await;
-    assert!(retried.success, "the retry delivers: {retried:?}");
-    let retried_receipt = retried.data.expect("receipt");
-    // The restart: a fresh worker over the same journal.
-    drop(first_worker);
-    let respawned = Arc::new(Worker::new(config, None));
-    *respawned.recovery.lock().unwrap() = Some(
-        crate::journal::WorkerRecoveryJournal::open(&respawned.config.recovery_journal_path)
-            .unwrap(),
-    );
-    let re_created = respawned
-        .dispatch(
-            "create",
-            &json!({ "noSession": true, "cwd": "/tmp", "name": "target" }),
-        )
-        .await;
-    assert!(re_created.success, "re-create failed: {re_created:?}");
-    // Both keys restored with their lanes: exactly two visible items,
-    // and each duplicate answers its recorded receipt.
-    assert_eq!(
-        queue_texts(&respawned.core, Lane::Steering)
-            .iter()
-            .filter(|text| text.contains("the failure"))
-            .count(),
-        2,
-        "both committed deliveries restored"
-    );
-    let duplicate = respawned
-        .dispatch(
-            "worker_deliver_message",
-            &keyed_payload("during the failure", "msgreq_h2"),
-        )
-        .await;
-    assert_eq!(
-        duplicate.data.expect("receipt"),
-        retried_receipt,
-        "the restart answers the recorded receipt"
-    );
-    assert_eq!(
-        queue_texts(&respawned.core, Lane::Steering).len(),
-        2,
-        "no duplicate visible message"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
+        if lost {
+            // Model a crash that left only half a multi-byte character in
+            // the failed transaction. The scanner must repair this tail.
+            let split = written
+                .windows("夜".len())
+                .position(|w| w == "夜".as_bytes())
+                .unwrap()
+                + 1;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(journal_path)
+                .unwrap()
+                .set_len(split as u64)
+                .unwrap();
+        }
+        let respawned = Arc::new(Worker::new(config.clone(), None));
+        *respawned.recovery.lock().unwrap() =
+            Some(crate::journal::WorkerRecoveryJournal::open(journal_path).unwrap());
+        let created = respawned
+            .dispatch(
+                "create",
+                &json!({
+                    "noSession": true, "cwd": "/tmp", "name": "target",
+                }),
+            )
+            .await;
+        assert!(
+            created.success,
+            "restart must restore prior queue: {created:?}"
+        );
+        let texts = queue_texts(&respawned.core, Lane::Steering);
+        assert!(texts.contains(&"[agent-message from cloud kid]\n\nneighbor".to_string()));
+        let prior = respawned
+            .dispatch(
+                "worker_deliver_message",
+                &keyed_payload("neighbor", "msgreq_prior"),
+            )
+            .await;
+        assert_eq!(
+            prior.data.unwrap(),
+            neighbor_receipt,
+            "the earlier key survives both outcomes"
+        );
+        let after = respawned
+            .dispatch(
+                "worker_deliver_message",
+                &keyed_payload("failed 夜 delivery", "msgreq_failed"),
+            )
+            .await;
+        assert!(after.success, "reconcile after reopen: {after:?}");
+        let receipt = after.data.unwrap();
+        let final_texts = queue_texts(&respawned.core, Lane::Steering);
+        assert_eq!(
+            final_texts.len(),
+            2,
+            "one prior and one newly/previously committed message: {final_texts:?}"
+        );
+        let duplicate = respawned
+            .dispatch(
+                "worker_deliver_message",
+                &keyed_payload("failed 夜 delivery", "msgreq_failed"),
+            )
+            .await;
+        assert_eq!(duplicate.data.unwrap(), receipt);
+        assert_eq!(queue_texts(&respawned.core, Lane::Steering).len(), 2);
+        let _ = std::fs::remove_dir_all(journal_path.parent().unwrap());
+    }
 }

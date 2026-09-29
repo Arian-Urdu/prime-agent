@@ -1,9 +1,13 @@
 //! Agent-message command tests (moved with the commands concern).
 use super::*;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 pub(super) fn test_worker() -> Arc<Worker> {
     let dir = std::env::temp_dir().join(format!("pa-worker-am-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let config = WorkerConfig {
         socket_path: dir.join("worker.sock"),
         supervisor_socket_path: PathBuf::new(),

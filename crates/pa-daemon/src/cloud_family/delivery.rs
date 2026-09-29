@@ -39,7 +39,7 @@ use pa_types::daemon::cloud::{CloudFamilyEvent, CloudFamilyEventPayload};
 
 use super::family::{agent_family_relationship, family_row_from_summary, AGENT_FAMILY_REACH_ERROR};
 use super::inbox::CloudInboxLog;
-use super::{AgentMessageLookup, CloudFamilyDelivery, IncomingCloudMessage};
+use super::{AgentMessageLookup, CloudDeliveryError, CloudFamilyDelivery, IncomingCloudMessage};
 use crate::lease::canonical_session_path;
 use crate::registry::ResidentWorker;
 use crate::supervisor::Supervisor;
@@ -76,7 +76,7 @@ impl LocalFamilyDelivery {
     async fn deliver_idempotent(
         &self,
         message: &IncomingCloudMessage,
-    ) -> Result<CloudAgentMessageReceipt, String> {
+    ) -> Result<CloudAgentMessageReceipt, CloudDeliveryError> {
         // The recorded receipt is the delivery truth: a duplicate event
         // (a wire replay) answers it without any new delivery.
         {
@@ -86,9 +86,9 @@ impl LocalFamilyDelivery {
             }
             // Durable admission BEFORE the delivery (the crash-gap
             // protocol): the re-drive input survives the crash.
-            inbox
-                .admit(message)
-                .map_err(|error| format!("admit {}: {error:#}", message.request_id))?;
+            inbox.admit(message).map_err(|error| {
+                CloudDeliveryError::Rejected(format!("admit {}: {error:#}", message.request_id))
+            })?;
         }
         let receipt = self.deliver_to_local_family(message).await?;
         {
@@ -96,7 +96,10 @@ impl LocalFamilyDelivery {
             inbox
                 .record_receipt(&message.request_id, receipt.clone())
                 .map_err(|error| {
-                    format!("record the receipt for {}: {error:#}", message.request_id)
+                    CloudDeliveryError::Unresolved(format!(
+                        "record the receipt for {}: {error:#}",
+                        message.request_id
+                    ))
                 })?;
         }
         Ok(receipt)
@@ -109,31 +112,34 @@ impl LocalFamilyDelivery {
     async fn deliver_to_local_family(
         &self,
         message: &IncomingCloudMessage,
-    ) -> Result<CloudAgentMessageReceipt, String> {
+    ) -> Result<CloudAgentMessageReceipt, CloudDeliveryError> {
         // The source resolves first, like the TS registry handler
         // (`resolveActive`): an unknown source answers with the TS error.
         let source_summary = self
             .remote_summary(&message.from_remote_session_id)
             .ok_or_else(|| {
-                format!(
+                CloudDeliveryError::Rejected(format!(
                     "Unknown cloud message source: {}",
                     message.from_remote_session_id
-                )
+                ))
             })?;
         let target = self
             .supervisor
             .registry
             .resolve(&message.target_selector)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| CloudDeliveryError::Rejected(error.to_string()))?;
         let target_summary = self
             .target_summary(&target, &message.target_selector)
-            .await?;
+            .await
+            .map_err(CloudDeliveryError::Rejected)?;
         let source_row = family_row_from_summary(&source_summary);
         let target_row = family_row_from_summary(&target_summary);
         // The nuclear-family reach assert (TS `assertAgentFamilyReach`).
         if agent_family_relationship(&source_row, &target_row).is_none() {
-            return Err(AGENT_FAMILY_REACH_ERROR.to_string());
+            return Err(CloudDeliveryError::Rejected(
+                AGENT_FAMILY_REACH_ERROR.to_string(),
+            ));
         }
         // The TS self-target guard.
         let source_active = source_summary
@@ -148,7 +154,9 @@ impl LocalFamilyDelivery {
             .or_else(|| target_summary.get("id").and_then(Value::as_str))
             .unwrap_or_default();
         if source_active == target_active {
-            return Err("Agent messaging cannot target the sending session".to_string());
+            return Err(CloudDeliveryError::Rejected(
+                "Agent messaging cannot target the sending session".to_string(),
+            ));
         }
         // The TS sender block for a cloud source: the endpoint fields,
         // no parent edges (the local arm of `deliverCloudAgentMessage`).
@@ -180,8 +188,9 @@ impl LocalFamilyDelivery {
             delivery_mode: None,
             rest,
         };
-        let payload = serde_json::to_value(&delivery)
-            .map_err(|error| format!("invalid delivery command: {error}"))?;
+        let payload = serde_json::to_value(&delivery).map_err(|error| {
+            CloudDeliveryError::Rejected(format!("invalid delivery command: {error}"))
+        })?;
         let response = self
             .supervisor
             .route_command_typed(
@@ -192,11 +201,16 @@ impl LocalFamilyDelivery {
                 crate::backpressure::RouteAdmission::SupervisorInternal,
             )
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| CloudDeliveryError::Unresolved(error.to_string()))?;
         if !response.success {
-            return Err(response
+            let error = response
                 .error
-                .unwrap_or_else(|| "delivery failed".to_string()));
+                .unwrap_or_else(|| "delivery failed".to_string());
+            return Err(if error.starts_with(super::CLOUD_COMMIT_UNCERTAIN) {
+                CloudDeliveryError::Unresolved(error)
+            } else {
+                CloudDeliveryError::Rejected(error)
+            });
         }
         let data = response.data.unwrap_or(Value::Null);
         // TS receipt validation: `id` and `deliveryStatus` must be
@@ -204,10 +218,15 @@ impl LocalFamilyDelivery {
         if data.get("id").and_then(Value::as_str).is_none()
             || data.get("deliveryStatus").and_then(Value::as_str).is_none()
         {
-            return Err("Session worker returned an invalid agent-message receipt".to_string());
+            return Err(CloudDeliveryError::Unresolved(
+                "Session worker returned an invalid agent-message receipt".to_string(),
+            ));
         }
-        serde_json::from_value::<CloudAgentMessageReceipt>(data)
-            .map_err(|_| "Session worker returned an invalid agent-message receipt".to_string())
+        serde_json::from_value::<CloudAgentMessageReceipt>(data).map_err(|_| {
+            CloudDeliveryError::Unresolved(
+                "Session worker returned an invalid agent-message receipt".to_string(),
+            )
+        })
     }
 
     /// One remote session's roster summary (TS `resolveActive`): by its
@@ -255,7 +274,7 @@ impl CloudFamilyDelivery for LocalFamilyDelivery {
     async fn deliver_agent_message(
         &self,
         message: IncomingCloudMessage,
-    ) -> Result<CloudAgentMessageReceipt, String> {
+    ) -> Result<CloudAgentMessageReceipt, CloudDeliveryError> {
         self.deliver_idempotent(&message).await
     }
 
@@ -450,7 +469,8 @@ pub async fn reconcile_uncertain<D: CloudFamilyDelivery>(
             // arm (TS `handleAgentMessageRequest`'s catch).
             AgentMessageLookup::Unknown => match delivery.deliver_agent_message(incoming).await {
                 Ok(receipt) => Some((true, Some(receipt), None)),
-                Err(error) => Some((false, None, Some(error))),
+                Err(CloudDeliveryError::Rejected(error)) => Some((false, None, Some(error))),
+                Err(CloudDeliveryError::Unresolved(_)) => None,
             },
             // The seam durably admitted but the outcome could not be
             // resolved: the receiver may already hold the message, so

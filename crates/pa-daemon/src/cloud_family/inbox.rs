@@ -16,6 +16,8 @@
 
 use std::collections::VecDeque;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -39,6 +41,9 @@ pub struct CloudInboxLog {
     path: PathBuf,
     slots: VecDeque<InboxSlot>,
     max_remembered: usize,
+    // A failed append may have left complete unsynced bytes. No later
+    // append or compaction can advance past them until a fresh synced open.
+    quarantined: bool,
 }
 
 /// How a journal file's unparsable lines classified: a crash-torn
@@ -61,32 +66,56 @@ pub(crate) enum JournalTail {
 /// [`crate::journal`]). The valid ORIGINAL line strings are retained so
 /// the repair rewrite preserves them byte-for-byte.
 pub(crate) fn load_journal_lines(path: &Path) -> Result<(Vec<String>, JournalTail)> {
-    let contents = match fs::read_to_string(path) {
+    let contents = match fs::read(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok((Vec::new(), JournalTail::Clean));
         }
         Err(error) => return Err(anyhow::anyhow!("read journal {}: {error}", path.display())),
     };
+    let (complete, fragment) = crate::journal::split_ndjson_boundaries(&contents);
     let mut valid = Vec::new();
     let mut tail = JournalTail::Clean;
     let mut malformed_seen = false;
-    for line in contents.split('\n') {
+    for line in complete {
         if line.is_empty() {
             continue;
         }
-        if serde_json::from_str::<Value>(line).is_ok() {
+        // A complete delimited record with non-UTF-8 bytes is corruption,
+        // not the interrupted UTF-8 character in an undelimited tail.
+        let text = std::str::from_utf8(line).map_err(|error| {
+            anyhow!(
+                "journal {} has invalid delimited UTF-8: {error}",
+                path.display()
+            )
+        })?;
+        if serde_json::from_str::<Value>(text).is_ok() {
             if malformed_seen {
-                // A valid line after an unparsable one: the unparsable
-                // line was not the torn tail of an interrupted append.
                 tail = JournalTail::MidFile;
                 malformed_seen = false;
             } else {
-                valid.push(line.to_string());
+                valid.push(text.to_string());
             }
         } else if malformed_seen {
             tail = JournalTail::MidFile;
             malformed_seen = false;
+        } else {
+            malformed_seen = true;
+        }
+    }
+    if let Some(fragment) = fragment {
+        let text = std::str::from_utf8(fragment).ok();
+        if let Some(text) = text.filter(|line| serde_json::from_str::<Value>(line).is_ok()) {
+            if malformed_seen {
+                tail = JournalTail::MidFile;
+            } else {
+                // JSON closed but newline was lost: keep and re-delimit
+                // before the next append can glue a second record onto it.
+                valid.push(text.to_string());
+                tail = JournalTail::TornTail;
+            }
+        } else if malformed_seen {
+            tail = JournalTail::MidFile;
         } else {
             malformed_seen = true;
         }
@@ -130,6 +159,32 @@ impl CloudInboxLog {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        crate::journal::validate_private_journal_parent(path)?;
+        crate::journal::validate_journal_file(path)?;
+        match fs::File::open(path) {
+            Ok(file) => {
+                file.sync_all().with_context(|| {
+                    format!("sync cloud inbox {} before replay", path.display())
+                })?;
+                crate::journal::validate_journal_file(path)?;
+                #[cfg(unix)]
+                {
+                    fs::File::open(path.parent().context("cloud inbox has no parent")?)?
+                        .sync_all()?;
+                    let opened = file.metadata()?;
+                    let current = fs::symlink_metadata(path)?;
+                    anyhow::ensure!(
+                        (opened.dev(), opened.ino()) == (current.dev(), current.ino()),
+                        "cloud inbox {} was replaced during replay sync",
+                        path.display()
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("open cloud inbox {}", path.display()))
+            }
+        }
         let (valid_lines, tail) = load_journal_lines(path)?;
         match tail {
             JournalTail::Clean => {}
@@ -145,6 +200,7 @@ impl CloudInboxLog {
             path: path.to_path_buf(),
             slots: VecDeque::new(),
             max_remembered: DEFAULT_OUTBOX_RECORDS,
+            quarantined: false,
         };
         log.load_lines(&valid_lines);
         Ok(log)
@@ -176,10 +232,14 @@ impl CloudInboxLog {
     ///
     /// Returns an error when the durable admission append fails.
     pub fn admit(&mut self, message: &IncomingCloudMessage) -> Result<Admission> {
+        anyhow::ensure!(
+            !self.quarantined,
+            "cloud inbox quarantined after failed append"
+        );
         if self.slot(&message.request_id).is_some() {
             return Ok(Admission::Already);
         }
-        crate::journal::append_record(
+        if let Err(error) = crate::journal::append_record(
             &self.path,
             &json!({
                 "version": 1,
@@ -189,7 +249,17 @@ impl CloudInboxLog {
                 "fromRemoteSessionId": message.from_remote_session_id,
                 "message": message.message,
             }),
-        )?;
+        ) {
+            self.quarantined = true;
+            return Err(error);
+        }
+        #[cfg(unix)]
+        if let Err(error) =
+            fs::File::open(self.path.parent().context("cloud inbox has no parent")?)?.sync_all()
+        {
+            self.quarantined = true;
+            return Err(error).context("sync cloud inbox directory after admission");
+        }
         self.push_slot(InboxSlot {
             request_id: message.request_id.clone(),
             target_selector: message.target_selector.clone(),
@@ -213,6 +283,10 @@ impl CloudInboxLog {
         request_id: &str,
         receipt: CloudAgentMessageReceipt,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !self.quarantined,
+            "cloud inbox quarantined after failed append"
+        );
         let Some(index) = self
             .slots
             .iter()
@@ -225,7 +299,7 @@ impl CloudInboxLog {
         if self.slots[index].receipt.is_some() {
             return Ok(());
         }
-        crate::journal::append_record(
+        if let Err(error) = crate::journal::append_record(
             &self.path,
             &json!({
                 "version": 1,
@@ -233,8 +307,10 @@ impl CloudInboxLog {
                 "requestId": request_id,
                 "receipt": receipt,
             }),
-        )
-        .context("append the inbox receipt record")?;
+        ) {
+            self.quarantined = true;
+            return Err(error).context("append the inbox receipt record");
+        }
         self.slots[index].receipt = Some(receipt);
         Ok(())
     }
@@ -345,6 +421,15 @@ impl CloudInboxLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    fn private_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
 
     fn message(request_id: &str, target: &str) -> IncomingCloudMessage {
         IncomingCloudMessage {
@@ -369,7 +454,7 @@ mod tests {
     /// `Already`.
     #[test]
     fn two_phase_round_trip_survives_the_reopen() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("cloud-inbox.jsonl");
         let mut log = CloudInboxLog::open(&path).unwrap();
         assert_eq!(
@@ -407,7 +492,7 @@ mod tests {
     /// the re-drive input, and a crash-truncated tail line is skipped.
     #[test]
     fn admitted_without_receipt_is_the_re_drive_input() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("cloud-inbox.jsonl");
         let mut log = CloudInboxLog::open(&path).unwrap();
         log.admit(&message("msgreq_gap", "target-b")).unwrap();
@@ -457,12 +542,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn multibyte_tail_and_missing_delimiter_are_repaired_before_append() {
+        let dir = private_dir();
+        let path = dir.path().join("cloud-inbox.jsonl");
+        let mut log = CloudInboxLog::open(&path).unwrap();
+        log.admit(&message("prior", "target")).unwrap();
+        let prior = fs::read(&path).unwrap();
+        let mut torn = prior.clone();
+        torn.extend_from_slice(b"{\"message\":\"");
+        torn.extend_from_slice(&"夜".as_bytes()[..1]);
+        fs::write(&path, torn).unwrap();
+        let mut log = CloudInboxLog::open(&path).unwrap();
+        assert!(log.admission("prior").is_some());
+        assert_eq!(fs::read(&path).unwrap(), prior);
+        log.admit(&message("second", "target")).unwrap();
+        let mut complete = fs::read(&path).unwrap();
+        complete.pop(); // JSON is complete; only its newline was lost.
+        fs::write(&path, complete).unwrap();
+        let mut log = CloudInboxLog::open(&path).unwrap();
+        log.admit(&message("third", "target")).unwrap();
+        let reopened = CloudInboxLog::open(&path).unwrap();
+        assert!(reopened.admission("prior").is_some());
+        assert!(reopened.admission("second").is_some());
+        assert!(reopened.admission("third").is_some());
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 3);
+    }
+
     /// Mid-file corruption (an unparsable line before a valid one) fails
     /// closed: the journal is never opened and its history is never
     /// silently rewritten.
     #[test]
     fn mid_file_corruption_fails_closed() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("cloud-inbox.jsonl");
         let mut log = CloudInboxLog::open(&path).unwrap();
         log.admit(&message("msgreq_m1", "target")).unwrap();
@@ -486,7 +598,7 @@ mod tests {
     /// an admit.
     #[test]
     fn window_compaction_keeps_admits_without_receipts() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("cloud-inbox.jsonl");
         let mut log = CloudInboxLog::open(&path).unwrap();
         log.max_remembered = 4;

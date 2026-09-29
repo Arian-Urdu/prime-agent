@@ -338,7 +338,10 @@ impl Worker {
                     return response_failure(
                         None,
                         "worker_deliver_message",
-                        &format!("cloud inbox journal: {error:#}"),
+                        &format!(
+                            "{}: cloud inbox journal: {error:#}",
+                            crate::cloud_family::CLOUD_COMMIT_UNCERTAIN
+                        ),
                         None,
                     )
                 }
@@ -418,12 +421,11 @@ impl Worker {
                 // have landed) — the answer carries the uncertainty
                 // marker, never a receipt and never a plain refusal.
                 self.rollback_agent_message_delivery(&admission);
+                // Keep the pause held for this worker's remaining lifetime.
+                // Its journal is quarantined: the runner cannot consume any
+                // previously queued work until a fresh worker syncs and
+                // replays the original journal before accepting commands.
                 drop(recovery);
-                let _ = self.input_pauses.release(
-                    &pause_id,
-                    CLOUD_INBOX_PAUSE_OWNER,
-                    &self.config.active_session_id,
-                );
                 response_failure(
                     None,
                     "worker_deliver_message",

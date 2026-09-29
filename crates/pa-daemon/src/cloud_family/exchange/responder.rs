@@ -8,8 +8,8 @@ use pa_types::daemon::cloud::{
 };
 
 use super::{
-    AgentMessageLookup, CloudFamilyDelivery, FamilyResultSubmitter, HandleOutcome,
-    IncomingCloudMessage,
+    AgentMessageLookup, CloudDeliveryError, CloudFamilyDelivery, FamilyResultSubmitter,
+    HandleOutcome, IncomingCloudMessage,
 };
 use crate::cloud_family::log::{Admission, FamilyResultLog};
 
@@ -165,7 +165,7 @@ impl CloudFamilyResponder {
                             error: None,
                         },
                     },
-                    Err(error) => CloudFamilyCommand {
+                    Err(CloudDeliveryError::Rejected(error)) => CloudFamilyCommand {
                         payload: CloudFamilyCommandPayload::AgentMessageResult {
                             request_id: request_id.clone(),
                             ok: false,
@@ -173,6 +173,9 @@ impl CloudFamilyResponder {
                             error: Some(truncate_utf16(error, 2000)),
                         },
                     },
+                    Err(CloudDeliveryError::Unresolved(_)) => {
+                        return Ok(HandleOutcome::Uncertain);
+                    }
                 }
             }
             CloudFamilyEventPayload::FamilyRosterRequest {

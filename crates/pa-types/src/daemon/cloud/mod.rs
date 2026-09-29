@@ -11,9 +11,12 @@
 //! surface). The validators live in [`request_validation`],
 //! [`event_validation`], [`shapes_validation`], [`message_validation`],
 //! and [`validation`] (family), sharing the TS-exact checks in [`checks`]:
-//! exact problem strings, exact check order, UTF-16-unit string bounds
-//! (TS `.length` semantics), and canonical JSON rendered with JavaScript
-//! number semantics so digests match the TS bytes.
+//! exact problem strings, exact check order, JS property-key order
+//! (`Object.keys` yields array indices first), UTF-16-unit string bounds
+//! (TS `.length` semantics), JS-integer acceptance (`Number.isInteger`
+//! over the parsed `f64`), and canonical JSON whose keys sort by UTF-16
+//! code units and whose numbers render with JavaScript semantics so
+//! digests match the TS bytes.
 //!
 //! This module is vocabulary only: no transport, gateway, journal, or
 //! capability advertising is implemented here. The family kinds of the
@@ -137,6 +140,27 @@ fn json_string(out: &mut String, text: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Orders two object keys by UTF-16 code units: TS `Object.keys(record).sort()`
+/// compares strings by their UTF-16 code units, where an astral character
+/// (surrogates D800-DFFF) sorts before the BMP range from U+E000 up, unlike
+/// Rust's scalar-value `str` ordering, and digests are computed over the
+/// resulting order.
+fn cmp_utf16_units(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut a = a.encode_utf16();
+    let mut b = b.encode_utf16();
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) => match x.cmp(&y) {
+                std::cmp::Ordering::Equal => {}
+                other => return other,
+            },
+        }
+    }
+}
+
 fn canonicalize_into(out: &mut String, value: &Value, depth: usize) -> Result<(), String> {
     if depth > CLOUD_MAX_JSON_DEPTH {
         return Err(format!(
@@ -164,7 +188,7 @@ fn canonicalize_into(out: &mut String, value: &Value, depth: usize) -> Result<()
         Value::Object(map) => {
             out.push('{');
             let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
-            keys.sort_unstable();
+            keys.sort_unstable_by(|a, b| cmp_utf16_units(a, b));
             for (index, key) in keys.iter().enumerate() {
                 if index > 0 {
                     out.push(',');
@@ -193,6 +217,7 @@ mod checks;
 mod event_validation;
 mod family;
 mod frames;
+mod js_number;
 mod message_validation;
 mod request_validation;
 mod shapes_validation;

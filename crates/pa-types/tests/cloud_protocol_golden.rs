@@ -21,6 +21,14 @@ fn corpus() -> Value {
     serde_json::from_str(CORPUS).expect("corpus JSON")
 }
 
+/// SHA-256 of `git show
+/// 193d42bf:packages/coding-agent/src/core/cloud/protocol.ts`; the harness
+/// hashes the exact source it imports, so a corpus recorded against a
+/// drifted source fails here instead of silently claiming the pin.
+const PINNED_TS_SOURCE_SHA256: &str =
+    "fef54f95c50444c85423d23b8ebcf7cd58aacec53b4dcbe02608bbb6256f81c4";
+const PINNED_TS_SOURCE_BYTES: i64 = 61_956;
+
 #[test]
 fn provenance_pins_the_ts_source() {
     let provenance = &corpus()["provenance"];
@@ -28,8 +36,35 @@ fn provenance_pins_the_ts_source() {
         provenance["commit"],
         "193d42bf (origin/feat/direct-cloud-sandbox)"
     );
+    assert_eq!(
+        provenance["source"],
+        "packages/coding-agent/src/core/cloud/protocol.ts"
+    );
+    assert_eq!(provenance["sourceSha256"], PINNED_TS_SOURCE_SHA256);
+    assert_eq!(provenance["sourceBytes"], PINNED_TS_SOURCE_BYTES);
     assert_eq!(provenance["protocolName"], "prime-agent.cloud");
     assert_eq!(provenance["protocolVersion"], 3);
+}
+
+#[test]
+fn raw_wire_spellings_parse_and_serialize_identically_to_ts() {
+    for case in corpus()["rawParses"].as_array().expect("rawParses") {
+        let name = case["name"].as_str().expect("name");
+        let raw = case["rawJson"].as_str().expect("rawJson");
+        let message = parse_cloud_message(raw).unwrap_or_else(|error| panic!("{name}: {error}"));
+        let serialized =
+            serialize_cloud_message(&message).unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(
+            serialized,
+            case["serialized"].as_str().expect("serialized"),
+            "raw parse {name} serialized differently than the TS side"
+        );
+        let reparsed: CloudMessage = parse_cloud_message(&serialized).expect("reparse");
+        assert_eq!(
+            reparsed, message,
+            "codec round trip changed raw parse {name}"
+        );
+    }
 }
 
 #[test]

@@ -27,6 +27,7 @@ use crate::JsonMap;
 pub struct CloudFamilyInfo {
     /// The cloud child's depth under its local parent (guest-relative root
     /// is 0).
+    #[serde(deserialize_with = "super::js_number::deserialize_u64")]
     pub depth: u64,
     pub parent_session_id: String,
     pub parent_session_file: String,
@@ -87,6 +88,7 @@ pub struct CloudFamilyRow {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(deserialize_with = "super::js_number::deserialize_u64")]
     pub depth: u64,
     pub status: CloudFamilyRowStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -188,6 +190,7 @@ pub enum CloudFamilyEventPayload {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudFamilyEvent {
+    #[serde(deserialize_with = "super::js_number::deserialize_u64")]
     pub sequence: u64,
     pub recorded_at: String,
     #[serde(flatten)]

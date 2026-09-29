@@ -53,9 +53,11 @@ pub const CLOUD_REQUEST_DIGEST_DOMAIN: &str = "prime-agent.cloud.request.v1";
 pub struct CloudHello {
     /// Negotiated once in hello; frames carry no version. Must equal
     /// [`CLOUD_PROTOCOL_VERSION`].
+    #[serde(deserialize_with = "super::js_number::deserialize_u64")]
     pub protocol_version: u64,
     /// Event-log generation the client last observed; stale attachments are
     /// fenced off.
+    #[serde(deserialize_with = "super::js_number::deserialize_u64")]
     pub generation: u64,
     pub client_id: CloudClientId,
     /// Pre-allocated session to attach.
@@ -80,6 +82,7 @@ pub struct CloudHello {
 pub struct CloudSnapshot {
     pub session_id: CloudSessionId,
     /// Event-log epoch this tail belongs to.
+    #[serde(deserialize_with = "super::js_number::deserialize_u64")]
     pub generation: u64,
     /// Position covered by this snapshot; equals the last event sequence.
     pub cursor: CloudCursor,
@@ -108,6 +111,7 @@ pub struct CloudSubscribe {
 pub struct CloudEventsFrame {
     pub session_id: CloudSessionId,
     /// Event-log epoch the batch belongs to.
+    #[serde(deserialize_with = "super::js_number::deserialize_u64")]
     pub generation: u64,
     pub events: Vec<CloudEvent>,
 }
@@ -119,6 +123,7 @@ pub struct CloudSubmit {
     pub session_id: CloudSessionId,
     /// Event-log generation the client last observed; stale attachments are
     /// fenced off.
+    #[serde(deserialize_with = "super::js_number::deserialize_u64")]
     pub generation: u64,
     /// Client-chosen id; retries reuse it to stay idempotent.
     pub command_id: CloudCommandId,
@@ -136,6 +141,7 @@ pub struct CloudGetCommand {
     pub session_id: CloudSessionId,
     /// Event-log generation the sender last observed; stale attachments are
     /// fenced off.
+    #[serde(deserialize_with = "super::js_number::deserialize_u64")]
     pub generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_id: Option<CloudCommandId>,
@@ -152,6 +158,7 @@ pub struct CloudCommand {
     pub session_id: CloudSessionId,
     /// Event-log generation the receipt belongs to; stamps every command
     /// frame.
+    #[serde(deserialize_with = "super::js_number::deserialize_u64")]
     pub generation: u64,
     pub receipt: CloudCommandReceipt,
     /// Canonical JSON of the claimed command's request, present only on a
@@ -286,16 +293,14 @@ pub fn cloud_request_digest(request: &serde_json::Value) -> Result<String, Strin
     Ok(cloud_digest(&canonical_json(request)?))
 }
 
-/// TS `isCloudDigest`.
+/// TS `isCloudDigest`: `sha256:` plus exactly 64 hex characters
+/// (`[0-9a-f]`).
 #[must_use]
 pub fn is_cloud_digest(value: &str) -> bool {
     let Some(hex) = value.strip_prefix("sha256:") else {
         return false;
     };
-    hex.len() == 64
-        && hex
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +327,10 @@ pub fn parse_cloud_message(frame: &str) -> Result<CloudMessage, String> {
     if let Some(problem) = cloud_message_problem(&value) {
         return Err(problem);
     }
+    // Integer fields normalize through JavaScript number semantics
+    // (`1.0`, `1e0`, and >2^53 literals round through `f64` like
+    // `JSON.parse`); an integral JS number above 2^64 - 2^11 has no `u64`
+    // home, so the typed parse reports it there.
     serde_json::from_value(value).map_err(|error| error.to_string())
 }
 

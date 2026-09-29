@@ -78,8 +78,10 @@ impl CloudCommandState {
 pub struct CloudCursor {
     /// Event-log epoch; bumped whenever the log is rewritten, so stale
     /// cursors resnapshot.
+    #[serde(deserialize_with = "super::js_number::deserialize_u64")]
     pub generation: u64,
     /// Last event sequence the holder consumed; 0 means nothing yet.
+    #[serde(deserialize_with = "super::js_number::deserialize_u64")]
     pub sequence: u64,
 }
 
@@ -161,8 +163,10 @@ pub struct CloudModelMetadata {
     /// Display name for the guest's model stub.
     pub name: String,
     /// Context window in tokens.
+    #[serde(deserialize_with = "super::js_number::deserialize_u64")]
     pub context_window: u64,
     /// Maximum output tokens.
+    #[serde(deserialize_with = "super::js_number::deserialize_u64")]
     pub max_tokens: u64,
     /// Whether the model supports reasoning levels.
     pub reasoning: bool,
@@ -199,6 +203,7 @@ pub struct CloudArtifactRef {
     /// gateway.
     pub path: String,
     pub sha256: String,
+    #[serde(deserialize_with = "super::js_number::deserialize_u64")]
     pub bytes: u64,
 }
 
@@ -226,6 +231,7 @@ pub struct CloudRosterRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub status: CloudChildStatus,
+    #[serde(deserialize_with = "super::js_number::deserialize_u64")]
     pub depth: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
@@ -252,10 +258,17 @@ pub enum CloudTaskState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudUsageTotals {
+    #[serde(deserialize_with = "super::js_number::deserialize_u64")]
     pub input_tokens: u64,
+    #[serde(deserialize_with = "super::js_number::deserialize_u64")]
     pub output_tokens: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::js_number::deserialize_option_u64"
+    )]
     pub cached_tokens: Option<u64>,
+    #[serde(deserialize_with = "super::js_number::deserialize_u64")]
     pub requests: u64,
 }
 
@@ -397,21 +410,25 @@ pub enum CloudCommandRequest {
 )]
 pub enum CloudEvent {
     CommandAccepted {
+        #[serde(deserialize_with = "super::js_number::deserialize_u64")]
         sequence: u64,
         recorded_at: String,
         receipt: CloudCommandReceipt,
     },
     CommandState {
+        #[serde(deserialize_with = "super::js_number::deserialize_u64")]
         sequence: u64,
         recorded_at: String,
         receipt: CloudCommandReceipt,
     },
     SessionStatus {
+        #[serde(deserialize_with = "super::js_number::deserialize_u64")]
         sequence: u64,
         recorded_at: String,
         status: CloudSessionStatus,
     },
     OutputDelta {
+        #[serde(deserialize_with = "super::js_number::deserialize_u64")]
         sequence: u64,
         recorded_at: String,
         task_id: CloudTaskId,
@@ -422,6 +439,7 @@ pub enum CloudEvent {
     /// Durable mirror of one guest session-file entry
     /// (`session_entries` capability).
     SessionEntry {
+        #[serde(deserialize_with = "super::js_number::deserialize_u64")]
         sequence: u64,
         recorded_at: String,
         /// Remote session id (the guest's session id), not a
@@ -437,6 +455,7 @@ pub enum CloudEvent {
     },
     /// Ephemeral live session event frame (`session_events` capability).
     SessionEvent {
+        #[serde(deserialize_with = "super::js_number::deserialize_u64")]
         sequence: u64,
         recorded_at: String,
         session_id: String,
@@ -445,11 +464,14 @@ pub enum CloudEvent {
     },
     /// Latest session metadata snapshot (`session_events` capability).
     SessionMeta {
+        #[serde(deserialize_with = "super::js_number::deserialize_u64")]
         sequence: u64,
         recorded_at: String,
         session_id: String,
         streaming: bool,
+        #[serde(deserialize_with = "super::js_number::deserialize_u64")]
         running_tools: u64,
+        #[serde(deserialize_with = "super::js_number::deserialize_u64")]
         queue: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recap: Option<String>,
@@ -462,12 +484,14 @@ pub enum CloudEvent {
     },
     /// Remote descendant roster rows (`roster_stream` capability).
     RosterDelta {
+        #[serde(deserialize_with = "super::js_number::deserialize_u64")]
         sequence: u64,
         recorded_at: String,
         rows: Vec<CloudRosterRow>,
     },
     /// One remote child run transition (`roster_stream` capability).
     ChildUpdate {
+        #[serde(deserialize_with = "super::js_number::deserialize_u64")]
         sequence: u64,
         recorded_at: String,
         child_id: String,
@@ -481,15 +505,18 @@ pub enum CloudEvent {
     },
     /// Token totals for one remote session (`session_events` capability).
     Usage {
+        #[serde(deserialize_with = "super::js_number::deserialize_u64")]
         sequence: u64,
         recorded_at: String,
         session_id: String,
         totals: CloudUsageTotals,
+        #[serde(deserialize_with = "super::js_number::deserialize_u64")]
         revision: u64,
     },
     /// v3: the guest asks for its cross-boundary family rows
     /// (`family_messages` capability).
     FamilyRosterRequest {
+        #[serde(deserialize_with = "super::js_number::deserialize_u64")]
         sequence: u64,
         recorded_at: String,
         request_id: String,
@@ -498,6 +525,7 @@ pub enum CloudEvent {
     },
     /// v3: a guest session sends one agent message across the boundary.
     AgentMessageRequest {
+        #[serde(deserialize_with = "super::js_number::deserialize_u64")]
         sequence: u64,
         recorded_at: String,
         request_id: String,

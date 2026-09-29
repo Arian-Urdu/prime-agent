@@ -43,6 +43,8 @@ pub fn cloud_message_problem(value: &Value) -> Option<String> {
 
 /// TS `helloProblem`.
 fn hello_problem(value: &Value) -> Option<String> {
+    #[allow(clippy::cast_precision_loss)] // the protocol version is a small exact integer
+    let expected_version = super::CLOUD_PROTOCOL_VERSION as f64;
     let base = first_problem([
         expect_fields(
             value,
@@ -62,8 +64,11 @@ fn hello_problem(value: &Value) -> Option<String> {
             "hello.protocolVersion",
             1,
         ),
-        match record_field(value, "protocolVersion").and_then(Value::as_u64) {
-            Some(version) if version == super::CLOUD_PROTOCOL_VERSION => None,
+        // TS compares the parsed numbers with `===`; exact IEEE equality
+        // is the parity requirement, not an epsilon comparison.
+        #[allow(clippy::float_cmp)]
+        match record_field(value, "protocolVersion").and_then(Value::as_f64) {
+            Some(version) if version == expected_version => None,
             _ => Some(format!(
                 "hello.protocolVersion must equal {}",
                 super::CLOUD_PROTOCOL_VERSION
@@ -84,8 +89,8 @@ fn hello_problem(value: &Value) -> Option<String> {
     }
     let cursor_generation = record_field(value, "cursor")
         .and_then(|cursor| cursor.get("generation"))
-        .and_then(Value::as_u64);
-    let generation = record_field(value, "generation").and_then(Value::as_u64);
+        .and_then(Value::as_f64);
+    let generation = record_field(value, "generation").and_then(Value::as_f64);
     if cursor_generation.is_some() && cursor_generation != generation {
         return Some("hello.cursor.generation must match hello.generation".to_string());
     }
@@ -184,14 +189,14 @@ fn snapshot_problem(value: &Value) -> Option<String> {
             "snapshot.events must hold at most {CLOUD_MAX_SNAPSHOT_EVENTS} events"
         ));
     }
-    let mut last_sequence = 0_u64;
+    let mut last_sequence = 0_f64;
     for (index, event) in events.iter().enumerate() {
         if let Some(problem) = cloud_event_problem(event, &format!("snapshot.events[{index}]")) {
             return Some(problem);
         }
         let sequence = event
             .get("sequence")
-            .and_then(Value::as_u64)
+            .and_then(Value::as_f64)
             .unwrap_or_default();
         if sequence <= last_sequence {
             return Some(format!(
@@ -201,12 +206,12 @@ fn snapshot_problem(value: &Value) -> Option<String> {
         last_sequence = sequence;
     }
     let cursor = record_field(value, "cursor").unwrap_or(&Value::Null);
-    let cursor_generation = cursor.get("generation").and_then(Value::as_u64);
-    let generation = record_field(value, "generation").and_then(Value::as_u64);
+    let cursor_generation = cursor.get("generation").and_then(Value::as_f64);
+    let generation = record_field(value, "generation").and_then(Value::as_f64);
     if cursor_generation != generation {
         return Some("snapshot.cursor.generation must match snapshot.generation".to_string());
     }
-    let cursor_sequence = cursor.get("sequence").and_then(Value::as_u64);
+    let cursor_sequence = cursor.get("sequence").and_then(Value::as_f64);
     if !events.is_empty() && cursor_sequence != Some(last_sequence) {
         return Some("snapshot.cursor.sequence must match the last event sequence".to_string());
     }
@@ -241,14 +246,14 @@ fn events_problem(value: &Value) -> Option<String> {
             "events.events must hold at most {CLOUD_MAX_SNAPSHOT_EVENTS} entries"
         ));
     }
-    let mut last_sequence = 0_u64;
+    let mut last_sequence = 0_f64;
     for (index, event) in events.iter().enumerate() {
         if let Some(problem) = cloud_event_problem(event, &format!("events.events[{index}]")) {
             return Some(problem);
         }
         let sequence = event
             .get("sequence")
-            .and_then(Value::as_u64)
+            .and_then(Value::as_f64)
             .unwrap_or_default();
         if sequence <= last_sequence {
             return Some(format!(
@@ -280,7 +285,10 @@ fn submit_problem(value: &Value) -> Option<String> {
         cloud_id_problem(record_field(value, "sessionId"), "submit.sessionId"),
         expect_integer(record_field(value, "generation"), "submit.generation", 1),
         cloud_id_problem(record_field(value, "commandId"), "submit.commandId"),
-        record_field(value, "request").and_then(cloud_request_problem),
+        // TS passes `value.request` (undefined when absent) straight to
+        // `cloudRequestProblem`, so a missing request reports the request
+        // problem here, before the digest check hashes `null`.
+        cloud_request_problem(record_field(value, "request").unwrap_or(&Value::Null)),
         super::checks::expect_digest(record_field(value, "digest"), "submit.digest"),
     ]);
     if base.is_some() {

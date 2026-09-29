@@ -1,8 +1,10 @@
 //! Shared runtime-check helpers for the cloud wire validators (TS
 //! `protocol.ts` `expect*`/`optional*` helpers): exact problem strings,
 //! exact check order. String bounds count UTF-16 code units (TS `.length`
-//! semantics; astral characters count as two), so an id valid here is valid
-//! in TS and vice versa.
+//! semantics; astral characters count as two), integers check with JS
+//! `Number.isInteger` semantics over the parsed `f64` (so `1.0` and `1e0`
+//! are integers), and field presence walks keys in `Object.keys` order, so
+//! an id valid here is valid in TS and vice versa.
 
 use serde_json::Value;
 
@@ -11,14 +13,34 @@ pub(super) fn first_problem<const N: usize>(problems: [Option<String>; N]) -> Op
 }
 
 pub(super) fn expect_fields(value: &Value, fields: &[&str]) -> Option<String> {
-    value
-        .as_object()
-        .and_then(|map| {
-            map.keys()
-                .find(|key| !fields.contains(&key.as_str()))
-                .cloned()
-        })
+    let map = value.as_object()?;
+    // TS `expectFields` walks `Object.keys`, which yields array-index keys
+    // ("0".."4294967294") ascending first and the rest in insertion order.
+    // The allowed field names are never array indices, so the smallest
+    // array index wins over any later insertion-order key.
+    let mut smallest_index: Option<u32> = None;
+    for key in map.keys() {
+        if let Some(index) = js_array_index(key) {
+            smallest_index = Some(smallest_index.map_or(index, |prev| prev.min(index)));
+        }
+    }
+    if let Some(index) = smallest_index {
+        return Some(format!("unexpected field: {index}"));
+    }
+    map.keys()
+        .find(|key| !fields.contains(&key.as_str()))
         .map(|key| format!("unexpected field: {key}"))
+}
+
+/// One canonical JavaScript array-index property key: decimal digits, no
+/// leading zeros, `0..=4294967294` (the keys `Object.keys` orders
+/// numerically; anything else is a plain string key).
+fn js_array_index(key: &str) -> Option<u32> {
+    let index: u32 = key.parse().ok()?;
+    if index < u32::MAX && index.to_string() == key {
+        return Some(index);
+    }
+    None
 }
 
 pub(super) fn expect_string(
@@ -55,9 +77,13 @@ pub(super) fn optional_string(
     }
 }
 
+/// TS `expectInteger`: `Number.isInteger` over the parsed `f64`, so the
+/// valid JS spellings (`1.0`, `1e0`, integers beyond i64 or 2^53) pass
+/// exactly as they do through `JSON.parse`.
+#[allow(clippy::cast_precision_loss)] // the 0/1 bounds are exact in f64
 pub(super) fn expect_integer(value: Option<&Value>, label: &str, minimum: i64) -> Option<String> {
-    match value.and_then(Value::as_i64) {
-        Some(number) if number >= minimum => None,
+    match value.and_then(Value::as_f64) {
+        Some(number) if super::js_number::is_js_integer(number) && number >= minimum as f64 => None,
         _ => Some(format!("{label} must be an integer of at least {minimum}")),
     }
 }

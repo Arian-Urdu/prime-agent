@@ -2,6 +2,8 @@
 	"provenance": {
 		"source": "packages/coding-agent/src/core/cloud/protocol.ts",
 		"commit": "193d42bf (origin/feat/direct-cloud-sandbox)",
+		"sourceSha256": "fef54f95c50444c85423d23b8ebcf7cd58aacec53b4dcbe02608bbb6256f81c4",
+		"sourceBytes": 61956,
 		"protocolVersion": 3,
 		"protocolName": "prime-agent.cloud",
 		"recordedWith": "node v25.9.0"
@@ -533,6 +535,27 @@
 				"digest": "sha256:77e1ff26948a9eaef9b1cc0ad037cfd582738691e94da87e0b3edabcc09f35f6"
 			},
 			"serialized": "{\"commandId\":\"cmd_1\",\"digest\":\"sha256:77e1ff26948a9eaef9b1cc0ad037cfd582738691e94da87e0b3edabcc09f35f6\",\"generation\":1,\"request\":{\"from\":{\"activeSessionId\":\"act_1\",\"runtimeKind\":\"top-level\",\"sessionId\":\"sess_1\",\"sessionName\":\"root\"},\"fromRelationship\":\"child\",\"kind\":\"send_message\",\"message\":\"status update\",\"messageId\":\"agentmsg_9\",\"targetRemoteSessionId\":\"remote_child\"},\"sessionId\":\"sess_1\",\"type\":\"submit\"}"
+		},
+		{
+			"name": "submit_utf16_keys",
+			"value": {
+				"type": "submit",
+				"sessionId": "sess_1",
+				"generation": 1,
+				"commandId": "cmd_1",
+				"request": {
+					"kind": "extension_ui_response",
+					"requestId": "ext_1",
+					"response": {
+						"a": 0,
+						"": 1,
+						"𐀀": 2
+					},
+					"targetSessionId": "remote_child"
+				},
+				"digest": "sha256:d01b0e3bd9142d156c68c61b01b7c0f93ad9a8064490eacd339f4c10a29fc110"
+			},
+			"serialized": "{\"commandId\":\"cmd_1\",\"digest\":\"sha256:d01b0e3bd9142d156c68c61b01b7c0f93ad9a8064490eacd339f4c10a29fc110\",\"generation\":1,\"request\":{\"kind\":\"extension_ui_response\",\"requestId\":\"ext_1\",\"response\":{\"a\":0,\"𐀀\":2,\"\":1},\"targetSessionId\":\"remote_child\"},\"sessionId\":\"sess_1\",\"type\":\"submit\"}"
 		}
 	],
 	"requests": [
@@ -931,6 +954,53 @@
 			"rawJson": "{\"kind\":\"prompt\",\"text\":\"numbers stay flat inside strings: 2.0 -0 1e21\"}",
 			"canonical": "{\"kind\":\"prompt\",\"text\":\"numbers stay flat inside strings: 2.0 -0 1e21\"}",
 			"digest": "sha256:4c02b7d08c192010e21da011e1d982a8cad8c845fa735b00a79243b550246444"
+		},
+		{
+			"rawJson": "{\"kind\":\"extension_ui_response\",\"requestId\":\"ext_1\",\"response\":{\"a\":0,\"\\uE000\":1,\"\\uD800\\uDC00\":2}}",
+			"canonical": "{\"kind\":\"extension_ui_response\",\"requestId\":\"ext_1\",\"response\":{\"a\":0,\"𐀀\":2,\"\":1}}",
+			"digest": "sha256:8d8c5ec00f5c2a0eccc1559597387b905214e78360b71aafb70b19c0865ce373"
+		}
+	],
+	"rawParses": [
+		{
+			"name": "hello_float_spellings",
+			"rawJson": "{\"type\":\"hello\",\"protocolVersion\":3.0,\"generation\":1.0,\"clientId\":\"c\",\"sessionId\":\"s\"}",
+			"serialized": "{\"clientId\":\"c\",\"generation\":1,\"protocolVersion\":3,\"sessionId\":\"s\",\"type\":\"hello\"}"
+		},
+		{
+			"name": "hello_exponent_spellings",
+			"rawJson": "{\"type\":\"hello\",\"protocolVersion\":3e0,\"generation\":1e0,\"clientId\":\"c\",\"sessionId\":\"s\"}",
+			"serialized": "{\"clientId\":\"c\",\"generation\":1,\"protocolVersion\":3,\"sessionId\":\"s\",\"type\":\"hello\"}"
+		},
+		{
+			"name": "hello_cursor_floats",
+			"rawJson": "{\"type\":\"hello\",\"protocolVersion\":3,\"generation\":2.0,\"clientId\":\"c\",\"sessionId\":\"s\",\"cursor\":{\"generation\":2.0,\"sequence\":7.0}}",
+			"serialized": "{\"clientId\":\"c\",\"cursor\":{\"generation\":2,\"sequence\":7},\"generation\":2,\"protocolVersion\":3,\"sessionId\":\"s\",\"type\":\"hello\"}"
+		},
+		{
+			"name": "hello_generation_beyond_i64",
+			"rawJson": "{\"type\":\"hello\",\"protocolVersion\":3,\"generation\":9223372036854775808,\"clientId\":\"c\",\"sessionId\":\"s\"}",
+			"serialized": "{\"clientId\":\"c\",\"generation\":9223372036854776000,\"protocolVersion\":3,\"sessionId\":\"s\",\"type\":\"hello\"}"
+		},
+		{
+			"name": "hello_generation_beyond_2_53",
+			"rawJson": "{\"type\":\"hello\",\"protocolVersion\":3,\"generation\":9007199254740993,\"clientId\":\"c\",\"sessionId\":\"s\"}",
+			"serialized": "{\"clientId\":\"c\",\"generation\":9007199254740992,\"protocolVersion\":3,\"sessionId\":\"s\",\"type\":\"hello\"}"
+		},
+		{
+			"name": "submit_generation_exponent",
+			"rawJson": "{\"type\":\"submit\",\"sessionId\":\"s\",\"generation\":1e0,\"commandId\":\"c\",\"request\":{\"kind\":\"prompt\",\"text\":\"hi\"},\"digest\":\"sha256:e7dfe480c4463263a93755ec83d15829b19df0698e8b764baa4b5e9a3d7bc727\"}",
+			"serialized": "{\"commandId\":\"c\",\"digest\":\"sha256:e7dfe480c4463263a93755ec83d15829b19df0698e8b764baa4b5e9a3d7bc727\",\"generation\":1,\"request\":{\"kind\":\"prompt\",\"text\":\"hi\"},\"sessionId\":\"s\",\"type\":\"submit\"}"
+		},
+		{
+			"name": "events_frame_floats",
+			"rawJson": "{\"type\":\"events\",\"sessionId\":\"s\",\"generation\":1e0,\"events\":[{\"sequence\":1.0,\"kind\":\"session_status\",\"recordedAt\":\"t\",\"status\":\"idle\"},{\"sequence\":2.0,\"kind\":\"session_status\",\"recordedAt\":\"t\",\"status\":\"busy\"}]}",
+			"serialized": "{\"events\":[{\"kind\":\"session_status\",\"recordedAt\":\"t\",\"sequence\":1,\"status\":\"idle\"},{\"kind\":\"session_status\",\"recordedAt\":\"t\",\"sequence\":2,\"status\":\"busy\"}],\"generation\":1,\"sessionId\":\"s\",\"type\":\"events\"}"
+		},
+		{
+			"name": "session_meta_floats",
+			"rawJson": "{\"type\":\"events\",\"sessionId\":\"s\",\"generation\":1,\"events\":[{\"sequence\":1.0,\"kind\":\"session_meta\",\"recordedAt\":\"t\",\"sessionId\":\"r\",\"streaming\":true,\"runningTools\":2.0,\"queue\":-0.0}]}",
+			"serialized": "{\"events\":[{\"kind\":\"session_meta\",\"queue\":0,\"recordedAt\":\"t\",\"runningTools\":2,\"sequence\":1,\"sessionId\":\"r\",\"streaming\":true}],\"generation\":1,\"sessionId\":\"s\",\"type\":\"events\"}"
 		}
 	],
 	"invalid": [
@@ -2503,6 +2573,233 @@
 			"validator": "id",
 			"value": 5,
 			"problem": "id must be a non-empty string of at most 128 characters"
+		},
+		{
+			"validator": "message",
+			"value": {
+				"type": "submit",
+				"sessionId": "s",
+				"generation": 1,
+				"commandId": "c",
+				"request": {
+					"kind": "prompt",
+					"text": "hi"
+				},
+				"digest": "sha256:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"
+			},
+			"problem": "submit.digest must be a sha256:<64 hex> digest"
+		},
+		{
+			"validator": "message",
+			"value": {
+				"type": "command",
+				"sessionId": "s",
+				"generation": 1,
+				"receipt": {
+					"commandId": "cmd_1",
+					"digest": "sha256:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+					"state": "accepted",
+					"submittedAt": "2026-09-29T00:00:00.000Z",
+					"updatedAt": "2026-09-29T00:00:00.001Z",
+					"uncertain": false
+				}
+			},
+			"problem": "command.receipt.digest must be a sha256:<64 hex> digest"
+		},
+		{
+			"validator": "message",
+			"value": {
+				"type": "command",
+				"sessionId": "s",
+				"generation": 1,
+				"receipt": {
+					"commandId": "cmd_1",
+					"digest": "SHA256:E7DFE480C4463263A93755EC83D15829B19DF0698E8B764BAA4B5E9A3D7BC727",
+					"state": "accepted",
+					"submittedAt": "2026-09-29T00:00:00.000Z",
+					"updatedAt": "2026-09-29T00:00:00.001Z",
+					"uncertain": false
+				}
+			},
+			"problem": "command.receipt.digest must be a sha256:<64 hex> digest"
+		},
+		{
+			"validator": "event",
+			"value": {
+				"sequence": 1,
+				"recordedAt": "t",
+				"kind": "session_entry",
+				"sessionId": "r",
+				"entryId": "e",
+				"entry": {
+					"type": "message",
+					"id": "m",
+					"timestamp": "t"
+				},
+				"artifacts": [
+					{
+						"path": "p",
+						"sha256": "sha256:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+						"bytes": 1
+					}
+				]
+			},
+			"problem": "event.artifacts[0].sha256 must be a sha256:<64 hex> digest"
+		},
+		{
+			"validator": "message",
+			"value": {
+				"type": "submit",
+				"sessionId": "s",
+				"generation": 1,
+				"commandId": "c",
+				"digest": "sha256:3987933c2e79489e6e9e1a47ec34c6ac29aeea7d0c70dc4053c604a0cce59de0"
+			},
+			"problem": "request must be a JSON object"
+		},
+		{
+			"validator": "message",
+			"value": {
+				"type": "hello",
+				"protocolVersion": 3,
+				"generation": 1,
+				"clientId": "c",
+				"sessionId": "s",
+				"zz": 1,
+				"aa": 2
+			},
+			"problem": "unexpected field: zz"
+		},
+		{
+			"validator": "message",
+			"value": {
+				"5": 2,
+				"10": 3,
+				"type": "hello",
+				"protocolVersion": 3,
+				"generation": 1,
+				"clientId": "c",
+				"sessionId": "s",
+				"b": 1
+			},
+			"problem": "unexpected field: 5"
+		},
+		{
+			"validator": "message",
+			"value": {
+				"4294967294": 1,
+				"type": "hello",
+				"protocolVersion": 3,
+				"generation": 1,
+				"clientId": "c",
+				"sessionId": "s"
+			},
+			"problem": "unexpected field: 4294967294"
+		},
+		{
+			"validator": "message",
+			"value": {
+				"type": "hello",
+				"protocolVersion": 3,
+				"generation": 1,
+				"clientId": "c",
+				"sessionId": "s",
+				"4294967295": 1,
+				"zz": 2
+			},
+			"problem": "unexpected field: 4294967295"
+		},
+		{
+			"validator": "request",
+			"value": {
+				"kind": "prompt",
+				"text": "hi",
+				"zz": 1,
+				"aa": 2
+			},
+			"problem": "unexpected field: zz"
+		},
+		{
+			"validator": "message",
+			"value": {
+				"type": "hello",
+				"protocolVersion": 3,
+				"generation": 0.5,
+				"clientId": "c",
+				"sessionId": "s"
+			},
+			"problem": "hello.generation must be an integer of at least 1"
+		},
+		{
+			"validator": "message",
+			"value": {
+				"type": "hello",
+				"protocolVersion": 3,
+				"generation": 2,
+				"clientId": "c",
+				"sessionId": "s",
+				"cursor": {
+					"generation": 3,
+					"sequence": 0
+				}
+			},
+			"problem": "hello.cursor.generation must match hello.generation"
+		},
+		{
+			"validator": "message",
+			"value": {
+				"type": "events",
+				"sessionId": "s",
+				"generation": 1,
+				"events": [
+					{
+						"sequence": 2,
+						"kind": "session_status",
+						"recordedAt": "t",
+						"status": "idle"
+					},
+					{
+						"sequence": 1,
+						"kind": "session_status",
+						"recordedAt": "t",
+						"status": "idle"
+					}
+				]
+			},
+			"problem": "events.events[1].sequence must strictly increase"
+		},
+		{
+			"validator": "message",
+			"value": {
+				"type": "snapshot",
+				"sessionId": "s",
+				"generation": 1,
+				"cursor": {
+					"generation": 1,
+					"sequence": 3
+				},
+				"status": "idle",
+				"state": {
+					"cwd": "/w",
+					"modelId": "m",
+					"queuedCommandIds": []
+				},
+				"events": [
+					{
+						"sequence": 1,
+						"kind": "session_status",
+						"recordedAt": "t",
+						"status": "idle"
+					},
+					{
+						"sequence": 2,
+						"kind": "session_status",
+						"recordedAt": "t",
+						"status": "idle"
+					}
+				]
+			},
+			"problem": "snapshot.cursor.sequence must match the last event sequence"
 		}
 	]
 }

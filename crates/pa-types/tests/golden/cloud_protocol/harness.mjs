@@ -15,13 +15,20 @@
  * history:
  *   git show 193d42bf:packages/coding-agent/src/core/cloud/protocol.ts \
  *     > /tmp/cloud-protocol.ts
+ * The recording hashes the exact TS source bytes into the corpus provenance
+ * (`sourceSha256`); the Rust golden test pins that digest, so a corpus
+ * recorded against a drifted source fails the parity gate instead of
+ * silently claiming the pin.
  */
 
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const tsPath = process.env.CLOUD_PROTOCOL_TS ?? "/tmp/cloud-protocol.ts";
+const tsSource = fs.readFileSync(tsPath);
+const tsSourceSha256 = createHash("sha256").update(tsSource).digest("hex");
 const protocol = await import(tsPath);
 const outPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "corpus.json");
 
@@ -334,6 +341,18 @@ const submitFrames = [];
 			fromRelationship: "child",
 		}),
 	});
+	// UTF-16 key order through the full submit path: the digest covers the
+	// astral key before the private-use key, and the serialized frame pins
+	// the exact canonical bytes.
+	submitFrames.push({
+		name: "submit_utf16_keys",
+		value: submit({
+			kind: "extension_ui_response",
+			requestId: "ext_1",
+			response: { a: 0, "\uE000": 1, "\uD800\uDC00": 2 },
+			targetSessionId: "remote_child",
+		}),
+	});
 }
 
 // JS-number parity: raw JSON whose number literals exercise String(number)
@@ -341,6 +360,29 @@ const submitFrames = [];
 const numberCases = [
 	'{"kind":"extension_ui_response","requestId":"ext_1","response":{"integral_float":2.0,"half":0.5,"neg_zero":-0,"expo_hi":1e21,"expo_lo":1e-7,"plain_big":1e20,"beyond_2_53":9007199254740993,"neg_beyond_2_53":-9007199254740993,"pi":3.14159}}',
 	'{"kind":"prompt","text":"numbers stay flat inside strings: 2.0 -0 1e21"}',
+	// JS sorts object keys by UTF-16 code units, not by scalar value: the
+	// astral key (surrogates D800 DC00) sorts before the private-use key
+	// (E000) and after the ASCII key, so the canonical bytes and the
+	// request digest pin that exact order.
+	'{"kind":"extension_ui_response","requestId":"ext_1","response":{"a":0,"\\uE000":1,"\\uD800\\uDC00":2}}',
+];
+
+// Raw wire spellings TS accepts: integral floats (1.0, 1e0) and integer
+// literals beyond i64/beyond 2^53, which JSON.parse stores as doubles.
+// Recorded as raw JSON strings (JSON.stringify would re-render a JS value
+// and lose the spellings) with the canonical bytes the TS side serializes.
+const rawParses = [
+	{ name: "hello_float_spellings", rawJson: '{"type":"hello","protocolVersion":3.0,"generation":1.0,"clientId":"c","sessionId":"s"}' },
+	{ name: "hello_exponent_spellings", rawJson: '{"type":"hello","protocolVersion":3e0,"generation":1e0,"clientId":"c","sessionId":"s"}' },
+	{ name: "hello_cursor_floats", rawJson: '{"type":"hello","protocolVersion":3,"generation":2.0,"clientId":"c","sessionId":"s","cursor":{"generation":2.0,"sequence":7.0}}' },
+	{ name: "hello_generation_beyond_i64", rawJson: '{"type":"hello","protocolVersion":3,"generation":9223372036854775808,"clientId":"c","sessionId":"s"}' },
+	{ name: "hello_generation_beyond_2_53", rawJson: '{"type":"hello","protocolVersion":3,"generation":9007199254740993,"clientId":"c","sessionId":"s"}' },
+	{
+		name: "submit_generation_exponent",
+		rawJson: `{"type":"submit","sessionId":"s","generation":1e0,"commandId":"c","request":{"kind":"prompt","text":"hi"},"digest":"${protocol.cloudRequestDigest({ kind: "prompt", text: "hi" })}"}`,
+	},
+	{ name: "events_frame_floats", rawJson: '{"type":"events","sessionId":"s","generation":1e0,"events":[{"sequence":1.0,"kind":"session_status","recordedAt":"t","status":"idle"},{"sequence":2.0,"kind":"session_status","recordedAt":"t","status":"busy"}]}' },
+	{ name: "session_meta_floats", rawJson: '{"type":"events","sessionId":"s","generation":1,"events":[{"sequence":1.0,"kind":"session_meta","recordedAt":"t","sessionId":"r","streaming":true,"runningTools":2.0,"queue":-0.0}]}' },
 ];
 
 // ---------------------------------------------------------------- valid events
@@ -514,12 +556,48 @@ caseAt("id", "");
 caseAt("id", "x".repeat(129));
 caseAt("id", 5);
 
+// strict hex digests: TS isCloudDigest is [0-9a-f]{64}, so g-z and
+// uppercase spellings are invalid wherever a digest appears
+caseAt("message", { type: "submit", sessionId: "s", generation: 1, commandId: "c", request: { kind: "prompt", text: "hi" }, digest: `sha256:${"g".repeat(64)}` });
+caseAt("message", { type: "command", sessionId: "s", generation: 1, receipt: { ...RECEIPT, digest: `sha256:${"g".repeat(64)}` } });
+caseAt("message", { type: "command", sessionId: "s", generation: 1, receipt: { ...RECEIPT, digest: RECEIPT.digest.toUpperCase() } });
+caseAt("event", { sequence: 1, recordedAt: "t", kind: "session_entry", sessionId: "r", entryId: "e", entry: { type: "message", id: "m", timestamp: "t" }, artifacts: [{ path: "p", sha256: `sha256:${"g".repeat(64)}`, bytes: 1 }] });
+
+// missing submit.request: the request validator runs on the absent value
+// (this digest is the canonical digest of `null`, so only the request
+// check catches the frame)
+caseAt("message", { type: "submit", sessionId: "s", generation: 1, commandId: "c", digest: protocol.cloudDigest("null") });
+
+// unexpected-field order: Object.keys yields array indices ascending
+// first, then the remaining keys in insertion order (never sorted)
+caseAt("message", { type: "hello", protocolVersion: 3, generation: 1, clientId: "c", sessionId: "s", zz: 1, aa: 2 });
+caseAt("message", { type: "hello", protocolVersion: 3, generation: 1, clientId: "c", sessionId: "s", b: 1, 5: 2, 10: 3 });
+caseAt("message", { type: "hello", protocolVersion: 3, generation: 1, clientId: "c", sessionId: "s", 4294967294: 1 });
+caseAt("message", { type: "hello", protocolVersion: 3, generation: 1, clientId: "c", sessionId: "s", 4294967295: 1, zz: 2 });
+caseAt("request", { kind: "prompt", text: "hi", zz: 1, aa: 2 });
+
+// JS integer spellings the validators must reject, and float spellings
+// that cross-check generation/cursor/sequence comparisons
+caseAt("message", { type: "hello", protocolVersion: 3, generation: 0.5, clientId: "c", sessionId: "s" });
+caseAt("message", { type: "hello", protocolVersion: 3, generation: 2, clientId: "c", sessionId: "s", cursor: { generation: 3.0, sequence: 0 } });
+caseAt("message", { type: "events", sessionId: "s", generation: 1, events: [{ sequence: 2.0, kind: "session_status", recordedAt: "t", status: "idle" }, { sequence: 1.0, kind: "session_status", recordedAt: "t", status: "idle" }] });
+caseAt("message", { type: "snapshot", sessionId: "s", generation: 1, cursor: { generation: 1, sequence: 3.0 }, status: "idle", state: { cwd: "/w", modelId: "m", queuedCommandIds: [] }, events: [{ sequence: 1.0, kind: "session_status", recordedAt: "t", status: "idle" }, { sequence: 2.0, kind: "session_status", recordedAt: "t", status: "idle" }] });
+// NOTE: raw 1e400 is deliberately NOT recorded: V8's JSON.parse accepts it
+// as Infinity and reports a validation problem, while serde_json refuses
+// it at parse time ("number out of range"), so only the not-valid-JSON
+// prefix class is engine-pinned, not a byte-identical replay.
+
 // ------------------------------------------------------------------ record TS
 
 const corpus = {
 	provenance: {
 		source: "packages/coding-agent/src/core/cloud/protocol.ts",
 		commit: "193d42bf (origin/feat/direct-cloud-sandbox)",
+		// SHA-256 over the exact TS source bytes this corpus was recorded
+		// from; the Rust golden test pins it, so recording against a
+		// drifted or mislabeled source fails the parity gate.
+		sourceSha256: tsSourceSha256,
+		sourceBytes: tsSource.byteLength,
 		protocolVersion: protocol.CLOUD_PROTOCOL_VERSION,
 		protocolName: protocol.CLOUD_PROTOCOL_NAME,
 		recordedWith: "node " + process.version,
@@ -528,6 +606,7 @@ const corpus = {
 	requests: [],
 	events: [],
 	numbers: [],
+	rawParses: [],
 	invalid: [],
 };
 
@@ -558,6 +637,12 @@ for (const rawJson of numberCases) {
 		canonical: protocol.canonicalJson(value),
 		digest: protocol.cloudRequestDigest(value),
 	});
+}
+
+for (const { name, rawJson } of rawParses) {
+	const parsed = protocol.parseCloudMessage(rawJson);
+	if (!parsed.ok) throw new Error(`raw parse case ${name} rejected by TS: ${parsed.error}`);
+	corpus.rawParses.push({ name, rawJson, serialized: protocol.serializeCloudMessage(parsed.message) });
 }
 
 for (const event of events) {
@@ -620,5 +705,5 @@ for (const { validator, value, rawJson } of invalid) {
 
 fs.writeFileSync(outPath, JSON.stringify(corpus, null, "\t") + "\n");
 console.log(
-	`corpus: ${corpus.frames.length} frames, ${corpus.requests.length} requests, ${corpus.events.length} events, ${corpus.numbers.length} number cases, ${corpus.invalid.length} invalid cases -> ${outPath}`,
+	`corpus: ${corpus.frames.length} frames, ${corpus.requests.length} requests, ${corpus.events.length} events, ${corpus.numbers.length} number cases, ${corpus.rawParses.length} raw parse cases, ${corpus.invalid.length} invalid cases (ts source sha256 ${tsSourceSha256}) -> ${outPath}`,
 );

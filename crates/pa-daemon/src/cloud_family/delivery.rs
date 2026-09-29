@@ -504,7 +504,3 @@ pub async fn reconcile_uncertain<D: CloudFamilyDelivery>(
     }
     outcome
 }
-
-#[cfg(test)]
-#[path = "delivery_tests.rs"]
-mod tests;

@@ -179,6 +179,26 @@ pub fn restrict_open_file(_file: &std::fs::File) -> std::io::Result<()> {
     Ok(())
 }
 
+/// True when the path's owner is the effective user (Unix); an unreadable
+/// path answers false. On Windows inherited ACLs govern access, so
+/// ownership is not a separate gate and the check is a no-op true.
+#[cfg(unix)]
+#[must_use]
+pub fn owned_by_effective_user(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.uid() == nix::unistd::Uid::effective().as_raw())
+}
+
+/// Windows arm of [`owned_by_effective_user`]: inherited ACLs carry the
+/// access decision, so ownership is not a separate gate.
+#[cfg(not(unix))]
+#[must_use]
+pub fn owned_by_effective_user(_path: &Path) -> bool {
+    // Windows: inherited ACLs apply; see the ACL note above.
+    true
+}
+
 /// Create directories recursively with the private dir mode on platforms with
 /// mode bits; existing directories are left untouched (mkdir semantics).
 ///

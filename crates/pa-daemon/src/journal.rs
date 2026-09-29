@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 const COMPACT_AFTER_RECORDS: usize = 4096;
@@ -33,6 +33,16 @@ pub(crate) fn validate_journal_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The privacy contract a keyed (cloud) journal commit demands of its
+/// parent: a real (non-symlink) directory, owner-only mode bits where the
+/// platform has them, and ownership by the effective user. The checks ride
+/// the platform wall (`pa_core::platform::perms`): on Windows inherited
+/// ACLs govern, so the mode and owner checks are no-ops there.
+///
+/// # Errors
+///
+/// Returns an error when the parent cannot be inspected or violates the
+/// contract.
 pub(crate) fn validate_private_journal_parent(path: &Path) -> Result<()> {
     let parent = path
         .parent()
@@ -43,25 +53,47 @@ pub(crate) fn validate_private_journal_parent(path: &Path) -> Result<()> {
         "worker journal parent {} must be a real private directory",
         parent.display()
     );
-    #[cfg(unix)]
-    {
+    if let Some(mode) = pa_core::platform::perms::file_mode(parent) {
         anyhow::ensure!(
-            metadata.permissions().mode() & 0o777 == 0o700,
+            mode == pa_core::platform::perms::PRIVATE_DIR_MODE,
             "worker journal parent {} must have mode 0700",
             parent.display()
         );
-        let owner = rustix::process::geteuid().as_raw();
-        anyhow::ensure!(
-            metadata.uid() == owner,
-            "worker journal parent {} must be owned by the current user",
-            parent.display()
-        );
-        Ok(())
     }
-    #[cfg(not(unix))]
-    Err(anyhow::anyhow!(
-        "owner-private cloud journals are unsupported on this platform"
-    ))
+    anyhow::ensure!(
+        pa_core::platform::perms::owned_by_effective_user(parent),
+        "worker journal parent {} must be owned by the current user",
+        parent.display()
+    );
+    Ok(())
+}
+
+/// Create or tighten the journal's parent to the private mode a keyed
+/// (cloud) commit requires: a missing parent chain is created private, and
+/// a pre-existing parent owned by the effective user is tightened to 0700
+/// (a normal `create_dir_all` parent is 0755 under the usual umask — the
+/// commit must work against it, not quarantine over it). A parent owned by
+/// anyone else is left untouched and fails the validation that follows:
+/// privacy is never assumed from a directory this process does not
+/// control.
+///
+/// # Errors
+///
+/// Returns an error when the parent cannot be created or tightened.
+pub(crate) fn ensure_private_journal_parent(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("worker journal has no parent directory")?;
+    pa_core::platform::perms::create_dir_all_private(parent)
+        .with_context(|| format!("create private {}", parent.display()))?;
+    if pa_core::platform::perms::file_mode(parent)
+        .is_some_and(|mode| mode != pa_core::platform::perms::PRIVATE_DIR_MODE)
+        && pa_core::platform::perms::owned_by_effective_user(parent)
+    {
+        pa_core::platform::perms::restrict_dir(parent)
+            .with_context(|| format!("tighten {}", parent.display()))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn append_record(path: &Path, record: &Value) -> Result<()> {
@@ -924,6 +956,7 @@ impl WorkerRecoveryJournal {
         let scan = scan_worker_journal(path)?;
         let folded = fold_journal_scan(&scan);
         if !folded.cloud_inbox.is_empty() {
+            ensure_private_journal_parent(path)?;
             validate_private_journal_parent(path)?;
         }
         // The torn tail of an interrupted append is repaired BEFORE any
@@ -989,9 +1022,7 @@ impl WorkerRecoveryJournal {
         transaction: &WorkerCheckpointTransactionRecord,
     ) -> Result<()> {
         let result = (|| {
-            if let Some(parent) = self.path.parent() {
-                fs::create_dir_all(parent)?;
-            }
+            ensure_private_journal_parent(&self.path)?;
             validate_private_journal_parent(&self.path)?;
             validate_journal_file(&self.path)?;
             let mut file = OpenOptions::new()
@@ -2059,16 +2090,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn cloud_journal_rejects_symlink_and_nonprivate_parent() {
+    fn cloud_journal_rejects_a_symlink_parent_and_tightens_a_loose_own_one() {
         let path = temp_path("safe.jsonl");
         let linked = path.with_file_name("linked.jsonl");
         fs::write(&path, "").unwrap();
         std::os::unix::fs::symlink(&path, &linked).unwrap();
         assert!(WorkerRecoveryJournal::open(&linked).is_err());
         let mut journal = WorkerRecoveryJournal::open(&path).unwrap();
+        // A loose own parent is tightened and the keyed commit lands; a
+        // parent owned by anyone else still fails closed — it cannot be
+        // tightened, and privacy is never assumed from it.
         let parent = path.parent().unwrap();
         fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(journal
+        journal
             .record_queue_checkpoint(
                 "sess-a",
                 "sess-a-file",
@@ -2079,10 +2113,58 @@ mod tests {
                 &[],
                 Some(("msgreq_private", &serde_json::json!({"id":"receipt"}))),
             )
-            .is_err());
-        assert!(journal.is_quarantined());
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+            .unwrap();
+        assert!(!journal.is_quarantined());
+        assert_eq!(
+            pa_core::platform::perms::file_mode(parent),
+            Some(0o700),
+            "the loose own parent is tightened"
+        );
         let _ = fs::remove_dir_all(parent);
+    }
+
+    /// The regression (the #3164 review): a NORMAL journal parent — the
+    /// mode `create_dir_all` produces under the usual umask — must not
+    /// quarantine the keyed commit. The first keyed checkpoint against a
+    /// plain-created parent tightens it to the private mode and lands;
+    /// the restart replays the admission from it.
+    #[cfg(unix)]
+    #[test]
+    fn keyed_commit_tightens_a_normal_parent_instead_of_quarantining() {
+        let dir = std::env::temp_dir().join(format!("pa-daemon-journal-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        // The umask-independent normal shape: what create_dir_all makes
+        // on the usual 022 umask.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.join("recovery.jsonl");
+        let mut journal = WorkerRecoveryJournal::open(&path).unwrap();
+        journal
+            .record_queue_checkpoint(
+                "sess-n",
+                "sess-n-file",
+                None,
+                true,
+                "steer_queued",
+                &[],
+                &[],
+                Some((
+                    "msgreq_normal",
+                    &serde_json::json!({"id": "receipt-normal"}),
+                )),
+            )
+            .unwrap_or_else(|error| panic!("keyed commit against a normal parent: {error:#}"));
+        assert!(!journal.is_quarantined());
+        assert_eq!(
+            pa_core::platform::perms::file_mode(&dir),
+            Some(0o700),
+            "the parent is tightened to the private mode"
+        );
+        let reopened = WorkerRecoveryJournal::open(&path).unwrap();
+        assert_eq!(
+            reopened.cloud_inbox_receipt("msgreq_normal"),
+            Some(&serde_json::json!({"id": "receipt-normal"}))
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Mid-file corruption (an unparsable line followed by a valid one)

@@ -4,8 +4,6 @@
 //! dedupe key and the visible lane.
 use super::agent_message_tests::{created_worker, queue_texts};
 use super::*;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 fn keyed_payload(message: &str, request_id: &str) -> Value {
     json!({
@@ -138,10 +136,10 @@ async fn duplicate_request_answers_the_recorded_receipt_without_re_delivering() 
 /// message.
 #[tokio::test]
 async fn restart_restores_the_lane_and_the_inbox_key() {
+    // A normal (non-private) parent — the production shape: the keyed
+    // path must tighten it itself.
     let dir = std::env::temp_dir().join(format!("pa-worker-cloud-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    #[cfg(unix)]
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let config = WorkerConfig {
         socket_path: dir.join("worker.sock"),
         supervisor_socket_path: PathBuf::new(),

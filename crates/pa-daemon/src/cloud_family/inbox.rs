@@ -156,9 +156,7 @@ impl CloudInboxLog {
     /// Returns an error when the parent directory cannot be created,
     /// the file is corrupted mid-file, or the repair rewrite fails.
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        crate::journal::ensure_private_journal_parent(path)?;
         crate::journal::validate_private_journal_parent(path)?;
         crate::journal::validate_journal_file(path)?;
         match fs::File::open(path) {
@@ -447,6 +445,37 @@ mod tests {
             "deliveryMode": "steer",
         }))
         .unwrap()
+    }
+
+    /// The regression (the #3164 review): the inbox opens against the
+    /// NORMAL parent — a plain-created (non-private) directory owned by
+    /// this user is tightened to 0700, and a missing parent chain is
+    /// created private — instead of failing on a mode the open demanded
+    /// but never established.
+    #[cfg(unix)]
+    #[test]
+    fn open_tightens_a_normal_parent_and_creates_missing_ones_privately() {
+        let dir = std::env::temp_dir().join(format!("pa-cloud-inbox-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        // The umask-independent normal shape: what create_dir_all makes
+        // on the usual 022 umask.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let log = CloudInboxLog::open(&dir.join("cloud-inbox.jsonl")).unwrap();
+        drop(log);
+        assert_eq!(
+            pa_core::platform::perms::file_mode(&dir),
+            Some(0o700),
+            "the pre-existing parent is tightened to the private mode"
+        );
+        let nested = dir.join("nested").join("inner");
+        let log = CloudInboxLog::open(&nested.join("cloud-inbox.jsonl")).unwrap();
+        drop(log);
+        assert_eq!(
+            pa_core::platform::perms::file_mode(&nested),
+            Some(0o700),
+            "the created parent chain is private"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The two-phase round trip: admit, record, reopen — the receipt and

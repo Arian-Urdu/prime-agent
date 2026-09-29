@@ -5,6 +5,7 @@
 
 use pa_types::ai::Usage;
 use pa_types::session::ChildUsageOrigin;
+use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 
 use super::InProcessRlmHost;
@@ -59,11 +60,9 @@ pub struct InProcessChildRecord {
     state: Mutex<ChildRunState>,
 }
 
-use std::sync::Arc;
-
 /// The mutable run state (the daemon `ChildRecord`'s mutable half, plus
-/// the live introspection the in-process host can afford).
-#[derive(Debug)]
+/// the live introspection the in-process host can afford). No `Debug`:
+/// the retained agent subscription has no debug form.
 // The mirrored TS API shape is deliberate (the booleans are the product's
 // own surface, not a refactor target).
 #[allow(clippy::struct_excessive_bools)]
@@ -95,6 +94,12 @@ pub(crate) struct ChildRunState {
     /// Pending per-origin usage batches (TS `pendingChildUsage`), flushed
     /// at child run ends and at settlement.
     pub(crate) pending_usage: Vec<(ChildUsageOrigin, Usage)>,
+    /// The child agent event subscription (`Agent::subscribe` keeps the
+    /// listener until it is explicitly removed — TS semantics). Taken and
+    /// unsubscribed at the run task's end and on delete/close, so the
+    /// record (and the engine, and the kernel) release once the registry
+    /// drops them instead of leaking through the agent's listener list.
+    pub(crate) listener: Option<pa_agent::agent::Subscription>,
 }
 
 impl InProcessChildRecord {
@@ -136,6 +141,7 @@ impl InProcessChildRecord {
                 }),
                 last_activity_at_ms: started_at_ms,
                 pending_usage: Vec::new(),
+                listener: None,
             }),
         }
     }
@@ -164,31 +170,52 @@ impl InProcessChildRecord {
         self.state().await.settled_status.is_none()
     }
 
-    /// Record a terminal state and wake `collect` waiters. Idempotent per
-    /// record: the first settle wins (a cancelled run's later natural
-    /// settle keeps the cancelled verdict).
+    /// Record a terminal state. Idempotent per record: the first settle
+    /// wins (a cancelled run's later natural settle keeps the cancelled
+    /// verdict). Does NOT wake `collect` waiters — the run arm publishes
+    /// the settle signal only after its accounting and notice admission
+    /// landed (TS awaits terminal-message retention before resolving run
+    /// settlement), so a collect result never precedes the parent's
+    /// notice.
     pub(crate) async fn settle_as(&self, status: &'static str, error: Option<String>) {
-        {
-            let mut state = self.state().await;
-            if state.settled_status.is_some() {
-                return;
-            }
-            state.settled_status = Some(status);
-            if state.error.is_none() {
-                state.error = error;
-            }
-            state.activity = None;
+        let mut state = self.state().await;
+        if state.settled_status.is_some() {
+            return;
         }
+        state.settled_status = Some(status);
+        if state.error.is_none() {
+            state.error = error;
+        }
+        state.activity = None;
+    }
+
+    /// Wake `collect` waiters: the terminal verdict, accounting, and
+    /// notice admission have all landed.
+    pub(crate) fn publish_settled(&self) {
         let _ = self.settled_tx.send(true);
     }
 
+    /// Take and unsubscribe the child event listener (idempotent). The
+    /// agent's listener list is the last edge that keeps this record
+    /// (and its engine, and its kernel) alive after the registry drops
+    /// it.
+    pub(crate) async fn unsubscribe_listener(&self) {
+        if let Some(listener) = self.state().await.listener.take() {
+            listener.unsubscribe().await;
+        }
+    }
+
     /// Claim the terminal notice exactly once: `true` for the caller that
-    /// must deliver it.
+    /// must deliver it. A failed claim leaves the delivered flag
+    /// untouched (an already-delivered notice never re-arms for a later
+    /// claimant).
     pub(crate) async fn claim_notice(&self) -> bool {
         let mut state = self.state().await;
-        let claimed = !state.notice_delivered;
-        state.notice_delivered = claimed;
-        claimed
+        if state.notice_delivered {
+            return false;
+        }
+        state.notice_delivered = true;
+        true
     }
 
     /// The roster row (live introspection: real activity, tool counts, the

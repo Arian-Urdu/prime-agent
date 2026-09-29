@@ -12,16 +12,27 @@
 //! [`RlmSpawnHandle`] shape, the same roster/collect/delete envelopes and
 //! selector errors, spawn-name reservation across admission, deleted-child
 //! tombstones, terminal notices, child usage attribution, and the
-//! in-process family surface (`agent_message`/`agent_observe`) the worker
-//! gets over the wire. Divergences are documented on each seam.
+//! local-family surface (`agent_message`/`agent_observe` over the
+//! in-process parent/siblings/children). Divergences are documented on
+//! each seam.
 //!
-//! Ownership: one host instance per parent session. The host is created
-//! before the parent engine (it rides `SessionEngineConfig`'s
-//! `rlm_subagent_host`), then [`InProcessRlmHost::bind_parent`] binds it
-//! to the assembled engine. Every strong edge points down the tree
-//! (parent engine → host → child records → child engines → child hosts);
-//! every edge back up is weak, so dropping the parent engine tears the
-//! whole subtree down with it, kernels included.
+//! Remote family boundary: a resident embedding that adopts this host as
+//! its ROOT must supply the [`RlmRemoteFamily`] seam at composition time
+//! — the guest root's cloud parent/siblings live beyond the sandbox, and
+//! without the seam their messaging (replies included) has no route. The
+//! standalone host is local-only and makes no remote-family parity claim;
+//! adopting it as a guest root without the seam blocks adoption.
+//!
+//! Composition contract: the embedding owns the parent engine's lifetime.
+//! Drop the parent engine and the subtree follows (every strong edge
+//! points down the tree: parent engine → host → child records → child
+//! engines → child hosts; every edge back up is weak, and the child event
+//! listeners release at settle, so nothing leaks through the agents'
+//! listener lists). A session END — a close or replacement while children
+//! run — must call [`InProcessRlmHost::close_children`] so running
+//! children abort and their kernels tear down; a settled subtree needs
+//! nothing (registry-deleted and listener-released children drop with the
+//! parent engine).
 
 mod family;
 mod model;
@@ -33,26 +44,23 @@ mod spawn;
 #[cfg(test)]
 mod tests;
 
-pub use family::{family_host_handlers, FamilyHostHandlers, FamilySelf, InProcessFamilyController};
+pub use family::{
+    family_host_handlers, FamilyHostHandlers, FamilySelf, InProcessFamilyController,
+    RlmRemoteFamily,
+};
 pub use model::{assert_thinking_supported, resolve_child_model, ResolvedChildModel};
 pub use registry::{ChildIdentity, InProcessChildRecord};
 
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
 
 use pa_agent::stream::StreamFn;
 use pa_agent::types::Model as AgentModel;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::Mutex;
 
 use super::engine::SessionEngine;
 use super::rlm_host::RlmSubagentHost;
 use crate::models::registry::ModelRegistry;
-
-/// How long a detached child prompt waits for its spawning parent turn to
-/// end before prompting anyway (the daemon host's `TURN_DONE_WAIT_SECS`;
-/// a stuck turn must not orphan the child's task).
-const TURN_DONE_WAIT_SECS: u64 = 60;
 
 /// The default recursion bound (TS `resolveRlmMaxDepth`).
 pub const DEFAULT_RLM_MAX_DEPTH: u32 = 2;
@@ -80,6 +88,16 @@ pub struct InProcessRlmHostConfig {
     /// The thinking level children inherit when neither the spawn request
     /// nor the parent's live level supplies one.
     pub default_thinking: Option<String>,
+    /// The remote family surface a resident embedding composes in (the
+    /// guest's supervisor-routed rows and sends beyond the sandbox
+    /// boundary). `None` — the standalone default — keeps the host
+    /// local-only; the guest's root supplies the seam at composition
+    /// time (see [`RlmRemoteFamily`]). Child hosts never carry it.
+    pub remote_family: Option<Arc<dyn family::RlmRemoteFamily>>,
+    /// The root session's own runtime kind for its family/observe rows
+    /// (`None` reports `top-level`; a guest root that is itself a cloud
+    /// child reports its actual kind).
+    pub root_runtime_kind: Option<String>,
 }
 
 /// The parent engine a host is bound to (all weak: the parent engine owns
@@ -117,14 +135,6 @@ struct HostInner {
     /// answer a just-deleted selector with its settled cancelled envelope.
     deleted_children: std::sync::Mutex<std::collections::HashMap<String, registry::DeletedChild>>,
     parent: std::sync::RwLock<Option<ParentBinding>>,
-    /// Bumped once per completed parent run (the parent agent subscription
-    /// installed at bind time). Detached child prompts wait for the next
-    /// bump so the parent's continuation request is always in flight
-    /// before the child's first model turn — the same ordering the daemon
-    /// host gets from the worker turn loop.
-    turn_done: watch::Sender<u64>,
-    /// The parent agent subscription keeping the turn boundary alive.
-    turn_subscription: Mutex<Option<pa_agent::agent::Subscription>>,
     /// The host of the parent this one spawns under (`None` for the
     /// resident root's host): the sibling roster resolves through it.
     parent_host: std::sync::Mutex<Option<Weak<HostInner>>>,
@@ -158,8 +168,6 @@ impl InProcessRlmHost {
                 pending_spawn_names: std::sync::Mutex::new(std::collections::HashSet::new()),
                 deleted_children: std::sync::Mutex::new(std::collections::HashMap::new()),
                 parent: std::sync::RwLock::new(None),
-                turn_done: watch::Sender::new(0),
-                turn_subscription: Mutex::new(None),
                 parent_host: std::sync::Mutex::new(None),
             }),
         }
@@ -210,23 +218,6 @@ impl InProcessRlmHost {
             session_file,
             cwd,
         });
-        // The turn boundary: the parent agent's run end bumps the watch a
-        // detached child prompt waits on. Listener futures run inline with
-        // the run's settlement, so the bump itself stays trivial.
-        let agent = engine.session.agent().clone();
-        let turn_done = self.inner.turn_done.clone();
-        let subscription = agent
-            .subscribe(move |event, _signal| {
-                let turn_done = turn_done.clone();
-                Box::pin(async move {
-                    if matches!(event, pa_agent::types::AgentEvent::AgentEnd { .. }) {
-                        turn_done.send_modify(|value| *value += 1);
-                    }
-                    Ok(())
-                })
-            })
-            .await;
-        *self.inner.turn_subscription.lock().await = Some(subscription);
     }
 
     /// The parent binding, split into its weak engine and the identity
@@ -373,24 +364,29 @@ impl InProcessRlmHost {
                 .settle_as("cancelled", Some("Closed with parent session".to_string()))
                 .await;
             record.engine.session.agent().abort();
+            // No notice is owed (the parent is going away), and the
+            // listener must release so the engine and its kernel tear
+            // down with the registry clear instead of leaking through
+            // the agent's listener list.
+            record.unsubscribe_listener().await;
+            record.publish_settled();
         }
         self.inner.children.lock().await.clear();
     }
 
-    /// Wait for the parent turn after `generation` to end (bounded: a
-    /// stuck turn releases the child anyway).
-    pub(crate) async fn wait_turn_done(&self, generation: u64) {
-        let mut receiver = self.inner.turn_done.subscribe();
-        let _ = tokio::time::timeout(
-            Duration::from_secs(TURN_DONE_WAIT_SECS),
-            receiver.wait_for(|value| *value > generation),
-        )
-        .await;
+    /// The composed remote family surface, when the embedding supplied
+    /// one (the guest's supervisor-routed rows and sends).
+    pub(crate) fn remote_family(&self) -> Option<Arc<dyn family::RlmRemoteFamily>> {
+        self.inner.config.remote_family.clone()
     }
 
-    /// The current turn-boundary generation (captured at spawn admission).
-    pub(crate) fn turn_generation(&self) -> u64 {
-        *self.inner.turn_done.subscribe().borrow()
+    /// The root session's runtime kind for its own family/observe rows.
+    pub(crate) fn root_runtime_kind(&self) -> String {
+        self.inner
+            .config
+            .root_runtime_kind
+            .clone()
+            .unwrap_or_else(|| "top-level".to_string())
     }
 }
 

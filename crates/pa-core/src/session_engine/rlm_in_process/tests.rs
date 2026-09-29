@@ -137,6 +137,8 @@ impl TestRig {
             rlm_depth: depth,
             rlm_max_depth: max_depth,
             default_thinking: None,
+            remote_family: None,
+            root_runtime_kind: None,
         }));
         let sessions_dir = agent_dir.join("sessions");
         std::fs::create_dir_all(&sessions_dir).unwrap();
@@ -234,14 +236,12 @@ async fn spawn_admits_settles_and_collects() {
     assert_eq!(handle.name, "worker");
     assert_eq!(handle.model, "test-provider/glm-5.3-turbo");
     assert!(Path::new(&handle.session_dir).is_dir());
-    // The roster answers while the task waits on the parent's turn
-    // boundary: the child is registered and running.
+    // The roster answers immediately: the child is registered and running
+    // — no parent turn gates it (TS starts the detached runtime at once).
     let roster = rig.host.list_subagents().await.unwrap();
     assert_eq!(roster.len(), 1);
     assert_eq!(roster[0].status, "running");
-    // The parent's turn releases the child's task; collect waits for the
-    // settle.
-    rig.run_parent_turn("parent continues").await;
+    // The child runs and settles on its own; collect waits for the settle.
     let collected = rig
         .host
         .collect(vec![handle.rlm_child_id.clone()], 10_000)
@@ -411,6 +411,8 @@ async fn model_resolution_and_thinking_errors_match_ts() {
         rlm_depth: 0,
         rlm_max_depth: 0,
         default_thinking: None,
+        remote_family: None,
+        root_runtime_kind: None,
     });
     let error = unbound.spawn(spawn_request(None, None)).await.unwrap_err();
     assert_eq!(
@@ -453,9 +455,8 @@ async fn collect_timeout_returns_running_snapshots() {
         ))
         .await
         .unwrap();
-    rig.run_parent_turn("parent continues").await;
-    // The stalled child stays running: a zero-timeout collect returns its
-    // snapshot, never an error.
+    // The stalled child starts immediately and stays running: a
+    // zero-timeout collect returns its snapshot, never an error.
     let collected = rig.host.collect(vec![], 0).await.unwrap();
     let result = one(&collected);
     assert_eq!(result.status, "running");
@@ -494,6 +495,99 @@ async fn collect_timeout_returns_running_snapshots() {
 }
 
 #[tokio::test]
+async fn deleting_a_running_child_delivers_the_cancelled_notice() {
+    let rig = TestRig::new().await;
+    rig.catalog
+        .provider("glm-5.3-turbo")
+        .push_stalled_turn("partial");
+    let handle = rig
+        .host
+        .spawn(spawn_request(
+            Some("doomed"),
+            Some("test-provider/glm-5.3-turbo"),
+        ))
+        .await
+        .unwrap();
+    // The delete path owns the cancellation row: it claims the notice (no
+    // pre-marked flag suppresses it) and admits it on the idle parent.
+    rig.catalog
+        .provider("glm-5.3")
+        .push_text_turn("notice turn");
+    let deleted = rig
+        .host
+        .delete_subagent(handle.rlm_child_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(deleted.outcome, Some("deleted"));
+    let parent = Arc::clone(&rig.engine);
+    let target_id = handle.rlm_child_id.clone();
+    eventually("the cancelled notice row", move || {
+        let parent = Arc::clone(&parent);
+        let target_id = target_id.clone();
+        async move {
+            let rows = parent
+                .session
+                .shared_persistence()
+                .lock()
+                .await
+                .get_entries();
+            rows.iter().any(|entry| {
+                matches!(
+                    entry,
+                    pa_types::session::FileEntry::CustomMessage { payload, .. }
+                        if payload.custom_type
+                            == crate::session_engine::rlm_notices::RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE
+                            && payload.details.as_ref()
+                                .and_then(|details| details.get("childId"))
+                                .and_then(serde_json::Value::as_str)
+                                == Some(target_id.as_str())
+                )
+            })
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_deleted_settled_child_releases_its_engine() {
+    let rig = TestRig::new().await;
+    rig.catalog.provider("glm-5.3-turbo").push_text_turn("done");
+    let handle = rig
+        .host
+        .spawn(spawn_request(
+            Some("ephemeral"),
+            Some("test-provider/glm-5.3-turbo"),
+        ))
+        .await
+        .unwrap();
+    let collected = rig
+        .host
+        .collect(vec![handle.rlm_child_id.clone()], 10_000)
+        .await
+        .unwrap();
+    assert_eq!(one(&collected).status, "done");
+    // The child engine is reachable through the record before the delete.
+    let engine_weak = {
+        let child = rig.first_child().await;
+        let weak = Arc::downgrade(&child.engine);
+        assert!(weak.upgrade().is_some());
+        weak
+    };
+    rig.host
+        .delete_subagent(handle.rlm_child_id.clone())
+        .await
+        .unwrap();
+    // The registry dropped the record and the run task released the event
+    // listener: the engine (and its kernel) tears down instead of leaking
+    // through the agent's listener list.
+    eventually("the deleted child's engine to drop", || {
+        let probe = engine_weak.clone();
+        async move { probe.upgrade().is_none() }
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn child_usage_attributes_into_the_parent_row() {
     let rig = TestRig::new().await;
     rig.run_parent_turn("parent's spawning turn").await;
@@ -510,7 +604,6 @@ async fn child_usage_attributes_into_the_parent_row() {
         .rlm_usage
         .register_spawn(&handle.rlm_child_id)
         .await;
-    rig.run_parent_turn("release").await;
     let collected = rig
         .host
         .collect(vec![handle.rlm_child_id.clone()], 10_000)
@@ -542,7 +635,6 @@ async fn progress_notes_surface_in_the_roster() {
         .spawn(spawn_request(None, Some("test-provider/glm-5.3-turbo")))
         .await
         .unwrap();
-    rig.run_parent_turn("parent continues").await;
     // The child's own `rlm.progress.note` store feeds the roster row.
     let child = rig.first_child().await;
     let _ = child.engine.rlm.notes.note("halfway there", 1_000).await;
@@ -552,7 +644,7 @@ async fn progress_notes_surface_in_the_roster() {
 }
 
 #[tokio::test]
-async fn no_reply_notice_lands_on_the_parent() {
+async fn collect_settles_only_after_the_notice_is_admitted() {
     let rig = TestRig::new().await;
     rig.catalog
         .provider("glm-5.3-turbo")
@@ -565,20 +657,32 @@ async fn no_reply_notice_lands_on_the_parent() {
         ))
         .await
         .unwrap();
-    // The parent's turn releases the child's task; the child settles
-    // without an agent-message reply.
-    rig.run_parent_turn("parent continues").await;
+    // The child settles without an agent-message reply; the settle
+    // signal publishes only after the no-reply notice is admitted on the
+    // parent, so at the collect return the notice turn is already
+    // admitted (streaming) or its row already persisted.
+    rig.catalog
+        .provider("glm-5.3")
+        .push_text_turn("notice reply");
     let collected = rig
         .host
         .collect(vec![handle.rlm_child_id.clone()], 10_000)
         .await
         .unwrap();
     assert_eq!(one(&collected).status, "done");
-    // The settle's no-reply notice delivers as the parent's own turn; its
-    // reply is the next queued parent script.
-    rig.catalog
-        .provider("glm-5.3")
-        .push_text_turn("notice reply");
+    let streaming = rig.engine.session.agent().state().await.is_streaming;
+    let notice_admitted = rig.parent_rows().await.iter().any(|entry| {
+        matches!(
+            entry,
+            pa_types::session::FileEntry::CustomMessage { payload, .. }
+                if payload.custom_type
+                    == crate::session_engine::rlm_notices::RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE
+        )
+    });
+    assert!(
+        streaming || notice_admitted,
+        "the no-reply notice admission precedes the collect settle"
+    );
     let parent = Arc::clone(&rig.engine);
     eventually("the no-reply notice row", move || {
         let parent = Arc::clone(&parent);
@@ -616,7 +720,6 @@ async fn a_child_reply_suppresses_the_notice() {
         ))
         .await
         .unwrap();
-    rig.run_parent_turn("parent continues").await;
     // The child's family controller: the parent is its one family member.
     let child = rig.first_child().await;
     let controller = InProcessFamilyController::new(
@@ -629,6 +732,16 @@ async fn a_child_reply_suppresses_the_notice() {
     assert_eq!(family.len(), 1);
     assert_eq!(family[0].id, rig.engine.session.session_id().await);
     assert_eq!(family[0].relationship.as_str(), "parent");
+    // The requested name is durable session state: the child's own file
+    // carries the session-info row, and the parent binding reads it.
+    let child_session_name = child
+        .engine
+        .session
+        .shared_persistence()
+        .lock()
+        .await
+        .get_session_name();
+    assert_eq!(child_session_name.as_deref(), Some("chatty"));
     // The reply delivers as the parent's own turn; the parent's script
     // needs that turn queued.
     rig.catalog.provider("glm-5.3").push_text_turn("parent ack");
@@ -659,9 +772,8 @@ async fn a_child_reply_suppresses_the_notice() {
     // The child's reply flipped the record's replied flag.
     assert!(child.state().await.replied_since_task);
     // The abort settles the stalled run; the no-reply notice is withheld.
-    // Wait until the child's stalled run is actually streaming (the
-    // detached run task admits the prompt behind the parent's turn
-    // boundary; an abort before the run registers is a no-op).
+    // Wait until the child's stalled run is actually streaming (an abort
+    // before the run registers is a no-op).
     let streaming_child = Arc::clone(&child.engine);
     eventually("the child streams", move || {
         let engine = Arc::clone(&streaming_child);
@@ -704,7 +816,6 @@ async fn the_parent_reaches_and_observes_its_children() {
         ))
         .await
         .unwrap();
-    rig.run_parent_turn("parent continues").await;
     let collected = rig
         .host
         .collect(vec![handle.rlm_child_id.clone()], 10_000)
@@ -770,4 +881,228 @@ async fn the_parent_reaches_and_observes_its_children() {
         .await
         .unwrap();
     assert!(!recent.is_empty());
+}
+
+#[tokio::test]
+async fn an_idle_target_send_returns_at_admission() {
+    let rig = TestRig::new().await;
+    // The child stalls mid-turn; the parent sends it a message while it
+    // is busy: the receipt returns when the steering lane accepts the
+    // row, without waiting the child's (never-ending) model turn.
+    rig.catalog
+        .provider("glm-5.3-turbo")
+        .push_stalled_turn("partial");
+    let handle = rig
+        .host
+        .spawn(spawn_request(
+            Some("busy"),
+            Some("test-provider/glm-5.3-turbo"),
+        ))
+        .await
+        .unwrap();
+    let child = rig.first_child().await;
+    eventually("the child streams", move || {
+        let engine = Arc::clone(&child.engine);
+        async move { engine.session.agent().state().await.is_streaming }
+    })
+    .await;
+    let controller = InProcessFamilyController::new(Arc::clone(&rig.host), FamilySelf::Root);
+    let receipt = controller
+        .send_agent_message(AgentMessageSendInput {
+            target: handle.rlm_child_id.clone(),
+            message: "status?".to_string(),
+            receiver_role: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(receipt.delivery_status.as_str(), "queued");
+    // An IDLE target admits the injected row and returns at admission:
+    // the sender resumes while the target's model turn still runs.
+    rig.catalog
+        .provider("glm-5.3-turbo")
+        .push_stalled_turn("reply");
+    let child2 = rig.first_child().await;
+    child2.engine.session.agent().abort();
+    child2.engine.session.agent().wait_for_idle().await;
+    let controller = InProcessFamilyController::new(
+        Arc::clone(&child2.child_host),
+        FamilySelf::Child {
+            child_id: handle.rlm_child_id.clone(),
+        },
+    );
+    let parent_id = rig.engine.session.session_id().await;
+    rig.catalog
+        .provider("glm-5.3")
+        .push_stalled_turn("parent turn");
+    let started = std::time::Instant::now();
+    let receipt = controller
+        .send_agent_message(AgentMessageSendInput {
+            target: parent_id,
+            message: "reply while the parent streams".to_string(),
+            receiver_role: None,
+        })
+        .await
+        .unwrap();
+    // The receipt landed in well under a model turn, while the parent's
+    // admitted turn is still streaming (admission, not run completion).
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(receipt.delivery_status.as_str(), "delivered");
+    assert!(
+        rig.engine.session.agent().state().await.is_streaming,
+        "the send returned before the target's model turn finished"
+    );
+    rig.engine.session.agent().abort();
+}
+
+#[tokio::test]
+async fn the_child_session_name_lands_in_the_session_file() {
+    let rig = TestRig::new().await;
+    rig.catalog.provider("glm-5.3-turbo").push_text_turn("done");
+    let handle = rig
+        .host
+        .spawn(spawn_request(
+            Some("named-worker"),
+            Some("test-provider/glm-5.3-turbo"),
+        ))
+        .await
+        .unwrap();
+    let collected = rig
+        .host
+        .collect(vec![handle.rlm_child_id.clone()], 10_000)
+        .await
+        .unwrap();
+    assert_eq!(one(&collected).status, "done");
+    // The durable file carries the session-info row (a resumed child file
+    // reads its own name), not just the registry metadata.
+    let child = rig.first_child().await;
+    let entries = child
+        .engine
+        .session
+        .shared_persistence()
+        .lock()
+        .await
+        .get_entries();
+    let name_row = entries.iter().find_map(|entry| match entry {
+        pa_types::session::FileEntry::SessionInfo { payload, .. } => payload.name.clone(),
+        _ => None,
+    });
+    assert_eq!(name_row.as_deref(), Some("named-worker"));
+    // The child's own observe row reports the durable name.
+    let controller = InProcessFamilyController::new(
+        Arc::clone(&child.child_host),
+        FamilySelf::Child {
+            child_id: handle.rlm_child_id.clone(),
+        },
+    );
+    let agents = controller.list_agents().await.unwrap();
+    let self_row = agents
+        .iter()
+        .find(|agent| agent.is_current)
+        .expect("the child's own observe row");
+    assert_eq!(self_row.session_name.as_deref(), Some("named-worker"));
+}
+
+#[tokio::test]
+async fn a_composed_remote_family_routes_sends_beyond_the_local_graph() {
+    struct RemoteSurface {
+        members: Vec<crate::session_engine::agent_messaging::AgentFamilyMember>,
+        sent: Mutex<Vec<String>>,
+    }
+    impl super::RlmRemoteFamily for RemoteSurface {
+        fn members(
+            &self,
+        ) -> crate::session_engine::rlm_host::RlmHostFuture<
+            Vec<crate::session_engine::agent_messaging::AgentFamilyMember>,
+        > {
+            let members = self.members.clone();
+            Box::pin(async move { Ok(members) })
+        }
+        fn send(
+            &self,
+            input: AgentMessageSendInput,
+        ) -> crate::session_engine::rlm_host::RlmHostFuture<
+            crate::session_engine::agent_messaging::AgentMessageReceipt,
+        > {
+            self.sent.lock().unwrap().push(input.message.clone());
+            Box::pin(async move {
+                Ok(crate::session_engine::agent_messaging::AgentMessageReceipt {
+                    id: "remote".to_string(),
+                    target: "cloud-parent".to_string(),
+                    target_session_id: None,
+                    target_session_name: Some("cloud-parent".to_string()),
+                    target_runtime_kind: Some("top-level".to_string()),
+                    message: input.message,
+                    delivery_status:
+                        crate::session_engine::agent_messaging::AgentMessageDeliveryStatus::Delivered,
+                    delivery_mode: None,
+                    receiver_role: input.receiver_role,
+                    delivered_at: None,
+                    queued_at: None,
+                })
+            })
+        }
+    }
+    // The remote seam is a composition concern of the ROOT host: a host
+    // built without it stays local-only.
+    let rig = TestRig::new().await;
+    let controller = InProcessFamilyController::new(Arc::clone(&rig.host), FamilySelf::Root);
+    let error = controller
+        .send_agent_message(AgentMessageSendInput {
+            target: "cloud-parent".to_string(),
+            message: "up?".to_string(),
+            receiver_role: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .starts_with("No agent message target matches"),
+        "{error}"
+    );
+    // A composed remote family extends the roster and routes non-local
+    // sends through the seam.
+    let remote = Arc::new(RemoteSurface {
+        members: vec![crate::session_engine::agent_messaging::AgentFamilyMember {
+            relationship: crate::session_engine::agent_messaging::AgentFamilyRelationship::Parent,
+            id: "cloud-parent".to_string(),
+            name: Some("cloud-parent".to_string()),
+            aliases: Vec::new(),
+        }],
+        sent: Mutex::new(Vec::new()),
+    });
+    let host = Arc::new(InProcessRlmHost::new(super::InProcessRlmHostConfig {
+        agent_dir: rig.agent_dir.clone(),
+        registry: Arc::clone(&rig.host.config().registry),
+        stream_fn_factory: rig.catalog.factory(),
+        rlm_depth: 0,
+        rlm_max_depth: 0,
+        default_thinking: None,
+        remote_family: Some(remote.clone() as Arc<dyn super::RlmRemoteFamily>),
+        root_runtime_kind: Some("subagent".to_string()),
+    }));
+    host.bind_parent(Arc::clone(&rig.engine)).await;
+    let controller = InProcessFamilyController::new(host, FamilySelf::Root);
+    let family = controller.family().await.unwrap();
+    assert!(family.iter().any(|member| member.id == "cloud-parent"));
+    let receipt = controller
+        .send_agent_message(AgentMessageSendInput {
+            target: "cloud-parent".to_string(),
+            message: "up?".to_string(),
+            receiver_role: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(receipt.id, "remote");
+    assert_eq!(
+        remote.sent.lock().unwrap().as_slice(),
+        ["up?".to_string()].as_slice()
+    );
+    // The composed root kind surfaces on the root's own observe row.
+    let agents = controller.list_agents().await.unwrap();
+    let self_row = agents
+        .iter()
+        .find(|agent| agent.is_current)
+        .expect("the root observe row");
+    assert_eq!(self_row.runtime_kind.as_deref(), Some("subagent"));
 }

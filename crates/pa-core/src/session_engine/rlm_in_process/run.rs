@@ -25,18 +25,17 @@ const SETTLE_POLL_SLICE_MS: u64 = 250;
 /// daemon watcher's stability re-check).
 const SETTLE_GRACE_MS: u64 = 250;
 
-/// The detached child run task (TS `_startRlmChildRun`'s detached arm).
-/// Errors never propagate: every terminal state lands on the record.
+/// The detached child run task (TS `_startRlmChildRun`'s detached arm):
+/// starts the child immediately — TS runs the detached runtime at once,
+/// and no parent turn boundary gates child execution (the daemon host's
+/// boundary wait exists for cross-process prompt routing, which an
+/// in-process prompt admission does not have). Errors never propagate:
+/// every terminal state lands on the record.
 pub(super) async fn run_child_task(
     host: InProcessRlmHost,
     record: Arc<InProcessChildRecord>,
     prompt: String,
-    turn_generation: u64,
 ) {
-    // The parent's continuation request for the spawning turn is in
-    // flight before the child's first model turn starts (the daemon
-    // host's deterministic ordering).
-    host.wait_turn_done(turn_generation).await;
     if record.state().await.closed_by_parent {
         return;
     }
@@ -53,30 +52,44 @@ pub(super) async fn run_child_task(
     if let Err(error) = admission {
         let error = error.to_string();
         record.settle_as("error", Some(error.clone())).await;
-        flush_pending_usage(&host, &record).await;
-        super::notices::deliver_failure_notice(&host, &record, &error).await;
+        finish_run(&host, &record, Some(error)).await;
         return;
     }
     wait_for_task_settle(&record).await;
-    flush_pending_usage(&host, &record).await;
-    let (status, error, replied) = {
-        let state = record.state().await;
-        (
-            state.settled_status,
-            state.error.clone(),
-            state.replied_since_task,
-        )
-    };
+    record.settle_as("done", None).await;
+    finish_run(&host, &record, None).await;
+}
+
+/// The run's terminal sequence, in the order TS resolves settlement
+/// (`_startRlmChildRun`'s `finally`): flush the child's usage accounting,
+/// deliver the parent's terminal notice, THEN publish the settle signal
+/// (a `collect` result never precedes the notice), and release the event
+/// listener so the record — engine and kernel included — drops with the
+/// registry entry instead of leaking through the agent's listener list.
+async fn finish_run(
+    host: &InProcessRlmHost,
+    record: &Arc<InProcessChildRecord>,
+    error: Option<String>,
+) {
+    flush_pending_usage(host, record).await;
     // A cancel or close claimed the verdict and its notice already; a
     // failed run reports its failure, a completed one without an explicit
     // reply reports the no-reply notice.
-    if status == Some("error") {
-        if let Some(error) = error {
-            super::notices::deliver_failure_notice(&host, &record, &error).await;
+    let (status, replied) = {
+        let state = record.state().await;
+        (state.settled_status, state.replied_since_task)
+    };
+    match (status, error) {
+        (Some("error"), Some(error)) => {
+            super::notices::deliver_failure_notice(host, record, &error).await;
         }
-    } else if status == Some("done") && !replied {
-        super::notices::deliver_no_reply_notice(&host, &record).await;
+        (Some("done"), None) if !replied => {
+            super::notices::deliver_no_reply_notice(host, record).await;
+        }
+        _ => {}
     }
+    record.publish_settled();
+    record.unsubscribe_listener().await;
 }
 
 /// Subscribe the child agent's events into the record: activity, tool
@@ -85,7 +98,7 @@ pub(super) async fn run_child_task(
 async fn subscribe_child_events(record: &Arc<InProcessChildRecord>) {
     let agent = record.engine.session.agent().clone();
     let run_record = Arc::clone(record);
-    agent
+    let subscription = agent
         .subscribe(move |event, _signal| {
             let run_record = Arc::clone(&run_record);
             Box::pin(async move {
@@ -94,6 +107,11 @@ async fn subscribe_child_events(record: &Arc<InProcessChildRecord>) {
             })
         })
         .await;
+    // Retained: the agent keeps the listener until it is explicitly
+    // removed, and the record owns the only handle — released at the run
+    // task's end and on delete/close so the engine and its kernel tear
+    // down with the registry entry.
+    record.state().await.listener = Some(subscription);
 }
 
 /// One child event's record updates (TS `_startRlmChildRun`'s child
@@ -311,7 +329,6 @@ async fn wait_for_task_settle(record: &Arc<InProcessChildRecord>) {
         }
         tokio::time::sleep(Duration::from_millis(SETTLE_POLL_SLICE_MS)).await;
     }
-    record.settle_as("done", None).await;
 }
 
 /// Flush the child's per-origin usage batches into the parent's
@@ -437,12 +454,13 @@ pub(super) fn delete_subagent(
         {
             let mut state = record.state().await;
             state.closed_by_parent = true;
-            state.notice_delivered = true;
         }
         if was_running {
             // No recorded error: the tombstone's envelope reads the TS
             // fallback reason ("Deleted by parent orchestrator"), the
-            // same text the cancelled notice carries.
+            // same text the cancelled notice carries. The notice claim is
+            // reserved here — the delete path owns the cancellation row,
+            // and the run arm's racing claim collapses into it.
             record.settle_as("cancelled", None).await;
             super::notices::deliver_cancelled_notice(
                 &host,
@@ -455,6 +473,11 @@ pub(super) fn delete_subagent(
         host.remember_deleted_child(&record).await;
         let entry = record.entry(now_ms()).await;
         host.remove_child(&record).await;
+        // The registry dropped the record: release the event listener so
+        // the engine (and its kernel) tears down once the run task exits,
+        // and wake any collect waiter on the cancelled verdict.
+        record.unsubscribe_listener().await;
+        record.publish_settled();
         Ok(RlmDeleteSubagentResult {
             subagent: entry,
             outcome: Some("deleted"),

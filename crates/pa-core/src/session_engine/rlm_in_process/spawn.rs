@@ -73,12 +73,11 @@ pub(super) fn spawn(
         // scope's end transfers the name from the pending set to the
         // registered record (a successful admission made the name
         // durable through the registry).
-        let turn_generation = host.turn_generation();
         let run_host = host.clone();
         let run_record = Arc::clone(&record);
         let prompt = request.prompt.clone();
         tokio::spawn(async move {
-            run_child_task(run_host, run_record, prompt, turn_generation).await;
+            run_child_task(run_host, run_record, prompt).await;
         });
         Ok(RlmSpawnHandle {
             rlm_child_id: child_id,
@@ -143,8 +142,20 @@ async fn admission(
         parent_session: facts.session_file.clone(),
         rlm_depth: Some(u64::from(depth) + 1),
     });
+    // The session name is durable session state, not registry metadata:
+    // the child's own observe row, its message senders, and any resumed
+    // child file read it (TS guest `createGuestSubagentRuntime` sets it on
+    // the session). It lands before the engine build, so the handle
+    // publishes a fully-admitted child.
+    session_manager
+        .append_session_info(name)
+        .map_err(|error| anyhow::anyhow!("persist RLM child session name: {error}"))?;
     // The child's own children host: grandchildren spawn through it, with
     // this parent's depth bound inherited one level down.
+    // The child's own children host: grandchildren spawn through it, with
+    // this parent's depth bound inherited one level down. The remote
+    // family surface is the resident root's composition concern — child
+    // hosts stay local-only (their family is entirely in-process).
     let child_host = Arc::new(InProcessRlmHost::new(super::InProcessRlmHostConfig {
         agent_dir: config.agent_dir.clone(),
         registry: config.registry.clone(),
@@ -152,6 +163,8 @@ async fn admission(
         rlm_depth: depth + 1,
         rlm_max_depth: config.rlm_max_depth,
         default_thinking: thinking.clone(),
+        remote_family: None,
+        root_runtime_kind: None,
     }));
     child_host.set_parent_host(host);
     let engine = Arc::new(

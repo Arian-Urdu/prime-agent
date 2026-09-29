@@ -12,9 +12,11 @@ use crate::session_engine::rlm_notices::{
 };
 
 /// Deliver one terminal custom row to the parent session: admitted as its
-/// own turn while the parent is idle (TS `_enqueueRlmTerminalNoticeAction`),
-/// or deferred onto the next admitted turn while the parent runs (TS
-/// `_deferRlmTerminalNotice`'s `_pendingNextTurnMessages` arm).
+/// own turn while the parent is idle (TS `_enqueueRlmTerminalNoticeAction`,
+/// via the admission-only prompt so the settle signal never waits out the
+/// parent's model turn), or deferred onto the next admitted turn while the
+/// parent runs (TS `_deferRlmTerminalNotice`'s `_pendingNextTurnMessages`
+/// arm).
 async fn deliver_notice_row(host: &InProcessRlmHost, row: pa_types::session::CustomMessage) {
     let Some(parent) = host.parent_engine() else {
         return;
@@ -22,7 +24,11 @@ async fn deliver_notice_row(host: &InProcessRlmHost, row: pa_types::session::Cus
     let session = &parent.session;
     if session.agent().state().await.is_streaming {
         session.queue_next_turn_row(row);
-    } else if session.prompt_injected_message(&row).await.is_err() {
+    } else if session
+        .prompt_injected_message_until_accepted(&row)
+        .await
+        .is_err()
+    {
         // A turn raced the idle check: the deferral arm owns the fallback.
         session.queue_next_turn_row(row);
     }

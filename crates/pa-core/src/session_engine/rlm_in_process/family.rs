@@ -27,6 +27,35 @@ use crate::session_engine::engine::SessionEngine;
 use crate::session_engine::session_message_to_loop;
 use pa_types::session::{AgentMessage as SessionAgentMessage, CustomMessage, FileEntry};
 
+/// The remote family surface a resident embedding composes into its root
+/// host (the guest's supervisor-routed rows and sends): the family
+/// members beyond the sandbox boundary — the guest root's cloud parent
+/// and siblings — and the delivery route for messages that target them.
+///
+/// The standalone host runs local-only (`None`): its family is exactly
+/// the in-process graph. The guest supplies the seam at composition
+/// time; without it the guest root's remote parent/sibling messaging —
+/// replies included — has no route, so adopting this host as the guest
+/// root requires the seam (the module docs spell out the boundary).
+pub trait RlmRemoteFamily: Send + Sync {
+    /// The remote family members, in the roster shape the kernel's
+    /// `agent_message.send` resolves selectors against.
+    fn members(&self) -> super::super::rlm_host::RlmHostFuture<Vec<AgentFamilyMember>>;
+    /// Deliver one agent message to a remote member; the receipt matches
+    /// the local send's shape.
+    fn send(
+        &self,
+        input: AgentMessageSendInput,
+    ) -> super::super::rlm_host::RlmHostFuture<AgentMessageReceipt>;
+}
+
+/// Whether a selector addresses one member by id, name, or alias.
+fn member_matches(member: &AgentFamilyMember, selector: &str) -> bool {
+    member.id == selector
+        || member.member_name() == selector
+        || member.aliases.iter().any(|alias| alias == selector)
+}
+
 /// Which session a controller serves.
 #[derive(Debug, Clone)]
 pub enum FamilySelf {
@@ -41,13 +70,6 @@ impl FamilySelf {
         match self {
             FamilySelf::Root => None,
             FamilySelf::Child { child_id } => Some(child_id),
-        }
-    }
-
-    fn runtime_kind(&self) -> &'static str {
-        match self {
-            FamilySelf::Root => "top-level",
-            FamilySelf::Child { .. } => "subagent",
         }
     }
 }
@@ -81,7 +103,7 @@ struct FamilyNode {
     session_id: String,
     session_name: Option<String>,
     engine: Arc<SessionEngine>,
-    runtime_kind: &'static str,
+    runtime_kind: String,
     record: Option<Arc<InProcessChildRecord>>,
 }
 
@@ -113,6 +135,16 @@ impl FamilyNode {
     }
 }
 
+/// The runtime kind one session reports: the composed root kind for a
+/// resident root, `subagent` for a spawned child.
+fn session_kind(host: &InProcessRlmHost) -> String {
+    if host.parent_host().is_some() {
+        "subagent".to_string()
+    } else {
+        host.root_runtime_kind()
+    }
+}
+
 /// The per-session family controller.
 pub struct InProcessFamilyController {
     /// The host owning THIS session's children (its parent binding names
@@ -138,6 +170,15 @@ impl InProcessFamilyController {
         self.host.parent_engine()
     }
 
+    /// This session's own runtime kind for its family rows (the composed
+    /// root kind for the resident root, `subagent` for a child).
+    fn self_runtime_kind(&self) -> String {
+        match &self.served {
+            FamilySelf::Root => self.host.root_runtime_kind(),
+            FamilySelf::Child { .. } => "subagent".to_string(),
+        }
+    }
+
     /// The parent member (a child's controller only): the parent HOST's
     /// binding — the session that spawned this one. This host's own
     /// binding names THIS session (its children attribute and notify
@@ -152,7 +193,7 @@ impl InProcessFamilyController {
             session_id,
             session_name,
             engine,
-            runtime_kind: "top-level",
+            runtime_kind: session_kind(&parent_host),
             record: None,
         })
     }
@@ -168,7 +209,7 @@ impl InProcessFamilyController {
                 session_id: record.session_id.clone(),
                 session_name: Some(record.session_name.clone()),
                 engine: Arc::clone(&record.engine),
-                runtime_kind: "subagent",
+                runtime_kind: "subagent".to_string(),
                 record: Some(record),
             })
             .collect()
@@ -210,9 +251,16 @@ impl InProcessFamilyController {
         nodes
     }
 
-    /// The member list the `agent_message.send` handler resolves through.
-    async fn members(&self) -> Vec<AgentFamilyMember> {
-        self.nodes().await.iter().map(FamilyNode::member).collect()
+    /// The member list the `agent_message.send` handler resolves through:
+    /// the in-process graph plus the composed remote family (the guest
+    /// root's cloud parent/siblings; empty for a local-only host).
+    async fn members(&self) -> anyhow::Result<Vec<AgentFamilyMember>> {
+        let mut members: Vec<AgentFamilyMember> =
+            self.nodes().await.iter().map(FamilyNode::member).collect();
+        if let Some(remote) = self.host.remote_family() {
+            members.extend(remote.members().await?);
+        }
+        Ok(members)
     }
 
     /// One observe summary (self or a family node), TS roster semantics.
@@ -220,7 +268,7 @@ impl InProcessFamilyController {
         relationship: Option<AgentFamilyRelationship>,
         engine: &Arc<SessionEngine>,
         session_name: Option<String>,
-        runtime_kind: &'static str,
+        runtime_kind: &str,
         is_current: bool,
     ) -> AgentObserveSummary {
         let agent = engine.session.agent();
@@ -289,7 +337,11 @@ impl InProcessFamilyController {
             steer_custom_row(session, row);
             return Ok(AgentMessageDeliveryStatus::Queued);
         }
-        match session.prompt_injected_message(row).await {
+        // The admission-only prompt (TS `returnAfterAccepted: true`): the
+        // receipt lands once the receiver's turn is admitted, not after
+        // its whole model run — a sender never waits out the target's
+        // turn, so reciprocal parent/child work cannot deadlock.
+        match session.prompt_injected_message_until_accepted(row).await {
             Ok(_) => Ok(AgentMessageDeliveryStatus::Delivered),
             Err(error) => {
                 // A turn raced the idle check: the steering lane owns the
@@ -316,7 +368,7 @@ fn steer_custom_row(session: &crate::session_engine::AgentSession, row: &CustomM
 
 impl AgentMessageController for InProcessFamilyController {
     async fn family(&self) -> anyhow::Result<Vec<AgentFamilyMember>> {
-        Ok(self.members().await)
+        self.members().await
     }
 
     async fn send_agent_message(
@@ -337,18 +389,18 @@ impl AgentMessageController for InProcessFamilyController {
             .await
             .get_session_name();
         let sender_name = self_name.clone().unwrap_or_else(|| self_session_id.clone());
-        // The target node: resolved by selector over the live family.
-        let node = self
+        // The target node: resolved by selector over the live family. A
+        // selector no local node answers routes through the composed
+        // remote family (the guest root's cloud parent/siblings); a miss
+        // there is a genuine unknown target.
+        let Some(node) = self
             .nodes()
             .await
             .into_iter()
             .find(|node| node.matches(&input.target))
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No agent message target matches \"{}\" in the current parent session",
-                    input.target
-                )
-            })?;
+        else {
+            return self.send_remote(input, &message).await;
+        };
         // The sender's relationship to the receiver (the inverse of the
         // member's relationship): a child replying to its parent renders
         // "child:<name>".
@@ -367,7 +419,7 @@ impl AgentMessageController for InProcessFamilyController {
         let from = json!({
             "sessionId": self_session_id,
             "sessionName": self_name,
-            "runtimeKind": self.served.runtime_kind(),
+            "runtimeKind": self.self_runtime_kind(),
         });
         let target = json!({
             "activeSessionId": target_session_id,
@@ -403,7 +455,7 @@ impl AgentMessageController for InProcessFamilyController {
             target: target_session_id,
             target_session_id: None,
             target_session_name: node.session_name.clone(),
-            target_runtime_kind: Some(node.runtime_kind.to_string()),
+            target_runtime_kind: Some(node.runtime_kind.clone()),
             message,
             delivery_status: delivery,
             delivery_mode: Some("steer"),
@@ -411,6 +463,37 @@ impl AgentMessageController for InProcessFamilyController {
             delivered_at: delivered.then(crate::session::manager::format_iso_now),
             queued_at: (!delivered).then(crate::session::manager::format_iso_now),
         })
+    }
+}
+
+impl InProcessFamilyController {
+    /// Route one send through the composed remote family. A local-only
+    /// host (no seam) answers with the unknown-target error, exactly like
+    /// a send naming no family member.
+    async fn send_remote(
+        &self,
+        input: AgentMessageSendInput,
+        message: &str,
+    ) -> anyhow::Result<AgentMessageReceipt> {
+        let Some(remote) = self.host.remote_family() else {
+            anyhow::bail!(
+                "No agent message target matches \"{}\" in the current parent session",
+                input.target
+            );
+        };
+        let members = remote.members().await?;
+        if !members
+            .iter()
+            .any(|member| member_matches(member, &input.target))
+        {
+            anyhow::bail!(
+                "No agent message target matches \"{}\" in the current parent session",
+                input.target
+            );
+        }
+        let mut routed = input;
+        routed.message = message.to_string();
+        remote.send(routed).await
     }
 }
 
@@ -424,16 +507,8 @@ impl AgentObserveController for InProcessFamilyController {
                 .lock()
                 .await
                 .get_session_name();
-            summaries.push(
-                Self::summary(
-                    None,
-                    &engine,
-                    session_name,
-                    self.served.runtime_kind(),
-                    true,
-                )
-                .await,
-            );
+            let self_kind = self.self_runtime_kind();
+            summaries.push(Self::summary(None, &engine, session_name, &self_kind, true).await);
         }
         for node in self.nodes().await {
             summaries.push(
@@ -441,7 +516,7 @@ impl AgentObserveController for InProcessFamilyController {
                     Some(node.relationship),
                     &node.engine,
                     node.session_name.clone(),
-                    node.runtime_kind,
+                    &node.runtime_kind,
                     false,
                 )
                 .await,

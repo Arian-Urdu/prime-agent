@@ -7,8 +7,6 @@ use super::{
     DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION, QUEUED_INPUT_SUSPENDED,
 };
 
-use std::path::Path;
-
 use serde_json::Value;
 
 use crate::protocol::{response_failure, DaemonResponse};
@@ -25,6 +23,12 @@ struct AgentMessageAdmission {
     operation: &'static str,
     snapshot: crate::types::SessionActionSnapshot,
     receipt: Value,
+    /// The sender's live id when this delivery is one of this session's
+    /// RLM children replying (the settle watcher's no-reply suppression).
+    /// The callers apply it: the unkeyed path at admission (its TS
+    /// acceptance semantics — no rollback exists), the keyed path only
+    /// after the durable commit.
+    child_reply: Option<String>,
 }
 
 impl Worker {
@@ -286,6 +290,12 @@ impl Worker {
             Ok(admission) => admission,
             Err(response) => return response,
         };
+        // The local path's reply mark lands at admission (TS
+        // `acceptAgentSessionMessage` acceptance semantics — the local
+        // path has no rollback).
+        if let Some(child) = &admission.child_reply {
+            self.engine.mark_child_reply(child);
+        }
         // The delivery checkpoint (busy=true): the queued agent message is
         // admitted live work — a restart must revive the worker to
         // deliver it (agent-to-agent messages have no client that
@@ -373,62 +383,56 @@ impl Worker {
         };
         // The commit: the lanes snapshot, the busy verdict, and the
         // request-id admission ride ONE digest-sealed transaction line.
-        // No receipt is published until it is durable.
-        let committed = crate::worker::record_queue_checkpoint_locked(
+        // No receipt is published until it is durable — a commit that
+        // reports sync failure is NEVER acknowledged, whatever a
+        // subsequent read would see (unsynced bytes are not durability).
+        match crate::worker::record_queue_checkpoint_locked(
             journal,
             &self.core,
             QueueCheckpoint::Admitted {
                 operation: admission.operation,
             },
             Some((request_id, &admission.receipt)),
-        );
-        // The pause's job is done: the item is either durably admitted
-        // or being rolled back below (the runner must stay parked until
-        // the rollback completes).
-        let outcome = match committed.map_err(|error| error.to_string()) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                // A failed fsync may still have landed the record: the
-                // commit outcome is UNCERTAIN, so recover the journal
-                // state from disk before answering — never contradict a
-                // write that landed, never publish a receipt for one that
-                // did not.
-                match recover_commit_outcome(
-                    &self.config.recovery_journal_path,
-                    request_id,
-                    &admission.receipt,
-                ) {
-                    // The transaction landed (or a later state already
-                    // carries this delivery's receipt): adopt the
-                    // recovered journal state and answer the receipt.
-                    Ok(Some(reloaded)) => {
-                        *recovery = Some(reloaded);
-                        Ok(())
-                    }
-                    // The write genuinely failed (or the recovery read
-                    // itself failed — the disk is broken): fail closed.
-                    // The rollback happens below, after the recovery
-                    // guard drops (the runner stays parked until the
-                    // pause release, so the not-yet-committed item cannot
-                    // be picked up meanwhile).
-                    _ => Err(format!("cloud inbox journal: {error:#}")),
+        ) {
+            Ok(()) => {
+                drop(recovery);
+                let _ = self.input_pauses.release(
+                    &pause_id,
+                    CLOUD_INBOX_PAUSE_OWNER,
+                    &self.config.active_session_id,
+                );
+                // The reply mark is post-commit: a delivery that
+                // committed is a real reply; one that rolls back never
+                // suppresses the child's no-reply notice.
+                if let Some(child) = &admission.child_reply {
+                    self.engine.mark_child_reply(child);
                 }
+                self.finish_agent_message_delivery(admission)
             }
-        };
-        drop(recovery);
-        let _ = self.input_pauses.release(
-            &pause_id,
-            CLOUD_INBOX_PAUSE_OWNER,
-            &self.config.active_session_id,
-        );
-        match outcome {
-            Ok(()) => self.finish_agent_message_delivery(admission),
-            // The commit never landed: roll the enqueue back (exactly
-            // this delivery's item) and answer the failure — no
-            // receipt, no visible message, nothing durable.
             Err(error) => {
+                // The rollback runs BEFORE the recovery lock and the
+                // pause drop: under both, the runner cannot dequeue the
+                // uncommitted item and no concurrent checkpoint can
+                // snapshot the transient lane. The durable outcome of the
+                // failed commit is UNKNOWABLE (the write may or may not
+                // have landed) — the answer carries the uncertainty
+                // marker, never a receipt and never a plain refusal.
                 self.rollback_agent_message_delivery(&admission);
-                response_failure(None, "worker_deliver_message", &error, None)
+                drop(recovery);
+                let _ = self.input_pauses.release(
+                    &pause_id,
+                    CLOUD_INBOX_PAUSE_OWNER,
+                    &self.config.active_session_id,
+                );
+                response_failure(
+                    None,
+                    "worker_deliver_message",
+                    &format!(
+                        "{}: cloud inbox journal: {error:#}",
+                        crate::cloud_family::CLOUD_COMMIT_UNCERTAIN
+                    ),
+                    None,
+                )
             }
         }
     }
@@ -511,14 +515,14 @@ impl Worker {
         }
         let sender = payload.get("sender").cloned().unwrap_or(Value::Null);
         // A delivery from one of this session's RLM children counts as the
-        // child's reply: the settle watcher withholds the no-reply notice.
-        if let Some(child) = sender
+        // child's reply: the settle watcher's no-reply suppression is
+        // applied by the CALLER (the unkeyed path at admission, the keyed
+        // path after the durable commit).
+        let child_reply = sender
             .get("activeSessionId")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
-        {
-            self.engine.mark_child_reply(child);
-        }
+            .map(str::to_string);
         // Sender label precedence (TS `createAgentSessionMessagePrompt`):
         // session name, session id, active session id, client id.
         let sender_name = ["sessionName", "sessionId", "activeSessionId", "clientId"]
@@ -660,6 +664,7 @@ impl Worker {
             },
             snapshot,
             receipt,
+            child_reply,
         })
     }
 
@@ -670,26 +675,4 @@ impl Worker {
         self.work_notify.notify_one();
         response_success(None, "worker_deliver_message", Some(admission.receipt))
     }
-}
-
-/// The commit-outcome recovery for a failed checkpoint append: a failed
-/// fsync may still have landed the record, so the truth is what the
-/// journal on disk says. `Some(journal)` = the transaction carrying THIS
-/// delivery's receipt is on disk (adopt the recovered state — the
-/// caller answers the receipt); `None` = the write genuinely failed
-/// (roll back); `Err` = the recovery read itself failed (the disk is
-/// broken — roll back too, never answer success).
-pub(crate) fn recover_commit_outcome(
-    journal_path: &Path,
-    request_id: &str,
-    receipt: &Value,
-) -> std::result::Result<Option<crate::journal::WorkerRecoveryJournal>, ()> {
-    crate::journal::WorkerRecoveryJournal::open(journal_path)
-        .map(|reloaded| {
-            reloaded
-                .cloud_inbox_receipt(request_id)
-                .is_some_and(|recorded| recorded == receipt)
-                .then_some(reloaded)
-        })
-        .map_err(|_| ())
 }

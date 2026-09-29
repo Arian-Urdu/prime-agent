@@ -309,11 +309,11 @@ async fn keyed_delivery_fails_closed_and_rolls_back_when_the_append_fails() {
         "the delivery must fail closed when the commit fails: {refused:?}"
     );
     assert!(
-        refused
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("cloud inbox journal")),
-        "the TS-honest failure names the journal: {refused:?}"
+        refused.error.as_deref().is_some_and(|error| {
+            error.starts_with(crate::cloud_family::CLOUD_COMMIT_UNCERTAIN)
+                && error.contains("cloud inbox journal")
+        }),
+        "the failed commit answers the uncertainty marker, never a receipt: {refused:?}"
     );
     // Exactly the failed delivery's item is gone; the neighbors and
     // their order survive.
@@ -349,58 +349,6 @@ async fn keyed_delivery_fails_closed_and_rolls_back_when_the_append_fails() {
         .await;
     assert_eq!(duplicate.data.expect("receipt"), retried_receipt);
     assert_eq!(queue_texts(&worker.core, Lane::Steering).len(), 3);
-}
-
-/// The commit-outcome recovery: a failed append whose record actually
-/// landed (the fsync error was advisory) is answered with the receipt —
-/// never contradicted, never rolled back. The decision reads the
-/// journal state from disk.
-#[tokio::test]
-async fn a_landed_write_behind_a_failed_commit_is_answered_not_rolled_back() {
-    let worker = created_worker().await;
-    // One committed keyed delivery establishes the journal.
-    let committed = worker
-        .dispatch(
-            "worker_deliver_message",
-            &keyed_payload("first", "msgreq_g1"),
-        )
-        .await;
-    assert!(committed.success);
-    let committed_receipt = committed.data.expect("receipt");
-    // The commit of a SECOND delivery reports failure, but its write
-    // landed on disk (the disk state carries the transaction). The
-    // recover decision reads the disk: the recorded receipt for the
-    // request id proves the transaction is THIS delivery's.
-    let reloaded =
-        crate::journal::WorkerRecoveryJournal::open(&worker.config.recovery_journal_path).unwrap();
-    assert_eq!(
-        reloaded.cloud_inbox_receipt("msgreq_g1"),
-        Some(&committed_receipt),
-        "the committed transaction is on disk"
-    );
-    let recovered = crate::worker::input::recover_commit_outcome(
-        &worker.config.recovery_journal_path,
-        "msgreq_g1",
-        &committed_receipt,
-    );
-    assert!(
-        recovered.is_ok_and(|journal| journal.is_some()),
-        "a landed write is recovered, not contradicted"
-    );
-    // A receipt that is NOT on disk answers None (the rollback arm).
-    let ghost = crate::worker::input::recover_commit_outcome(
-        &worker.config.recovery_journal_path,
-        "msgreq_g1",
-        &json!({ "id": "agentmsg_ghost", "deliveryStatus": "delivered" }),
-    );
-    assert!(ghost.is_ok_and(|journal| journal.is_none()));
-    // A request id the journal never heard of answers None too.
-    let unknown = crate::worker::input::recover_commit_outcome(
-        &worker.config.recovery_journal_path,
-        "msgreq_unknown",
-        &committed_receipt,
-    );
-    assert!(unknown.is_ok_and(|journal| journal.is_none()));
 }
 
 /// The full injected-failure cycle with a RESTART: the append fails and

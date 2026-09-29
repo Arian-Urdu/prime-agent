@@ -15,6 +15,8 @@
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Write};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -48,14 +50,22 @@ impl FamilyRequestLog {
     /// Open (or create) the request log under `directory`, loading and
     /// validating the durable events.
     ///
+    /// The parent directory carries a strict private-placement
+    /// invariant: a missing chain is created private, a pre-existing
+    /// parent owned by the effective user is tightened to 0700 through a
+    /// verified handle, and a symlink or foreign-owned parent is
+    /// rejected — the envelope stores the message body in plaintext, and
+    /// a parent writable by others could redirect the appends.
+    /// Platforms without the owner/mode probes defer to the caller's
+    /// placement invariant (the wiring PR owns placement; revisit with
+    /// the platform ACL proof).
+    ///
     /// # Errors
     ///
-    /// Returns an error when the directory cannot be created, the log is
-    /// corrupt (digest, envelope, or sequence gap), or the repair write of a
-    /// crash-truncated tail fails.
+    /// Returns an error when the directory cannot be established as
+    /// owner-private, the log is corrupt (digest, envelope, or sequence
+    /// gap), or the repair write of a crash-truncated tail fails.
     pub fn open(directory: &Path, session_id: &str, max_records: usize) -> Result<Self> {
-        pa_core::platform::perms::create_dir_all_private(directory)
-            .with_context(|| format!("create {}", directory.display()))?;
         let mut log = Self {
             directory: directory.to_path_buf(),
             session_id: session_id.to_string(),
@@ -63,10 +73,10 @@ impl FamilyRequestLog {
             max_records,
             max_event_bytes: pa_types::daemon::cloud::CLOUD_MAX_MESSAGE_BYTES,
         };
+        crate::journal::ensure_private_journal_parent(&log.events_path())?;
         // Private from its first write (the creation mode below); a file
         // left at the umask-default mode by an older build moves to a
-        // fresh private inode HERE — the envelope stores the message
-        // body in plaintext.
+        // fresh private inode HERE.
         #[cfg(unix)]
         crate::journal::ensure_private_journal_file(&log.events_path())?;
         log.load()?;
@@ -103,12 +113,28 @@ impl FamilyRequestLog {
         }
         let mut line = envelope;
         line.push('\n');
+        // Nofollow discipline (the keyed append's contract): the path is
+        // lstat'd as a regular non-symlink file, and the opened inode is
+        // proven to be that same object before ANY plaintext is written —
+        // a replaced or symlinked path refuses the append instead of
+        // writing through it.
+        crate::journal::validate_journal_file(&self.events_path())?;
         let mut options = OpenOptions::new();
         options.create(true).append(true);
         pa_core::platform::perms::set_private_mode(&mut options);
         let mut file = options
             .open(self.events_path())
             .with_context(|| format!("open {}", self.events_path().display()))?;
+        #[cfg(unix)]
+        {
+            let opened = file.metadata()?;
+            let current = fs::symlink_metadata(self.events_path())?;
+            anyhow::ensure!(
+                (opened.dev(), opened.ino()) == (current.dev(), current.ino()),
+                "cloud event outbox {} was replaced before the append",
+                self.events_path().display()
+            );
+        }
         file.write_all(line.as_bytes())?;
         file.sync_all()?;
         self.events.push(event.clone());
@@ -301,13 +327,20 @@ impl FamilyResultLog {
     /// and their answers. A crash-truncated or malformed tail is skipped,
     /// like the recovery journals.
     ///
+    /// The parent directory carries the same strict private-placement
+    /// invariant as the request log: a missing chain is created private,
+    /// a pre-existing own parent is tightened through a verified handle,
+    /// and a symlink or foreign-owned parent is rejected. Platforms
+    /// without the owner/mode probes defer to the caller's placement
+    /// invariant (the wiring PR owns placement; revisit with the
+    /// platform ACL proof).
+    ///
     /// # Errors
     ///
-    /// Returns an error when the parent directory cannot be created.
+    /// Returns an error when the parent directory cannot be established
+    /// as owner-private.
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            pa_core::platform::perms::create_dir_all_private(parent)?;
-        }
+        crate::journal::ensure_private_journal_parent(path)?;
         // Private from its first write (the creation mode in
         // journal::append_record); a file left at the umask-default mode
         // by an older build moves to a fresh private inode HERE.
@@ -607,6 +640,87 @@ mod tests {
             reopened.uncertain(),
             vec!["msgreq_r1".to_string()],
             "the migrated admission replays"
+        );
+    }
+
+    /// The private-placement invariant (the follow-up review): a symlink
+    /// parent is rejected BEFORE anything is touched — the target is
+    /// never tightened through the link — and a pre-existing loose own
+    /// parent is tightened, not left writable by others.
+    #[cfg(unix)]
+    #[test]
+    fn family_logs_enforce_a_private_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        // The symlinked parent: rejected for both logs, and the target's
+        // mode is never touched.
+        let target = root.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let request_error = FamilyRequestLog::open(&link, "sess_priv", 50)
+            .err()
+            .expect("the symlinked parent is rejected")
+            .to_string();
+        assert!(
+            request_error.contains("must be a real private directory"),
+            "the symlinked parent is rejected: {request_error}"
+        );
+        let result_error = FamilyResultLog::open(&link.join("family-results.jsonl"))
+            .err()
+            .expect("the symlinked parent is rejected")
+            .to_string();
+        assert!(
+            result_error.contains("must be a real private directory"),
+            "the symlinked parent is rejected: {result_error}"
+        );
+        assert_eq!(
+            pa_core::platform::perms::file_mode(&target),
+            Some(0o755),
+            "the symlink target is never tightened"
+        );
+        // A pre-existing loose own parent is tightened at open.
+        let loose = root.path().join("loose");
+        fs::create_dir_all(&loose).unwrap();
+        fs::set_permissions(&loose, fs::Permissions::from_mode(0o755)).unwrap();
+        FamilyRequestLog::open(&loose, "sess_priv", 50).unwrap();
+        assert_eq!(
+            pa_core::platform::perms::file_mode(&loose),
+            Some(0o700),
+            "the loose own parent is tightened at open"
+        );
+    }
+
+    /// The append's nofollow discipline: a replaced (symlinked) outbox
+    /// path refuses the append instead of writing the plaintext body
+    /// through it.
+    #[cfg(unix)]
+    #[test]
+    fn outbox_append_refuses_a_replaced_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = FamilyRequestLog::open(dir.path(), "sess_priv", 50).unwrap();
+        let events = dir.path().join("outbox-events.ndjson");
+        let sink = dir.path().join("attacker-sink");
+        fs::write(&sink, "").unwrap();
+        fs::remove_file(&events).unwrap();
+        std::os::unix::fs::symlink(&sink, &events).unwrap();
+        let error = log
+            .append(CloudFamilyEventPayload::AgentMessageRequest {
+                request_id: "msgreq_priv".to_string(),
+                from_remote_session_id: "remote_child".to_string(),
+                target_selector: "sibling".to_string(),
+                message: "the plaintext body".to_string(),
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("not a regular"),
+            "the replaced path refuses the append: {error:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(&sink).unwrap(),
+            "",
+            "no plaintext is written through the replaced path"
         );
     }
 

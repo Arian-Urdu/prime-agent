@@ -34,6 +34,7 @@ pub mod provider_retry;
 pub mod refine;
 pub mod request_timing;
 pub mod rlm_host;
+pub mod rlm_in_process;
 pub mod rlm_notices;
 pub mod rlm_usage;
 pub mod runtime;

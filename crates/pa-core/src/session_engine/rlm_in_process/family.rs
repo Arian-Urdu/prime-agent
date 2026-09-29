@@ -1,0 +1,494 @@
+//! The in-process family surface: one controller per session (the parent
+//! and every child) implementing `agent_message` and `agent_observe` over
+//! the live family graph — no supervisor link, no wire route. Delivery
+//! is the TS in-process shape: the rendered `[agent-message from ...]`
+//! prompt as an `agent_message` custom row, admitted as its own turn on
+//! an idle target (`prompt_injected_message`) or steered onto a busy
+//! one (`queueIfBusy` + `streamingBehavior: "steer"`), with receipts.
+
+use std::sync::Arc;
+
+use serde_json::json;
+
+use super::now_ms;
+use super::registry::{record_matches, InProcessChildRecord};
+use super::InProcessRlmHost;
+use crate::kernel::shared::HostRequestHandlers;
+use crate::session_engine::agent_messaging::{
+    create_agent_session_message_id, create_agent_session_message_prompt,
+    create_agent_session_message_row, register_agent_message_host_handlers,
+    register_agent_observe_host_handlers, AgentFamilyMember, AgentFamilyRelationship,
+    AgentMessageController, AgentMessageDeliveryStatus, AgentMessagePromptPayload,
+    AgentMessageReceipt, AgentMessageSendInput, AgentObserveActivity, AgentObserveController,
+    AgentObserveMessagePreview, AgentObserveSummary, AgentSessionMessageRowPayload,
+    DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
+};
+use crate::session_engine::engine::SessionEngine;
+use crate::session_engine::session_message_to_loop;
+use pa_types::session::{AgentMessage as SessionAgentMessage, CustomMessage, FileEntry};
+
+/// Which session a controller serves.
+#[derive(Debug, Clone)]
+pub enum FamilySelf {
+    /// The resident root (the guest session).
+    Root,
+    /// One spawned child, by its `rlm_child_id`.
+    Child { child_id: String },
+}
+
+impl FamilySelf {
+    fn child_id(&self) -> Option<&str> {
+        match self {
+            FamilySelf::Root => None,
+            FamilySelf::Child { child_id } => Some(child_id),
+        }
+    }
+
+    fn runtime_kind(&self) -> &'static str {
+        match self {
+            FamilySelf::Root => "top-level",
+            FamilySelf::Child { .. } => "subagent",
+        }
+    }
+}
+
+/// The host-handlers bundle for one session's family surface: merge it
+/// into the engine's `extra_host_handlers`.
+pub type FamilyHostHandlers = HostRequestHandlers;
+
+/// Build one session's family handlers over `host` (the host that owns
+/// that session's children): the parent engine's handlers serve the root,
+/// a child's serve the child.
+#[must_use]
+pub fn family_host_handlers(
+    host: &Arc<InProcessRlmHost>,
+    served: FamilySelf,
+) -> FamilyHostHandlers {
+    let controller = InProcessFamilyController::new(Arc::clone(host), served);
+    let mut handlers = HostRequestHandlers::new();
+    register_agent_message_host_handlers(Arc::clone(&controller), &mut handlers);
+    register_agent_observe_host_handlers(controller, &mut handlers);
+    handlers
+}
+
+/// One addressable family member: its identity, its live engine, and the
+/// child record behind it (present for child and sibling rows).
+struct FamilyNode {
+    relationship: AgentFamilyRelationship,
+    /// The member's primary selector: the child id for spawned rows, the
+    /// session id for the parent.
+    id: String,
+    session_id: String,
+    session_name: Option<String>,
+    engine: Arc<SessionEngine>,
+    runtime_kind: &'static str,
+    record: Option<Arc<InProcessChildRecord>>,
+}
+
+impl FamilyNode {
+    /// The roster member the `agent_message.send` handler resolves
+    /// through (the daemon controller lists the RLM child id as the
+    /// primary and the durable session id as an alias).
+    fn member(&self) -> AgentFamilyMember {
+        AgentFamilyMember {
+            relationship: self.relationship,
+            id: self.id.clone(),
+            name: self.session_name.clone(),
+            aliases: if self.record.is_some() {
+                vec![self.session_id.clone()]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// Whether a selector addresses this node.
+    fn matches(&self, selector: &str) -> bool {
+        self.id == selector
+            || self.session_id == selector
+            || self.session_name.as_deref() == Some(selector)
+            || self.record.as_ref().is_some_and(|record| {
+                record_matches(record, selector) && self.id != record.session_id.as_str()
+            })
+    }
+}
+
+/// The per-session family controller.
+pub struct InProcessFamilyController {
+    /// The host owning THIS session's children (its parent binding names
+    /// this session itself: the root's host binds the root engine, a
+    /// child's host binds the child engine).
+    host: Arc<InProcessRlmHost>,
+    served: FamilySelf,
+}
+
+impl InProcessFamilyController {
+    /// Build one session's controller over its host (the handler
+    /// registration is the kernel path; embeddings and tests may drive
+    /// the controller directly).
+    #[must_use]
+    pub fn new(host: Arc<InProcessRlmHost>, served: FamilySelf) -> Arc<Self> {
+        Arc::new(Self { host, served })
+    }
+}
+
+impl InProcessFamilyController {
+    /// This session's own engine (the host's parent binding).
+    fn self_engine(&self) -> Option<Arc<SessionEngine>> {
+        self.host.parent_engine()
+    }
+
+    /// The parent member (a child's controller only): the parent HOST's
+    /// binding — the session that spawned this one. This host's own
+    /// binding names THIS session (its children attribute and notify
+    /// against it); the family parent lives one host up the tree.
+    fn parent_node(&self) -> Option<FamilyNode> {
+        let parent_host = self.host.parent_host()?;
+        let engine = parent_host.parent_engine()?;
+        let (session_id, session_name) = parent_host.parent_identity()?;
+        Some(FamilyNode {
+            relationship: AgentFamilyRelationship::Parent,
+            id: session_id.clone(),
+            session_id,
+            session_name,
+            engine,
+            runtime_kind: "top-level",
+            record: None,
+        })
+    }
+
+    /// The child nodes a host's registry holds.
+    async fn child_nodes(host: &InProcessRlmHost) -> Vec<FamilyNode> {
+        host.children()
+            .await
+            .into_iter()
+            .map(|record| FamilyNode {
+                relationship: AgentFamilyRelationship::Child,
+                id: record.rlm_child_id.clone(),
+                session_id: record.session_id.clone(),
+                session_name: Some(record.session_name.clone()),
+                engine: Arc::clone(&record.engine),
+                runtime_kind: "subagent",
+                record: Some(record),
+            })
+            .collect()
+    }
+
+    /// The sibling nodes (a child's controller): the parent host's other
+    /// children.
+    async fn sibling_nodes(&self) -> Vec<FamilyNode> {
+        let Some(parent_host) = self.host.parent_host() else {
+            return Vec::new();
+        };
+        let self_child_id = self.served.child_id();
+        Self::child_nodes(&parent_host)
+            .await
+            .into_iter()
+            .filter(|node| {
+                node.record
+                    .as_ref()
+                    .is_none_or(|record| Some(record.rlm_child_id.as_str()) != self_child_id)
+            })
+            .map(|mut node| {
+                node.relationship = AgentFamilyRelationship::Sibling;
+                node
+            })
+            .collect()
+    }
+
+    /// Every family node (self excluded): the parent, the siblings, the
+    /// children.
+    async fn nodes(&self) -> Vec<FamilyNode> {
+        let mut nodes = Vec::new();
+        if !matches!(self.served, FamilySelf::Root) {
+            if let Some(parent) = self.parent_node() {
+                nodes.push(parent);
+            }
+            nodes.extend(self.sibling_nodes().await);
+        }
+        nodes.extend(Self::child_nodes(&self.host).await);
+        nodes
+    }
+
+    /// The member list the `agent_message.send` handler resolves through.
+    async fn members(&self) -> Vec<AgentFamilyMember> {
+        self.nodes().await.iter().map(FamilyNode::member).collect()
+    }
+
+    /// One observe summary (self or a family node), TS roster semantics.
+    async fn summary(
+        relationship: Option<AgentFamilyRelationship>,
+        engine: &Arc<SessionEngine>,
+        session_name: Option<String>,
+        runtime_kind: &'static str,
+        is_current: bool,
+    ) -> AgentObserveSummary {
+        let agent = engine.session.agent();
+        let state = agent.state().await;
+        let queued_count = agent.steering_previews().len() + agent.follow_up_previews().len();
+        let busy = state.is_streaming || queued_count > 0;
+        let activity = if state.is_streaming {
+            AgentObserveActivity::Model
+        } else if !state.pending_tool_calls.is_empty() {
+            AgentObserveActivity::Tool
+        } else {
+            AgentObserveActivity::Idle
+        };
+        let session_id = engine.session.session_id().await;
+        AgentObserveSummary {
+            active_session_id: Some(session_id.clone()),
+            session_id,
+            session_name,
+            relationship,
+            runtime_kind: Some(runtime_kind.to_string()),
+            status: if busy {
+                crate::session_engine::agent_messaging::AgentFamilyStatus::Running
+            } else {
+                crate::session_engine::agent_messaging::AgentFamilyStatus::Idle
+            },
+            activity: Some(activity),
+            is_current,
+            is_streaming: state.is_streaming,
+            is_compacting: false,
+            attached_clients: 0,
+            queued_count,
+            is_session_active: true,
+        }
+    }
+
+    /// The engine a target selector addresses: self first, then the
+    /// family nodes.
+    async fn engine_for(&self, target: &str) -> Option<Arc<SessionEngine>> {
+        if let Some(engine) = self.self_engine() {
+            if engine.session.session_id().await == target {
+                return Some(engine);
+            }
+        }
+        self.nodes()
+            .await
+            .into_iter()
+            .find(|node| node.matches(target))
+            .map(|node| node.engine)
+    }
+
+    /// Deliver one agent message row to a target session: its own turn
+    /// while idle, the steering lane while busy (TS
+    /// `acceptAgentMessagePrompt`'s two arms).
+    async fn deliver(
+        engine: &Arc<SessionEngine>,
+        row: &CustomMessage,
+    ) -> anyhow::Result<AgentMessageDeliveryStatus> {
+        let session = &engine.session;
+        let agent = session.agent();
+        let pending = agent.steering_previews().len() + agent.follow_up_previews().len();
+        crate::session_engine::agent_messaging::assert_agent_message_queue_capacity(
+            pending,
+            DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
+        )?;
+        if agent.state().await.is_streaming {
+            steer_custom_row(session, row);
+            return Ok(AgentMessageDeliveryStatus::Queued);
+        }
+        match session.prompt_injected_message(row).await {
+            Ok(_) => Ok(AgentMessageDeliveryStatus::Delivered),
+            Err(error) => {
+                // A turn raced the idle check: the steering lane owns the
+                // fallback exactly like TS's busy arm.
+                if session.agent().state().await.is_streaming {
+                    steer_custom_row(session, row);
+                    return Ok(AgentMessageDeliveryStatus::Queued);
+                }
+                anyhow::bail!("Agent message was not accepted: {error}");
+            }
+        }
+    }
+}
+
+/// Queue one custom row onto the agent's steering lane (the loop delivers
+/// it at the next turn boundary and persists it through `message_end`,
+/// the same lane the daemon worker's queued items ride).
+fn steer_custom_row(session: &crate::session_engine::AgentSession, row: &CustomMessage) {
+    let Some(message) = session_message_to_loop(&SessionAgentMessage::Custom(row.clone())) else {
+        return;
+    };
+    session.agent().steer(message);
+}
+
+impl AgentMessageController for InProcessFamilyController {
+    async fn family(&self) -> anyhow::Result<Vec<AgentFamilyMember>> {
+        Ok(self.members().await)
+    }
+
+    async fn send_agent_message(
+        &self,
+        input: AgentMessageSendInput,
+    ) -> anyhow::Result<AgentMessageReceipt> {
+        let message = crate::session_engine::agent_messaging::normalize_agent_session_message(
+            &input.message,
+        )?;
+        let Some(self_engine) = self.self_engine() else {
+            anyhow::bail!("the in-process family is not bound to a session yet");
+        };
+        let self_session_id = self_engine.session.session_id().await;
+        let self_name = self_engine
+            .session
+            .shared_persistence()
+            .lock()
+            .await
+            .get_session_name();
+        let sender_name = self_name.clone().unwrap_or_else(|| self_session_id.clone());
+        // The target node: resolved by selector over the live family.
+        let node = self
+            .nodes()
+            .await
+            .into_iter()
+            .find(|node| node.matches(&input.target))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No agent message target matches \"{}\" in the current parent session",
+                    input.target
+                )
+            })?;
+        // The sender's relationship to the receiver (the inverse of the
+        // member's relationship): a child replying to its parent renders
+        // "child:<name>".
+        let from_relationship = match node.relationship {
+            AgentFamilyRelationship::Parent => Some(AgentFamilyRelationship::Child),
+            AgentFamilyRelationship::Child => Some(AgentFamilyRelationship::Parent),
+            AgentFamilyRelationship::Sibling => Some(AgentFamilyRelationship::Sibling),
+        };
+        let prompt = create_agent_session_message_prompt(&AgentMessagePromptPayload {
+            message: message.clone(),
+            sender_name: sender_name.clone(),
+            from_relationship,
+        });
+        let target_session_id = node.session_id.clone();
+        let id = create_agent_session_message_id();
+        let from = json!({
+            "sessionId": self_session_id,
+            "sessionName": self_name,
+            "runtimeKind": self.served.runtime_kind(),
+        });
+        let target = json!({
+            "activeSessionId": target_session_id,
+            "sessionId": target_session_id,
+            "sessionName": node.session_name,
+            "runtimeKind": node.runtime_kind,
+        });
+        let row = create_agent_session_message_row(&AgentSessionMessageRowPayload {
+            id: &id,
+            prompt: &prompt,
+            message: &message,
+            from: &from,
+            from_relationship,
+            target: &target,
+            timestamp: now_ms(),
+        });
+        let row: CustomMessage = serde_json::from_value(row)
+            .map_err(|error| anyhow::anyhow!("agent message row conversion failed: {error}"))?;
+        let delivery = Self::deliver(&node.engine, &row).await?;
+        // A child's delivery to its parent is its reply: the parent's
+        // record flips `replied_since_task` and the no-reply terminal
+        // notice is withheld (TS `_parentReplyCount`).
+        if from_relationship == Some(AgentFamilyRelationship::Child) {
+            if let Some(child_id) = self.served.child_id() {
+                if let Some(parent_host) = self.host.parent_host() {
+                    parent_host.mark_replied(child_id).await;
+                }
+            }
+        }
+        let delivered = matches!(delivery, AgentMessageDeliveryStatus::Delivered);
+        Ok(AgentMessageReceipt {
+            id,
+            target: target_session_id,
+            target_session_id: None,
+            target_session_name: node.session_name.clone(),
+            target_runtime_kind: Some(node.runtime_kind.to_string()),
+            message,
+            delivery_status: delivery,
+            delivery_mode: Some("steer"),
+            receiver_role: input.receiver_role,
+            delivered_at: delivered.then(crate::session::manager::format_iso_now),
+            queued_at: (!delivered).then(crate::session::manager::format_iso_now),
+        })
+    }
+}
+
+impl AgentObserveController for InProcessFamilyController {
+    async fn list_agents(&self) -> anyhow::Result<Vec<AgentObserveSummary>> {
+        let mut summaries = Vec::new();
+        if let Some(engine) = self.self_engine() {
+            let session_name = engine
+                .session
+                .shared_persistence()
+                .lock()
+                .await
+                .get_session_name();
+            summaries.push(
+                Self::summary(
+                    None,
+                    &engine,
+                    session_name,
+                    self.served.runtime_kind(),
+                    true,
+                )
+                .await,
+            );
+        }
+        for node in self.nodes().await {
+            summaries.push(
+                Self::summary(
+                    Some(node.relationship),
+                    &node.engine,
+                    node.session_name.clone(),
+                    node.runtime_kind,
+                    false,
+                )
+                .await,
+            );
+        }
+        Ok(summaries)
+    }
+
+    async fn get_agent(&self, target: &str) -> anyhow::Result<Option<AgentObserveSummary>> {
+        Ok(self.list_agents().await?.into_iter().find(|summary| {
+            summary.active_session_id.as_deref() == Some(target)
+                || summary.session_id == target
+                || summary.session_name.as_deref() == Some(target)
+        }))
+    }
+
+    async fn recent_messages(
+        &self,
+        target: &str,
+        limit: usize,
+        max_chars: usize,
+    ) -> anyhow::Result<Vec<AgentObserveMessagePreview>> {
+        let Some(engine) = self.engine_for(target).await else {
+            anyhow::bail!("No agent matches \"{target}\" in the current family");
+        };
+        let entries = {
+            let session = engine.session.shared_persistence();
+            let session = session.lock().await;
+            session.get_entries()
+        };
+        let messages: Vec<&SessionAgentMessage> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                FileEntry::Message { message, .. } => Some(message),
+                _ => None,
+            })
+            .collect();
+        let total = messages.len();
+        let start = total.saturating_sub(limit);
+        let mut previews = Vec::with_capacity(total - start);
+        for (index, message) in messages.iter().enumerate().skip(start) {
+            previews.push(
+                crate::session_engine::agent_messaging::create_agent_observe_message_preview(
+                    message, index, max_chars,
+                ),
+            );
+        }
+        Ok(previews)
+    }
+}

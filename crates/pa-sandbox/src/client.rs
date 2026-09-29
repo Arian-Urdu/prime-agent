@@ -144,6 +144,7 @@ impl<T: SandboxTransport> PrimeSandboxClient<T> {
                     self.platform_headers(),
                     Some(body.to_string().into_bytes()),
                     self.request_timeout,
+                    self.platform_secrets(),
                     "Sandbox create",
                     parse_sandbox,
                 )
@@ -177,6 +178,7 @@ impl<T: SandboxTransport> PrimeSandboxClient<T> {
             self.platform_headers(),
             None,
             self.request_timeout,
+            self.platform_secrets(),
             "Sandbox fetch",
             parse_sandbox,
         )
@@ -199,6 +201,7 @@ impl<T: SandboxTransport> PrimeSandboxClient<T> {
                 self.platform_headers(),
                 None,
                 self.request_timeout,
+                self.platform_secrets(),
                 "Sandbox delete",
                 |value| require_delete_response(&value),
             )
@@ -285,7 +288,7 @@ impl<T: SandboxTransport> PrimeSandboxClient<T> {
         ]
     }
 
-    fn platform_secrets(&self) -> Vec<&str> {
+    pub(crate) fn platform_secrets(&self) -> Vec<&str> {
         vec![self.api_key.as_str()]
     }
 
@@ -302,6 +305,7 @@ impl<T: SandboxTransport> PrimeSandboxClient<T> {
         headers: Vec<(String, String)>,
         body: Option<Vec<u8>>,
         timeout: Duration,
+        secrets: Vec<&str>,
         context: &str,
         parse: Parse,
     ) -> Result<R, SandboxError>
@@ -324,7 +328,10 @@ impl<T: SandboxTransport> PrimeSandboxClient<T> {
                 &url,
                 response.status,
                 &response.body,
-                &self.platform_secrets(),
+                // The redaction set is per call: platform calls redact the
+                // API key, gateway calls additionally redact the sandbox
+                // bearer token (TS passes [apiKey, token] for both).
+                &secrets,
                 context,
             ));
         }

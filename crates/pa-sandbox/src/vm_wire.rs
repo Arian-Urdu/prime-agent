@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+use crate::error::SandboxError;
 use crate::gateway::{validate_gateway_credentials, GatewayAuth, MAX_ERROR_BODY_BYTES};
 use crate::proto::{ProtoError, ProtoErrorKind, Reader};
 use crate::transport::{ResponseChunks, SandboxTransport};
@@ -211,13 +212,14 @@ pub(crate) fn error_from_status_body(
 
 /// Parse a Connect end-of-stream frame; a body carrying `error` throws
 /// the typed stream error, everything else is a clean end of stream (TS
-/// `parseEndOfStreamFrame`). The message is redacted against the gateway
-/// token (a reviewed hardening: the TS module trusts the peer not to echo
-/// credentials).
+/// `parseEndOfStreamFrame`). The message is redacted against the active
+/// gateway token (a reviewed hardening over the TS module, which trusts
+/// the peer not to echo credentials).
 pub(crate) fn parse_end_of_stream(
     payload: &[u8],
     method: &'static str,
     url: &str,
+    token: &str,
 ) -> Result<(), CommandSessionError> {
     let parsed = if payload.is_empty() {
         serde_json::Value::Object(serde_json::Map::new())
@@ -254,7 +256,7 @@ pub(crate) fn parse_end_of_stream(
         .and_then(serde_json::Value::as_str)
         .map_or_else(
             || format!("Command session {method} failed ({})", code.as_str()),
-            str::to_string,
+            |message| SandboxError::redact_secrets(message, std::slice::from_ref(&token)),
         );
     Err(CommandSessionError::new(code, message).with_context(method, url, None, None))
 }

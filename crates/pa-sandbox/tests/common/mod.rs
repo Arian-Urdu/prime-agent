@@ -22,6 +22,9 @@ type RequestLog = Arc<Mutex<Vec<Vec<u8>>>>;
 /// One scripted reply on a connection.
 #[derive(Debug, Clone)]
 pub struct ScriptedResponse {
+    /// Pause after reading the request and before writing anything back
+    /// (a slow server head, for deadline semantics).
+    pub head_delay: Duration,
     /// The complete response bytes written as soon as the request is read
     /// (status line, headers, and any immediately-sent body).
     pub raw: Vec<u8>,
@@ -41,6 +44,7 @@ impl ScriptedResponse {
     #[must_use]
     pub fn raw(bytes: Vec<u8>) -> Self {
         Self {
+            head_delay: Duration::ZERO,
             raw: bytes,
             stream: Vec::new(),
             close: false,
@@ -53,6 +57,7 @@ impl ScriptedResponse {
     #[must_use]
     pub fn streaming(raw: Vec<u8>, stream: Vec<(Vec<u8>, Duration)>) -> Self {
         Self {
+            head_delay: Duration::ZERO,
             raw,
             stream,
             close: false,
@@ -160,6 +165,9 @@ async fn run(listener: TcpListener, requests: RequestLog, responses: ResponseQue
                         b"HTTP/1.1 500 Drained\r\ncontent-length: 0\r\n\r\n".to_vec(),
                     )
                 });
+                if !script.head_delay.is_zero() {
+                    tokio::time::sleep(script.head_delay).await;
+                }
                 if socket.write_all(&script.raw).await.is_err() {
                     return;
                 }

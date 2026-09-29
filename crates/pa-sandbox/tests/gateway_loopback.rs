@@ -12,7 +12,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{json_response, raw_response, redirect_response, MockServer};
+use common::{json_response, raw_response, redirect_response, text_response, MockServer};
 use pa_sandbox::transport::TransportResponse;
 use pa_sandbox::{
     ClientOptions, ExecRequest, GatewayAuth, GatewayOptions, PrimeSandboxClient, SandboxErrorCode,
@@ -381,37 +381,59 @@ async fn gateway_errors_map_the_typed_codes() {
 
 #[tokio::test]
 async fn error_details_never_carry_the_gateway_token() {
-    let server = MockServer::start(Vec::new()).await;
-    server.push_raw(json_response(
-        403,
-        "Forbidden",
-        r#"{"detail":"denied","token":"gateway-token-xyz"}"#,
-    ));
-    let client = platform_client(&server);
-    let error = client
-        .exec_container_command(
-            SANDBOX_ID,
-            ExecRequest {
-                command: "ls".to_string(),
-                working_dir: None,
-                env: None,
-                timeout_seconds: None,
-                user: None,
-            },
-            &gateway_options(&server),
-        )
-        .await
-        .unwrap_err();
-    let rendered = format!("{error:?}");
-    assert!(!rendered.contains(GATEWAY_TOKEN), "{rendered}");
-    assert!(
-        error.details().unwrap().contains("[redacted]"),
-        "{rendered}"
-    );
-    assert!(
-        !error.details().unwrap().contains(GATEWAY_TOKEN),
-        "{rendered}"
-    );
+    // The token echoed under an ordinary key or in plain text is the leak
+    // shape (a "token"-named key would be masked by key-scrubbing alone).
+    for body in [
+        r#"{"detail":"denied: Bearer gateway-token-xyz"}"#,
+        "upstream rejected Bearer gateway-token-xyz",
+    ] {
+        // Exec: a 403 body echoing the sandbox-bound token.
+        let server = MockServer::start(Vec::new()).await;
+        server.push_raw(text_response(403, "Forbidden", body));
+        let client = platform_client(&server);
+        let error = client
+            .exec_container_command(
+                SANDBOX_ID,
+                ExecRequest {
+                    command: "ls".to_string(),
+                    working_dir: None,
+                    env: None,
+                    timeout_seconds: None,
+                    user: None,
+                },
+                &gateway_options(&server),
+            )
+            .await
+            .unwrap_err();
+        let rendered = format!("{error:?}");
+        assert!(!rendered.contains(GATEWAY_TOKEN), "{rendered}");
+        assert!(
+            error.details().unwrap().contains("[redacted]"),
+            "{rendered}"
+        );
+        // Upload: the same echo on the multipart path.
+        let server = MockServer::start(Vec::new()).await;
+        server.push_raw(text_response(403, "Forbidden", body));
+        let client = platform_client(&server);
+        let error = client
+            .upload_file(
+                SANDBOX_ID,
+                UploadRequest {
+                    path: "/x".to_string(),
+                    filename: "x".to_string(),
+                    content: vec![1, 2, 3],
+                },
+                &gateway_options(&server),
+            )
+            .await
+            .unwrap_err();
+        let rendered = format!("{error:?}");
+        assert!(!rendered.contains(GATEWAY_TOKEN), "{rendered}");
+        assert!(
+            error.details().unwrap().contains("[redacted]"),
+            "{rendered}"
+        );
+    }
 }
 
 #[tokio::test]

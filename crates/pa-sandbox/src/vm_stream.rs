@@ -187,6 +187,9 @@ struct OpenedStream {
     response: StreamedResponse,
     method: &'static str,
     url: String,
+    /// The gateway token this attempt authenticated with; end-of-stream
+    /// error messages are redacted against it.
+    token: String,
 }
 
 /// The outcome of one attach attempt.
@@ -295,6 +298,7 @@ where
         response,
         method,
         url,
+        token,
     } = opened;
     let mut decoder = match ConnectFrameDecoder::new(inner.max_event_frame_bytes) {
         Ok(decoder) => decoder,
@@ -340,7 +344,7 @@ where
                 .with_context(method, url.clone(), None, None));
             }
             if frame.flags & CONNECT_FRAME_END_OF_STREAM != 0 {
-                return match parse_end_of_stream(&frame.payload, method, &url) {
+                return match parse_end_of_stream(&frame.payload, method, &url, &token) {
                     Ok(()) => Attempt::CleanEof,
                     Err(fault) => Attempt::Fault(fault),
                 };
@@ -414,13 +418,20 @@ where
         } else {
             start_bytes
         };
+        // TS parity: `Connect-Timeout-Ms: 0` is an explicit no-deadline for
+        // sandboxd, and zero also disables the local open deadline (the
+        // TS fetch call converts 0 to undefined); any other value bounds
+        // the open locally too.
+        let open_deadline = connect_timeout_ms
+            .filter(|timeout_ms| *timeout_ms != 0)
+            .map(Duration::from_millis);
         let request = TransportRequest {
             method: Method::Post,
             headers: stream_headers(&auth, inner.keepalive_interval_seconds, connect_timeout_ms),
             url: url.clone(),
             body: Some(encode_connect_frame(payload, 0)),
             max_response_bytes: None,
-            timeout: connect_timeout_ms.map(Duration::from_millis),
+            timeout: open_deadline,
         };
         let response = inner
             .transport
@@ -455,6 +466,7 @@ where
             response,
             method,
             url,
+            token: auth.token,
         })
     })
     .await

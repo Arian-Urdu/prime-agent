@@ -107,6 +107,7 @@ fn connect_stream(frames: Vec<Vec<u8>>) -> ScriptedResponse {
     }
     stream.push((http_chunk_end(), Duration::ZERO));
     ScriptedResponse {
+        head_delay: Duration::ZERO,
         raw: connect_stream_head(200, "OK"),
         stream,
         close: false,
@@ -287,6 +288,7 @@ async fn release_detaches_without_signaling_or_reattaching() {
     // release can end the attachment, and no signal is ever sent.
     let server = MockServer::start(Vec::new()).await;
     server.push(ScriptedResponse {
+        head_delay: Duration::ZERO,
         raw: connect_stream_head(200, "OK"),
         stream: vec![(http_chunk(&start_frame(77)), Duration::from_millis(5))],
         close: false,
@@ -807,4 +809,113 @@ async fn stream_errors_do_not_reconnect_when_the_budget_is_spent() {
         1,
         "no reattach on a definitive answer"
     );
+}
+
+#[tokio::test]
+async fn end_of_stream_error_messages_never_carry_the_token() {
+    // A valid 200 connect+proto stream whose end-of-stream frame echoes
+    // the gateway token inside error.message: the typed fault must not
+    // disclose it through Display or Debug.
+    let server = MockServer::start(Vec::new()).await;
+    let message = format!("no session 7 (auth Bearer {TOKEN} failed)");
+    let body = format!(
+        r#"{{"error":{{"code":"not_found","message":{}}}}}"#,
+        serde_json::to_string(&message).unwrap()
+    );
+    server.push(connect_stream(vec![encode_connect_frame(
+        body.as_bytes(),
+        0x02,
+    )]));
+    let client = client_for(auth(server.url(""), TOKEN));
+    let error = client
+        .start(
+            &start_request(),
+            StartOptions {
+                stream: StreamOptions {
+                    max_reconnects: Some(0),
+                    reconnect_base_delay: None,
+                    max_pending_events: None,
+                },
+                connect_timeout_ms: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), CommandSessionErrorCode::NotFound);
+    let rendered = format!("{error:?}");
+    assert!(!rendered.contains(TOKEN), "{rendered}");
+    assert!(error.to_string().contains("[redacted]"), "{rendered}");
+    assert!(error.to_string().contains("no session 7"), "{rendered}");
+}
+
+#[tokio::test]
+async fn a_zero_connect_timeout_disables_the_local_open_deadline() {
+    // `Connect-Timeout-Ms: 0` is the explicit no-deadline form: the header
+    // is still sent, but a slow response head must not trip a local
+    // zero-duration timeout (TS converts 0 to undefined for its own
+    // deadline).
+    let server = MockServer::start(Vec::new()).await;
+    let stream = vec![
+        (http_chunk(&start_frame(21)), Duration::from_millis(5)),
+        (http_chunk(&end_frame()), Duration::from_millis(5)),
+        (http_chunk_end(), Duration::ZERO),
+    ];
+    server.push(ScriptedResponse {
+        head_delay: Duration::from_millis(400),
+        raw: connect_stream_head(200, "OK"),
+        stream,
+        close: false,
+        hold: false,
+    });
+    let client = client_for(auth(server.url(""), TOKEN));
+    let mut process = client
+        .start(
+            &start_request(),
+            StartOptions {
+                stream: StreamOptions {
+                    max_reconnects: Some(0),
+                    reconnect_base_delay: None,
+                    max_pending_events: None,
+                },
+                connect_timeout_ms: Some(0),
+            },
+        )
+        .await
+        .expect("a slow head survives the explicit no-deadline open");
+    assert_eq!(process.pid(), 21);
+    match process.next_event().await.unwrap().unwrap() {
+        CommandSessionEvent::End(_) => {}
+        other => panic!("expected end, got {other:?}"),
+    }
+    // The header still carries the explicit zero for sandboxd.
+    assert!(
+        server.recorded_requests()[0].contains("connect-timeout-ms: 0"),
+        "{}",
+        server.recorded_requests()[0]
+    );
+}
+
+#[tokio::test]
+async fn a_zero_unary_control_timeout_is_rejected_before_sending() {
+    // TS parity: an explicitly supplied control-RPC deadline must be
+    // positive; zero is rejected locally, nothing is sent.
+    let server = MockServer::start(Vec::new()).await;
+    server.push_raw(proto_response(200, "OK", b""));
+    let client = client_for(auth(server.url(""), TOKEN));
+    let error = client
+        .send_input(
+            UUID,
+            InputChannel::Stdin,
+            b"zz",
+            SendInputOptions {
+                control: ControlOptions {
+                    connect_timeout_ms: Some(Duration::ZERO),
+                },
+                input_uuid: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), CommandSessionErrorCode::InvalidRequest);
+    assert_eq!(server.request_count(), 0, "nothing was sent");
 }

@@ -508,6 +508,14 @@ where
         request_bytes: Vec<u8>,
         timeout: Duration,
     ) -> Result<(), CommandSessionError> {
+        // TS parity: an explicitly supplied control-RPC deadline must be
+        // positive (the streaming Start has its own zero-disables
+        // semantics).
+        if timeout.is_zero() {
+            return Err(CommandSessionError::invalid_request(
+                "connectTimeoutMs must be a positive duration",
+            ));
+        }
         let mut attempt = 0;
         loop {
             attempt += 1;

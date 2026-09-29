@@ -167,6 +167,7 @@ impl<T: SandboxTransport> PrimeSandboxClient<T> {
             self.platform_headers(),
             None,
             self.request_timeout_or(options.request_timeout),
+            self.platform_secrets(),
             "Sandbox auth",
             move |value| parse_gateway_auth(value, allow_insecure),
         )
@@ -242,6 +243,7 @@ impl<T: SandboxTransport> PrimeSandboxClient<T> {
             gateway_headers(&auth, "application/json"),
             Some(serde_json::Value::Object(body).to_string().into_bytes()),
             timeout,
+            auth.secrets(self.api_key.as_str()),
             "Sandbox exec",
             parse_exec_result,
         )
@@ -291,6 +293,7 @@ impl<T: SandboxTransport> PrimeSandboxClient<T> {
             headers,
             Some(body),
             self.request_timeout_or(options.request_timeout),
+            auth.secrets(self.api_key.as_str()),
             "Sandbox upload",
             parse_upload_result,
         )

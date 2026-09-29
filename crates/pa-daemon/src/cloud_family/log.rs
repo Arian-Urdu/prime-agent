@@ -13,7 +13,7 @@
 //! the TS record cap, so an unacked full log stalls exactly like TS.
 
 use std::collections::VecDeque;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -54,7 +54,8 @@ impl FamilyRequestLog {
     /// corrupt (digest, envelope, or sequence gap), or the repair write of a
     /// crash-truncated tail fails.
     pub fn open(directory: &Path, session_id: &str, max_records: usize) -> Result<Self> {
-        fs::create_dir_all(directory).with_context(|| format!("create {}", directory.display()))?;
+        pa_core::platform::perms::create_dir_all_private(directory)
+            .with_context(|| format!("create {}", directory.display()))?;
         let mut log = Self {
             directory: directory.to_path_buf(),
             session_id: session_id.to_string(),
@@ -62,6 +63,12 @@ impl FamilyRequestLog {
             max_records,
             max_event_bytes: pa_types::daemon::cloud::CLOUD_MAX_MESSAGE_BYTES,
         };
+        // Private from its first write (the creation mode below); a file
+        // left at the umask-default mode by an older build moves to a
+        // fresh private inode HERE — the envelope stores the message
+        // body in plaintext.
+        #[cfg(unix)]
+        crate::journal::ensure_private_journal_file(&log.events_path())?;
         log.load()?;
         Ok(log)
     }
@@ -96,9 +103,10 @@ impl FamilyRequestLog {
         }
         let mut line = envelope;
         line.push('\n');
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        pa_core::platform::perms::set_private_mode(&mut options);
+        let mut file = options
             .open(self.events_path())
             .with_context(|| format!("open {}", self.events_path().display()))?;
         file.write_all(line.as_bytes())?;
@@ -175,7 +183,12 @@ impl FamilyRequestLog {
     fn load(&mut self) -> Result<()> {
         let path = self.events_path();
         let Ok(content) = fs::read_to_string(&path) else {
-            File::create(&path).with_context(|| format!("create {}", path.display()))?;
+            let mut options = OpenOptions::new();
+            options.create(true).write(true).truncate(true);
+            pa_core::platform::perms::set_private_mode(&mut options);
+            options
+                .open(&path)
+                .with_context(|| format!("create {}", path.display()))?;
             return Ok(());
         };
         let mut lines: Vec<&str> = content.split('\n').collect();
@@ -221,7 +234,12 @@ impl FamilyRequestLog {
         let path = self.events_path();
         let temp = path.with_extension("ndjson.tmp");
         {
-            let file = File::create(&temp).with_context(|| format!("create {}", temp.display()))?;
+            let mut options = OpenOptions::new();
+            options.create(true).write(true).truncate(true);
+            pa_core::platform::perms::set_private_mode(&mut options);
+            let file = options
+                .open(&temp)
+                .with_context(|| format!("create {}", temp.display()))?;
             let mut writer = BufWriter::new(file);
             for line in &lines {
                 writer.write_all(line.as_bytes())?;
@@ -288,8 +306,13 @@ impl FamilyResultLog {
     /// Returns an error when the parent directory cannot be created.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            pa_core::platform::perms::create_dir_all_private(parent)?;
         }
+        // Private from its first write (the creation mode in
+        // journal::append_record); a file left at the umask-default mode
+        // by an older build moves to a fresh private inode HERE.
+        #[cfg(unix)]
+        crate::journal::ensure_private_journal_file(path)?;
         // A crash-torn trailing append is repaired before any append can
         // glue onto it (which would strand the record forever); mid-file
         // corruption fails closed — the journal's history is never
@@ -463,6 +486,129 @@ impl FamilyResultLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The request outbox carries the message body in PLAINTEXT (the TS
+    /// envelope), so its inode must be private from the first write — the
+    /// umask-default 0644 file was readable through any traversable path
+    /// (the review's finding in the #3145 substrate).
+    #[cfg(unix)]
+    #[test]
+    fn request_outbox_is_private_from_its_first_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = dir.path().join("nested-outbox");
+        let mut log = FamilyRequestLog::open(&outbox, "sess_priv", 50).unwrap();
+        log.append(CloudFamilyEventPayload::AgentMessageRequest {
+            request_id: "msgreq_priv".to_string(),
+            from_remote_session_id: "remote_child".to_string(),
+            target_selector: "sibling".to_string(),
+            message: "the plaintext body".to_string(),
+        })
+        .unwrap();
+        let events = outbox.join("outbox-events.ndjson");
+        let content = fs::read_to_string(&events).unwrap();
+        assert!(
+            content.contains("the plaintext body"),
+            "the envelope stores the message in plaintext: {content}"
+        );
+        assert_eq!(
+            pa_core::platform::perms::file_mode(&events),
+            Some(0o600),
+            "the plaintext outbox inode is private from its first write"
+        );
+        assert_eq!(
+            pa_core::platform::perms::file_mode(&outbox),
+            Some(0o700),
+            "the created outbox directory is private"
+        );
+    }
+
+    /// A legacy outbox written at the umask-default mode (the base
+    /// substrate's shape) migrates to a fresh private inode at open: the
+    /// bytes are preserved verbatim, the inode changes, and appends after
+    /// the swap replay.
+    #[cfg(unix)]
+    #[test]
+    fn legacy_loose_outbox_migrates_to_a_fresh_private_inode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = FamilyRequestLog::open(dir.path(), "sess_priv", 50).unwrap();
+        log.append(CloudFamilyEventPayload::AgentMessageRequest {
+            request_id: "msgreq_priv".to_string(),
+            from_remote_session_id: "remote_child".to_string(),
+            target_selector: "sibling".to_string(),
+            message: "the plaintext body".to_string(),
+        })
+        .unwrap();
+        let events = dir.path().join("outbox-events.ndjson");
+        // The old shape: the same file at the umask-default 0644.
+        fs::set_permissions(&events, fs::Permissions::from_mode(0o644)).unwrap();
+        let before = fs::symlink_metadata(&events).unwrap();
+        let bytes = fs::read(&events).unwrap();
+
+        let reopened = FamilyRequestLog::open(dir.path(), "sess_priv", 50).unwrap();
+
+        let after = fs::symlink_metadata(&events).unwrap();
+        assert_ne!(
+            (after.dev(), after.ino()),
+            (before.dev(), before.ino()),
+            "the legacy loose outbox moves to a fresh private inode"
+        );
+        assert_eq!(pa_core::platform::perms::file_mode(&events), Some(0o600));
+        assert_eq!(
+            fs::read(&events).unwrap(),
+            bytes,
+            "history is preserved byte-for-byte"
+        );
+        assert_eq!(reopened.tail_sequence(), 1, "the migrated record replays");
+        // The private inode keeps serving: an append after the swap
+        // survives a reopen.
+        log.append(CloudFamilyEventPayload::FamilyRosterRequest {
+            request_id: "famreq_priv".to_string(),
+            from_remote_session_id: "remote_child".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            FamilyRequestLog::open(dir.path(), "sess_priv", 50)
+                .unwrap()
+                .tail_sequence(),
+            2,
+            "the post-swap append lands and replays"
+        );
+    }
+
+    /// The result journal's first write is private, and a legacy loose
+    /// file migrates to a fresh private inode with its admissions
+    /// intact.
+    #[cfg(unix)]
+    #[test]
+    fn result_journal_is_private_and_migrates_a_legacy_loose_file() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("family-results.jsonl");
+        let mut log = FamilyResultLog::open(&path).unwrap();
+        log.admit("msgreq_r1").unwrap();
+        assert_eq!(
+            pa_core::platform::perms::file_mode(&path),
+            Some(0o600),
+            "the result journal inode is private from its first write"
+        );
+        // The old shape: the same file at the umask-default 0644.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let before = fs::symlink_metadata(&path).unwrap();
+        let reopened = FamilyResultLog::open(&path).unwrap();
+        let after = fs::symlink_metadata(&path).unwrap();
+        assert_ne!(
+            (after.dev(), after.ino()),
+            (before.dev(), before.ino()),
+            "the legacy loose result journal moves to a fresh private inode"
+        );
+        assert_eq!(pa_core::platform::perms::file_mode(&path), Some(0o600));
+        assert_eq!(
+            reopened.uncertain(),
+            vec!["msgreq_r1".to_string()],
+            "the migrated admission replays"
+        );
+    }
 
     /// The crash-torn trailing append: the tail is repaired (truncated to
     /// its valid records) before any append can glue onto it, and the

@@ -320,8 +320,13 @@ fn run_trial(
     let secrets = seeded_secrets(seed, size);
     let prompt = build_orchestrator_prompt(config, size, &secrets);
 
-    let created = command_data(
-        client,
+    // The create's result classes decide the cleanup: a successful create
+    // hands the session id to the shared cleanup below; a refused create
+    // (the daemon answered) is authoritative — nothing was created; a
+    // lost create response (timeout or transport reset) is ambiguous —
+    // the daemon may already have created `swarm-eval-{size}-{trial}`,
+    // and with no id returned it would outlive the run as a live orphan.
+    let create_result = client.command(
         &json!({
             "type": "create",
             "name": format!("swarm-eval-{size}-{trial}"),
@@ -333,7 +338,32 @@ fn run_trial(
             },
         }),
         Duration::from_mins(2),
-    )?;
+    );
+    let created = match create_result {
+        Ok(response) if response.get("success").and_then(Value::as_bool) == Some(true) => {
+            response.get("data").cloned().unwrap_or(Value::Null)
+        }
+        Ok(response) => {
+            let _ = fs::remove_dir_all(&trial_root);
+            return Err(format!("command failed: {response}"));
+        }
+        Err(error) => {
+            // Reconcile the trial's own sessions dir over a fresh
+            // connection and kill whatever the daemon reports there
+            // before reporting the failure.
+            let reconcile = reconcile_orphaned_create(client, socket, &sessions_dir);
+            let _ = fs::remove_dir_all(&trial_root);
+            return Err(match reconcile {
+                Ok(0) => format!("create failed: {error}; reconcile found no orphaned session"),
+                Ok(count) => {
+                    format!("create failed: {error}; reconcile killed {count} orphaned session(s)")
+                }
+                Err(reconcile_error) => {
+                    format!("create failed: {error}; reconcile failed: {reconcile_error}")
+                }
+            });
+        }
+    };
     let session_id = created
         .get("activeSessionId")
         .or_else(|| created.get("id"))
@@ -375,6 +405,48 @@ fn run_trial(
         }
         (Err(message), Err(cleanup_error)) => Err(format!("{message}; {cleanup_error}")),
     }
+}
+
+/// After an ambiguous `create` (the response was lost to a timeout or a
+/// transport reset), the daemon may still have created the trial's session
+/// under the trial's own sessions dir — with no id ever returned, it would
+/// outlive the run. The reconcile lists that dir over a fresh connection
+/// and kills every session the daemon reports under it. Matching by the
+/// trial's unique sessions dir (not by the session name, which repeats
+/// across runs with the same sweep coordinates) keeps a concurrent
+/// harness process's live session out of the kill set.
+fn reconcile_orphaned_create(
+    client: &mut Client,
+    socket: &Path,
+    sessions_dir: &Path,
+) -> Result<usize, String> {
+    let mut retry = Client::connect(socket)
+        .map_err(|connect_error| format!("reconnect failed: {connect_error}"))?;
+    let list_result = retry.command(
+        &json!({
+            "type": "list",
+            "all": true,
+            "sessionDir": sessions_dir.to_string_lossy(),
+        }),
+        Duration::from_secs(30),
+    );
+    // The fresh connection heals the sweep's shared client either way.
+    *client = retry;
+    let listed = list_result.map_err(|error| format!("the trial sessions list failed: {error}"))?;
+    let rows = listed
+        .get("data")
+        .and_then(|data| data.get("sessions"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "the trial sessions list returned no sessions field".to_string())?;
+    let mut killed = 0;
+    for row in rows {
+        let Some(orphan_id) = row.get("activeSessionId").and_then(Value::as_str) else {
+            continue;
+        };
+        kill_session(client, socket, orphan_id)?;
+        killed += 1;
+    }
+    Ok(killed)
 }
 
 /// The cleanup kill. Unlike a scored command, a transport failure here
@@ -1029,6 +1101,131 @@ mod tests {
                 || error.contains("daemon socket error")
                 || error.contains("failed to send command"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_create_orphan_is_reconciled_and_killed() {
+        // The create response can be lost to a reset while the daemon still
+        // created the session; with no id returned the orphan would outlive
+        // the trial. The harness must reconcile the trial's own sessions
+        // dir over a fresh connection and kill what the daemon reports
+        // there before reporting the trial failure.
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let socket = dir.path().join("orphan.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let (list_tx, list_rx) = channel();
+        let (kill_tx, kill_rx) = channel();
+        thread::spawn(move || {
+            // Connection 1: hello, read the create, drop (the response is
+            // lost).
+            let (stream, _) = listener.accept().expect("accept 1");
+            let mut writer = stream.try_clone().expect("clone 1");
+            let mut reader = BufReader::new(stream);
+            let _ = writeln!(writer, r#"{{"type":"daemon_hello"}}"#);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read create");
+            drop(writer);
+            drop(reader);
+            // Connection 2 (the reconcile): report one orphaned session
+            // under the trial dir, then answer the kill.
+            let (stream, _) = listener.accept().expect("accept 2");
+            let mut writer = stream.try_clone().expect("clone 2");
+            let mut reader = BufReader::new(stream);
+            let _ = writeln!(writer, r#"{{"type":"daemon_hello"}}"#);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read list");
+            let envelope: Value = serde_json::from_str(line.trim()).expect("list envelope");
+            let _ = list_tx.send(envelope.get("command").cloned().unwrap_or(Value::Null));
+            let _ = writeln!(
+                writer,
+                "{}",
+                json!({
+                    "id": envelope.get("id").cloned().unwrap_or(Value::Null),
+                    "type": "response",
+                    "success": true,
+                    "data": { "sessions": [
+                        { "sessionFile": "/tmp/orphan/sessions/o.jsonl",
+                          "activeSessionId": "s-orphan" }
+                    ] }
+                })
+            );
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read kill");
+            let envelope: Value = serde_json::from_str(line.trim()).expect("kill envelope");
+            let _ = kill_tx.send(envelope.get("command").cloned().unwrap_or(Value::Null));
+            let _ = writeln!(
+                writer,
+                "{}",
+                json!({
+                    "id": envelope.get("id").cloned().unwrap_or(Value::Null),
+                    "type": "response",
+                    "success": true
+                })
+            );
+        });
+        let out_dir = tempfile::TempDir::new().expect("out dir");
+        let config = test_config(out_dir.path(), 2, 15.0);
+        let runs_root = dir.path().join("runs");
+        let mut client = Client::connect(&socket).expect("connect");
+        let error = run_trial(&mut client, &socket, &config, 2, 1, &runs_root)
+            .expect_err("the lost create response fails the trial");
+        // The reconcile listed the trial's own sessions dir...
+        let list_command = list_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the reconcile list ran");
+        assert_eq!(list_command["type"], "list", "{list_command}");
+        assert_eq!(list_command["all"], true, "{list_command}");
+        assert!(
+            list_command["sessionDir"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("sessions"),
+            "{list_command}"
+        );
+        // ...and killed the orphan the daemon reported there.
+        let kill_command = kill_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the orphan kill ran");
+        assert_eq!(kill_command["type"], "kill", "{kill_command}");
+        assert_eq!(
+            kill_command["activeSessionId"], "s-orphan",
+            "{kill_command}"
+        );
+        assert!(error.contains("create failed"), "{error}");
+        assert!(error.contains("reconcile killed 1"), "{error}");
+        // The scratch dir still went.
+        assert!(!runs_root.join("size-2-trial-1").exists());
+    }
+
+    #[test]
+    fn a_refused_create_skips_the_reconcile() {
+        // A refused create (the daemon answered success: false) is
+        // authoritative: nothing was created, so no reconcile pass runs.
+        let daemon = fake_daemon(Vec::new());
+        let out_dir = tempfile::TempDir::new().expect("out dir");
+        let config = test_config(out_dir.path(), 2, 15.0);
+        let runs_root = out_dir.path().join("runs");
+        let mut client = Client::connect(&daemon.socket).expect("connect");
+        let error = run_trial(&mut client, &daemon.socket, &config, 2, 1, &runs_root)
+            .expect_err("the refused create fails the trial");
+        assert!(error.contains("command failed"), "{error}");
+        assert!(!error.contains("reconcile"), "{error}");
+        // Drain every command the driver sent: no list may appear.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut commands = Vec::new();
+        loop {
+            while let Ok(command) = daemon.commands.try_recv() {
+                commands.push(command);
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            commands.iter().all(|command| command["type"] != "list"),
+            "no reconcile list for a refused create: {commands:?}"
         );
     }
 

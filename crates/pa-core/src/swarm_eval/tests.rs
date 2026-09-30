@@ -168,7 +168,7 @@ fn parses_arguments_with_defaults_and_validates_the_model() {
     assert_eq!(config.pattern, ArrivalPattern::Spread);
     assert_eq!(config.trials, 1);
     assert_eq!(config.gap_seconds, 2.0);
-    assert_eq!(config.timeout_minutes, 15.0);
+    assert_eq!(config.timeout_minutes, 35.0);
     assert_eq!(config.seed, 1);
 
     assert_eq!(
@@ -228,6 +228,24 @@ fn an_overflowing_timeout_literal_falls_back_to_the_clamped_default() {
     let config =
         parse_eval_args(&args(&["--model", "m", "--timeout-minutes", "-1e999"])).expect("parses");
     assert_eq!(config.timeout_minutes, 1.0);
+}
+
+#[test]
+fn the_default_timeout_covers_the_largest_supported_spread_schedule() {
+    // The largest supported crew in the default Spread pattern waits
+    // `(MAX_CREW_SIZE - 1) * gap_seconds` before its last child even
+    // replies; the default timeout must cover that schedule plus the
+    // last reply and the orchestrator's final ANSWER step, or supported
+    // sizes fail by harness schedule instead of by measurement.
+    let config = default_eval_config();
+    let last_child_wait = (MAX_CREW_SIZE - 1) as f64 * config.gap_seconds;
+    let final_turn_budget = 240.0;
+    assert!(
+        config.timeout_minutes * 60.0 >= last_child_wait + final_turn_budget,
+        "default timeout {} min cannot cover the largest supported spread schedule \
+         ({last_child_wait}s sleep + {final_turn_budget}s of final turns)",
+        config.timeout_minutes
+    );
 }
 
 #[test]

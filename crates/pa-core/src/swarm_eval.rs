@@ -252,6 +252,13 @@ pub struct SwarmEvalConfig {
 }
 
 /// The default configuration (model and out dir are filled by the caller).
+///
+/// The per-trial timeout is sized to the largest supported crew in the
+/// default Spread pattern: the last child's staggered sleep alone waits
+/// `(MAX_CREW_SIZE - 1) * gap_seconds` = 1,798s, and the poll must also
+/// observe that reply plus the orchestrator's final ANSWER step, so the
+/// default covers the full schedule plus a final-turn budget instead of
+/// cutting supported sizes off mid-schedule.
 #[must_use]
 pub fn default_eval_config() -> SwarmEvalConfig {
     SwarmEvalConfig {
@@ -261,7 +268,7 @@ pub fn default_eval_config() -> SwarmEvalConfig {
         pattern: ArrivalPattern::Spread,
         trials: 1,
         gap_seconds: 2.0,
-        timeout_minutes: 15.0,
+        timeout_minutes: 35.0,
         out_dir: String::new(),
         seed: 1,
     }

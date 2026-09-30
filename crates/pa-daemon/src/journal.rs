@@ -238,6 +238,7 @@ pub(crate) fn establish_private_journal_parent_injecting(
     establish_private_journal_parent_inner(path, Some(fail_first_mkdir_sync))
 }
 
+#[cfg(unix)]
 use std::sync::atomic::Ordering;
 
 /// The path-based form of [`establish_private_journal_parent`] for callers

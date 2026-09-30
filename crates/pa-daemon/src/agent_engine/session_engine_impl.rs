@@ -515,6 +515,9 @@ impl SessionEngine for AgentSessionEngine {
             // new model with the old level. No durable
             // `thinking_level_change` row: TS `setModel` records only
             // the model row; `/thinking` owns the intent row.
+            // Deliberate divergence: TS `_getThinkingLevelForModelSwitch` takes the
+            // settings default when leaving a non-thinking model; this path re-clamps
+            // the requested level so a user's choice survives a plain-model hop.
             let level = map_thinking_level(self.effective_thinking());
             let _ = self.runtime.block_on(
                 core.session

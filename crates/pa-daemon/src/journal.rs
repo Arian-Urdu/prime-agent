@@ -119,6 +119,14 @@ pub(crate) fn validate_private_journal_parent(path: &Path) -> Result<()> {
 /// fails), or the final tighten fails.
 #[cfg(unix)]
 pub(crate) fn establish_private_journal_parent(path: &Path) -> Result<File> {
+    establish_private_journal_parent_inner(path, None)
+}
+
+#[cfg(unix)]
+fn establish_private_journal_parent_inner(
+    path: &Path,
+    fail_first_mkdir_sync: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<File> {
     use std::path::Component;
     let parent = path.parent().context("journal has no parent directory")?;
     anyhow::ensure!(
@@ -163,9 +171,10 @@ pub(crate) fn establish_private_journal_parent(path: &Path) -> Result<File> {
                             // acknowledged append must never lose an
                             // ancestor to a crash. Fail closed on the
                             // sync error.
-                            #[cfg(test)]
-                            if ESTABLISH_FAIL_NEXT_MKDIR_SYNC.swap(false, Ordering::SeqCst) {
-                                anyhow::bail!("injected ancestor sync failure after mkdirat");
+                            if let Some(fail_first_mkdir_sync) = fail_first_mkdir_sync {
+                                if fail_first_mkdir_sync.swap(false, Ordering::SeqCst) {
+                                    anyhow::bail!("injected ancestor sync failure after mkdirat");
+                                }
                             }
                             current
                                 .sync_all()
@@ -212,14 +221,23 @@ pub(crate) fn establish_private_journal_parent(path: &Path) -> Result<File> {
     Ok(current)
 }
 
-/// Test-only injection: fail the FIRST created-ancestor directory sync
-/// of the next establishment — deterministically proving the walk fails
-/// closed instead of proceeding without the durable NAME.
-#[cfg(test)]
-pub(crate) static ESTABLISH_FAIL_NEXT_MKDIR_SYNC: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// The test-only entry of [`establish_private_journal_parent`]: the
+/// FIRST created-ancestor directory sync fails deterministically when
+/// the caller's OWN flag is set — a per-call injector with no
+/// process-global state, so no concurrently running test can consume
+/// it or be consumed by it.
+///
+/// # Errors
+///
+/// Returns the establishment's error, or the injected sync failure.
+#[cfg(all(test, unix))]
+pub(crate) fn establish_private_journal_parent_injecting(
+    path: &Path,
+    fail_first_mkdir_sync: &std::sync::atomic::AtomicBool,
+) -> Result<File> {
+    establish_private_journal_parent_inner(path, Some(fail_first_mkdir_sync))
+}
 
-#[cfg(test)]
 use std::sync::atomic::Ordering;
 
 /// The path-based form of [`establish_private_journal_parent`] for callers
@@ -2638,10 +2656,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_failed_ancestor_sync_fails_the_establishment_closed() {
-        ESTABLISH_FAIL_NEXT_MKDIR_SYNC.store(true, Ordering::SeqCst);
+        // The injector is test-LOCAL: only this call can consume it, so
+        // no concurrently running test is affected.
+        let fail_first_mkdir_sync = std::sync::atomic::AtomicBool::new(true);
         let root = temp_path_root();
-        let error = establish_private_journal_parent(&root.join("fresh/nested/recovery.jsonl"))
-            .expect_err("the ancestor sync failure fails closed");
+        let error = establish_private_journal_parent_injecting(
+            &root.join("fresh/nested/recovery.jsonl"),
+            &fail_first_mkdir_sync,
+        )
+        .expect_err("the ancestor sync failure fails closed");
         assert!(
             error.to_string().contains("injected ancestor sync"),
             "the injected sync failure refuses the establishment: {error:#}"

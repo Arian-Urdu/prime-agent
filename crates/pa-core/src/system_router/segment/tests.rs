@@ -1,0 +1,182 @@
+//! The segment-runner battery: action-space precedence, adapter cleanup on
+//! every path, and the init budget.
+
+use std::sync::Arc;
+
+use serde_json::json;
+
+use super::super::decide::RouterDecisionFn;
+use super::super::test_support as support;
+use super::super::types::{
+    parse_system_router_run_spec, RouterRunStatus, RouterSegmentEnvironment, FINISH_ACTION,
+};
+use super::*;
+
+fn action_model() -> Model {
+    serde_json::from_value(json!({
+        "id": "action-model", "name": "Action Model", "api": "openai-completions",
+        "provider": "testprov", "baseUrl": "http://localhost", "reasoning": false,
+        "input": ["text"], "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+        "contextWindow": 8_000, "maxTokens": 512
+    }))
+    .unwrap()
+}
+
+fn options(
+    env: Arc<support::ScriptedEnvironment>,
+    decide: RouterDecisionFn,
+) -> RouterSegmentOptions {
+    RouterSegmentOptions {
+        model: action_model(),
+        api_key: Some("test-key".to_string()),
+        headers: None,
+        session_id: Some("session-1".to_string()),
+        policy: crate::session_engine::provider_retry::DEFAULT_PROVIDER_RETRY_POLICY,
+        env: Some(env),
+        decide: Some(decide),
+        signal: None,
+    }
+}
+
+fn spec(actions: Option<serde_json::Value>, timeout_ms: u64) -> ParsedSystemRouterRunSpec {
+    let mut payload = json!({
+        "goal": "reach the overworld",
+        "timeoutMs": timeout_ms,
+        "environment": { "stdio": { "command": ["python3", "adapter.py"] } }
+    });
+    if let Some(actions) = actions {
+        payload["actions"] = actions;
+    }
+    parse_system_router_run_spec(&payload).unwrap()
+}
+
+#[tokio::test]
+async fn the_declared_action_space_wins_over_the_adapters_defaults() {
+    let env = support::ScriptedEnvironment::with_observation(support::observation("title screen"))
+        .then_init_actions(json!({ "wait": { "description": "Wait one tick." } }))
+        .then_execute("advanced", false);
+    let decide = support::scripted_decide(vec![
+        support::valid_decision("look", &[], 0.9),
+        support::valid_decision(FINISH_ACTION, &[], 0.9),
+    ]);
+    let spec = spec(
+        Some(json!({ "look": { "description": "Look at the screen.", "risk": "read" } })),
+        5_000,
+    );
+    let result = run_router_segment(&spec, options(Arc::clone(&env), decide))
+        .await
+        .unwrap();
+    assert_eq!(result.status, RouterRunStatus::Done);
+    assert_eq!(result.executed, 1);
+    assert_eq!(result.model.provider, "testprov");
+    assert_eq!(result.model.thinking_level, "off");
+    assert!(env.calls.lock().unwrap().contains(&"init".to_string()));
+    assert!(*env.closes.lock().unwrap() >= 1, "the adapter is closed");
+}
+
+#[tokio::test]
+async fn an_undeclared_space_uses_the_adapters_defaults() {
+    let env = support::ScriptedEnvironment::with_observation(support::observation("idle"))
+        .then_init_actions(json!({ "wait": { "description": "Wait one tick." } }))
+        .then_execute("waited", false);
+    let decide = support::scripted_decide(vec![
+        support::valid_decision("wait", &[], 0.9),
+        support::valid_decision(FINISH_ACTION, &[], 0.9),
+    ]);
+    let result = run_router_segment(&spec(None, 5_000), options(Arc::clone(&env), decide))
+        .await
+        .unwrap();
+    assert_eq!(result.status, RouterRunStatus::Done);
+    assert_eq!(result.executed, 1);
+}
+
+#[tokio::test]
+async fn a_missing_action_space_fails_and_closes_the_adapter() {
+    let env = support::ScriptedEnvironment::with_observation(support::observation("idle"));
+    let error = run_router_segment(
+        &spec(None, 5_000),
+        options(Arc::clone(&env), support::scripted_decide(vec![])),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "system_router.run has no action space: declare one or use an adapter that supplies its own"
+    );
+    assert!(*env.closes.lock().unwrap() >= 1, "the adapter never leaks");
+}
+
+#[tokio::test]
+async fn an_init_failure_closes_the_adapter() {
+    let env = support::ScriptedEnvironment::with_observation(support::observation("idle"))
+        .then_init_error("no rom loaded");
+    let error = run_router_segment(
+        &spec(Some(json!({ "look": { "description": "Look." } })), 5_000),
+        options(Arc::clone(&env), support::scripted_decide(vec![])),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "environment adapter init failed: no rom loaded"
+    );
+    assert!(*env.closes.lock().unwrap() >= 1);
+}
+
+#[tokio::test]
+async fn an_already_aborted_segment_never_touches_the_adapter() {
+    let env = support::ScriptedEnvironment::with_observation(support::observation("idle"));
+    let controller = pa_agent::abort::AbortController::new();
+    controller.abort();
+    let mut options = options(Arc::clone(&env), support::scripted_decide(vec![]));
+    options.signal = Some(controller.signal());
+    let result = run_router_segment(
+        &spec(Some(json!({ "look": { "description": "Look." } })), 5_000),
+        options,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.status, RouterRunStatus::Failed);
+    assert_eq!(result.reason, "aborted");
+    assert!(env.calls.lock().unwrap().is_empty());
+    assert_eq!(result.steps, 0);
+}
+
+#[tokio::test]
+async fn adapter_init_is_bounded_by_the_segment_budget() {
+    let mut payload = json!({
+        "goal": "reach the overworld",
+        "timeoutMs": 150,
+        "environment": { "stdio": { "command": ["sh", "-c", "sleep 30"] } }
+    });
+    payload["actions"] = json!({ "look": { "description": "Look." } });
+    let spec = parse_system_router_run_spec(&payload).unwrap();
+    let options = RouterSegmentOptions {
+        model: action_model(),
+        api_key: Some("test-key".to_string()),
+        headers: None,
+        session_id: None,
+        policy: crate::session_engine::provider_retry::DEFAULT_PROVIDER_RETRY_POLICY,
+        env: None,
+        decide: Some(support::scripted_decide(vec![])),
+        signal: None,
+    };
+    let started = std::time::Instant::now();
+    let error = run_router_segment(&spec, options).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("environment adapter init exceeded the segment timeout of 150ms"),
+        "unexpected error: {error}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+/// The env trait object is what the loop closes; keep the compiler honest
+/// about the `RouterSegmentEnvironment` supertrait.
+#[test]
+fn a_scripted_environment_implements_the_segment_contract() {
+    fn assert_segment<T: RouterSegmentEnvironment>(_env: &T) {}
+    let env = support::ScriptedEnvironment::with_observation(support::observation("x"));
+    assert_segment(&*env);
+}

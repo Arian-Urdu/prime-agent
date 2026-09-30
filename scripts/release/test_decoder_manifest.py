@@ -42,9 +42,20 @@ class DecoderManifest(unittest.TestCase):
             dist = root / "dist"
             binary = root / "unstripped"
             for target, alias in TARGETS:
+                # The fixture ELF must match the declared target: split_debug
+                # picks the binutils tool by target, and the target-prefixed
+                # objcopy refuses a foreign-arch image (the cross-compile
+                # reality the release pipeline now exercises). The aarch64
+                # leg needs the cross gcc; without it the leg is skipped
+                # loudly rather than built with a lying fixture.
+                compiler = {"x86_64-unknown-linux-gnu": "gcc",
+                            "aarch64-unknown-linux-gnu": "aarch64-linux-gnu-gcc"}[target]
+                if shutil.which(compiler) is None:
+                    print(f"SKIP: {compiler} not installed; {target} fixture not built")
+                    continue
                 source = root / f"{alias}.c"
                 source.write_text(f"int main(void) {{ return {len(alias)}; }}\n")
-                run("gcc", "-g", "-Wl,--build-id", "-o", str(binary), str(source))
+                run(compiler, "-g", "-Wl,--build-id", "-o", str(binary), str(source))
                 shipped = root / alias / "prime-agent"
                 decoder = dist / f"prime-agent-0.1.0-{alias}.debug.gz"
                 run(sys.executable, str(SPLITTER), "--binary", str(binary),

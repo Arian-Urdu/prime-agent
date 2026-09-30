@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# Register and run a GitHub Actions self-hosted runner inside a Prime sandbox
+# VM (docs/sandbox-runners.md). Runs ONCE per sandbox provision, as root; it
+# drops to the dedicated runner user for everything that touches GitHub.
+#
+# Environment (the sandbox SDK injects secrets as env vars; the registration
+# token is a one-hour credential and MUST NOT be logged or passed by argv):
+#   RUNNER_TOKEN   REQUIRED. A fresh registration token (minted per
+#                  provision; see docs/sandbox-runners.md for both mint
+#                  routes). Missing => hard fail, no partial state.
+#   RUNNER_URL     Registration scope. Default: the org
+#                  (https://github.com/PrimeIntellect-ai). Use the repo URL
+#                  to scope the runner to one repository instead.
+#   RUNNER_NAME    Runner name shown in the org/repo runner list.
+#                  Default: prime-runner-<sandbox hostname suffix>.
+#   RUNNER_LABELS  Comma-separated labels jobs target.
+#                  Default: prime-linux-x64.
+#   RUNNER_DIR     Default: /opt/gh-runner. Must NOT live under /root (the
+#                  runner user must reach it).
+#   RUNNER_USER    Default: gh-runner.
+#
+# The runner tarball is pinned (version + sha256); the digest is reviewed
+# like any other dependency pin. Pinned: v2.337.0.
+set -euo pipefail
+
+RUNNER_URL="${RUNNER_URL:-https://github.com/PrimeIntellect-ai}"
+RUNNER_NAME="${RUNNER_NAME:-prime-runner-$(hostname | tail -c 5)}"
+RUNNER_LABELS="${RUNNER_LABELS:-prime-linux-x64}"
+RUNNER_DIR="${RUNNER_DIR:-/opt/gh-runner}"
+RUNNER_USER="${RUNNER_USER:-gh-runner}"
+RUNNER_VERSION="2.337.0"
+RUNNER_SHA256="70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613"
+RUNNER_TARBALL="actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+RUNNER_DOWNLOAD="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${RUNNER_TARBALL}"
+
+log() { printf '[register_runner] %s\n' "$*"; }
+
+[ "$(id -u)" -eq 0 ] || { log "must run as root (the provision step)"; exit 1; }
+[ -n "${RUNNER_TOKEN:-}" ] || { log "RUNNER_TOKEN is required (mint a fresh one; it lives 1 hour)"; exit 1; }
+case "${RUNNER_URL}" in
+  https://github.com/*) ;;
+  *) log "RUNNER_URL must be an https://github.com/... URL"; exit 1 ;;
+esac
+
+# The runner refuses to run as root, so the agent runs as a dedicated user
+# with no sudo grants: that user is the security boundary between job code
+# and the provision layer.
+if ! id -u "${RUNNER_USER}" >/dev/null 2>&1; then
+  useradd --create-home --shell /bin/bash "${RUNNER_USER}"
+  passwd -l "${RUNNER_USER}" >/dev/null 2>&1 || true
+fi
+
+log "installing runner host prerequisites"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -q
+apt-get install -y -q --no-install-recommends \
+  ca-certificates curl git jq libicu70 libkrb5-3 zlib1g \
+  build-essential python3 pkg-config binutils
+
+mkdir -p "${RUNNER_DIR}"
+if [ -f "${RUNNER_DIR}/.runner" ]; then
+  log "already registered (fresh-provision contract violated): refusing to double-register"
+  exit 1
+fi
+
+log "fetching runner v${RUNNER_VERSION} (sha256-pinned)"
+curl -fsSL -o "/tmp/${RUNNER_TARBALL}" "${RUNNER_DOWNLOAD}"
+echo "${RUNNER_SHA256}  /tmp/${RUNNER_TARBALL}" | sha256sum -c -
+tar -xzf "/tmp/${RUNNER_TARBALL}" -C "${RUNNER_DIR}"
+rm -f "/tmp/${RUNNER_TARBALL}"
+chown -R "${RUNNER_USER}:${RUNNER_USER}" "${RUNNER_DIR}"
+
+# config.sh validates the token against GitHub and writes the registration
+# state; the token only ever crosses as an argv to config.sh (never logged,
+# never echoed by this script). A bad/expired token fails here, leaving no
+# partial registration.
+log "registering '${RUNNER_NAME}' with labels [${RUNNER_LABELS}] at ${RUNNER_URL}"
+su -s /bin/bash "${RUNNER_USER}" -c "cd '${RUNNER_DIR}' && ./config.sh --unattended \
+  --url '${RUNNER_URL}' \
+  --token '${RUNNER_TOKEN}' \
+  --name '${RUNNER_NAME}' \
+  --labels '${RUNNER_LABELS}'"
+
+# Sandboxes have no systemd (the sandbox init is not systemd): run the agent
+# under a restart-on-exit supervision loop instead of svc.sh. The loop is a
+# small script file in the runner directory (no nested quoting through
+# su/bash -c layers); it logs each exit, and a stopped runner shows up as
+# Offline in the runner list, which is the alerting surface
+# (docs/sandbox-runners.md).
+log "starting the runner agent (supervision loop)"
+cat > "${RUNNER_DIR}/runner-supervise.sh" <<'SUPERVISE'
+#!/bin/bash
+cd "$(dirname "$0")"
+while true; do
+  ./run.sh
+  rc=$?
+  printf '[register_runner] run.sh exited rc=%s at %s; restarting in 10s\n' \
+    "$rc" "$(date -u +%FT%TZ)" >> runner-supervisor.log
+  sleep 10
+done
+SUPERVISE
+chown "${RUNNER_USER}:${RUNNER_USER}" "${RUNNER_DIR}/runner-supervise.sh"
+chmod 700 "${RUNNER_DIR}/runner-supervise.sh"
+su -s /bin/bash "${RUNNER_USER}" -c "setsid nohup ${RUNNER_DIR}/runner-supervise.sh > /dev/null 2>&1 < /dev/null &"
+
+log "runner provisioned: name=${RUNNER_NAME} labels=[${RUNNER_LABELS}] dir=${RUNNER_DIR}"
+log "verify: it should appear Idle in the GitHub runner list within a minute"

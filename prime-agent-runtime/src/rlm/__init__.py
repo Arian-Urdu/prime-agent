@@ -571,8 +571,12 @@ async def _job_watch_loop(handle: Any, interval: float, baseline: int) -> None:
     finally:
         # The watch always ends with the job: the entry leaves the table
         # so `job_list` reports only live watches and a re-registration on
-        # the same pid starts a fresh poller.
-        _JOB_WATCHES.pop(pid, None)
+        # the same pid starts a fresh poller. The pop only fires when this
+        # task still owns the entry — a cancelled task's finally must not
+        # undo a replacement registration that reused the pid.
+        entry = _JOB_WATCHES.get(pid)
+        if entry is not None and entry["task"] is asyncio.current_task():
+            _JOB_WATCHES.pop(pid, None)
 
 
 async def watch_job(handle: Any, interval_seconds: float = 5.0) -> dict[str, Any]:

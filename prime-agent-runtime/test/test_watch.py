@@ -157,6 +157,28 @@ class RlmWatchAgentTest(unittest.TestCase):
             asyncio.run(rlm.rlm.watch.agent_cancel("watch-agent-sub-1"))
         host_request.assert_awaited_once_with("rlm.watch.agent_cancel", {"id": "watch-agent-sub-1"})
 
+    def test_cancelled_watch_finally_does_not_pop_a_replacement(self) -> None:
+        """A re-registration on the same pid survives the cancelled task's cleanup."""
+
+        async def scenario() -> None:
+            rlm._JOB_WATCHES.clear()
+            first = FakeJobHandle(4244, ["a" * 10])
+            first.running = True
+            await rlm.rlm.watch.job(first, interval_seconds=0.05)
+            # Cancel the live watch (the task is cancelled but its finally
+            # may run late), then immediately re-register on the same pid.
+            rlm.rlm.watch.job_cancel(4244)
+            second = FakeJobHandle(4244, ["b" * 10])
+            second.running = True
+            result = await rlm.rlm.watch.job(second, interval_seconds=0.05)
+            self.assertEqual(result, {"pid": 4244, "watching": True})
+            # Let the cancelled task's finally run: the replacement stays.
+            await asyncio.sleep(0.02)
+            self.assertEqual(rlm.rlm.watch.job_list(), [{"pid": 4244, "interval": 0.05}])
+
+        asyncio.run(scenario())
+        rlm._JOB_WATCHES.clear()
+
     def test_agent_watch_rejects_empty_targets_before_the_host_request(self) -> None:
         host_request = AsyncMock(return_value={})
         with patch.object(rlm, "host_request", host_request):

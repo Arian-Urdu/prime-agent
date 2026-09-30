@@ -108,8 +108,12 @@ impl SessionNavigation {
             core.store = Some(file);
         }
         // The replacement session starts on the default push lane with
-        // fresh counters (the TS replacement built a new AgentSession).
+        // fresh counters (the TS replacement built a new AgentSession) —
+        // and its watches die with the replaced session (TS #2356: the
+        // registry is cleared on dispose; stale subscriptions must not
+        // bleed into the new session's notices).
         self.agent_digest.reset_session_state();
+        self.engine.clear_agent_watches();
         self.engine.set_session_file(new_path.clone());
         // TS re-restores the moved-to session's saved model at its runtime
         // recreation (`createRuntime` -> `createAgentSession`): the

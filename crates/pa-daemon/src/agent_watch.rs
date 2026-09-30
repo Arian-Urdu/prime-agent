@@ -177,6 +177,13 @@ impl AgentWatchRegistry {
                 subscription.last_status.clone_from(&snapshot.status);
                 change
             });
+            // A count BELOW the baseline (the child compacted: the store's
+            // message count restarted from the kept window) re-baselines
+            // silently — a shrink is a discontinuity, not negative growth,
+            // and the watch must keep emitting ranges from the new count.
+            if snapshot.message_count < subscription.last_seen_messages {
+                subscription.last_seen_messages = snapshot.message_count;
+            }
             let from_index = subscription.last_seen_messages;
             if snapshot.message_count > from_index || status_change.is_some() {
                 subscription.last_seen_messages = snapshot.message_count;
@@ -315,6 +322,48 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("active"), "{error}");
+    }
+
+    #[test]
+    fn a_shrinking_count_compaction_re_baselines_and_keeps_emitting() {
+        let mut registry = AgentWatchRegistry::default();
+        registry
+            .register(
+                "w1",
+                "child-1",
+                "active-1",
+                "c1",
+                AgentWatchSnapshot {
+                    message_count: 10,
+                    status: "idle".to_string(),
+                },
+            )
+            .unwrap();
+        // The child compacted: the count restarts below the old baseline.
+        let mut seen: Vec<String> = Vec::new();
+        let shrunk = |_child: &str| {
+            Some(AgentWatchSnapshot {
+                message_count: 4,
+                status: "idle".to_string(),
+            })
+        };
+        registry.poll(&mut AgentWatchState {
+            message_count: &shrunk,
+            on_event: &mut |_event| {},
+        });
+        // Growth from the re-baselined count still emits a correct range.
+        let grown = |_child: &str| {
+            Some(AgentWatchSnapshot {
+                message_count: 7,
+                status: "idle".to_string(),
+            })
+        };
+        registry.poll(&mut AgentWatchState {
+            message_count: &grown,
+            on_event: &mut |event| seen.push(format_agent_watch_notice(&event)),
+        });
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].contains("messages 4..7 (+3)"), "{seen:?}");
     }
 
     #[test]

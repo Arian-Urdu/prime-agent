@@ -307,6 +307,15 @@ impl AgentSessionEngine {
         );
     }
 
+    /// Clear every watch subscription (the "watchers die with the session"
+    /// rule at a session replacement: the reused engine must not carry the
+    /// replaced session's subscriptions into the new one). The shared
+    /// poller exits on its next tick (the empty registry disarms it).
+    pub fn clear_agent_watches(&self) {
+        let mut state = self.watch_host_state();
+        state.registry = AgentWatchRegistry::default();
+    }
+
     /// The watch host state accessor (register/poll paths hold the lock
     /// briefly; the poll task clones what it needs).
     pub(crate) fn watch_host_state(&self) -> std::sync::MutexGuard<'_, AgentWatchHostState> {

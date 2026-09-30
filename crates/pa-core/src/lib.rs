@@ -90,4 +90,5 @@ pub mod slash_command_args;
 // unit batteries; per the crate facade policy its surface stays crate-private.
 pub(crate) mod system_router;
 pub mod update;
+pub mod workspace_snapshot;
 pub use kernel::ReplKernelManager;

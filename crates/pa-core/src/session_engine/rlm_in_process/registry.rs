@@ -57,6 +57,11 @@ pub struct InProcessChildRecord {
     pub(crate) child_host: Arc<InProcessRlmHost>,
     /// The settle signal `collect` waits on.
     pub(crate) settled_tx: watch::Sender<bool>,
+    /// The closed signal the run task races its task prompt against: a
+    /// delete or close mid-run (including before the prompt registers)
+    /// tears the task down within one slice instead of letting a closed
+    /// record start or keep a turn.
+    pub(crate) closed_tx: watch::Sender<bool>,
     state: Mutex<ChildRunState>,
 }
 
@@ -115,6 +120,7 @@ impl InProcessChildRecord {
         child_host: Arc<InProcessRlmHost>,
     ) -> Self {
         let (settled_tx, _) = watch::channel(false);
+        let (closed_tx, _) = watch::channel(false);
         Self {
             rlm_child_id,
             session_name,
@@ -125,6 +131,7 @@ impl InProcessChildRecord {
             engine,
             child_host,
             settled_tx,
+            closed_tx,
             state: Mutex::new(ChildRunState {
                 settled_status: None,
                 answer_preview: None,
@@ -193,6 +200,20 @@ impl InProcessChildRecord {
     /// notice admission have all landed.
     pub(crate) fn publish_settled(&self) {
         let _ = self.settled_tx.send(true);
+    }
+
+    /// Mark the record closed by its parent (delete or close) and wake the
+    /// closed watch so the run task stops racing its prompt against a
+    /// record that no longer belongs to the registry.
+    pub(crate) async fn mark_closed(&self) {
+        self.state().await.closed_by_parent = true;
+        let _ = self.closed_tx.send(true);
+    }
+
+    /// Whether the record was closed by its parent (a cheap flag read for
+    /// the settle loop's ticks; the watch is the prompt race's wake).
+    pub(crate) async fn is_closed(&self) -> bool {
+        self.state().await.closed_by_parent
     }
 
     /// Take and unsubscribe the child event listener (idempotent). The

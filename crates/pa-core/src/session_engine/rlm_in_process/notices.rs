@@ -23,14 +23,28 @@ async fn deliver_notice_row(host: &InProcessRlmHost, row: pa_types::session::Cus
     };
     let session = &parent.session;
     if session.agent().state().await.is_streaming {
-        session.queue_next_turn_row(row);
-    } else if session
-        .prompt_injected_message_until_accepted(&row)
-        .await
-        .is_err()
-    {
-        // A turn raced the idle check: the deferral arm owns the fallback.
-        session.queue_next_turn_row(row);
+        // TS's deferred immediate action: the busy parent admits the row
+        // through the steering lane, so the CURRENT run delivers it at its
+        // next boundary — no future user turn is required (the volatile
+        // next-turn mailbox would strand it on a quiet session).
+        super::family::steer_custom_row(session, &row);
+        return;
+    }
+    match session.prompt_injected_message_until_accepted(&row).await {
+        Ok(_) => {}
+        Err(error) => {
+            if session.agent().state().await.is_streaming {
+                // A turn raced the idle check: the steering lane owns the
+                // fallback, same as the busy arm.
+                super::family::steer_custom_row(session, &row);
+            } else {
+                // A genuine admission failure is exceptional (a digest
+                // capture failing, say): the next-turn mailbox is the
+                // last resort so the row is never dropped outright.
+                let _ = error;
+                session.queue_next_turn_row(row);
+            }
+        }
     }
 }
 

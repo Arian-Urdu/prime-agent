@@ -357,11 +357,11 @@ impl InProcessRlmHost {
     pub async fn close_children(&self) {
         let children = self.children().await;
         for record in &children {
-            {
-                let mut state = record.state().await;
-                state.closed_by_parent = true;
-                state.notice_delivered = true;
-            }
+            // No notice is owed (the parent is going away), and the
+            // closed watch wakes the run task's prompt race so its own
+            // descendants cascade through the teardown.
+            record.state().await.notice_delivered = true;
+            record.mark_closed().await;
             let () = record
                 .settle_as("cancelled", Some("Closed with parent session".to_string()))
                 .await;

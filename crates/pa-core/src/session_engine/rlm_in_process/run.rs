@@ -45,18 +45,30 @@ pub(super) async fn run_child_task(
     // The daemon prompt shape: the raw task text as the child's first
     // user row (the in-process host matches the established Rust child
     // surface; the TS custom-row spawn label is a documented divergence).
-    // The prompt is raced against parent teardown: a stalled run never
-    // returns on its own, and the parent's engine dropping must tear this
-    // run down promptly, not only after the run happens to end.
+    // The prompt is raced against the record's closed watch AND parent
+    // teardown: a delete or close (which can land between the listener
+    // install and the prompt registration, where its abort finds an idle
+    // agent and would otherwise leave a closed record running a turn) and
+    // a dropped parent engine both tear the task down within one slice.
     let admission = tokio::select! {
         result = record.engine.session.prompt(
             &prompt,
             crate::session_engine::PromptOptions::default(),
         ) => Some(result),
-        () = parent_gone(&host) => None,
+        () = closed_or_parent_gone(&host, &record) => None,
     };
     match admission {
-        None => teardown_close(&host, &record).await,
+        None => {
+            // Which teardown: a closed record (delete or close) leaves the
+            // terminal verdict's error to the closer — the delete's
+            // tombstone reads its own fallback reason either way — while
+            // a dropped parent engine owns its own end text.
+            if record.is_closed().await {
+                teardown_closed(&host, &record).await;
+            } else {
+                teardown_parent_gone(&host, &record).await;
+            }
+        }
         Some(Err(error)) => {
             // The terminal sequence keeps its order: accounting, notice
             // admission, THEN the settled state and its wake signal — the
@@ -68,28 +80,52 @@ pub(super) async fn run_child_task(
             TaskSettle::Done => {
                 finish_run(&host, &record, &TaskVerdict::Done).await;
             }
-            TaskSettle::ParentGone => teardown_close(&host, &record).await,
+            TaskSettle::Closed => teardown_closed(&host, &record).await,
+            TaskSettle::ParentGone => teardown_parent_gone(&host, &record).await,
         },
     }
 }
 
-/// Resolve once the parent engine is gone (the binding weak died). Bounded
-/// polling: teardown latency is one settle slice.
-async fn parent_gone(host: &InProcessRlmHost) {
+/// Resolve once the record is closed (delete or close) or the parent
+/// engine is gone (the binding weak died). Bounded ticks wake on the
+/// closed watch's own signal; teardown latency is one settle slice.
+async fn closed_or_parent_gone(host: &InProcessRlmHost, record: &Arc<InProcessChildRecord>) {
+    let mut closed = record.closed_tx.subscribe();
     loop {
         if host.parent_engine().is_none() {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(SETTLE_POLL_SLICE_MS)).await;
+        if *closed.borrow_and_update() {
+            return;
+        }
+        tokio::select! {
+            changed = closed.changed() => {
+                if changed.is_ok() && *closed.borrow_and_update() {
+                    return;
+                }
+            }
+            () = tokio::time::sleep(Duration::from_millis(SETTLE_POLL_SLICE_MS)) => {}
+        }
     }
 }
 
-/// Parent teardown: nothing observes this run's result anymore. Abort it,
-/// close the whole descendant subtree (grandchildren cascade the same
-/// way through their own run tasks), settle the record, and run the
-/// terminal sequence so the engine tears down with this task's exit
-/// instead of outliving its parent.
-async fn teardown_close(host: &InProcessRlmHost, record: &Arc<InProcessChildRecord>) {
+/// Teardown of a run nobody observes anymore. Abort the run, close the
+/// whole descendant subtree (grandchildren cascade through their own run
+/// tasks), settle the record, and run the terminal sequence so the
+/// engine tears down with this task's exit instead of outliving its
+/// registry removal. The two variants differ only in the settle error:
+/// a closed record leaves the verdict's error to its closer (the delete
+/// path's tombstone reads its own fallback reason whichever settle wins
+/// the race), a dropped parent records the teardown reason.
+async fn teardown_closed(host: &InProcessRlmHost, record: &Arc<InProcessChildRecord>) {
+    record.engine.session.agent().abort();
+    record.child_host.close_children().await;
+    record.settle_as("cancelled", None).await;
+    finish_run(host, record, &TaskVerdict::Cancelled).await;
+}
+
+/// The parent-engine teardown variant (the binding weak died).
+async fn teardown_parent_gone(host: &InProcessRlmHost, record: &Arc<InProcessChildRecord>) {
     record.engine.session.agent().abort();
     record.child_host.close_children().await;
     record
@@ -374,9 +410,11 @@ async fn child_usage_origin(
     ChildUsageOrigin::DirectUser
 }
 
-/// How the task run ended: drained on its own, or its parent tore down.
+/// How the task run ended: drained on its own, closed by its parent
+/// (delete or close), or its parent tore down.
 enum TaskSettle {
     Done,
+    Closed,
     ParentGone,
 }
 
@@ -396,11 +434,14 @@ async fn wait_for_task_settle(
         if host.parent_engine().is_none() {
             return TaskSettle::ParentGone;
         }
+        if record.is_closed().await {
+            return TaskSettle::Closed;
+        }
         let agent = record.engine.session.agent();
         // Every iteration waits a bounded slice — an idle agent's
         // `wait_for_idle` resolves immediately (no run slot), so racing
         // it bare would spin; a busy run gets the slice as its tick so a
-        // parent teardown is still noticed mid-stream.
+        // parent teardown or a mid-run delete is still noticed promptly.
         if agent.state().await.is_streaming {
             tokio::select! {
                 () = agent.wait_for_idle() => {}
@@ -411,6 +452,9 @@ async fn wait_for_task_settle(
         }
         if host.parent_engine().is_none() {
             return TaskSettle::ParentGone;
+        }
+        if record.is_closed().await {
+            return TaskSettle::Closed;
         }
         let child_host = record.child_host.clone();
         let stable = !agent.has_queued_messages() && !child_host.any_running().await;
@@ -548,23 +592,24 @@ pub(super) fn delete_subagent(
     Box::pin(async move {
         let record = resolve_record(&host, &target, "subagent").await?;
         let was_running = record.is_running().await;
-        {
-            let mut state = record.state().await;
-            state.closed_by_parent = true;
-        }
+        // Closed first: the run task's prompt race sees the watch and
+        // tears itself down (its own descendants cascade through it).
+        record.mark_closed().await;
         if was_running {
-            // No recorded error: the tombstone's envelope reads the TS
-            // fallback reason ("Deleted by parent orchestrator"), the
-            // same text the cancelled notice carries. The notice claim is
-            // reserved here — the delete path owns the cancellation row,
-            // and the run arm's racing claim collapses into it.
-            record.settle_as("cancelled", None).await;
+            // The cancellation notice admits BEFORE the settled state
+            // lands: a concurrent collect never observes the cancelled
+            // verdict ahead of the notice admission, and the delete
+            // receipt itself (built after the settle) implies it. The
+            // notice claim is the delete's — the run arm's racing claim
+            // collapses into it. No recorded error: the tombstone's
+            // envelope reads the TS fallback reason.
             super::notices::deliver_cancelled_notice(
                 &host,
                 &record,
                 "Deleted by parent orchestrator",
             )
             .await;
+            record.settle_as("cancelled", None).await;
             record.engine.session.agent().abort();
         }
         host.remember_deleted_child(&record).await;

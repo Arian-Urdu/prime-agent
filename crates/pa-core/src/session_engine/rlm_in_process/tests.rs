@@ -529,6 +529,23 @@ async fn deleting_a_running_child_delivers_the_cancelled_notice() {
         .await
         .unwrap();
     assert_eq!(deleted.outcome, Some("deleted"));
+    // The cancellation notice admitted BEFORE the settled state landed, so
+    // the delete receipt itself implies it: at the receipt's return the
+    // notice turn is streaming or its row already persisted — no
+    // polling-ahead window exists for a concurrent collect.
+    let streaming = rig.engine.session.agent().state().await.is_streaming;
+    let notice_admitted = rig.parent_rows().await.iter().any(|entry| {
+        matches!(
+            entry,
+            pa_types::session::FileEntry::CustomMessage { payload, .. }
+                if payload.custom_type
+                    == crate::session_engine::rlm_notices::RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE
+        )
+    });
+    assert!(
+        streaming || notice_admitted,
+        "the delete receipt implies the cancelled notice admission"
+    );
     eventually("the deleted running child's engine to drop", || {
         let probe = engine_weak.clone();
         async move { probe.upgrade().is_none() }
@@ -657,6 +674,136 @@ async fn dropping_the_parent_engine_closes_the_running_subtree() {
         async move { probe.upgrade().is_none() }
     })
     .await;
+    let _ = handle;
+}
+
+#[tokio::test]
+async fn deleting_a_child_closes_its_own_running_descendants() {
+    let rig = TestRig::new().await;
+    rig.catalog
+        .provider("glm-5.3-turbo")
+        .push_stalled_turn("child partial");
+    let handle = rig
+        .host
+        .spawn(spawn_request(
+            Some("parent-of-grand"),
+            Some("test-provider/glm-5.3-turbo"),
+        ))
+        .await
+        .unwrap();
+    // A grandchild runs under the child; the parent-side delete only
+    // closes the child record — the closed watch must make the child's
+    // run task tear down its own descendant subtree.
+    rig.catalog
+        .provider("glm-5.3-turbo")
+        .push_stalled_turn("grand partial");
+    let child = rig.first_child().await;
+    child
+        .child_host
+        .spawn(spawn_request(
+            Some("grand"),
+            Some("test-provider/glm-5.3-turbo"),
+        ))
+        .await
+        .unwrap();
+    let child_weak = Arc::downgrade(&child.engine);
+    let grand_weak = {
+        let grand = child
+            .child_host
+            .children()
+            .await
+            .first()
+            .map(|record| Arc::clone(&record.engine))
+            .expect("the grandchild");
+        Arc::downgrade(&grand)
+    };
+    drop(child);
+    rig.host
+        .delete_subagent(handle.rlm_child_id.clone())
+        .await
+        .unwrap();
+    eventually("the deleted child's engine to drop", || {
+        let probe = child_weak.clone();
+        async move { probe.upgrade().is_none() }
+    })
+    .await;
+    eventually("the grandchild engine to drop through the cascade", || {
+        let probe = grand_weak.clone();
+        async move { probe.upgrade().is_none() }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_notice_to_a_busy_parent_rides_the_steering_lane() {
+    let rig = TestRig::new().await;
+    // The parent runs a stalled turn; the child fails instantly, so its
+    // failure notice fires while the parent is busy.
+    rig.catalog.provider("glm-5.3").push_stalled_turn("busy");
+    rig.engine
+        .session
+        .prompt(
+            "hold the line",
+            crate::session_engine::PromptOptions {
+                return_after_accepted: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let parent = Arc::clone(&rig.engine);
+    eventually("the parent to stream its stalled turn", move || {
+        let parent = Arc::clone(&parent);
+        async move { parent.session.agent().state().await.is_streaming }
+    })
+    .await;
+    rig.catalog
+        .provider("glm-5.3-turbo")
+        .push_fail_start_turn("child exploded");
+    let handle = rig
+        .host
+        .spawn(spawn_request(
+            Some("failing"),
+            Some("test-provider/glm-5.3-turbo"),
+        ))
+        .await
+        .unwrap();
+    // The busy parent does NOT park the notice on the volatile next-turn
+    // mailbox: the row steers onto the running turn's delivery lane.
+    eventually("the notice on the steering lane", || {
+        let previews = rig.engine.session.agent().steering_previews().len();
+        async move { previews >= 1 }
+    })
+    .await;
+    // The steered row delivers with the next admitted turn (here: the
+    // aborted stalled run ends and the test's follow-up prompt starts the
+    // delivery run, the same vehicle any queue resumption would use).
+    rig.engine.session.agent().abort();
+    rig.engine.session.agent().wait_for_idle().await;
+    rig.catalog.provider("glm-5.3").push_text_turn("delivery");
+    rig.engine
+        .session
+        .prompt(
+            "deliver it",
+            crate::session_engine::PromptOptions::default(),
+        )
+        .await
+        .unwrap();
+    rig.engine.session.agent().wait_for_idle().await;
+    let failure_rows = rig
+        .parent_rows()
+        .await
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry,
+                pa_types::session::FileEntry::CustomMessage { payload, .. }
+                    if payload.custom_type
+                        == crate::session_engine::rlm_notices::RLM_CHILD_FAILURE_CUSTOM_TYPE
+            )
+        })
+        .count();
+    assert_eq!(failure_rows, 1, "the steered notice row persisted");
     let _ = handle;
 }
 

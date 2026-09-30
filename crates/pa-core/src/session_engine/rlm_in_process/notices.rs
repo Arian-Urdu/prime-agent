@@ -44,18 +44,33 @@ pub(super) fn terminal_row(
 
 /// Keep the winning claim pending on every admission failure. Retrying the
 /// exact same row is safe: the parent session's stable key is idempotent.
-/// A closed parent is handled by the closer's separate first-wins claim.
-pub(super) async fn admit_claimed_notice(
+/// A permanently refused generation parks the immutable claim with its
+/// diagnostic; close freezes a parked retry before releasing the child.
+pub(super) enum AdmissionRow {
+    Terminal(pa_types::session::CustomMessage),
+    Reply(pa_types::session::CustomMessage),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RetryPolicy {
+    SparseWhileOpen,
+    ParkAfterBurst,
+}
+
+pub(super) async fn admit_claimed_row(
     record: &Arc<InProcessChildRecord>,
     parent: Arc<crate::session_engine::engine::SessionEngine>,
-    row: pa_types::session::CustomMessage,
+    row: AdmissionRow,
+    retry_policy: RetryPolicy,
 ) -> bool {
     const BURST_ATTEMPTS: u32 = 3;
     const PARKED_RETRY_MS: u64 = 5_000;
     let mut failures = 0_u32;
     let mut held_parent = Some(parent);
     let mut closed = record.closed_tx.subscribe();
-    record.clear_parked().await;
+    if !record.clear_parked().await {
+        return false;
+    }
     loop {
         // The original parent stays alive for the whole transaction. Close
         // waits until this transaction commits or parks; once closed, no
@@ -76,11 +91,25 @@ pub(super) async fn admit_claimed_notice(
             record.mark_parked().await;
             return false;
         };
-        let result = parent
-            .session
-            .admit_terminal_notice(&record.parent_session_id, &record.rlm_child_id, &row)
-            .await;
+        let retry_gate = record.notice_retry_gate.lock().await;
+        if record.state().await.generation_frozen {
+            return false;
+        }
+        let result = match &row {
+            AdmissionRow::Terminal(message) => {
+                parent
+                    .session
+                    .admit_terminal_notice(&record.parent_session_id, &record.rlm_child_id, message)
+                    .await
+            }
+            AdmissionRow::Reply(message) => parent
+                .session
+                .admit_durable_reply(message)
+                .await
+                .map(|_| ()),
+        };
         drop(parent);
+        drop(retry_gate);
         match result {
             Ok(()) => return true,
             Err(error) => {
@@ -100,6 +129,9 @@ pub(super) async fn admit_claimed_notice(
             // run task makes sparse retry attempts while the parent stays
             // open; close wakes it and releases its listener/engine.
             record.mark_parked().await;
+            if retry_policy == RetryPolicy::ParkAfterBurst {
+                return false;
+            }
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_millis(PARKED_RETRY_MS)) => {}
                 changed = closed.changed() => {
@@ -109,7 +141,9 @@ pub(super) async fn admit_claimed_notice(
             if *closed.borrow_and_update() {
                 return false;
             }
-            record.clear_parked().await;
+            if !record.clear_parked().await {
+                return false;
+            }
             failures = 0;
             continue;
         }

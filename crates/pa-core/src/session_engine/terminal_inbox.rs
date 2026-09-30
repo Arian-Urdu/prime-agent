@@ -97,6 +97,39 @@ impl AgentSession {
         }
     }
 
+    /// Strictly retain one explicit child reply before accepting it into
+    /// the parent's live agent. The reply's stable `details.id` is the
+    /// file-backed settle proof for a no-notice `DoneReplied` claim.
+    pub(crate) async fn admit_durable_reply(
+        &self,
+        row: &CustomMessage,
+    ) -> anyhow::Result<AdmitStatus> {
+        let mut admission = self.terminal_admission.lock().await;
+        if admission.closed {
+            return Err(ClosedTerminalGeneration.into());
+        }
+        let id = row
+            .details
+            .as_ref()
+            .and_then(|details| details.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("explicit reply lacks a stable id"))?;
+        self.session.lock().await.append_agent_message(row)?;
+        self.pre_synced_reply_ids
+            .lock()
+            .expect("pre-synced reply lock")
+            .insert(id.to_string());
+        if admission.registered_replies.contains(id) {
+            return Ok(AdmitStatus::Busy);
+        }
+        let batch = self.injected_prompt_messages(row).await?;
+        let status = self
+            .agent
+            .admit_or_enqueue(pa_agent::agent::AgentMessageBatch::Batch(batch));
+        admission.registered_replies.insert(id.to_string());
+        Ok(status)
+    }
+
     /// Re-admit from the original JSONL rows after binding an engine. The
     /// manager's stable-key append is idempotent: replay never writes a
     /// second notice row. A synced notice without a consumed marker remains

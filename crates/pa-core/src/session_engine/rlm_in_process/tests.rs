@@ -4305,3 +4305,408 @@ async fn a_forced_assistant_persistence_failure_leaves_the_notice_pending() {
         .collect();
     assert!(unconsumed.is_empty());
 }
+
+#[tokio::test]
+async fn a_fail_once_cancelled_delete_recovers_within_its_own_burst() {
+    // A TRANSIENT single admission failure must not park a delete's own
+    // Cancelled claim or require a second user delete: the task-abort
+    // closed signal is not a parent-generation close, so the claimant
+    // keeps its bounded three-attempt burst (250/500ms) while the
+    // original parent stays open — and the FIRST delete succeeds.
+    let rig = TestRig::new().await;
+    let parent_file = session_file_of(&rig.engine).await;
+    rig.run_parent_turn("first turn").await;
+    rig.catalog
+        .provider("glm-5.3-turbo")
+        .push_stalled_turn("child partial");
+    let handle = rig
+        .host
+        .spawn(spawn_request(
+            Some("fail-once"),
+            Some("test-provider/glm-5.3-turbo"),
+        ))
+        .await
+        .unwrap();
+    let child = rig.first_child().await;
+    let child_engine = Arc::clone(&child.engine);
+    eventually("the child to stream", move || {
+        let engine = Arc::clone(&child_engine);
+        async move { engine.session.agent().state().await.is_streaming }
+    })
+    .await;
+    // Fail exactly the first admission attempt, then clear the fault
+    // inside the burst's backoff window.
+    rig.engine
+        .session
+        .shared_persistence()
+        .lock()
+        .await
+        .set_notice_append_fault(true);
+    let child_id = handle.rlm_child_id.clone();
+    let delete = tokio::spawn({
+        let host = Arc::clone(&rig.host);
+        let target = child_id.clone();
+        async move { host.delete_subagent(target).await.unwrap() }
+    });
+    eventually("the first admission attempt to fail", || {
+        let child = &child;
+        async move { child.state().await.admission_error.is_some() }
+    })
+    .await;
+    rig.engine
+        .session
+        .shared_persistence()
+        .lock()
+        .await
+        .set_notice_append_fault(false);
+    // The claimant's own burst retries land the row: the FIRST delete
+    // returns a successful cancelled receipt — never a parked refusal
+    // and never a second user delete.
+    let deleted = delete.await.expect("the first delete succeeds");
+    assert_eq!(deleted.outcome, Some("deleted"));
+    assert_eq!(deleted.subagent.status, "cancelled");
+    assert_eq!(
+        child.state().await.settled_status,
+        Some("cancelled"),
+        "the delete's own burst published its cancelled verdict"
+    );
+    let rows = raw_notice_rows(&parent_file);
+    assert_eq!(rows.len(), 1, "one cancelled row through the burst");
+    assert_eq!(rows[0].kind, "cancelled");
+    assert_eq!(rows[0].child_id, handle.rlm_child_id);
+    let collected = rig
+        .host
+        .collect(vec![handle.rlm_child_id.clone()], 0)
+        .await
+        .unwrap();
+    let result = one(&collected);
+    assert!(result.settled);
+    assert_eq!(result.status, "cancelled");
+    assert!(rig.host.list_subagents().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_parked_claim_is_frozen_against_its_timed_retry_across_a_descendant_close() {
+    // The close must atomically freeze a genuinely parked claim against
+    // its sparse timed retry: while the closer walks a held descendant
+    // subtree, the parked retry must NOT reactivate — no new admission,
+    // no settle, no row — and the close completes with the claim still
+    // pending.
+    let rig = TestRig::new().await;
+    let parent_file = session_file_of(&rig.engine).await;
+    rig.run_parent_turn("first turn").await;
+    // A child whose error claim parks (the persistent fault exhausts the
+    // three-attempt burst), with a stalled grandchild under it so the
+    // closer's descendant walk does real, gatable work.
+    rig.engine
+        .session
+        .shared_persistence()
+        .lock()
+        .await
+        .set_notice_append_fault(true);
+    rig.catalog
+        .provider("glm-5.3-turbo")
+        .push_fail_start_turn("child exploded");
+    let handle = rig
+        .host
+        .spawn(spawn_request(
+            Some("frozen"),
+            Some("test-provider/glm-5.3-turbo"),
+        ))
+        .await
+        .unwrap();
+    let child = rig.first_child().await;
+    eventually("the claim to park after its burst", || {
+        let child = &child;
+        async move { child.state().await.parked }
+    })
+    .await;
+    assert!(
+        child.state().await.settled_status.is_none(),
+        "a parked claim never settles"
+    );
+    // A stalled grandchild under the child; its Claimed/BeforePublish
+    // gates hold the closer mid-descendant-walk deterministically.
+    rig.catalog
+        .provider("glm-5.3-turbo")
+        .push_stalled_turn("grand partial");
+    let (grand_claimed, grand_publish) = install_child_gates(&child.child_host);
+    let _grand = child
+        .child_host
+        .spawn(spawn_request(
+            Some("grand"),
+            Some("test-provider/glm-5.3-turbo"),
+        ))
+        .await
+        .unwrap();
+    // Clear the fault: from here on, ANY reactivated admission would
+    // succeed and publish — the only thing standing between the parked
+    // claim and a settled row is the close's freeze.
+    rig.engine
+        .session
+        .shared_persistence()
+        .lock()
+        .await
+        .set_notice_append_fault(false);
+    // Fire the close: it observes the parked claim and freezes it, then
+    // walks the descendants — which stall at the grandchild's gate.
+    let closer = tokio::spawn({
+        let host = Arc::clone(&rig.host);
+        async move { host.close_children().await }
+    });
+    grand_claimed.reached().await;
+    assert!(
+        !closer.is_finished(),
+        "the close is held mid-descendant-walk"
+    );
+    // While the closer is held, the parked retry must have exited WITHOUT
+    // reactivating: the run task released its listener (an unfenced
+    // retry would still be asleep holding it — and would succeed on the
+    // cleared fault at its 5s wake, settling and writing a row).
+    eventually("the frozen parked retry to exit", || {
+        let child = &child;
+        async move { child.state().await.listener.is_none() }
+    })
+    .await;
+    // Let the descendant walk finish; the close completes with the claim
+    // STILL parked and unsettled: no reactivation, no row, no tombstone.
+    grand_claimed.release();
+    grand_publish.reached().await;
+    grand_publish.release();
+    closer.await.expect("the close completes");
+    assert!(
+        child.state().await.settled_status.is_none(),
+        "the frozen claim never reactivated across the descendant close"
+    );
+    assert!(child.state().await.parked, "the claim stays parked");
+    assert_eq!(
+        child.claimed_kind().await,
+        Some(super::registry::NoticeKind::Error),
+        "the immutable claim stays with its claimant"
+    );
+    assert!(
+        raw_notice_rows(&parent_file).is_empty(),
+        "the frozen retry never wrote a row"
+    );
+    assert!(rig.host.list_subagents().await.unwrap().is_empty());
+    let error = rig
+        .host
+        .collect(vec![handle.rlm_child_id.clone()], 0)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().starts_with("No direct RLM child matches"),
+        "the close leaves no tombstone"
+    );
+}
+
+#[tokio::test]
+async fn an_existing_file_dir_sync_fault_keeps_one_row_and_the_retry_resyncs() {
+    // The EXISTING-FILE append path must fsync the session directory
+    // before a terminal row's success returns. The fault fires once
+    // after the row's line + file sync + index landed but before the
+    // directory sync: the landed row stays durable, the admission
+    // surfaces the failure, and the idempotent retry re-syncs the SAME
+    // row — never a second one.
+    let rig = TestRig::new().await;
+    let parent_file = session_file_of(&rig.engine).await;
+    // An already-flushed, existing file: the notice append takes the
+    // single-line arm (not the fresh wholesale rewrite).
+    rig.run_parent_turn("first turn").await;
+    crate::session::manager::fault_hooks::arm(
+        &parent_file,
+        crate::session::manager::fault_hooks::Fault::AppendDirSyncFail,
+        1,
+    );
+    rig.catalog
+        .provider("glm-5.3-turbo")
+        .push_text_turn("child done");
+    rig.catalog.provider("glm-5.3").push_text_turn("notice ack");
+    let handle = rig
+        .host
+        .spawn(spawn_request(
+            Some("dirsynced"),
+            Some("test-provider/glm-5.3-turbo"),
+        ))
+        .await
+        .unwrap();
+    let collected = rig
+        .host
+        .collect(vec![handle.rlm_child_id.clone()], 10_000)
+        .await
+        .unwrap();
+    let result = one(&collected);
+    assert_eq!(result.status, "done");
+    assert!(result.settled, "the retry settled the winner");
+    // The landed row is the one canonical row: the retry re-synced it
+    // in place instead of appending a duplicate.
+    let rows = raw_notice_rows(&parent_file);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the dir-sync fault left exactly one row (every line parses)"
+    );
+    assert_eq!(rows[0].child_id, handle.rlm_child_id);
+    assert_eq!(rows[0].kind, "completed_without_reply");
+    assert!(rows[0].content.contains("no-reply child:dirsynced"));
+    let parent_id = rig.engine.session.session_id().await;
+    assert_eq!(
+        rows[0].notice_key,
+        format!("{}:{}", parent_id, handle.rlm_child_id)
+    );
+}
+
+#[tokio::test]
+async fn an_undurable_reply_keeps_done_replied_pending_until_the_row_lands() {
+    // A busy parent's explicit reply whose DURABLE admission fails must
+    // not let DoneReplied publish: the reserved reply stays pending on
+    // the claim, the verdict holds with its diagnostic, and only the
+    // recovered durable reply row settles it — with NO terminal notice
+    // row ever owed.
+    let rig = TestRig::new().await;
+    let parent_file = session_file_of(&rig.engine).await;
+    // One completed turn first (a real durable file), then the parent
+    // stays BUSY across the whole reply sequence.
+    rig.run_parent_turn("first turn").await;
+    rig.catalog.provider("glm-5.3").push_stalled_turn("busy");
+    rig.engine
+        .session
+        .prompt(
+            "hold the line",
+            crate::session_engine::PromptOptions {
+                return_after_accepted: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let parent = Arc::clone(&rig.engine);
+    eventually("the parent to stream", move || {
+        let parent = Arc::clone(&parent);
+        async move { parent.session.agent().state().await.is_streaming }
+    })
+    .await;
+    rig.catalog
+        .provider("glm-5.3-turbo")
+        .push_stalled_turn("child partial");
+    let handle = rig
+        .host
+        .spawn(spawn_request(
+            Some("replier"),
+            Some("test-provider/glm-5.3-turbo"),
+        ))
+        .await
+        .unwrap();
+    let child = rig.first_child().await;
+    let child_engine = Arc::clone(&child.engine);
+    eventually("the child to stream", move || {
+        let engine = Arc::clone(&child_engine);
+        async move { engine.session.agent().state().await.is_streaming }
+    })
+    .await;
+    // The reply's strict durable admission fails: the send errors, the
+    // row is reserved pending on the child, and nothing is durable.
+    rig.engine
+        .session
+        .shared_persistence()
+        .lock()
+        .await
+        .set_notice_append_fault(true);
+    let controller = InProcessFamilyController::new(
+        Arc::clone(&child.child_host),
+        FamilySelf::Child {
+            child_id: handle.rlm_child_id.clone(),
+        },
+    );
+    let family = controller.family().await.unwrap();
+    let error = controller
+        .send_agent_message(AgentMessageSendInput {
+            target: family[0].id.clone(),
+            message: "task done, shipping the report".to_string(),
+            receiver_role: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("notice append fault"), "{error}");
+    assert!(
+        raw_lines(&parent_file)
+            .into_iter()
+            .all(|line| line["customType"]
+                != crate::session_engine::agent_messaging::AGENT_MESSAGE_CUSTOM_TYPE),
+        "the undurable reply landed no row"
+    );
+    assert!(
+        child.state().await.replied_since_task,
+        "the reply is reserved on the claim"
+    );
+    // The child completes: its DoneReplied claim must stay PENDING with
+    // the admission diagnostic while the reply row is undurable.
+    child.engine.session.agent().abort();
+    let child_id = handle.rlm_child_id.clone();
+    eventually("the pending DoneReplied admission diagnostic", || {
+        let rig = &rig;
+        let child_id = child_id.clone();
+        async move {
+            let collected = rig.host.collect(vec![child_id], 0).await.unwrap();
+            let result = one(&collected);
+            result.status == "running"
+                && result
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("Terminal notice admission pending")
+        }
+    })
+    .await;
+    let collected = rig
+        .host
+        .collect(vec![handle.rlm_child_id.clone()], 200)
+        .await
+        .unwrap();
+    assert_eq!(
+        one(&collected).status,
+        "running",
+        "the DoneReplied verdict stays pending until the reply is durable"
+    );
+    let parked_child = Arc::clone(&child);
+    eventually("the undurable reply claim to park", move || {
+        let record = Arc::clone(&parked_child);
+        async move { record.state().await.parked }
+    })
+    .await;
+    // Recover: the durable reply row lands, the claim settles — and no
+    // terminal notice row is ever owed for the replied child.
+    rig.engine
+        .session
+        .shared_persistence()
+        .lock()
+        .await
+        .set_notice_append_fault(false);
+    let collected = rig
+        .host
+        .collect(vec![handle.rlm_child_id.clone()], 10_000)
+        .await
+        .unwrap();
+    let result = one(&collected);
+    assert_eq!(result.status, "done");
+    assert!(result.settled);
+    assert_eq!(result.replied_since_task, Some(true));
+    assert_eq!(
+        child.claimed_kind().await,
+        Some(super::registry::NoticeKind::DoneReplied)
+    );
+    let reply_rows = raw_lines(&parent_file)
+        .into_iter()
+        .filter(|line| {
+            line["type"] == "custom_message"
+                && line["customType"]
+                    == crate::session_engine::agent_messaging::AGENT_MESSAGE_CUSTOM_TYPE
+        })
+        .count();
+    assert_eq!(reply_rows, 1, "the recovered reply row landed once");
+    assert!(
+        raw_notice_rows(&parent_file).is_empty(),
+        "a durable reply owes no terminal notice row"
+    );
+    rig.engine.session.agent().abort();
+}

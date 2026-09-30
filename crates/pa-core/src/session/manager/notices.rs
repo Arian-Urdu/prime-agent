@@ -36,7 +36,9 @@ use crate::platform::sync_dir;
 // file) lives in the child module at the same tree position
 // (session::manager::notices::scan).
 mod scan;
-use scan::{last_assistant_entry_id, notice_key_of, scan_notice_content, FileNoticeScan};
+use scan::{
+    keyed_message_id, last_assistant_entry_id, notice_key_of, scan_notice_content, FileNoticeScan,
+};
 
 // The durable-tail concern (file/truncation sync, pre-append tail
 // hygiene, and the post-failure reconcile) lives in the child module
@@ -64,6 +66,13 @@ pub const NOTICE_CONSUMED_KEYS_FIELD: &str = "noticeKeys";
 /// wire vocabulary, so the two spellings must move together).
 pub const TERMINAL_NOTICE_CUSTOM_TYPES: [&str; 2] =
     ["rlm_child_terminal_notice", "rlm_child_failure"];
+/// The custom type of an agent-message reply row (the wire is TS
+/// `agent_message`; the canonical factories live in
+/// `session_engine::agent_messaging` - coordinated like
+/// `TERMINAL_NOTICE_CUSTOM_TYPES`).
+pub const AGENT_MESSAGE_CUSTOM_TYPE: &str = "agent_message";
+/// The `details` field carrying an agent-message reply's stable id.
+pub const AGENT_MESSAGE_KEY_FIELD: &str = "id";
 
 /// One repair plus one retry of the same line - a second failure
 /// surfaces instead of looping.
@@ -229,15 +238,27 @@ impl SessionManager {
         self.notify_persist_listeners();
         let index = self.file_entries.len() - 1;
         self.index_appended_entry(index);
+        // The containing directory's entry must be durable before
+        // success: an existing file does not prove it - the ordinary
+        // first assistant/session_info rewrite creates the file without
+        // a directory fsync. A pending directory sync keeps the landed
+        // row indexed - it is on disk - and the idempotent retry
+        // re-syncs the existing row instead of appending a second one.
+        #[cfg(test)]
+        if fault_hooks::take(&path, Fault::AppendDirSyncFail) {
+            return Err(fault_hooks::injected_error());
+        }
+        path.parent().map_or(Ok(()), sync_dir)?;
         Ok(id)
     }
 
     /// Fail every strict notice write on this manager before it
-    /// touches the file (test builds only): [`Self::append_terminal_notice`]
-    /// and [`Self::append_notice_consumed`] return the synthetic fault
-    /// without writing a byte, ordinary append paths are unaffected,
-    /// and after clearing the same key still appends exactly once (the
-    /// idempotence scan finds nothing, so the retry commits one row).
+    /// touches the file (test builds only): [`Self::append_terminal_notice`],
+    /// [`Self::append_notice_consumed`], and [`Self::append_agent_message`]
+    /// return the synthetic fault without writing a byte, ordinary
+    /// append paths are unaffected, and after clearing the same key
+    /// still appends exactly once (the idempotence scan finds nothing,
+    /// so the retry commits one row).
     #[cfg(test)]
     pub fn set_notice_append_fault(&mut self, fail: bool) {
         self.notice_append_fault = fail;
@@ -295,6 +316,68 @@ impl SessionManager {
                 details: notice.details.clone(),
                 display: notice.display,
                 rest: notice.rest.clone(),
+            },
+            base,
+        };
+        self.strict_append_entry(entry)
+    }
+
+    /// Append one durable agent-message reply row, idempotent by its
+    /// stable `details.id`: the parent session's JSONL holds exactly
+    /// one durable row per reply id even across retries and reopens, so
+    /// a `DoneReplied` publication can require this primitive's
+    /// success without duplicating the row the live turn's `MessageEnd`
+    /// would persist (the subscriber recognizes the pre-synced
+    /// `details.id` and skips the duplicate; ordinary custom behavior
+    /// is preserved). The row rides the same strict arm as terminal
+    /// notices - fresh rewrite carrying header + buffered rows,
+    /// complete line + file fsync, containing-directory fsync,
+    /// torn-tail reconcile - and the JSONL entry id, the stable row id,
+    /// is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] when the row is not the
+    /// `agent_message` custom type or carries no non-empty
+    /// `details.id`; [`ErrorKind::Unsupported`] on a non-persisted
+    /// manager; and the underlying I/O error when the durable append
+    /// fails (a poisoned writer fails fast until a rewrite heals it).
+    pub fn append_agent_message(&mut self, message: &CustomMessage) -> io::Result<String> {
+        #[cfg(test)]
+        if self.notice_append_fault {
+            return Err(io::Error::other("notice append fault (test)"));
+        }
+        if message.custom_type != AGENT_MESSAGE_CUSTOM_TYPE {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "agent message requires the agent_message custom type",
+            ));
+        }
+        let key = keyed_message_id(message.details.as_ref(), AGENT_MESSAGE_KEY_FIELD)
+            .ok_or_else(|| {
+                io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "agent message requires a non-empty details.id",
+                )
+            })?
+            .to_string();
+        let scan = self.scan_notice_file()?;
+        if let Some(entry_id) = scan.agent_message_ids.get(&key) {
+            // Already durable on disk: confirm the landed bytes and hand
+            // back the existing row id - never a second row.
+            let path = self.require_session_file()?;
+            sync_file(&path)?;
+            path.parent().map_or(Ok(()), sync_dir)?;
+            return Ok(entry_id.clone());
+        }
+        let base = self.next_base();
+        let entry = FileEntry::CustomMessage {
+            payload: CustomMessageEntry {
+                custom_type: message.custom_type.clone(),
+                content: message.content.clone(),
+                details: message.details.clone(),
+                display: message.display,
+                rest: message.rest.clone(),
             },
             base,
         };
@@ -991,5 +1074,152 @@ mod tests {
             panic!("the marker row must be the last entry");
         };
         assert_eq!(payload.custom_type, "notice_consumed");
+    }
+
+    fn agent_reply(id: &str) -> CustomMessage {
+        CustomMessage {
+            custom_type: "agent_message".to_string(),
+            content: pa_types::ai::UserContent::Text(
+                "[agent-message from worker] the reply body".to_string(),
+            ),
+            display: true,
+            details: Some(serde_json::json!({
+                "id": id,
+                "message": "the reply body",
+                "from": { "sessionName": "worker" },
+            })),
+            timestamp: 1_500,
+            rest: serde_json::Map::default(),
+        }
+    }
+
+    #[test]
+    fn fault_append_dir_sync_fail_on_an_existing_file_keeps_the_row_durable() {
+        let (_tmp, _dir, mut manager) = persisted_manager();
+        // An ordinary assistant flush creates the file WITHOUT a
+        // directory fsync (the review's existing-file scenario).
+        manager.append_message(assistant_message()).unwrap();
+        let file = manager.get_session_file().unwrap().to_path_buf();
+        let rows_before = parse_session_entries(&read_file(&file)).len();
+        fault_hooks::arm(&file, Fault::AppendDirSyncFail, 1);
+        let error = manager.append_terminal_notice(&notice("k:a")).unwrap_err();
+        assert_eq!(error.to_string(), "injected fault");
+        // The complete line landed and is indexed on the live branch,
+        // but success was withheld pending the directory sync.
+        let entries = parse_session_entries(&read_file(&file));
+        assert_eq!(entries.len(), rows_before + 1);
+        assert_eq!(manager.get_leaf_id(), entries.last().unwrap().id());
+        let keys: Vec<String> = manager
+            .unconsumed_terminal_notices()
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(keys, ["k:a"]);
+        // The idempotent retry confirms the landed row: same id, no
+        // second row.
+        let id = manager.append_terminal_notice(&notice("k:a")).unwrap();
+        assert_eq!(Some(id.as_str()), entries.last().unwrap().id());
+        assert_eq!(
+            parse_session_entries(&read_file(&file)).len(),
+            rows_before + 1
+        );
+    }
+
+    #[test]
+    fn agent_reply_is_strict_and_idempotent_by_id() {
+        let (tmp, dir, mut manager) = persisted_manager();
+        let file = manager.get_session_file().unwrap().to_path_buf();
+        // A busy first-turn parent has no assistant yet: the strict
+        // rewrite lands header + reply together.
+        let id = manager
+            .append_agent_message(&agent_reply("agentmsg-1"))
+            .unwrap();
+        assert!(file.exists());
+        let entries = parse_session_entries(&read_file(&file));
+        assert_eq!(entries.len(), 2); // header + reply
+        let FileEntry::CustomMessage { payload, base } = &entries[1] else {
+            panic!("the reply row must be a custom_message entry");
+        };
+        assert_eq!(base.id.as_deref(), Some(id.as_str()));
+        assert_eq!(payload.custom_type, "agent_message");
+        assert_eq!(payload.details.as_ref().unwrap()["id"], "agentmsg-1");
+        // The retry hands back the SAME row id without a second row.
+        let retry = manager
+            .append_agent_message(&agent_reply("agentmsg-1"))
+            .unwrap();
+        assert_eq!(retry, id);
+        assert_eq!(parse_session_entries(&read_file(&file)).len(), 2);
+        // A different reply id lands its own row.
+        let other = manager
+            .append_agent_message(&agent_reply("agentmsg-2"))
+            .unwrap();
+        assert_ne!(other, id);
+        // Reopen: still idempotent, and reply rows are never terminal
+        // notices.
+        let mut reopened = SessionManager::open(tmp.path(), &dir, &file);
+        let reopened_id = reopened
+            .append_agent_message(&agent_reply("agentmsg-1"))
+            .unwrap();
+        assert_eq!(reopened_id, id);
+        assert!(reopened.unconsumed_terminal_notices().unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_reply_rows_outside_the_contract_are_rejected() {
+        let (_tmp, _dir, mut manager) = persisted_manager();
+        let mut wrong_type = agent_reply("agentmsg-1");
+        wrong_type.custom_type = "terminal_inbox_reply".to_string();
+        let error = manager.append_agent_message(&wrong_type).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        let mut without_id = agent_reply("agentmsg-1");
+        without_id.details = None;
+        let error = manager.append_agent_message(&without_id).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        let mut empty_id = agent_reply("agentmsg-1");
+        empty_id.details = Some(serde_json::json!({ "id": "", "message": "x" }));
+        let error = manager.append_agent_message(&empty_id).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        // Nothing was appended.
+        let file = manager.get_session_file().unwrap();
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn fault_append_dir_sync_fail_on_a_reply_keeps_it_durable() {
+        let (_tmp, _dir, mut manager) = persisted_manager();
+        manager.append_message(assistant_message()).unwrap();
+        let file = manager.get_session_file().unwrap().to_path_buf();
+        fault_hooks::arm(&file, Fault::AppendDirSyncFail, 1);
+        let error = manager
+            .append_agent_message(&agent_reply("agentmsg-1"))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "injected fault");
+        // The reply landed and is indexed; success withheld pending the
+        // directory sync.
+        let entries = parse_session_entries(&read_file(&file));
+        let FileEntry::CustomMessage { payload, base } = entries.last().unwrap() else {
+            panic!("the reply row must be the last entry");
+        };
+        assert_eq!(payload.custom_type, "agent_message");
+        assert_eq!(payload.details.as_ref().unwrap()["id"], "agentmsg-1");
+        assert_eq!(manager.get_leaf_id(), base.id.as_deref());
+        // The retry confirms the landed reply: same id, one row.
+        let id = manager
+            .append_agent_message(&agent_reply("agentmsg-1"))
+            .unwrap();
+        assert_eq!(Some(id.as_str()), base.id.as_deref());
+        let reopened_entries = parse_session_entries(&read_file(&file));
+        let reply_rows: Vec<&FileEntry> = reopened_entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    FileEntry::CustomMessage { payload, .. }
+                        if payload.custom_type == "agent_message"
+                )
+            })
+            .collect();
+        assert_eq!(reply_rows.len(), 1);
     }
 }

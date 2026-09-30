@@ -208,6 +208,9 @@ pub struct AgentSession {
     compaction_summary_sink: std::sync::Mutex<Option<compaction_exec::SummaryDeltaSink>>,
     /// Serializes notice admissions with parent input and generation close.
     terminal_admission: tokio::sync::Mutex<TerminalAdmission>,
+    /// Agent-message reply IDs pre-synced by the parent inbox. Ordinary
+    /// custom rows retain their normal `MessageEnd` persistence rule.
+    pre_synced_reply_ids: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Dropping the parent session stops its single coalescing queue pump.
     terminal_pump_shutdown: tokio::sync::watch::Sender<bool>,
     #[cfg(test)]
@@ -218,6 +221,7 @@ pub struct AgentSession {
 struct TerminalAdmission {
     closed: bool,
     registered: std::collections::HashSet<String>,
+    registered_replies: std::collections::HashSet<String>,
 }
 
 impl AgentSession {
@@ -258,6 +262,9 @@ impl AgentSession {
         let persistence = session.clone();
         let notice_delivery = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
         let delivery_for_subscriber = Arc::clone(&notice_delivery);
+        let pre_synced_reply_ids =
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let replies_for_subscriber = Arc::clone(&pre_synced_reply_ids);
         #[cfg(test)]
         let terminal_test_gate: terminal_inbox::TerminalGateSlot =
             Arc::new(std::sync::RwLock::new(None));
@@ -267,12 +274,14 @@ impl AgentSession {
             .subscribe(move |event, _signal| {
                 let persistence = persistence.clone();
                 let delivery = Arc::clone(&delivery_for_subscriber);
+                let replies = Arc::clone(&replies_for_subscriber);
                 #[cfg(test)]
                 let test_gate = Arc::clone(&subscriber_test_gate);
                 Box::pin(async move {
                     persist_event(
                         &persistence,
                         &delivery,
+                        &replies,
                         #[cfg(test)]
                         &test_gate,
                         event,
@@ -303,6 +312,7 @@ impl AgentSession {
             image_model_router: None,
             compaction_summary_sink: std::sync::Mutex::new(None),
             terminal_admission: tokio::sync::Mutex::new(TerminalAdmission::default()),
+            pre_synced_reply_ids,
             terminal_pump_shutdown,
             #[cfg(test)]
             terminal_test_gate,
@@ -422,6 +432,7 @@ impl AgentSession {
 async fn persist_event(
     session: &Arc<tokio::sync::Mutex<SessionManager>>,
     delivered: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    pre_synced_replies: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     #[cfg(test)] gate: &terminal_inbox::TerminalGateSlot,
     event: AgentEvent,
 ) -> std::io::Result<()> {
@@ -468,6 +479,22 @@ async fn persist_event(
                             .expect("notice delivery lock")
                             .insert(key.to_string());
                     }
+                    None
+                }
+                SessionAgentMessage::Custom(custom)
+                    if custom.custom_type == agent_messaging::AGENT_MESSAGE_CUSTOM_TYPE
+                        && custom
+                            .details
+                            .as_ref()
+                            .and_then(|details| details.get("id"))
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|id| {
+                                pre_synced_replies
+                                    .lock()
+                                    .expect("pre-synced reply lock")
+                                    .contains(id)
+                            }) =>
+                {
                     None
                 }
                 SessionAgentMessage::Custom(custom) => {

@@ -352,19 +352,6 @@ impl InProcessRlmHost {
             .map(|binding| (binding.session_id.clone(), binding.session_name.clone()))
     }
 
-    /// Mark that `child_id` replied to its parent since its task was
-    /// admitted (TS `_parentReplyCount`): the parent's no-reply terminal
-    /// notice is withheld.
-    pub(crate) async fn mark_replied(&self, child_id: &str) {
-        let children = self.children().await;
-        for record in children {
-            if record.rlm_child_id == child_id {
-                record.state().await.replied_since_task = true;
-                return;
-            }
-        }
-    }
-
     /// Whether any tracked child run is still unsettled (TS
     /// `_hasUnsettledRlmQuiescenceWork`'s child-run arm): the guest's
     /// status record and a child's own task-settle both read it.
@@ -481,14 +468,16 @@ impl InProcessRlmHost {
                     )
                     .await;
             } else {
-                if !record.await_settled_or_parked().await {
+                // Freeze the actual state under the retry gate before any
+                // descendant await. The 5s parked wake cannot reactivate
+                // a notice after this generation begins closing.
+                if record.freeze_for_close().await {
                     if let Some(error) = record.parked_error().await {
                         tracing::error!(child_id = %record.rlm_child_id, %error,
                             "closing parent with a parked terminal notice");
                     }
                 }
                 Box::pin(record.child_host.close_children()).await;
-                record.mark_closed().await;
                 record.engine.session.agent().abort();
             }
             record.unsubscribe_listener().await;

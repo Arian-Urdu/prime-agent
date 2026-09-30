@@ -25,7 +25,9 @@ logic of its own). The RLM recursion host seam
 selector-error vocabulary the daemon implements over the supervisor link.
 The in-process RLM host admits each child terminal notice through the parent
 session inbox: one fsynced JSONL row precedes live registration and child
-settlement. On reopen, notices without a `notice_consumed` marker replay from
+settlement. A child that replied settles only after its explicit reply row
+is durably admitted through that same strict writer. On reopen, notices without
+a `notice_consumed` marker replay from
 the original row. Model delivery is **at least once**, not exactly once: a
 crash after the parent model responds but before its assistant row and marker
 are synced can repeat inference. No durable terminal row means the child's

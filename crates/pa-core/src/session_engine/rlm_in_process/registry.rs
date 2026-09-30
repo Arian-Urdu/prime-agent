@@ -80,7 +80,12 @@ pub struct InProcessChildRecord {
     /// tears the task down within one slice instead of letting a closed
     /// record start or keep a turn.
     pub(crate) closed_tx: watch::Sender<bool>,
+    /// Abort the child task promptly without closing the winning notice
+    /// admission before its durable+live transaction completes.
+    pub(crate) task_cancel_tx: watch::Sender<bool>,
     state: Mutex<ChildRunState>,
+    /// Serializes a sparse retry attempt with a generation close.
+    pub(crate) notice_retry_gate: Mutex<()>,
 }
 
 /// The mutable run state (the daemon `ChildRecord`'s mutable half, plus
@@ -99,6 +104,8 @@ pub(crate) struct ChildRunState {
     /// was admitted (TS `_parentReplyCount`): the no-reply terminal notice
     /// is withheld once set.
     pub(crate) replied_since_task: bool,
+    /// Explicit replies awaiting their own strict durable admission.
+    pub(crate) pending_replies: Vec<pa_types::session::CustomMessage>,
     /// The terminal-notice claim: single ownership of the notice AND the
     /// settled verdict that must agree with it. `None` until claimed;
     /// once taken, every later claimant defers to the holder. `Closed` and
@@ -108,6 +115,8 @@ pub(crate) struct ChildRunState {
     /// first-wins claim remains pending for retry.
     pub(crate) admission_error: Option<String>,
     pub(crate) parked: bool,
+    /// Once close owns this generation, a parked claim may not reactivate.
+    pub(crate) generation_frozen: bool,
     /// The task prompt was admitted. Readers must not settle a pre-prompt
     /// child: it is idle by construction.
     pub(crate) prompt_admitted: bool,
@@ -148,6 +157,7 @@ impl InProcessChildRecord {
         let (settled_tx, _) = watch::channel(false);
         let (parked_tx, _) = watch::channel(false);
         let (closed_tx, _) = watch::channel(false);
+        let (task_cancel_tx, _) = watch::channel(false);
         Self {
             rlm_child_id,
             session_name,
@@ -162,14 +172,18 @@ impl InProcessChildRecord {
             settled_tx,
             parked_tx,
             closed_tx,
+            task_cancel_tx,
+            notice_retry_gate: Mutex::new(()),
             state: Mutex::new(ChildRunState {
                 settled_status: None,
                 answer_preview: None,
                 error: None,
                 replied_since_task: false,
+                pending_replies: Vec::new(),
                 notice: None,
                 admission_error: None,
                 parked: false,
+                generation_frozen: false,
                 prompt_admitted: false,
                 closed_by_parent: false,
                 tool_use_count: 0,
@@ -218,9 +232,14 @@ impl InProcessChildRecord {
     /// Mark the record closed by its parent (delete or close) and wake the
     /// closed watch so the run task stops racing its prompt against a
     /// record that no longer belongs to the registry.
-    pub(crate) async fn mark_closed(&self) {
+    pub(crate) async fn request_task_cancel(&self) {
         self.state().await.closed_by_parent = true;
-        let _ = self.closed_tx.send(true);
+        self.task_cancel_tx.send_replace(true);
+    }
+
+    pub(crate) async fn mark_closed(&self) {
+        self.request_task_cancel().await;
+        self.closed_tx.send_replace(true);
     }
 
     /// Whether the record was closed by its parent (a cheap flag read for
@@ -267,13 +286,32 @@ impl InProcessChildRecord {
         self.state().await.notice
     }
 
+    pub(crate) async fn begin_reply(&self, row: pa_types::session::CustomMessage) {
+        let mut state = self.state().await;
+        state.replied_since_task = true;
+        state.pending_replies.push(row);
+    }
+
+    pub(crate) async fn reply_admitted(&self, id: &str) {
+        let mut state = self.state().await;
+        state.pending_replies.retain(|row| {
+            row.details
+                .as_ref()
+                .and_then(|details| details.get("id"))
+                .and_then(serde_json::Value::as_str)
+                != Some(id)
+        });
+    }
+
     pub(crate) async fn admission_failed(&self, error: &anyhow::Error) {
         let diagnostic = format!("Terminal notice admission pending: {error}");
         tracing::error!(child_id = %self.rlm_child_id, "{diagnostic}");
         self.state().await.admission_error = Some(diagnostic);
     }
 
-    pub(crate) async fn publish_verdict(&self, kind: NoticeKind, error: Option<String>) {
+    /// Publish only a matching committed claim. `DoneReplied` returns false
+    /// while any explicit reply is still awaiting strict admission.
+    pub(crate) async fn publish_verdict(&self, kind: NoticeKind, error: Option<String>) -> bool {
         let mut state = self.state().await;
         assert_eq!(
             state.notice,
@@ -281,7 +319,10 @@ impl InProcessChildRecord {
             "only the terminal claimant publishes"
         );
         if state.settled_status.is_some() {
-            return;
+            return true;
+        }
+        if kind == NoticeKind::DoneReplied && !state.pending_replies.is_empty() {
+            return false;
         }
         state.settled_status = Some(match kind {
             NoticeKind::Done | NoticeKind::DoneReplied => "done",
@@ -295,6 +336,7 @@ impl InProcessChildRecord {
         drop(state);
         self.parked_tx.send_replace(false);
         self.publish_settled();
+        true
     }
 
     /// Wait for the winning claim to become public; there is no artificial
@@ -329,9 +371,35 @@ impl InProcessChildRecord {
         self.parked_tx.send_replace(true);
     }
 
-    pub(crate) async fn clear_parked(&self) {
-        self.state().await.parked = false;
+    pub(crate) async fn clear_parked(&self) -> bool {
+        let mut state = self.state().await;
+        if state.generation_frozen {
+            return false;
+        }
+        state.parked = false;
+        drop(state);
         self.parked_tx.send_replace(false);
+        true
+    }
+
+    /// The closer cannot act on a stale park: wait through a live retry,
+    /// then freeze the actual parked/committed state before descendants run.
+    pub(crate) async fn freeze_for_close(&self) -> bool {
+        loop {
+            self.await_settled_or_parked().await;
+            let _gate = self.notice_retry_gate.lock().await;
+            let mut state = self.state().await;
+            if state.settled_status.is_none() && !state.parked {
+                continue;
+            }
+            let parked = state.parked;
+            state.generation_frozen = true;
+            state.closed_by_parent = true;
+            drop(state);
+            self.task_cancel_tx.send_replace(true);
+            self.closed_tx.send_replace(true);
+            return parked;
+        }
     }
 
     pub(crate) async fn parked_error(&self) -> Option<String> {

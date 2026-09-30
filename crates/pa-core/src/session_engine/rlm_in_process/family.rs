@@ -327,27 +327,6 @@ impl InProcessFamilyController {
             .find(|node| node.matches(target))
             .map(|node| node.engine)
     }
-
-    /// Deliver one agent message row to a target session: its own turn
-    /// while idle, the steering lane while busy (TS
-    /// `acceptAgentMessagePrompt`'s two arms).
-    async fn deliver(
-        engine: &Arc<SessionEngine>,
-        row: &CustomMessage,
-    ) -> anyhow::Result<AgentMessageDeliveryStatus> {
-        let session = &engine.session;
-        let agent = session.agent();
-        let pending = agent.steering_previews().len() + agent.follow_up_previews().len();
-        crate::session_engine::agent_messaging::assert_agent_message_queue_capacity(
-            pending,
-            DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
-        )?;
-        let admission = session.admit_injected_or_steer(row).await?;
-        Ok(match admission {
-            pa_agent::admission::AdmitStatus::Admitted => AgentMessageDeliveryStatus::Delivered,
-            pa_agent::admission::AdmitStatus::Busy => AgentMessageDeliveryStatus::Queued,
-        })
-    }
 }
 
 impl AgentMessageController for InProcessFamilyController {
@@ -422,17 +401,43 @@ impl AgentMessageController for InProcessFamilyController {
         });
         let row: CustomMessage = serde_json::from_value(row)
             .map_err(|error| anyhow::anyhow!("agent message row conversion failed: {error}"))?;
-        let delivery = Self::deliver(&node.engine, &row).await?;
-        // A child's delivery to its parent is its reply: the parent's
-        // record flips `replied_since_task` and the no-reply terminal
-        // notice is withheld (TS `_parentReplyCount`).
-        if from_relationship == Some(AgentFamilyRelationship::Child) {
-            if let Some(child_id) = self.served.child_id() {
-                if let Some(parent_host) = self.host.parent_host() {
-                    parent_host.mark_replied(child_id).await;
-                }
+        let session = &node.engine.session;
+        let agent = session.agent();
+        let pending = agent.steering_previews().len() + agent.follow_up_previews().len();
+        crate::session_engine::agent_messaging::assert_agent_message_queue_capacity(
+            pending,
+            DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
+        )?;
+        // Reserve a child's explicit reply before admission so a racing
+        // completion claims DoneReplied, never Done/no-reply. A failed
+        // durable append leaves the original row pending for that claimant.
+        let reply_record = if from_relationship == Some(AgentFamilyRelationship::Child) {
+            match (self.served.child_id(), self.host.parent_host()) {
+                (Some(child_id), Some(parent_host)) => parent_host
+                    .children()
+                    .await
+                    .into_iter()
+                    .find(|record| record.rlm_child_id == child_id),
+                _ => None,
             }
+        } else {
+            None
+        };
+        if let Some(record) = &reply_record {
+            record.begin_reply(row.clone()).await;
         }
+        let admission = if reply_record.is_some() {
+            session.admit_durable_reply(&row).await
+        } else {
+            session.admit_injected_or_steer(&row).await
+        }?;
+        if let Some(record) = &reply_record {
+            record.reply_admitted(&id).await;
+        }
+        let delivery = match admission {
+            pa_agent::admission::AdmitStatus::Admitted => AgentMessageDeliveryStatus::Delivered,
+            pa_agent::admission::AdmitStatus::Busy => AgentMessageDeliveryStatus::Queued,
+        };
         let delivered = matches!(delivery, AgentMessageDeliveryStatus::Delivered);
         Ok(AgentMessageReceipt {
             id,

@@ -108,8 +108,8 @@ use repair::serialize_entry;
 // factories live in session_engine::rlm_notices).
 mod notices;
 pub use notices::{
-    NOTICE_CONSUMED_CUSTOM_TYPE, NOTICE_CONSUMED_KEYS_FIELD, NOTICE_KEY_FIELD,
-    TERMINAL_NOTICE_CUSTOM_TYPES,
+    AGENT_MESSAGE_CUSTOM_TYPE, AGENT_MESSAGE_KEY_FIELD, NOTICE_CONSUMED_CUSTOM_TYPE,
+    NOTICE_CONSUMED_KEYS_FIELD, NOTICE_KEY_FIELD, TERMINAL_NOTICE_CUSTOM_TYPES,
 };
 // The test-build fault hooks for the strict notice append are pub(crate)
 // inside the child module; lift them so the engine's in-process host

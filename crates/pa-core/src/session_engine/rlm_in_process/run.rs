@@ -90,7 +90,7 @@ pub(super) async fn run_child_task(
 /// engine is gone (the binding weak died). Bounded ticks wake on the
 /// closed watch's own signal; teardown latency is one settle slice.
 async fn closed_or_parent_gone(host: &InProcessRlmHost, record: &Arc<InProcessChildRecord>) {
-    let mut closed = record.closed_tx.subscribe();
+    let mut closed = record.task_cancel_tx.subscribe();
     loop {
         if host.parent_engine().is_none() {
             return;
@@ -204,10 +204,65 @@ async fn finish_run(
         TaskVerdict::Error(error) if kind == NoticeKind::Error => Some(error.clone()),
         _ => None,
     };
+    if kind == NoticeKind::DoneReplied {
+        let mut first_parent = parent;
+        loop {
+            let pending = record.state().await.pending_replies.first().cloned();
+            if let Some(row) = pending {
+                let Some(parent) = first_parent
+                    .take()
+                    .or_else(|| record.parent_engine.upgrade())
+                else {
+                    record
+                        .admission_failed(&anyhow::anyhow!(
+                            "original parent engine was released before reply admission"
+                        ))
+                        .await;
+                    record.mark_parked().await;
+                    record.unsubscribe_listener().await;
+                    return;
+                };
+                let id = row
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !super::notices::admit_claimed_row(
+                    record,
+                    parent,
+                    super::notices::AdmissionRow::Reply(row),
+                    super::notices::RetryPolicy::SparseWhileOpen,
+                )
+                .await
+                {
+                    record.unsubscribe_listener().await;
+                    return;
+                }
+                record.reply_admitted(&id).await;
+                continue;
+            }
+            #[cfg(test)]
+            host.pause_child_gate(super::ChildGatePoint::BeforePublish {
+                child_id: record.rlm_child_id.clone(),
+            })
+            .await;
+            if record.publish_verdict(kind, None).await {
+                record.unsubscribe_listener().await;
+                return;
+            }
+        }
+    }
     let preview = record.state().await.answer_preview.clone();
     if let Some(row) = super::notices::terminal_row(record, kind, error.as_deref(), preview) {
-        if !super::notices::admit_claimed_notice(record, parent.expect("notice has parent"), row)
-            .await
+        if !super::notices::admit_claimed_row(
+            record,
+            parent.expect("notice has parent"),
+            super::notices::AdmissionRow::Terminal(row),
+            super::notices::RetryPolicy::SparseWhileOpen,
+        )
+        .await
         {
             record.unsubscribe_listener().await;
             return;
@@ -647,24 +702,37 @@ pub(super) fn delete_subagent(
                 child_id: record.rlm_child_id.clone(),
             })
             .await;
-            record.mark_closed().await;
+            record.request_task_cancel().await;
             record.engine.session.agent().abort();
             record.child_host.close_children().await;
             flush_pending_usage(&host, &record).await;
-            if let Some(parent) = parent {
+            let admitted = if let Some(parent) = parent {
                 let row = super::notices::terminal_row(&record, NoticeKind::Cancelled, None, None)
                     .expect("cancelled notice");
-                if !super::notices::admit_claimed_notice(&record, parent, row).await {
-                    anyhow::bail!(record
-                        .parked_error()
-                        .await
-                        .unwrap_or_else(|| "terminal notice admission is pending".to_string()));
-                }
+                super::notices::admit_claimed_row(
+                    &record,
+                    parent,
+                    super::notices::AdmissionRow::Terminal(row),
+                    super::notices::RetryPolicy::ParkAfterBurst,
+                )
+                .await
             } else {
-                // A dropped parent has no live delivery target. This can
-                // only occur during process teardown; the close owner must
-                // have claimed ParentGone before deletion to publish it.
-                anyhow::bail!("original parent session ended before cancellation admission");
+                record
+                    .admission_failed(&anyhow::anyhow!(
+                        "original parent session ended before cancellation admission"
+                    ))
+                    .await;
+                record.mark_parked().await;
+                false
+            };
+            // Task cancellation is separate from the terminal admission's
+            // close signal: the winner gets its full retry burst first.
+            record.mark_closed().await;
+            if !admitted {
+                anyhow::bail!(record
+                    .parked_error()
+                    .await
+                    .unwrap_or_else(|| "terminal notice admission is pending".to_string()));
             }
             #[cfg(test)]
             host.pause_child_gate(super::ChildGatePoint::BeforePublish {
@@ -685,7 +753,14 @@ pub(super) fn delete_subagent(
                             None,
                         )
                         .expect("cancelled notice");
-                        if super::notices::admit_claimed_notice(&record, parent, row).await {
+                        if super::notices::admit_claimed_row(
+                            &record,
+                            parent,
+                            super::notices::AdmissionRow::Terminal(row),
+                            super::notices::RetryPolicy::ParkAfterBurst,
+                        )
+                        .await
+                        {
                             record.publish_verdict(NoticeKind::Cancelled, None).await;
                         }
                     }

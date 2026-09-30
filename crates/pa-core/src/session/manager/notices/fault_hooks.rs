@@ -19,8 +19,14 @@ pub enum Fault {
     PartialPrewrite,
     /// The complete line lands unsynced, then the sync fails.
     SyncFail,
-    /// The rewrite lands, then the directory fsync fails.
+    /// The wholesale rewrite lands (temp + `sync_all` + rename),
+    /// then the containing-directory fsync fails.
     DirFsyncFail,
+    /// An existing-file append lands (complete line + file sync) and
+    /// the row is indexed, then the containing-directory fsync fails:
+    /// success is withheld pending the sync and the idempotent retry
+    /// re-syncs the existing row.
+    AppendDirSyncFail,
 }
 
 #[derive(Default)]
@@ -28,6 +34,7 @@ struct Armed {
     partial_prewrite: usize,
     sync_fail: usize,
     dir_fsync_fail: usize,
+    append_dir_sync_fail: usize,
 }
 
 impl Armed {
@@ -36,6 +43,7 @@ impl Armed {
             Fault::PartialPrewrite => &mut self.partial_prewrite,
             Fault::SyncFail => &mut self.sync_fail,
             Fault::DirFsyncFail => &mut self.dir_fsync_fail,
+            Fault::AppendDirSyncFail => &mut self.append_dir_sync_fail,
         }
     }
 }

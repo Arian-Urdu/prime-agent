@@ -5,15 +5,15 @@
 //! trailing line is torn damage, and a terminal row needs its stable
 //! `noticeKey`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use pa_types::session::{AgentMessage, CustomMessage, FileEntry};
 
 use crate::session::{create_custom_message, parse_session_entries};
 
 use super::{
-    NOTICE_CONSUMED_CUSTOM_TYPE, NOTICE_CONSUMED_KEYS_FIELD, NOTICE_KEY_FIELD,
-    TERMINAL_NOTICE_CUSTOM_TYPES,
+    AGENT_MESSAGE_CUSTOM_TYPE, AGENT_MESSAGE_KEY_FIELD, NOTICE_CONSUMED_CUSTOM_TYPE,
+    NOTICE_CONSUMED_KEYS_FIELD, NOTICE_KEY_FIELD, TERMINAL_NOTICE_CUSTOM_TYPES,
 };
 
 /// One file-backed terminal-notice row.
@@ -33,6 +33,18 @@ pub(super) struct FileNoticeScan {
     pub(super) notice_rows: Vec<FileNoticeRow>,
     /// Keys covered by a durable consumption marker.
     pub(super) consumed_keys: HashSet<String>,
+    /// Durable agent-message reply rows: `details.id` -> entry id; the
+    /// first row per id is canonical.
+    pub(super) agent_message_ids: HashMap<String, String>,
+}
+
+/// The stable key of a keyed custom message row; None when the row
+/// carries no non-empty string at `field`.
+pub(super) fn keyed_message_id<'a>(
+    details: Option<&'a serde_json::Value>,
+    field: &str,
+) -> Option<&'a str> {
+    details?.get(field)?.as_str().filter(|key| !key.is_empty())
 }
 
 /// The stable key of a notice row; None when the row carries no
@@ -71,8 +83,10 @@ pub(super) fn scan_notice_content(content: &str) -> FileNoticeScan {
         last_assistant_id: None,
         notice_rows: Vec::new(),
         consumed_keys: HashSet::new(),
+        agent_message_ids: HashMap::new(),
     };
     let mut seen_keys = HashSet::new();
+    let mut seen_agent_message_ids = HashSet::new();
     for entry in parse_session_entries(terminated_body(content)) {
         match &entry {
             FileEntry::Message {
@@ -108,6 +122,18 @@ pub(super) fn scan_notice_content(content: &str) -> FileNoticeScan {
                     entry_id: entry.id().unwrap_or_default().to_string(),
                     message: create_custom_message(payload, &entry),
                 });
+            }
+            FileEntry::CustomMessage { payload, .. }
+                if payload.custom_type == AGENT_MESSAGE_CUSTOM_TYPE =>
+            {
+                let Some(id) = keyed_message_id(payload.details.as_ref(), AGENT_MESSAGE_KEY_FIELD)
+                else {
+                    continue;
+                };
+                if seen_agent_message_ids.insert(id.to_string()) {
+                    scan.agent_message_ids
+                        .insert(id.to_string(), entry.id().unwrap_or_default().to_string());
+                }
             }
             _ => {}
         }

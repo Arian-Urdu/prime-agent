@@ -269,8 +269,15 @@ fn validate_edit(edit: &RefinementEdit, computed_id: Option<&str>) -> Option<Str
         // and keep the stored spec (apply preserves `before.arguments`),
         // exactly like update_factory treats dag/machine.
         let arguments = edit.arguments.as_ref();
-        let dag = arguments.and_then(|args| args.get("dag"));
-        let machine = arguments.and_then(|args| args.get("machine"));
+        // JSON null is treated as absent, exactly like the kernel's Python
+        // writers (arguments.get("machine") returning None): a supplied
+        // "machine": null never counts as the machine form.
+        let dag = arguments
+            .and_then(|args| args.get("dag"))
+            .filter(|value| !value.is_null());
+        let machine = arguments
+            .and_then(|args| args.get("machine"))
+            .filter(|value| !value.is_null());
         if dag.is_some() && machine.is_some() {
             return Some("pass either dag or machine form, not both".to_string());
         }
@@ -762,6 +769,12 @@ mod tests {
         // An update that does supply arguments gets the same shape checks.
         edit.arguments =
             Some(serde_json::from_value(serde_json::json!({ "machine": machine })).unwrap());
+        assert_eq!(validate_edit(&edit, None), None);
+        // JSON null is absent, exactly like the kernel's Python writers: a
+        // valid dag with "machine": null is a dag-form edit, not both forms.
+        edit.arguments = Some(
+            serde_json::from_value(serde_json::json!({ "dag": dag, "machine": null })).unwrap(),
+        );
         assert_eq!(validate_edit(&edit, None), None);
         edit.arguments = Some(
             serde_json::from_value(serde_json::json!({ "dag": dag, "machine": machine })).unwrap(),

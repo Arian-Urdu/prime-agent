@@ -465,10 +465,13 @@ def validate_factory_machine(machine: Any) -> list[str]:
             sources = raw_src
             if not sources:
                 errors.append(f"transitions[{index}] from must name at least one state")
+            elif not all(_is_nonempty_str(src) for src in sources):
+                # Type-check BEFORE the set() dedupe: a malformed entry (a
+                # dict, a list) is unhashable and would raise a raw TypeError
+                # instead of reporting a validation error.
+                errors.append(f"transitions[{index}] from entries must be non-empty state id strings")
             elif len(set(sources)) != len(sources):
                 errors.append(f"transitions[{index}] from must not repeat a state")
-            elif not all(_is_nonempty_str(src) for src in sources):
-                errors.append(f"transitions[{index}] from entries must be non-empty state id strings")
             elif not all(src in states_by_id for src in sources):
                 missing = next(src for src in sources if src not in states_by_id)
                 errors.append(f"transitions[{index}] references unknown from-state {missing!r}")
@@ -492,7 +495,10 @@ def validate_factory_machine(machine: Any) -> list[str]:
         if on not in TRANSITION_ON_KINDS:
             errors.append(f"transitions[{index}] on must be one of {list(TRANSITION_ON_KINDS)}, got {on!r}")
         for src in sources:
-            if src in states_by_id:
+            # Malformed sources already reported their own error above; a
+            # non-string entry is unhashable and must never reach the dict
+            # lookup (validation reports errors; it never raises).
+            if _is_nonempty_str(src) and src in states_by_id:
                 src_state = states_by_id[src]
                 if src_state.get("lifecycle", NODE_LIFECYCLE_DEFAULT) == "resident":
                     errors.append(f"transitions[{index}] cannot leave resident state {src!r}")

@@ -217,6 +217,20 @@ fn timeout_minutes_inf_parses_to_an_unbounded_wait() {
 }
 
 #[test]
+fn an_overflowing_timeout_literal_falls_back_to_the_clamped_default() {
+    // `1e999` also parses to infinity (Rust's dec2flt overflow), which
+    // would silently open an unbounded wait without an explicit `inf`
+    // spelling; it falls back to the clamped default like any unparsable
+    // value.
+    let config =
+        parse_eval_args(&args(&["--model", "m", "--timeout-minutes", "1e999"])).expect("parses");
+    assert_eq!(config.timeout_minutes, 1.0);
+    let config =
+        parse_eval_args(&args(&["--model", "m", "--timeout-minutes", "-1e999"])).expect("parses");
+    assert_eq!(config.timeout_minutes, 1.0);
+}
+
+#[test]
 fn the_trial_deadline_degrades_extreme_timeouts_instead_of_panicking() {
     use std::time::{Duration, Instant};
     // The explicit unbounded wait.

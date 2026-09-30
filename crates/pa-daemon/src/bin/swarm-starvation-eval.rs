@@ -33,8 +33,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use pa_core::swarm_eval::transcript::snapshot_from_transcript;
 use pa_core::swarm_eval::{
     build_orchestrator_prompt, parse_answer_line, render_markdown_report, seeded_secrets,
-    trial_deadline, trial_result_from_snapshot, EvalArgsError, MessagingStatsSnapshot,
-    SwarmEvalConfig, SwarmEvalTrialResult,
+    trial_deadline, trial_result_from_snapshot, DefenseVerdict, EvalArgsError,
+    MessagingStatsSnapshot, SwarmEvalConfig, SwarmEvalTrialResult,
 };
 use pa_types::platform::transport::{connect_blocking, BlockingTransportStream};
 use serde_json::{json, Value};
@@ -237,7 +237,7 @@ fn run(socket: &Path, config: &SwarmEvalConfig) -> Result<(), String> {
                 config.trials, config.model
             );
             let started = Instant::now();
-            match run_trial(&mut client, config, size, trial, &runs_root) {
+            match run_trial(&mut client, socket, config, size, trial, &runs_root) {
                 Ok(result) => results.push(result),
                 Err(message) => {
                     eprintln!("trial failed: {message}");
@@ -283,6 +283,7 @@ fn run(socket: &Path, config: &SwarmEvalConfig) -> Result<(), String> {
 
 fn run_trial(
     client: &mut Client,
+    socket: &Path,
     config: &SwarmEvalConfig,
     size: usize,
     trial: usize,
@@ -359,12 +360,43 @@ fn run_trial(
     // trial directory removed whether the trial scored or errored, so a
     // failed prompt, poll, or stats request can never leave a live
     // orchestrator issuing real model requests after the trial ends.
-    let _ = client.command(
-        &json!({ "type": "kill", "activeSessionId": session_id }),
-        Duration::from_secs(30),
-    );
+    let cleanup = kill_session(client, socket, &session_id);
     let _ = fs::remove_dir_all(&trial_root);
-    outcome
+    match (outcome, cleanup) {
+        (outcome, Ok(())) => outcome,
+        // A scored trial whose session could not be confirmed killed is
+        // not a completed trial: the row keeps its measurements but fails
+        // with the cleanup failure, mirroring how the instant-fail fold
+        // treats a rate-limit error.
+        (Ok(mut result), Err(cleanup_error)) => {
+            result.instant_fail = Some(format!("cleanup failed: {cleanup_error}"));
+            result.verdict = DefenseVerdict::Fail;
+            Ok(result)
+        }
+        (Err(message), Err(cleanup_error)) => Err(format!("{message}; {cleanup_error}")),
+    }
+}
+
+/// The cleanup kill. Unlike a scored command, a transport failure here
+/// leaves the session's fate unknown — the daemon can be alive with the
+/// orchestrator still mid-turn — so the kill is retried once over a fresh
+/// connection before the failure propagates into the trial. A response
+/// envelope (even `success: false`, e.g. an unknown session) is the
+/// daemon's authoritative answer and settles the cleanup.
+fn kill_session(client: &mut Client, socket: &Path, session_id: &str) -> Result<(), String> {
+    let command = json!({ "type": "kill", "activeSessionId": session_id });
+    if let Err(first_error) = client.command(&command, Duration::from_secs(30)) {
+        let mut retry = Client::connect(socket)
+            .map_err(|connect_error| format!("{first_error}; reconnect: {connect_error}"))?;
+        let retry_result = retry.command(&command, Duration::from_secs(30));
+        // The fresh connection heals the shared client for the sweep's
+        // later trials.
+        *client = retry;
+        retry_result.map_err(|retry_error| {
+            format!("cleanup kill failed on both connections ({first_error}; {retry_error})")
+        })?;
+    }
+    Ok(())
 }
 
 /// The post-create trial body: prompt, poll, verify, and score. Cleanup is
@@ -932,6 +964,75 @@ mod tests {
     }
 
     #[test]
+    fn a_cleanup_kill_survives_a_mid_trial_socket_reset() {
+        // The daemon connection can reset mid-trial while the daemon (and
+        // the freshly prompted orchestrator session) lives on; the cleanup
+        // kill must reach the daemon over a fresh connection instead of
+        // being dropped on the dead one, leaving the session to spend
+        // tokens while the sweep moves on.
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let socket = dir.path().join("reset.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let (tx, rx) = channel();
+        thread::spawn(move || {
+            // Connection 1: hello and create succeed, then the stream is
+            // dropped (the reset) so every later command on it fails.
+            let (stream, _) = listener.accept().expect("accept 1");
+            let mut writer = stream.try_clone().expect("clone 1");
+            let mut reader = BufReader::new(stream);
+            let _ = writeln!(writer, r#"{{"type":"daemon_hello"}}"#);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read create");
+            let _ = writeln!(
+                writer,
+                "{}",
+                json!({ "id": "swarm-eval-1", "type": "response", "success": true,
+                        "data": { "activeSessionId": "s-eval" } })
+            );
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read prompt");
+            drop(writer);
+            drop(reader);
+            // Connection 2 (the cleanup retry): hello, then answer the kill
+            // and record it.
+            let (stream, _) = listener.accept().expect("accept 2");
+            let mut writer = stream.try_clone().expect("clone 2");
+            let mut reader = BufReader::new(stream);
+            let _ = writeln!(writer, r#"{{"type":"daemon_hello"}}"#);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read kill");
+            let envelope: Value = serde_json::from_str(line.trim()).expect("kill envelope");
+            let _ = tx.send(envelope.get("command").cloned().unwrap_or(Value::Null));
+            let _ = writeln!(
+                writer,
+                "{}",
+                json!({ "id": envelope.get("id").cloned().unwrap_or(Value::Null),
+                        "type": "response", "success": true })
+            );
+        });
+        let out_dir = tempfile::TempDir::new().expect("out dir");
+        let config = test_config(out_dir.path(), 2, 15.0);
+        let runs_root = dir.path().join("runs");
+        let mut client = Client::connect(&socket).expect("connect");
+        let error = run_trial(&mut client, &socket, &config, 2, 1, &runs_root)
+            .expect_err("the trial fails on the reset socket");
+        // The kill reached the daemon over the retry connection.
+        let command = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the cleanup kill arrived");
+        assert_eq!(command["type"], "kill", "{command}");
+        assert_eq!(command["activeSessionId"], "s-eval", "{command}");
+        // The trial reports the drive failure instead of silently
+        // completing.
+        assert!(
+            error.contains("the daemon closed the connection")
+                || error.contains("daemon socket error")
+                || error.contains("failed to send command"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn a_trailing_socket_flag_without_a_value_is_rejected() {
         // A trailing `--socket` must not fall back to the default socket:
         // the driver would spend real tokens against the wrong daemon.
@@ -966,7 +1067,7 @@ mod tests {
         };
         let runs_root = out_dir.path().join("runs");
         let mut client = Client::connect(&daemon.socket).expect("connect");
-        let error = run_trial(&mut client, &config, 2, 1, &runs_root)
+        let error = run_trial(&mut client, &daemon.socket, &config, 2, 1, &runs_root)
             .expect_err("the overflowing seed must fail the trial");
         assert!(
             error.contains("overflows the derived trial seed"),

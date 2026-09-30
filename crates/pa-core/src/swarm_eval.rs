@@ -336,13 +336,20 @@ pub fn parse_eval_args(argv: &[String]) -> Result<SwarmEvalConfig, EvalArgsError
                 // `inf`/`infinity` (any case, any sign) explicitly remove the
                 // per-trial timeout: `f64::parse` accepts them, and passing a
                 // non-finite value through to a `Duration` conversion panics
-                // mid-run. Every other unparsable or sub-minute value keeps
-                // the clamped default.
+                // mid-run. Only those spellings may open an unbounded wait:
+                // an overflowing numeric literal (`1e999`) also parses to
+                // infinity, so non-finite parses fall back to the clamped
+                // default like any unparsable or sub-minute value.
                 config.timeout_minutes = match raw.trim().to_ascii_lowercase().as_str() {
                     "inf" | "+inf" | "-inf" | "infinity" | "+infinity" | "-infinity" => {
                         f64::INFINITY
                     }
-                    _ => raw.parse::<f64>().unwrap_or(1.0).max(1.0),
+                    _ => raw
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|value| value.is_finite())
+                        .unwrap_or(1.0)
+                        .max(1.0),
                 };
             }
             "--out" => config.out_dir = arg_value(argv, &mut index, arg)?.to_string(),

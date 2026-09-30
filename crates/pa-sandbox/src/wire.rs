@@ -233,6 +233,7 @@ fn validate_idempotency_key(value: &str) -> Result<(), SandboxError> {
 
 /// Validate a create request locally, exactly mirroring the TS
 /// `createVmSandbox` guards; nothing is sent when this fails.
+#[allow(clippy::too_many_lines)] // Keep the complete create-request contract in one validation function.
 pub(crate) fn validate_create_request(request: &VmCreateRequest) -> Result<(), SandboxError> {
     if request.name.trim().is_empty() || request.name.len() > MAX_NAME_BYTES {
         return Err(SandboxError::invalid_request(

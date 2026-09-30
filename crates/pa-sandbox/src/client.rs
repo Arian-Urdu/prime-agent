@@ -192,7 +192,7 @@ impl<T: SandboxTransport> PrimeSandboxClient<T> {
                 format!("{}/api/v1/sandbox/{sandbox_id}", self.base_url),
                 None,
                 "Sandbox delete",
-                require_delete_response,
+                |value| require_delete_response(&value),
             )
             .await;
         match outcome {
@@ -327,7 +327,7 @@ impl<T: SandboxTransport> PrimeSandboxClient<T> {
 
 /// The delete response contract: any JSON object (TS checks
 /// `isRecord(value)`).
-fn require_delete_response(value: serde_json::Value) -> Result<(), SandboxError> {
+fn require_delete_response(value: &serde_json::Value) -> Result<(), SandboxError> {
     if value.is_object() {
         Ok(())
     } else {

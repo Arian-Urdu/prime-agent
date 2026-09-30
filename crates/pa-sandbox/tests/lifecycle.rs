@@ -46,6 +46,7 @@ impl ScriptedTransport {
 }
 
 impl SandboxTransport for &ScriptedTransport {
+    #[allow(clippy::unused_async_trait_impl)] // This scripted test transport completes immediately.
     async fn execute(
         &self,
         request: TransportRequest,
@@ -71,6 +72,7 @@ fn clone_error(error: &pa_sandbox::SandboxError) -> pa_sandbox::SandboxError {
     pa_sandbox::SandboxError::network(error.to_string())
 }
 
+#[allow(clippy::needless_pass_by_value)] // Test fixtures own their one-shot JSON bodies.
 fn ok(body: serde_json::Value) -> Reply {
     Reply::Response(TransportResponse {
         status: 200,
@@ -78,6 +80,7 @@ fn ok(body: serde_json::Value) -> Reply {
     })
 }
 
+#[allow(clippy::needless_pass_by_value)] // Test fixtures own their one-shot JSON bodies.
 fn status_reply(status: u16, body: serde_json::Value) -> Reply {
     Reply::Response(TransportResponse {
         status,
@@ -553,6 +556,7 @@ async fn construction_validates_the_configuration() {
 }
 
 #[tokio::test]
+#[allow(clippy::float_cmp)] // Exact integer-valued JSON numbers must match the reference profile.
 async fn sandbox_records_match_the_reference_profile() {
     let transport = ScriptedTransport::new(vec![ok(sandbox_wire("RUNNING"))]);
     let client = test_client(&transport);

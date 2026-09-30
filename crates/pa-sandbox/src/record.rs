@@ -98,11 +98,11 @@ pub(crate) fn parse_sandbox(value: serde_json::Value) -> Result<Sandbox, Sandbox
     ] {
         require_non_empty(value, field)?;
     }
-    if raw.gpu_count < 0 || raw.gpu_count > u32::MAX as i64 {
-        return Err(SandboxError::invalid_response(
+    let gpu_count = u32::try_from(raw.gpu_count).map_err(|_| {
+        SandboxError::invalid_response(
             "Sandbox response field gpuCount must be a non-negative integer",
-        ));
-    }
+        )
+    })?;
     Ok(Sandbox {
         id: raw.id,
         name: raw.name,
@@ -111,7 +111,7 @@ pub(crate) fn parse_sandbox(value: serde_json::Value) -> Result<Sandbox, Sandbox
         cpu_cores: raw.cpu_cores,
         memory_gb: raw.memory_gb,
         disk_size_gb: raw.disk_size_gb,
-        gpu_count: raw.gpu_count as u32,
+        gpu_count,
         gpu_type: raw.gpu_type,
         vm: raw.vm,
         network_allowlist: raw.network_allowlist,
@@ -169,6 +169,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)] // These exact integer-valued JSON numbers must round-trip unchanged.
     fn sandbox_records_parse_strictly() {
         let sandbox = parse_sandbox(sandbox_wire()).unwrap();
         assert_eq!(sandbox.id, "sb-1");

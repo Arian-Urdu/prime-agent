@@ -1,6 +1,6 @@
 """Window screenshots through the macOS screencapture tool, plus the attach hook.
 
-screenshot_window is synchronous and shells out to screencapture; the App layer
+_screenshot_window is synchronous and shells out to screencapture; the App layer
 calls it from its async wrapper. origin and size are CG screen-space integer
 pairs derived from AX window bounds by the App layer; window_id scopes the
 capture to one window so occluding content is never included.
@@ -19,7 +19,14 @@ from .errors import ComputerUseError
 
 _TIMEOUT_SECONDS = 10.0
 _ERROR_LIMIT = 200
-_SCREENSHOTS_DIR = Path.home() / ".prime" / "agent" / "tmp" / "computer-use"
+def _screenshots_dir() -> Path:
+    """The capture tmp dir under the agent state dir (env-overridable)."""
+    override = os.environ.get("PRIME_AGENT_CODING_AGENT_DIR")
+    base = Path(override).expanduser() if override else Path.home() / ".prime" / "agent"
+    return base / "tmp" / "computer-use"
+
+
+_SCREENSHOTS_DIR = _screenshots_dir()
 _SCREENCAPTURE_TOOL = "/usr/sbin/screencapture"
 _SWEEP_MAX_FILES = 20
 _SWEEP_MAX_AGE_SECONDS = 24 * 60 * 60
@@ -101,7 +108,7 @@ def _png_dimensions(path: Path) -> tuple[int, int]:
     return width, height
 
 
-def screenshot_window(
+def _screenshot_window(
     origin: tuple[int, int], size: tuple[int, int], window_id: int | None = None
 ) -> dict[str, str | int]:
     """Capture the target window, or the screen region as a documented fallback, into a PNG file.
@@ -191,7 +198,7 @@ def screenshot_window(
     return {"path": str(path), "width": width, "height": height}
 
 
-async def attach_image_if_available(path: str) -> None:
+async def _attach_image_if_available(path: str) -> None:
     """Load the screenshot at path into the model's context as an image attachment.
 
     Best-effort: every failure is swallowed silently, including a non-vision
@@ -205,4 +212,4 @@ async def attach_image_if_available(path: str) -> None:
         return
 
 
-attach = attach_image_if_available
+_attach = _attach_image_if_available

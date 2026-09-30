@@ -87,7 +87,7 @@ class _CaptureTestCase(unittest.TestCase):
 class WindowScopedCaptureTests(_CaptureTestCase):
     def test_window_id_captures_that_window_only(self) -> None:
         recorder = self.capture_run()
-        result = capture.screenshot_window((10, 20), (400, 300), window_id=4321)
+        result = capture._screenshot_window((10, 20), (400, 300), window_id=4321)
         argv = recorder.call_args[0][0]
         self.assertEqual(argv, [str(self.tool), "-x", "-o", "-l", "4321", argv[5]])
         self.assertEqual(Path(argv[5]).parent, self.shots_dir)
@@ -95,7 +95,7 @@ class WindowScopedCaptureTests(_CaptureTestCase):
 
     def test_without_window_id_falls_back_to_region(self) -> None:
         recorder = self.capture_run()
-        capture.screenshot_window((10, 20), (400, 300))
+        capture._screenshot_window((10, 20), (400, 300))
         argv = recorder.call_args[0][0]
         self.assertEqual(argv[:5], [str(self.tool), "-x", "-o", "-R", "10,20,400,300"])
         self.assertEqual(Path(argv[5]).parent, self.shots_dir)
@@ -103,7 +103,7 @@ class WindowScopedCaptureTests(_CaptureTestCase):
     def test_bad_window_id_is_invalid_argument(self) -> None:
         for bad in ("4321", 1.5, True):
             with self.subTest(bad=bad), self.assertRaises(ComputerUseError) as caught:
-                capture.screenshot_window((0, 0), (5, 5), window_id=bad)
+                capture._screenshot_window((0, 0), (5, 5), window_id=bad)
             self.assertEqual(caught.exception.code, "INVALID_ARGUMENT")
 
 
@@ -112,14 +112,14 @@ class PngHygieneTests(_CaptureTestCase):
         stale = self.write_shot("stale.png", _STALE_AGE_SECONDS)
         fresh = self.write_shot("fresh.png", 60)
         self.capture_run()
-        capture.screenshot_window((0, 0), (5, 5))
+        capture._screenshot_window((0, 0), (5, 5))
         self.assertFalse(stale.exists())
         self.assertTrue(fresh.exists())
 
     def test_sweep_keeps_at_most_the_twenty_most_recent(self) -> None:
         paths = [self.write_shot(f"shot-{index}.png", 3600 + (25 - index)) for index in range(25)]
         self.capture_run()
-        capture.screenshot_window((0, 0), (5, 5))
+        capture._screenshot_window((0, 0), (5, 5))
         survivors = [path for path in paths if path.exists()]
         self.assertEqual(survivors, paths[5:])
 
@@ -129,7 +129,7 @@ class PngHygieneTests(_CaptureTestCase):
         stamp = time.time() - _STALE_AGE_SECONDS
         os.utime(undeletable, (stamp, stamp))
         self.capture_run()
-        result = capture.screenshot_window((0, 0), (5, 5))
+        result = capture._screenshot_window((0, 0), (5, 5))
         self.assertTrue(result["path"].endswith(".png"))
         self.assertTrue(undeletable.exists())
 
@@ -137,7 +137,7 @@ class PngHygieneTests(_CaptureTestCase):
 class AbsoluteToolPathTests(_CaptureTestCase):
     def test_prefers_the_absolute_tool_path(self) -> None:
         recorder = self.capture_run()
-        capture.screenshot_window((0, 0), (5, 5))
+        capture._screenshot_window((0, 0), (5, 5))
         self.assertEqual(recorder.call_args[0][0][0], str(self.tool))
 
     def test_falls_back_to_which_when_absolute_tool_is_missing(self) -> None:
@@ -145,7 +145,7 @@ class AbsoluteToolPathTests(_CaptureTestCase):
         with mock.patch.object(capture, "_SCREENCAPTURE_TOOL", missing):
             with mock.patch.object(capture.shutil, "which", return_value="/opt/cua/screencapture"):
                 recorder = self.capture_run()
-                capture.screenshot_window((0, 0), (5, 5))
+                capture._screenshot_window((0, 0), (5, 5))
         self.assertEqual(recorder.call_args[0][0][0], "/opt/cua/screencapture")
 
     def test_which_results_are_made_absolute(self) -> None:
@@ -153,7 +153,7 @@ class AbsoluteToolPathTests(_CaptureTestCase):
         with mock.patch.object(capture, "_SCREENCAPTURE_TOOL", missing):
             with mock.patch.object(capture.shutil, "which", return_value="rel/screencapture"):
                 recorder = self.capture_run()
-                capture.screenshot_window((0, 0), (5, 5))
+                capture._screenshot_window((0, 0), (5, 5))
         self.assertEqual(recorder.call_args[0][0][0], os.path.abspath("rel/screencapture"))
 
     def test_no_tool_anywhere_maps_to_transport_error(self) -> None:
@@ -162,7 +162,7 @@ class AbsoluteToolPathTests(_CaptureTestCase):
             with mock.patch.object(capture.shutil, "which", return_value=None):
                 self.capture_run()
                 with self.assertRaises(ComputerUseError) as caught:
-                    capture.screenshot_window((0, 0), (5, 5))
+                    capture._screenshot_window((0, 0), (5, 5))
         self.assertEqual(caught.exception.code, "TRANSPORT_ERROR")
         self.assertIn("not available", caught.exception.message)
 
@@ -173,7 +173,7 @@ class ErrorContractTests(_CaptureTestCase):
         blocked.write_text("not a directory", encoding="utf-8")
         with mock.patch.object(capture, "_SCREENSHOTS_DIR", blocked):
             with self.assertRaises(ComputerUseError) as caught:
-                capture.screenshot_window((0, 0), (5, 5))
+                capture._screenshot_window((0, 0), (5, 5))
         self.assertEqual(caught.exception.code, "TRANSPORT_ERROR")
         self.assertIn("screenshot directory unavailable", caught.exception.message)
 
@@ -183,13 +183,13 @@ class ErrorContractTests(_CaptureTestCase):
                 raise PermissionError("no cg access")
 
         backends = types.SimpleNamespace(quartz=NoFrameworkAccess())
-        with mock.patch.object(inject, "require_mac", return_value=backends):
+        with mock.patch.object(inject, "_require_mac", return_value=backends):
             for call, args in (
-                (inject.click, (123, (1, 2))),
-                (inject.drag, (123, (1, 2), (3, 4))),
-                (inject.scroll, (123, "up")),
-                (inject.press_key, (123, "a")),
-                (inject.type_text, (123, "hi")),
+                (inject._click, (123, (1, 2))),
+                (inject._drag, (123, (1, 2), (3, 4))),
+                (inject._scroll, (123, "up")),
+                (inject._press_key, (123, "a")),
+                (inject._type_text, (123, "hi")),
             ):
                 with self.subTest(call=call.__name__), self.assertRaises(ComputerUseError) as caught:
                     call(*args)
@@ -203,27 +203,27 @@ class ErrorContractTests(_CaptureTestCase):
                 raise RuntimeError("boom")
 
         backends = types.SimpleNamespace(quartz=ExplodingFramework())
-        with mock.patch.object(inject, "require_mac", return_value=backends):
+        with mock.patch.object(inject, "_require_mac", return_value=backends):
             with self.assertRaises(ComputerUseError) as caught:
-                inject.click(123, (1, 2))
+                inject._click(123, (1, 2))
         self.assertEqual(caught.exception.code, "INJECTION_FAILED")
 
 
 class FileModesTests(_CaptureTestCase):
     def test_tmp_dir_is_private(self) -> None:
         self.capture_run()
-        capture.screenshot_window((0, 0), (5, 5))
+        capture._screenshot_window((0, 0), (5, 5))
         self.assertEqual(os.stat(self.shots_dir).st_mode & 0o777, 0o700)
 
     def test_written_png_is_owner_only(self) -> None:
         self.capture_run()
-        result = capture.screenshot_window((0, 0), (5, 5))
+        result = capture._screenshot_window((0, 0), (5, 5))
         self.assertEqual(os.stat(result["path"]).st_mode & 0o777, 0o600)
 
     def test_chmod_failures_never_break_the_capture(self) -> None:
         self.capture_run()
         with mock.patch.object(capture.os, "chmod", side_effect=PermissionError("nope")):
-            result = capture.screenshot_window((0, 0), (5, 5))
+            result = capture._screenshot_window((0, 0), (5, 5))
         self.assertTrue(result["path"].endswith(".png"))
 
 
@@ -235,7 +235,7 @@ class SymlinkGuardTests(_CaptureTestCase):
         link.symlink_to(real)
         with mock.patch.object(capture, "_SCREENSHOTS_DIR", link):
             with self.assertRaises(ComputerUseError) as caught:
-                capture.screenshot_window((0, 0), (5, 5))
+                capture._screenshot_window((0, 0), (5, 5))
         self.assertEqual(caught.exception.code, "TRANSPORT_ERROR")
         self.assertIn("symlink", caught.exception.message)
 
@@ -250,7 +250,7 @@ class SymlinkGuardTests(_CaptureTestCase):
         with mock.patch.object(capture, "_SCREENSHOTS_DIR", shots):
             with mock.patch.object(capture.Path, "home", return_value=fake_home):
                 with self.assertRaises(ComputerUseError) as caught:
-                    capture.screenshot_window((0, 0), (5, 5))
+                    capture._screenshot_window((0, 0), (5, 5))
         self.assertEqual(caught.exception.code, "TRANSPORT_ERROR")
         self.assertIn("symlink", caught.exception.message)
         self.assertFalse(shots.exists())
@@ -260,7 +260,7 @@ class SymlinkGuardTests(_CaptureTestCase):
         elsewhere.mkdir()
         with mock.patch.object(capture, "_SCREENSHOTS_DIR", elsewhere):
             self.capture_run()
-            result = capture.screenshot_window((0, 0), (5, 5))
+            result = capture._screenshot_window((0, 0), (5, 5))
         self.assertTrue(result["path"].endswith(".png"))
 
     def test_non_regular_target_is_refused(self) -> None:
@@ -271,7 +271,7 @@ class SymlinkGuardTests(_CaptureTestCase):
             blocked.mkdir()
             self.capture_run()
             with self.assertRaises(ComputerUseError) as caught:
-                capture.screenshot_window((0, 0), (5, 5))
+                capture._screenshot_window((0, 0), (5, 5))
         self.assertEqual(caught.exception.code, "TRANSPORT_ERROR")
         self.assertIn("not a regular file", caught.exception.message)
 
@@ -283,7 +283,7 @@ class SymlinkGuardTests(_CaptureTestCase):
             link.symlink_to(self.tool)
             self.capture_run()
             with self.assertRaises(ComputerUseError) as caught:
-                capture.screenshot_window((0, 0), (5, 5))
+                capture._screenshot_window((0, 0), (5, 5))
         self.assertEqual(caught.exception.code, "TRANSPORT_ERROR")
         self.assertIn("not a regular file", caught.exception.message)
 
@@ -292,39 +292,39 @@ class PngDimensionTests(_CaptureTestCase):
     def test_invalid_png_is_rejected(self) -> None:
         self.capture_run(png=b"not a png at all")
         with self.assertRaises(ComputerUseError) as caught:
-            capture.screenshot_window((0, 0), (5, 5))
+            capture._screenshot_window((0, 0), (5, 5))
         self.assertEqual(caught.exception.code, "TRANSPORT_ERROR")
         self.assertIn("valid PNG", caught.exception.message)
 
     def test_missing_png_is_rejected(self) -> None:
         self.capture_run(png=b"")
         with self.assertRaises(ComputerUseError) as caught:
-            capture.screenshot_window((0, 0), (5, 5))
+            capture._screenshot_window((0, 0), (5, 5))
         self.assertEqual(caught.exception.code, "TRANSPORT_ERROR")
         self.assertIn("readable PNG", caught.exception.message)
 
     def test_zero_dimension_png_is_rejected(self) -> None:
         self.capture_run(png=fake_png_bytes(0, 0))
         with self.assertRaises(ComputerUseError) as caught:
-            capture.screenshot_window((0, 0), (5, 5))
+            capture._screenshot_window((0, 0), (5, 5))
         self.assertEqual(caught.exception.code, "TRANSPORT_ERROR")
         self.assertIn("empty PNG", caught.exception.message)
 
     def test_region_capture_far_beyond_rect_is_rejected(self) -> None:
         self.capture_run(png=fake_png_bytes(4000, 3000))
         with self.assertRaises(ComputerUseError) as caught:
-            capture.screenshot_window((0, 0), (400, 300))
+            capture._screenshot_window((0, 0), (400, 300))
         self.assertEqual(caught.exception.code, "TRANSPORT_ERROR")
         self.assertIn("far from the requested", caught.exception.message)
 
     def test_region_capture_at_two_x_retina_scale_is_allowed(self) -> None:
         self.capture_run(png=fake_png_bytes(800, 600))
-        result = capture.screenshot_window((0, 0), (400, 300))
+        result = capture._screenshot_window((0, 0), (400, 300))
         self.assertEqual((result["width"], result["height"]), (400, 300))
 
     def test_window_capture_is_not_rect_checked(self) -> None:
         self.capture_run(png=fake_png_bytes(4000, 3000))
-        result = capture.screenshot_window((0, 0), (400, 300), window_id=77)
+        result = capture._screenshot_window((0, 0), (400, 300), window_id=77)
         self.assertEqual((result["width"], result["height"]), (400, 300))
 
 

@@ -12,7 +12,7 @@ import re
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from ._compat import require_mac
+from ._compat import _require_mac
 from .errors import ComputerUseError
 
 _MAX_DEPTH = 12
@@ -49,12 +49,12 @@ class Observation(NamedTuple):
     window_id: int | None = None
 
 
-def is_secure_field(element: dict[str, Any]) -> bool:
+def _is_secure_field(element: dict[str, Any]) -> bool:
     """Report whether one element is a secure text field (password input)."""
     return element.get("role") == _SECURE_ROLE and element.get("subrole") == _SECURE_SUBROLE
 
 
-def flatten(tree: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _flatten(tree: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Flatten one element tree depth-first into element-index order."""
     flat: list[dict[str, Any]] = []
     stack = list(reversed(tree))
@@ -65,7 +65,7 @@ def flatten(tree: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return flat
 
 
-def instructions_path(bundle_id: str) -> Path:
+def _instructions_path(bundle_id: str) -> Path:
     """Return the per-app instruction file path for one bundle id.
 
     The packaged location (a wheel install ships the files inside the
@@ -77,16 +77,16 @@ def instructions_path(bundle_id: str) -> Path:
     return _SKILL_INSTRUCTIONS_DIR / f"{sanitized}.md"
 
 
-def load_instructions(bundle_id: str) -> str | None:
+def _load_instructions(bundle_id: str) -> str | None:
     """Read per-app usage instructions, tolerating a missing or empty file."""
     try:
-        text = instructions_path(bundle_id).read_text(encoding="utf-8").strip()
+        text = _instructions_path(bundle_id).read_text(encoding="utf-8").strip()
     except OSError:
         return None
     return text or None
 
 
-def observe(pid: int) -> Observation:
+def _observe(pid: int) -> Observation:
     """Snapshot the focused window of one app process.
 
     Walks the focused window's children depth-first, capped at _MAX_DEPTH
@@ -95,24 +95,25 @@ def observe(pid: int) -> Observation:
     position, and size. Raises ComputerUseError TRANSPORT_ERROR off darwin or
     when the frameworks are missing.
     """
-    app_services = require_mac().app_services
+    app_services = _require_mac().app_services
     app_element = app_services.AXUIElementCreateApplication(pid)
     _set_messaging_timeout(app_services, app_element)
     window = _copy_value(app_services, app_element, "AXFocusedWindow")
     if window is None or _text(_copy_value(app_services, window, "AXRole")) == "AXApplication":
         # A windowless app reports the application element (or nothing) as its
-        # focused window; there is no window tree to observe yet.
+        # focused window; there is no window tree to _observe yet.
         return Observation(window_title=None, tree=[], refs=[], window_rect=None)
     tree: list[dict[str, Any]] = []
     refs: list[Any] = []
     _walk(app_services, window, 1, tree, refs)
+    window_id = _window_id(app_services, window)
     return Observation(
         window_title=_text(_copy_value(app_services, window, "AXTitle")),
         tree=tree,
         refs=refs,
-        window_rect=_window_rect(app_services, window),
+        window_rect=_window_rect(app_services, window) or _window_server_rect(window_id),
         focused_index=_focused_index(app_services, app_element, refs),
-        window_id=_window_id(app_services, window),
+        window_id=window_id,
     )
 
 
@@ -127,28 +128,28 @@ def _focused_index(app_services: Any, app_element: Any, refs: list[Any]) -> int 
     return None
 
 
-def live_fingerprint(ref: Any) -> tuple[str | None, str | None]:
+def _live_fingerprint(ref: Any) -> tuple[str | None, str | None]:
     """Read one live element's current (role, title) for freshness checking."""
-    app_services = require_mac().app_services
+    app_services = _require_mac().app_services
     return (
         _text(_copy_value(app_services, ref, "AXRole")),
         _text(_copy_value(app_services, ref, "AXTitle")),
     )
 
 
-def focused_is_secure(pid: int) -> bool | None:
+def _focused_is_secure(pid: int) -> bool | None:
     """Report whether the app's live focused element is a secure field.
 
     Returns None when the live focus cannot be read; callers fall back to
     their last snapshot.
     """
-    app_services = require_mac().app_services
+    app_services = _require_mac().app_services
     app_element = app_services.AXUIElementCreateApplication(pid)
     _set_messaging_timeout(app_services, app_element)
     focused = _copy_value(app_services, app_element, "AXFocusedUIElement")
     if focused is None:
         return None
-    return is_secure_field(
+    return _is_secure_field(
         {
             "role": _text(_copy_value(app_services, focused, "AXRole")),
             "subrole": _text(_copy_value(app_services, focused, "AXSubrole")),
@@ -156,15 +157,15 @@ def focused_is_secure(pid: int) -> bool | None:
     )
 
 
-def current_value(ref: Any) -> str | None:
+def _current_value(ref: Any) -> str | None:
     """Read one element's current AXValue as text, or None when unreadable."""
-    app_services = require_mac().app_services
+    app_services = _require_mac().app_services
     return _text(_copy_value(app_services, ref, "AXValue"))
 
 
-def perform_action(ref: Any, action: str) -> None:
+def _perform_action(ref: Any, action: str) -> None:
     """Perform one named accessibility action on an element."""
-    app_services = require_mac().app_services
+    app_services = _require_mac().app_services
     error = app_services.AXUIElementPerformAction(ref, action)
     if error != app_services.kAXErrorSuccess:
         raise ComputerUseError(
@@ -174,9 +175,9 @@ def perform_action(ref: Any, action: str) -> None:
         )
 
 
-def is_settable(ref: Any, attribute: str) -> bool:
+def _is_settable(ref: Any, attribute: str) -> bool:
     """Report whether an element accepts writes for one attribute."""
-    app_services = require_mac().app_services
+    app_services = _require_mac().app_services
     try:
         result = app_services.AXUIElementIsAttributeSettable(ref, attribute)
     except Exception:
@@ -185,9 +186,9 @@ def is_settable(ref: Any, attribute: str) -> bool:
     return error == app_services.kAXErrorSuccess and bool(settable)
 
 
-def set_value(ref: Any, value: str) -> None:
+def _set_value(ref: Any, value: str) -> None:
     """Set an element's AXValue attribute to a string."""
-    app_services = require_mac().app_services
+    app_services = _require_mac().app_services
     error = app_services.AXUIElementSetAttributeValue(ref, "AXValue", value)
     if error != app_services.kAXErrorSuccess:
         raise ComputerUseError(
@@ -197,9 +198,9 @@ def set_value(ref: Any, value: str) -> None:
         )
 
 
-def select_text_range(ref: Any, location: int, length: int) -> None:
+def _select_text_range(ref: Any, location: int, length: int) -> None:
     """Set the element's selected text range, leaving its content untouched."""
-    app_services = require_mac().app_services
+    app_services = _require_mac().app_services
     error = app_services.AXUIElementSetAttributeValue(
         ref, "AXSelectedTextRange", app_services.CFRangeMake(location, length)
     )
@@ -338,6 +339,33 @@ def _window_rect(app_services: Any, window: Any) -> tuple[float, float, float, f
     if position is None or size is None:
         return None
     return (position[0], position[1], size[0], size[1])
+
+
+def _window_server_rect(window_id: int | None) -> tuple[float, float, float, float] | None:
+    """Read one window's bounds from the window server by its CGWindowID.
+
+    Electron windows often omit AXPosition/AXSize on the AX element while
+    the window server always knows the bounds; the CGWindowID comes from
+    the private _AXWindowID attribute. Returns None when unknown.
+    """
+    if window_id is None:
+        return None
+    try:
+        quartz = _require_mac().quartz
+        options = quartz.kCGWindowListOptionOnScreenOnly | quartz.kCGWindowListExcludeDesktopElements
+        for info in quartz.CGWindowListCopyWindowInfo(options, window_id):
+            bounds = info.get("kCGWindowBounds")
+            if bounds is None:
+                continue
+            return (
+                float(bounds.get("X", 0.0)),
+                float(bounds.get("Y", 0.0)),
+                float(bounds.get("Width", 0.0)),
+                float(bounds.get("Height", 0.0)),
+            )
+    except Exception:
+        return None
+    return None
 
 
 def _set_messaging_timeout(app_services: Any, element: Any) -> None:

@@ -56,13 +56,13 @@ class ModuleSurfaceTests(unittest.TestCase):
 
     def test_require_linux_raises_off_linux(self) -> None:
         with self.assertRaises(ComputerUseError) as caught:
-            _compat.require_linux()
+            _compat._require_linux()
         self.assertEqual(caught.exception.code, "TRANSPORT_ERROR")
         self.assertIn("xdotool", caught.exception.message)
 
     def test_require_linux_loads_module_when_backend_is_linux(self) -> None:
-        with mock.patch.object(_compat, "backend", return_value="linux"):
-            loaded = _compat.require_linux()
+        with mock.patch.object(_compat, "_backend", return_value="linux"):
+            loaded = _compat._require_linux()
         self.assertIs(loaded, _linux)
         for name in SEAMS:
             with self.subTest(seam=name):
@@ -154,7 +154,7 @@ class ObserveTests(unittest.TestCase):
         with fake_x11(script):
             observation = _linux._observe(220)
         self.assertEqual(
-            diff.serialize(observation.tree),
+            diff._serialize(observation.tree),
             [
                 "[0] window (Slack) @ (1932, 40) 1000x700",
                 "  [1] window (XTerm) 'terminal' @ (1922, 20) 640x480",
@@ -862,7 +862,7 @@ class AppLinuxDispatchTests(unittest.TestCase):
 @unittest.skipUnless(LIVE, LIVE_SKIP)
 class LiveLinuxSmokes(unittest.TestCase):
     def test_require_linux_module_and_seams(self) -> None:
-        loaded = _compat.require_linux()
+        loaded = _compat._require_linux()
         for name in SEAMS:
             with self.subTest(seam=name):
                 self.assertTrue(callable(getattr(loaded, name, None)))

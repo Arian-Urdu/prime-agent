@@ -153,7 +153,7 @@ class FailClosedLaunchTests(AppTestCase):
     async def test_denied_name_never_launches(self) -> None:
         env = self.make_env(allowed=("com.other.app",))
         env.running = []
-        with mock.patch.object(apps, "bundle_for_name", return_value=env.bundle):
+        with mock.patch.object(apps, "_bundle_for_name", return_value=env.bundle):
             with self.assertRaises(errors.ComputerUseError) as caught:
                 await env.get_app("Example")
         self.assertEqual(caught.exception.code, "APP_NOT_ALLOWED")
@@ -162,7 +162,7 @@ class FailClosedLaunchTests(AppTestCase):
     async def test_unresolvable_name_fails_closed_without_launching(self) -> None:
         env = self.make_env()
         env.running = []
-        with mock.patch.object(apps, "bundle_for_name", return_value=None):
+        with mock.patch.object(apps, "_bundle_for_name", return_value=None):
             with self.assertRaises(errors.ComputerUseError) as caught:
                 await env.get_app("Mystery App")
         self.assertEqual(caught.exception.code, "APP_NOT_ALLOWED")
@@ -188,7 +188,7 @@ class FailClosedLaunchTests(AppTestCase):
     async def test_allowed_resolved_name_launches_once(self) -> None:
         env = self.make_env()
         env.running = []
-        with mock.patch.object(apps, "bundle_for_name", return_value=env.bundle):
+        with mock.patch.object(apps, "_bundle_for_name", return_value=env.bundle):
             app = await env.get_app("Example")
         self.assertEqual(env.launch_calls, ["Example"])
         self.assertEqual(app.bundle_id, env.bundle)
@@ -199,10 +199,10 @@ class CasefoldTests(unittest.TestCase):
         from computer_use.apps import RunningApp
 
         running = [RunningApp(bundle_id="com.example.app", name="Weiß", pid=1, path=None)]
-        with mock.patch.object(apps, "running_apps", lambda: running):
-            self.assertEqual(len(apps.resolve("weiss")), 1)
-            self.assertEqual(len(apps.resolve("WEISS")), 1)
-            self.assertEqual(apps.resolve("nope"), [])
+        with mock.patch.object(apps, "_running_apps", lambda: running):
+            self.assertEqual(len(apps._resolve("weiss")), 1)
+            self.assertEqual(len(apps._resolve("WEISS")), 1)
+            self.assertEqual(apps._resolve("nope"), [])
 
 
 class AllTypeClipboardTests(unittest.TestCase):
@@ -237,7 +237,7 @@ class AllTypeClipboardTests(unittest.TestCase):
 
         pasteboard = FakePasteboard()
         fake_mac = types.SimpleNamespace(cocoa=self._fake_cocoa(pasteboard))
-        with mock.patch.object(computer_use, "require_mac", lambda: fake_mac):
+        with mock.patch.object(computer_use, "_require_mac", lambda: fake_mac):
             saved = computer_use._save_clipboard()
             computer_use._restore_clipboard(saved)
         self.assertEqual(
@@ -272,7 +272,7 @@ class AllTypeClipboardTests(unittest.TestCase):
 
         pasteboard = EmptyPasteboard()
         fake_mac = types.SimpleNamespace(cocoa=self._fake_cocoa(pasteboard))
-        with mock.patch.object(computer_use, "require_mac", lambda: fake_mac):
+        with mock.patch.object(computer_use, "_require_mac", lambda: fake_mac):
             self.assertIsNone(computer_use._save_clipboard())
             computer_use._restore_clipboard(None)
         self.assertEqual(pasteboard.cleared, 1)
@@ -348,8 +348,8 @@ class PackagedInstructionsTests(unittest.TestCase):
             shutil.rmtree(self.packaged_dir.parents[0])
 
     def test_instructions_resolve_from_the_packaged_path_first(self) -> None:
-        self.assertTrue(str(ax.instructions_path(self.bundle)).endswith("src/computer_use/references/app-instructions/com.example.app.md"))
-        self.assertEqual(ax.load_instructions(self.bundle), "packaged instructions")
+        self.assertTrue(str(ax._instructions_path(self.bundle)).endswith("src/computer_use/references/app-instructions/com.example.app.md"))
+        self.assertEqual(ax._load_instructions(self.bundle), "packaged instructions")
 
     def test_packaged_file_ships_in_the_wheel(self) -> None:
         pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
@@ -362,8 +362,8 @@ class PackagedInstructionsTests(unittest.TestCase):
         self.packaged_file.unlink()
         self._cleanup()
         # Re-enter without the packaged file: the skill-dir layout resolves.
-        self.assertTrue(str(ax.instructions_path(self.bundle)).endswith("references/app-instructions/com.example.app.md"))
-        self.assertNotIn("src/computer_use/references", str(ax.instructions_path(self.bundle)))
+        self.assertTrue(str(ax._instructions_path(self.bundle)).endswith("references/app-instructions/com.example.app.md"))
+        self.assertNotIn("src/computer_use/references", str(ax._instructions_path(self.bundle)))
 
 
 if __name__ == "__main__":

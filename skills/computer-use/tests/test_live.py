@@ -1,6 +1,6 @@
 """Opt-in live pyobjc smoke tests, guarded by PRIME_CUA_LIVE=1.
 
-One smoke per live backend path: framework imports, the session-lock probe,
+One smoke per live _backend path: framework imports, the session-lock probe,
 and the real TCC probes. None of them read app content, post input events,
 or capture the screen. Set PRIME_CUA_LIVE=1 to run them deliberately.
 """
@@ -43,10 +43,10 @@ class LiveFrameworkSmokes(unittest.TestCase):
 @unittest.skipUnless(LIVE, SKIP_REASON)
 class LiveProbeSmokes(unittest.TestCase):
     def test_screen_locked_returns_bool(self) -> None:
-        self.assertIsInstance(policy.screen_locked(), bool)
+        self.assertIsInstance(policy._screen_locked(), bool)
 
     def test_permissions_status_reports_shape(self) -> None:
-        status = permissions.status()
+        status = permissions._status()
         self.assertEqual(sorted(status), ["accessibility", "help", "screen_recording"])
         self.assertIn(status["accessibility"], ("ok", "missing", "unknown"))
         self.assertIn(status["screen_recording"], ("ok", "missing", "unknown"))

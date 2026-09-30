@@ -17,7 +17,7 @@ from computer_use import diff
 def lines(tree: dict | list) -> list[str]:
     """Serialize one canned tree (dict root or element list) into lines."""
     elements = tree["children"] if isinstance(tree, dict) else tree
-    return diff.serialize(elements)
+    return diff._serialize(elements)
 
 
 def marked_lines(marked: str, marker: str) -> list[str]:
@@ -66,19 +66,19 @@ class SerializationTests(unittest.TestCase):
         self.assertIn("@", save_lines[0])
 
     def test_empty_tree_renders_no_lines(self) -> None:
-        self.assertEqual(diff.serialize([]), [])
+        self.assertEqual(diff._serialize([]), [])
 
 
 class DiffMarkerTests(unittest.TestCase):
     def test_identical_snapshots_produce_empty_diff(self) -> None:
         before = lines(fakes.small_tree())
         after = lines(fakes.deep_copy(fakes.small_tree()))
-        self.assertEqual(diff.diff(before, after), "")
+        self.assertEqual(diff._diff(before, after), "")
 
     def test_changed_value_is_marked_with_tilde(self) -> None:
         before = lines(fakes.small_tree())
         after = lines(fakes.with_changed_value(fakes.small_tree(), "Search", "new query"))
-        marked = diff.diff(before, after)
+        marked = diff._diff(before, after)
         tilde_lines = marked_lines(marked, "~")
         self.assertEqual(len(tilde_lines), 1)
         self.assertIn("new query", tilde_lines[0])
@@ -93,7 +93,7 @@ class DiffMarkerTests(unittest.TestCase):
                 fakes.element(role="AXButton", title="Fresh"),
             )
         )
-        marked = diff.diff(before, after)
+        marked = diff._diff(before, after)
         plus_lines = marked_lines(marked, "+")
         self.assertEqual(len(plus_lines), 1)
         self.assertIn("Fresh", plus_lines[0])
@@ -101,7 +101,7 @@ class DiffMarkerTests(unittest.TestCase):
     def test_removed_element_is_marked_with_minus(self) -> None:
         before = lines(fakes.small_tree())
         after = lines(fakes.without_child(fakes.small_tree(), "Password"))
-        marked = diff.diff(before, after)
+        marked = diff._diff(before, after)
         minus_lines = marked_lines(marked, "-")
         self.assertEqual(len(minus_lines), 1)
         self.assertIn("Password", minus_lines[0])
@@ -110,7 +110,7 @@ class DiffMarkerTests(unittest.TestCase):
     def test_unchanged_lines_are_omitted(self) -> None:
         before = lines(fakes.small_tree())
         after = lines(fakes.with_changed_value(fakes.small_tree(), "Search", "new query"))
-        marked = diff.diff(before, after)
+        marked = diff._diff(before, after)
         for title in ("Save", "Enabled", "Password"):
             with self.subTest(title=title):
                 self.assertNotIn(title, marked)
@@ -119,19 +119,19 @@ class DiffMarkerTests(unittest.TestCase):
 class DiffEdgeCaseTests(unittest.TestCase):
     def test_empty_before_snapshot_shows_everything_as_added(self) -> None:
         current = lines(fakes.small_tree())
-        marked = diff.diff([], current)
+        marked = diff._diff([], current)
         self.assertEqual(len(marked_lines(marked, "+")), len(current))
         self.assertIn("Search", marked)
 
     def test_empty_after_snapshot_shows_everything_as_removed(self) -> None:
         before = lines(fakes.small_tree())
-        marked = diff.diff(before, [])
+        marked = diff._diff(before, [])
         self.assertEqual(len(marked_lines(marked, "-")), len(before))
 
     def test_large_tree_single_change_diffs_to_one_line(self) -> None:
         before = lines(fakes.large_tree())
         after = lines(fakes.with_changed_value(fakes.large_tree(), "Text 3-4-2", "renamed"))
-        marked = diff.diff(before, after)
+        marked = diff._diff(before, after)
         changed = [line for line in marked.splitlines() if line[:1] in ("~", "+", "-")]
         self.assertEqual(len(changed), 1)
 

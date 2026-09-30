@@ -19,8 +19,10 @@ records; `permissions` mirrors `permissions_status()`.
 
 `get_app` raises `APP_NOT_ALLOWED` (allowlist gate), `PERMISSIONS_NOT_GRANTED`,
 `APP_NOT_RUNNING`, `AMBIGUOUS_APP`, `APP_LAUNCH_FAILED`, and `SCREEN_LOCKED`.
-Binding an installed app that is not running attempts to start it; a failed
-start raises `APP_LAUNCH_FAILED`.
+Binding an installed app that is not running launches it in the background
+(`open -g`): the app binds and observes without taking over the screen, and
+only an explicit `App.activate()` brings it forward. A failed start raises
+`APP_LAUNCH_FAILED`.
 
 ## App object
 
@@ -32,6 +34,7 @@ last observed AX text).
 | `await get_ax_state(diff: bool = True)` | `str` | Element-indexed AX text. `diff=True` shows only what changed since the previous snapshot; `diff=False` returns the full tree. Indices always refer to the latest snapshot, whichever view you read. |
 | `await get_screenshot(attach: bool = True)` | `dict` | `{"path", "width", "height"}` taken from the window bounds. `attach=True` loads the image into your context (attach failures are swallowed; the dict is still returned); `attach=False` skips attaching. |
 | `await get_state_and_screenshot(diff: bool = True, attach: bool = True)` | `dict` | One snapshot combining the two calls above: `{"state": ..., "screenshot": ...}`. |
+| `await get_text_regions()` | `list[dict]` | Window-scoped OCR over the focused window: a normalized list of text regions with window-relative pixel coordinates — the same space as screenshot `(x, y)` targets, so a region can be clicked directly. The screen-reading path for models that cannot see images (see Non-vision models in SKILL.md); also reads image and canvas text the AX tree cannot expose. |
 | `await click(target, button: str = "left", count: int = 1)` | `None` | `target` is an `element_index` or an `(x, y)` screenshot-coordinate tuple. `button`: `"left"` (default), `"right"`, `"middle"`; `count=2` double-clicks. |
 | `await drag(from_, to)` | `None` | Two `(x, y)` screenshot-coordinate points. |
 | `await scroll(target, direction: str, pages: int = 1)` | `None` | `direction` is one of `up`, `down`, `left`, `right`; `target` is an index or `(x, y)`. |
@@ -41,11 +44,18 @@ last observed AX text).
 | `await select_text(element_index: int, text: str, prefix: str \| None = None, suffix: str \| None = None)` | `None` | Selects an exact run of `text` inside the element. `prefix` and `suffix` disambiguate repeated occurrences. |
 | `await perform_secondary_action(element_index: int, action: str)` | `None` | Runs an AX action the element exposes. The element's available `actions` appear in its AX text — never guess a name. |
 | `await paste(text: str, format: str = "text")` | `None` | Writes through the clipboard in `text`, `md`, or `html` form; the previous clipboard content is restored. |
+| `await activate()` | `None` | Brings the app's frontmost window to the foreground and makes the app key. Keystrokes always reach the bound app's process, but app-scoped shortcuts (menus, quick switchers, composer keys) only fire while the app is key — call this before any shortcut-driven flow. Never fake focus from bash with `open -a`, osascript, or `screencapture`. |
+| `is_frontmost()` | `bool` | Whether the app is the frontmost (key) application. Synchronous, no `await`. The pre-flight check before a shortcut flow: when it returns `True`, app-scoped shortcuts fire without `activate()`. |
 
 Every `App` action can raise `ELEMENT_STALE`, `ACTION_UNSUPPORTED`,
 `INVALID_ARGUMENT`, `INJECTION_FAILED`, `TRANSPORT_ERROR`, `SCREEN_LOCKED`,
 `APP_NOT_ALLOWED` (the gate is re-checked on every action), and
 `PERMISSIONS_NOT_GRANTED`.
+
+Web views (Electron apps) often omit per-element geometry; an element click
+there raises `ACTION_UNSUPPORTED`. Switch to keyboard navigation or `(x, y)`
+window-screenshot coordinates — `get_text_regions()` supplies those
+coordinates for models that cannot see screenshots.
 
 ## AX text
 
@@ -79,6 +89,10 @@ Every failure raises `computer_use.errors.ComputerUseError` with a `code`:
 
 ## Policy files
 
+The skill's on-disk paths — settings, approvals, and screenshot tmp files —
+all derive from the agent state dir: `~/.prime/agent` by default, or the dir
+named by the `PRIME_AGENT_CODING_AGENT_DIR` environment variable when set.
+
 - Settings: `~/.prime/agent/settings/computer-use.toml` — `apps = {allowed =
   [...], blocked = [...]}`, `system_deny = [bundle ids]`, and `risk =
   {"com.apple.Safari" = "low"}` — quote every dotted bundle-id key (unquoted,
@@ -99,8 +113,8 @@ Emission is best-effort and never raises; properties are primitives only.
   first `get_state()` call (`emit=True`).
 - `computer_use_action` — `{action, outcome, duration_ms}` per action.
   `action` is one of `click`, `drag`, `scroll`, `press_key`, `type_text`,
-  `set_value`, `select_text`, `secondary`, `paste`, `get_state`; `outcome`
-  is `ok` or `error:<CODE>`.
+  `set_value`, `select_text`, `secondary`, `paste`, `activate`, `get_state`;
+  `outcome` is `ok` or `error:<CODE>`.
 
 ## Platforms
 

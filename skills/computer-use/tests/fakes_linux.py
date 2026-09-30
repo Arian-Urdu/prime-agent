@@ -239,10 +239,10 @@ def linux_app_environment(
         mock.patch.object(_linux.subprocess, "run", script),
         mock.patch.object(_linux.shutil, "which", lambda name: f"/usr/bin/{name}"),
         mock.patch.dict(os.environ, {"DISPLAY": ":42"}),
-        mock.patch.object(computer_use, "backend", lambda: "linux"),
-        mock.patch.object(computer_use, "require_linux", lambda: _linux),
+        mock.patch.object(computer_use, "_backend", lambda: "linux"),
+        mock.patch.object(computer_use, "_require_linux", lambda: _linux),
         mock.patch.object(policy, "SETTINGS_PATH", settings_path),
-        mock.patch.object(policy, "screen_locked", lambda: False),
+        mock.patch.object(policy, "_screen_locked", lambda: False),
         mock.patch.dict(computer_use._bound_apps, {}, clear=True),
         mock.patch.object(computer_use, "_instruction_shown", set()),
     ]

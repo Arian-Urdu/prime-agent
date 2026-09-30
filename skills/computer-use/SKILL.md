@@ -61,9 +61,11 @@ text = await app.get_ax_state()  # the settled UI, diffed again
 - A stale index raises `ELEMENT_STALE`. Never retry the same index:
   re-observe with `get_ax_state()` and act on fresh indices.
 - Never sleep or poll for a UI change. The runtime settles after each
-  action; the next `get_ax_state()` already shows the settled state.
+  action; the next `get_ax_state()` already shows the settled state. A
+  loading indicator is the exception: re-observe a few more times until it
+  clears (see Focus and keyboard shortcuts).
 - The full action surface (`drag`, `scroll`, `select_text`,
-  `perform_secondary_action`, `paste`) is in the API reference.
+  `perform_secondary_action`, `paste`, `activate`) is in the API reference.
 
 ## Screenshots
 
@@ -79,6 +81,45 @@ shot = await app.get_screenshot()  # attaches the image to your context
 - Pixel targets for `click`, `drag`, and `scroll` are `(x, y)` tuples in
   window-screenshot coordinates. Capture first, then act on those pixels.
 - Screenshots cost far more tokens than the AX diff. Observe by AX first.
+
+## Non-vision models
+
+A model that cannot see images gets nothing from screenshots. In that mode
+the AX text and its diff announcements stay the primary source, and
+`get_text_regions()` replaces the screenshot path:
+
+```python
+regions = await app.get_text_regions()  # window-scoped OCR
+```
+
+- `get_text_regions()` reads only the focused window. It returns a
+  normalized list of text regions with window-relative pixel coordinates —
+  the same space as screenshot pixel targets, so a region can be clicked
+  directly.
+- Use it wherever a vision model would take a screenshot: visual layouts,
+  images, canvases, controls the tree does not expose.
+- Never improvise screen reading: no full-screen `screencapture`, no
+  external OCR scripts. Observation stays window-scoped through this API.
+
+## Focus and keyboard shortcuts
+
+Work stays in the background. Launches are hidden (`open -g`): the app
+binds and observes without taking over the user's screen, and AX actions,
+`set_value`, `select_text`, and observation all work in the background.
+
+Keystrokes always reach the bound app's process: `type_text`, `press_key`,
+and `paste` are posted per-pid. But app-scoped shortcuts — Electron menus,
+quick switchers, composer keys — only fire while the app is key (frontmost).
+`await app.activate()` is the explicit, user-visible takeover reserved for
+those flows. Check `app.is_frontmost()` first and skip it when the app is
+already key; when you do call it, say so first — "I'm bringing Slack to the
+foreground to use its shortcuts."
+
+- `activate()` is the only supported way to bring the app forward. Never
+  work around focus from bash with `open -a`, osascript, or `screencapture`.
+- A slow or reload-triggering action can leave a loading indicator on
+  screen. Do not conclude failure: re-observe a few more times with
+  `get_ax_state()` until it clears, then judge the flow.
 
 ## Typing hazards
 
@@ -97,8 +138,10 @@ shot = await app.get_screenshot()  # attaches the image to your context
 
 - Apps outside the allowlist raise `APP_NOT_ALLOWED`. Tell the user the
   error and the fix: they add the app's bundle id to `apps.allowed` in
-  `~/.prime/agent/settings/computer-use.toml`. That file is user-edited
-  only — never edit it, and the skill never writes it either.
+  `~/.prime/agent/settings/computer-use.toml` — `~/.prime/agent` is the
+  default agent dir, and the `PRIME_AGENT_CODING_AGENT_DIR` environment
+  variable overrides it. That file is user-edited only — never edit it,
+  and the skill never writes it either.
 - Every action re-checks the gate and the screen. A locked screen fails
   with `SCREEN_LOCKED`: stop and ask the user to unlock. The skill never
   unlocks the screen itself.

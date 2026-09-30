@@ -66,7 +66,7 @@ from uuid import uuid4
 from . import capture
 from .ax import Observation
 from .errors import ComputerUseError
-from .keymap import ParsedChord, parse_chord
+from .keymap import ParsedChord, _parse_chord
 
 _ERROR_LIMIT = 200
 _TIMEOUT_SECONDS = 10.0
@@ -630,7 +630,7 @@ def _scroll(window_id: int, direction: str, pages: int = 1, point: tuple[float, 
 def _press_key(window_id: int, key: str) -> None:
     """Send one key chord such as "cmd+shift+f" to the bound window without activating it.
 
-    The chord parses with computer_use.keymap.parse_chord and translates to
+    The chord parses with computer_use.keymap._parse_chord and translates to
     xdotool's X11 keysym naming (cmd to super), delivered as
     `xdotool key --window <id> <chord>` synthetic input. Apps that ignore
     synthetic keyboard events do not receive the chord; the plain `xdotool
@@ -642,7 +642,7 @@ def _press_key(window_id: int, key: str) -> None:
     exits nonzero.
     """
     window_id = _window_id(window_id)
-    chord = parse_chord(key)
+    chord = _parse_chord(key)
     _require_display()
     _run_checked([_tool("xdotool"), "key", "--window", str(window_id), _chord_keysym(chord)], "key")
 

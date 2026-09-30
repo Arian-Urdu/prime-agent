@@ -75,14 +75,17 @@ impl Client {
         let deadline = Instant::now() + timeout;
         let mut line = String::new();
         loop {
-            line.clear();
             self.reader
                 .get_ref()
                 .set_read_timeout(Duration::from_millis(100))
                 .map_err(|error| format!("failed to set the read timeout: {error}"))?;
             match self.reader.read_line(&mut line) {
                 Ok(0) => return Err("the daemon closed the connection".to_string()),
-                Ok(_) if line.trim().is_empty() => {}
+                // A large frame can straddle the 100ms read windows: the
+                // buffer resets only after a complete line is consumed, so
+                // a read timeout keeps the partial bytes instead of
+                // discarding them and failing the frame's parse.
+                Ok(_) if line.trim().is_empty() => line.clear(),
                 Ok(_) => {
                     return serde_json::from_str(line.trim())
                         .map_err(|error| format!("invalid daemon line: {error}"));
@@ -676,6 +679,45 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn a_fragmented_frame_survives_read_timeouts() {
+        // A large daemon frame (a full transcript, a wide children list)
+        // can straddle the client's 100ms read windows; the partial bytes
+        // must survive the timeout retry instead of being cleared away
+        // and corrupting the line's parse.
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let socket = dir.path().join("frag.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut writer = stream.try_clone().expect("clone");
+            let mut reader = BufReader::new(stream);
+            let _ = writeln!(writer, r#"{{"type":"daemon_hello"}}"#);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            // The response arrives in two pieces with a gap wider than the
+            // client's 100ms read window.
+            let response = r#"{"id":"swarm-eval-1","type":"response","success":true,"data":{"text":"ANSWER: 501"}}"#;
+            writer
+                .write_all(&response.as_bytes()[..20])
+                .expect("first chunk");
+            writer.flush().expect("flush chunk");
+            thread::sleep(Duration::from_millis(300));
+            writer.write_all(&response.as_bytes()[20..]).expect("rest");
+            writer.write_all(b"\n").expect("newline");
+            writer.flush().expect("flush rest");
+        });
+        let mut client = Client::connect(&socket).expect("connect");
+        let response = client
+            .command(
+                &json!({ "type": "get_last_assistant_text", "activeSessionId": "s" }),
+                Duration::from_secs(5),
+            )
+            .expect("the fragmented frame completes");
+        assert_eq!(response["id"], "swarm-eval-1", "{response}");
+        assert_eq!(response["data"]["text"], "ANSWER: 501", "{response}");
     }
 
     #[test]

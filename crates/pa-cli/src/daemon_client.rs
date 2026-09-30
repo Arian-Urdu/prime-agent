@@ -290,6 +290,7 @@ mod tests {
             cwd: None,
             session_dir: None,
             include_client_owned: None,
+            include_remote_mesh: None,
             rest: serde_json::Map::new(),
         }
     }

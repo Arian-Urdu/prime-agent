@@ -30,8 +30,8 @@ pub use lineage::{
 };
 pub(crate) use rows::build_rows;
 pub use selection::{ancestor_session_ids, resolve_selection};
+pub use summary::{identity_scope, selection_key, session_title, summary_identity};
 pub(crate) use summary::{is_subagent_summary, session_model};
-pub use summary::{selection_key, session_title, summary_identity};
 
 /// The scope of a scoped agents view (TS `AgentsViewScopeKey` plus the
 /// display name): the subtree root the view lists descendants of.
@@ -57,6 +57,12 @@ pub struct AgentsViewRow {
     pub summary: Value,
     pub title: String,
     pub model: String,
+    /// The remote row's always-visible machine label
+    /// ("on <tailnet-host>", "on <tailnet-host> (offline)"): local rows
+    /// render none (TS #2516 `remoteHostLabel`; the label renders in its
+    /// own host column, sized to its content, so a MagicDNS hostname is
+    /// never truncated away).
+    pub host_label: Option<String>,
     /// Own usage cost plus every descendant's (TS `recursiveCost`).
     pub cost: f64,
     pub age: String,
@@ -118,6 +124,9 @@ impl AgentsViewRow {
 pub struct SelectionKey {
     pub session_id: Option<String>,
     pub active_session_id: Option<String>,
+    /// MagicDNS host of a remote row: the id fallbacks only match inside
+    /// that host (TS #2516).
+    pub remote_host: Option<String>,
 }
 
 /// One recursive rollup over the record hierarchy (TS

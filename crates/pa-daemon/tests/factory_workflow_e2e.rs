@@ -217,14 +217,30 @@ impl Client {
     }
 }
 
+/// The memoized kernel-python resolution (the probe spawns a python
+/// import of the whole runtime; the suite asks once).
+static KERNEL_PYTHON: std::sync::OnceLock<Option<pa_core::factory_eval::FactoryKernelPython>> =
+    std::sync::OnceLock::new();
+
 /// Resolve the kernel python the suite pins: the fleet's explicit override,
 /// the caller's product pin, then the shared resolver's candidates. The
 /// None-when-no-shared-venv case means CI: the standard bootstrap builds
 /// the venv from this checkout's runtime.
 fn kernel_python() -> Option<pa_core::factory_eval::FactoryKernelPython> {
-    let explicit = std::env::var_os("PA_E2E_KERNEL_PYTHON")
-        .or_else(|| std::env::var_os("PRIME_AGENT_KERNEL_PYTHON"))
-        .map(PathBuf::from);
+    KERNEL_PYTHON
+        .get_or_init(|| {
+            let explicit = std::env::var_os("PA_E2E_KERNEL_PYTHON")
+                .or_else(|| std::env::var_os("PRIME_AGENT_KERNEL_PYTHON"))
+                .map(PathBuf::from);
+            resolve_kernel_python(explicit)
+        })
+        .clone()
+}
+
+fn resolve_kernel_python(
+    explicit: Option<PathBuf>,
+) -> Option<pa_core::factory_eval::FactoryKernelPython> {
+    let explicit = explicit;
     let (kernel, shared_venv_exists) = resolve_factory_kernel_python(explicit);
     match (&kernel, shared_venv_exists) {
         (Some(_), _) => {}

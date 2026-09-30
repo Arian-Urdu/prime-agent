@@ -440,6 +440,18 @@ fn reconcile_orphaned_create(
         .ok_or_else(|| "the trial sessions list returned no sessions field".to_string())?;
     let mut killed = 0;
     for row in rows {
+        // `list { all: true, sessionDir }` also appends the daemon's other
+        // live residents (unmatched by the listed dir) and their passive
+        // children; only rows whose session file lives under the trial's
+        // own sessions dir are ours to kill — a concurrent eval's or a
+        // user's session on the same daemon must survive the reconcile.
+        let under_trial_dir = row
+            .get("sessionFile")
+            .and_then(Value::as_str)
+            .is_some_and(|session_file| Path::new(session_file).starts_with(sessions_dir));
+        if !under_trial_dir {
+            continue;
+        }
         let Some(orphan_id) = row.get("activeSessionId").and_then(Value::as_str) else {
             continue;
         };
@@ -1116,6 +1128,16 @@ mod tests {
         let listener = UnixListener::bind(&socket).expect("bind");
         let (list_tx, list_rx) = channel();
         let (kill_tx, kill_rx) = channel();
+        // The trial's own sessions dir, so the scripted list can place the
+        // orphan under it (the reconcile only kills rows whose session file
+        // lives there) beside a decoy from another dir that must survive.
+        let sessions_dir = dir
+            .path()
+            .join("runs")
+            .join("size-2-trial-1")
+            .join("sessions")
+            .to_string_lossy()
+            .to_string();
         thread::spawn(move || {
             // Connection 1: hello, read the create, drop (the response is
             // lost).
@@ -1145,8 +1167,14 @@ mod tests {
                     "type": "response",
                     "success": true,
                     "data": { "sessions": [
-                        { "sessionFile": "/tmp/orphan/sessions/o.jsonl",
-                          "activeSessionId": "s-orphan" }
+                        // The orphan under the trial's own sessions dir.
+                        { "sessionFile": format!("{sessions_dir}/o.jsonl"),
+                          "activeSessionId": "s-orphan" },
+                        // An unrelated live session of the same daemon
+                        // (a resident unmatched by the listed dir): the
+                        // reconcile must leave it alone.
+                        { "sessionFile": "/tmp/other/sessions/user.jsonl",
+                          "activeSessionId": "s-user" }
                     ] }
                 })
             );
@@ -1192,6 +1220,12 @@ mod tests {
             kill_command["activeSessionId"], "s-orphan",
             "{kill_command}"
         );
+        // Only the trial's own orphan: the unrelated resident the list
+        // also reported must survive the reconcile.
+        assert!(
+            kill_rx.recv_timeout(Duration::from_secs(1)).is_err(),
+            "the unrelated session must not be killed"
+        );
         assert!(error.contains("create failed"), "{error}");
         assert!(error.contains("reconcile killed 1"), "{error}");
         // The scratch dir still went.
@@ -1211,17 +1245,13 @@ mod tests {
             .expect_err("the refused create fails the trial");
         assert!(error.contains("command failed"), "{error}");
         assert!(!error.contains("reconcile"), "{error}");
-        // Drain every command the driver sent: no list may appear.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Drain every command the driver sent: no list may appear. The
+        // fake daemon records each command before it responds, so the
+        // channel is already complete when `run_trial` returns — one
+        // non-blocking drain catches everything (no fixed delay).
         let mut commands = Vec::new();
-        loop {
-            while let Ok(command) = daemon.commands.try_recv() {
-                commands.push(command);
-            }
-            if Instant::now() >= deadline {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
+        while let Ok(command) = daemon.commands.try_recv() {
+            commands.push(command);
         }
         assert!(
             commands.iter().all(|command| command["type"] != "list"),

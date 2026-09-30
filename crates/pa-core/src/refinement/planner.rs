@@ -259,9 +259,15 @@ fn validate_edit(edit: &RefinementEdit, computed_id: Option<&str>) -> Option<Str
             );
         }
     }
-    if action != RefinementAction::Delete && kind == RefinementKind::Factory {
+    if action != RefinementAction::Delete
+        && kind == RefinementKind::Factory
+        && (action == RefinementAction::Create || edit.arguments.is_some())
+    {
         // Structural check only: the kernel validator (`rlm.factory`) enforces
         // the full machine semantics at write time; do not reimplement it here.
+        // A create requires its spec; an update may omit `arguments` entirely
+        // and keep the stored spec (apply preserves `before.arguments`),
+        // exactly like update_factory treats dag/machine.
         let arguments = edit.arguments.as_ref();
         let dag = arguments.and_then(|args| args.get("dag"));
         let machine = arguments.and_then(|args| args.get("machine"));
@@ -748,6 +754,22 @@ mod tests {
         // Delete edits carry no spec requirement.
         edit.action = Some(RefinementAction::Delete);
         assert_eq!(validate_edit(&edit, None), None);
+        // An update that omits `arguments` keeps the stored spec (apply
+        // preserves `before.arguments`), exactly like update_factory.
+        edit.action = Some(RefinementAction::Update);
+        edit.arguments = None;
+        assert_eq!(validate_edit(&edit, None), None);
+        // An update that does supply arguments gets the same shape checks.
+        edit.arguments =
+            Some(serde_json::from_value(serde_json::json!({ "machine": machine })).unwrap());
+        assert_eq!(validate_edit(&edit, None), None);
+        edit.arguments = Some(
+            serde_json::from_value(serde_json::json!({ "dag": dag, "machine": machine })).unwrap(),
+        );
+        assert_eq!(
+            validate_edit(&edit, None),
+            Some("pass either dag or machine form, not both".to_string())
+        );
     }
 
     #[test]

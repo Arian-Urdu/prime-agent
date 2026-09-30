@@ -354,6 +354,48 @@ class HarnessStateTest(unittest.TestCase):
             self.assertEqual(len(reloaded.list("factory")), 1)
             self.assertIsNone(reloaded.get("factory", "broken"))
 
+    def test_generic_create_factory_without_arguments_is_rejected(self) -> None:
+        # Regression (bot review): a generic create with NO arguments stored
+        # an unusable factory (no dag, no machine) that run() later rejects;
+        # a NEW factory requires its spec (updates may omit it and preserve).
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+
+            with self.assertRaisesRegex(ValueError, "require a dag or machine object in arguments"):
+                state.create("factory", "No spec", "content", id="no_spec")
+            self.assertEqual(state.list("factory"), [])
+            self.assertIsNone(state.get("factory", "no_spec"))
+            reloaded = HarnessState(state.file_path)
+            self.assertEqual(reloaded.list("factory"), [])
+
+    def test_create_factory_deep_copies_the_caller_spec(self) -> None:
+        # Regression (bot review): storing the caller-owned spec by reference
+        # let a later mutation change the live entry without validation (and
+        # an update that omits both forms would then preserve the mutated,
+        # unvalidated spec).
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            dag = {"nodes": [{"id": "collect", "subagent": "worker"}]}
+            state.create_factory("Sweep", "Sweep review.", id="sweep", dag=dag)
+
+            dag["nodes"] = []  # corrupt the caller-owned dict after creation
+            self.assertEqual(
+                state.get("factory", "sweep").arguments["dag"],
+                {"nodes": [{"id": "collect", "subagent": "worker"}]},
+            )
+            # An update that omits both forms preserves the VALID stored spec,
+            # not the corrupted caller dict.
+            state.update_factory("sweep", "Sweep", "Sweep review across PRs.")
+            self.assertEqual(
+                state.get("factory", "sweep").arguments["dag"],
+                {"nodes": [{"id": "collect", "subagent": "worker"}]},
+            )
+            reloaded = HarnessState(state.file_path)
+            self.assertEqual(
+                reloaded.get("factory", "sweep").arguments["dag"],
+                {"nodes": [{"id": "collect", "subagent": "worker"}]},
+            )
+
     def test_save_failure_preserves_previous_state_on_disk(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             state = HarnessState(Path(temp_dir) / "harness_state.json")

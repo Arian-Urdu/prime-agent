@@ -9,6 +9,7 @@ Execution still belongs to Prime Agent's TypeScript host and the existing
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -334,13 +335,20 @@ def _validate_entry_shape(
                 raise ValueError(f"skill entry {entry_name!r} rejected: skill entries require a Python reference")
         else:
             _validate_python_skill_reference(reference, entry_name)
-    if kind == "factory" and arguments is not None:
+    if kind == "factory":
         # Every factory writer funnels through here, so an invalid spec can
         # never be persisted -- create_factory validates, and the generic
-        # create/update path (a refinement edit) gets the same dry run. An
-        # update that omits arguments (None) preserves the stored spec and
-        # skips validation, exactly like update_skill treats reference.
-        _validate_factory_arguments(entry_name, arguments)
+        # create/update path (a refinement edit) gets the same dry run. A
+        # NEW factory requires its spec (an arguments-less factory would
+        # store an unusable entry that run() later rejects); an update that
+        # omits arguments (None) preserves the stored spec and skips
+        # validation, exactly like update_skill treats reference.
+        if arguments is None and existing is None:
+            raise ValueError(
+                f"factory entry {entry_name!r} rejected: factory entries require a dag or machine object in arguments"
+            )
+        if arguments is not None:
+            _validate_factory_arguments(entry_name, arguments)
 
 
 def _validate_refinement_event(trigger: Any, changes: Any, *, evidence: Any, outcome: Any) -> None:
@@ -635,7 +643,10 @@ class HarnessState:
             if reference is not None:
                 existing.reference = dict(reference)
             if arguments is not None:
-                existing.arguments = dict(arguments)
+                # Factory specs are deep-copied: the nested dag/machine object
+                # is caller-owned, and a later mutation must never change the
+                # stored (validated) spec without a write-time dry run.
+                existing.arguments = copy.deepcopy(arguments) if kind == "factory" else dict(arguments)
             if metadata is not None:
                 existing.metadata = dict(metadata)
             existing.source = source
@@ -651,7 +662,7 @@ class HarnessState:
                 path=path if path is not None else "general",
                 scope=self.scope,
                 reference=dict(reference or {}),
-                arguments=dict(arguments or {}),
+                arguments=copy.deepcopy(arguments or {}) if kind == "factory" else dict(arguments or {}),
                 metadata=dict(metadata or {}),
                 source=source,
             )
@@ -952,7 +963,10 @@ class HarnessState:
         global_: bool = False,
         **kwargs: Any,
     ) -> HarnessEntry:
-        # Write-time dry run: an invalid spec (either form) never reaches the store.
+        # Write-time dry run: an invalid spec (either form) never reaches the
+        # store. The spec is deep-copied before storing: mutating the caller's
+        # dict after creation must not change the live entry (a later update
+        # that omits both forms would preserve the mutated, unvalidated spec).
         spec, key = _factory_spec_argument(dag, machine)
         errors = validate_factory_spec(spec)
         if errors:
@@ -963,7 +977,7 @@ class HarnessState:
             content,
             id=id,
             path=path,
-            arguments={key: spec},
+            arguments={key: copy.deepcopy(spec)},
             metadata=metadata,
             global_=global_,
             **kwargs,
@@ -990,7 +1004,7 @@ class HarnessState:
             errors = validate_factory_spec(spec)
             if errors:
                 raise ValueError("; ".join(errors))
-            arguments = {key: spec}
+            arguments = {key: copy.deepcopy(spec)}
         else:
             arguments = None
         return self.update(

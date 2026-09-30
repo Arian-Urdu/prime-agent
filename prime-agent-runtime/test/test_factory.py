@@ -3198,6 +3198,49 @@ class FactoryExecutorTest(unittest.TestCase):
         self.assertEqual(self.host.deleted_targets(), ["child-3"])
 
     @async_test
+    async def test_concurrent_stop_during_fail_fast_deletes_each_child_once(self) -> None:
+        # Regression (bot review): fail_fast's cancellation cascade runs while
+        # the run is still "running", so a concurrent stop() started its own
+        # pass mid-cascade and issued a duplicate delete_subagent for a child
+        # the first pass already owned. The pass CLAIMS each instance before
+        # its await, so every child is deleted exactly once.
+        self.host.outcomes["a"] = {"status": "error", "error": "boom"}
+        delete_gate = self.host.gate("rlm.delete_subagent", 1)
+        delete_entered = self.host.gate_entered("rlm.delete_subagent", 1)
+        self.store_factory(
+            {
+                "run": {"failure_policy": "fail_fast"},
+                "nodes": [
+                    {"id": "a", "subagent": "worker"},
+                    {"id": "b", "subagent": "worker"},
+                    {"id": "c", "subagent": "worker"},
+                ],
+            }
+        )
+        result = await self.start()
+        # a settles error -> fail_fast cancels b; the first delete is gated.
+        await delete_entered.wait()
+        # stop() lands while the run is still "running" (fail_fast sets
+        # "failed" only after its cascade): its pass must skip b (claimed)
+        # and cancel c itself.
+        stopped = await rlm_module.rlm.factory.stop(result["run_id"])
+        self.assertEqual(stopped["state"], "stopped")
+        delete_gate.set()
+        final = await self.settle(result)
+        self.assertEqual(final["state"], "stopped")
+        # The gated delete resumes after the stop pass: the fail_fast
+        # cascade finishes inside the control-loop task, so the task-done
+        # barrier waits for BOTH deletions deterministically (an assert on
+        # the delete list alone could race the released call).
+        run = self.executor._runs[result["run_id"]]
+        await self.wait_until(lambda: run.task.done())
+        # every child deleted exactly once, in one pass each
+        self.assertEqual(sorted(self.host.deleted_targets()), ["child-2", "child-3"])
+        self.assertEqual(
+            len([event for event in self.all_events_of(result, "cancel_failed")]), 0
+        )
+
+    @async_test
     async def test_failed_delete_records_cancel_failed_and_cancelled(self) -> None:
         # A delete that raises still releases the executor's slot, so the
         # ledger records the failure AND the cancellation (the eval replay
@@ -3730,6 +3773,43 @@ class FactoryExecutorTest(unittest.TestCase):
         self.assertEqual(final["usage"]["transitions_fired"], 2)
 
     @async_test
+    async def test_machine_join_paused_at_max_transitions_fires_after_resume(self) -> None:
+        # Regression (bot review): a join transition that reaches the
+        # max_transitions boundary was marked fired BEFORE the pause, so
+        # the resume skipped it forever and the join target never entered.
+        # The provisional mark must be cleared when the settle is re-queued.
+        self.store_machine(
+            {
+                "run": {"max_transitions": 1, "failure_policy": "continue"},
+                "states": [
+                    {"id": "a", "entry": True, "subagent": "worker"},
+                    {"id": "b", "entry": True, "subagent": "worker"},
+                    {"id": "c", "subagent": "worker", "max_entries": 2},
+                ],
+                "transitions": [
+                    {"from": "a", "to": "c"},
+                    {"from": ["a", "b"], "to": "c"},
+                ],
+            }
+        )
+        result = await self.start()
+        paused = await self.settle(result)
+        self.assertEqual(paused["state"], "paused")
+        self.assertIn("max_transitions_exceeded", self.host.notice_kinds())
+        # a->c fired before the pause; the join is the paused transition
+        self.assertEqual(self.state_report(paused, "c")["entries_used"], 1)
+        self.assertEqual(paused["usage"]["transitions_fired"], 1)
+        await rlm_module.rlm.factory.resume(result["run_id"])
+        final = await self.settle(result)
+        # the join fired after the resume: c has TWO entries, never one
+        self.assertEqual(final["state"], "done")
+        self.assertEqual(self.state_report(final, "c")["entries_used"], 2)
+        joins = [e for e in self.all_events_of(result, "transition_fired") if e.get("from") == ["a", "b"]]
+        self.assertEqual(len(joins), 1)
+        self.assertEqual(len(self.host.spawn_calls("c")), 2)
+        self.assertEqual(final["usage"]["transitions_fired"], 2)
+
+    @async_test
     async def test_machine_guards_compare_json_strictly(self) -> None:
         # eq: a bool never equals a number (true != 1) and a number never
         # equals a string; numbers compare numerically (1 == 1.0).
@@ -3837,6 +3917,14 @@ class FactoryExecutorTest(unittest.TestCase):
         self.assertFalse(_guard_passes(when(path="gone", op="ne", value=1), outputs))
         self.assertFalse(_guard_passes(when(path="gone", op="exists"), outputs))
         self.assertTrue(_guard_passes(when(path="approved", op="exists"), outputs))
+        # large JSON integers compare exactly: no lossy float conversion
+        # (9007199254740993 and 9007199254740992 are distinct under eq/ne)
+        big = {"verdict": {"n": 9007199254740993}}
+        self.assertTrue(_guard_passes(when(path="n", op="eq", value=9007199254740993), big))
+        self.assertFalse(_guard_passes(when(path="n", op="eq", value=9007199254740992), big))
+        self.assertTrue(_guard_passes(when(path="n", op="ne", value=9007199254740992), big))
+        # numeric cross-type equality stays exact too
+        self.assertTrue(_guard_passes(when(path="count", op="eq", value=1.0), outputs))
 
     @async_test
     async def test_machine_stall_fails_with_the_pending_entry_reason(self) -> None:

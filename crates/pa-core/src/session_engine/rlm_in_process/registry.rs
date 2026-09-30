@@ -5,8 +5,7 @@
 
 use pa_types::ai::Usage;
 use pa_types::session::ChildUsageOrigin;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Weak};
 use tokio::sync::{watch, Mutex};
 
 use super::InProcessRlmHost;
@@ -35,15 +34,12 @@ pub struct ChildIdentity {
 /// settled verdict that agrees with it (the claim fixes both).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NoticeKind {
-    /// Completed without an agent-message reply: the no-reply row, the
-    /// `done` verdict.
-    NoReply,
-    /// Failed: the failure row, the `error` verdict.
-    Failure,
-    /// Deleted by the parent: the cancelled row, the `cancelled` verdict.
+    Done,
+    DoneReplied,
+    Error,
     Cancelled,
-    /// Closed with the parent session: no notice is owed or delivered.
-    Suppressed,
+    Closed,
+    ParentGone,
 }
 
 /// The live child activity (TS `RlmChildRun.activity`): `waiting` while a
@@ -69,10 +65,16 @@ pub struct InProcessChildRecord {
     pub(crate) started_at_ms: u64,
     /// The child session engine — the in-process runtime itself.
     pub(crate) engine: Arc<SessionEngine>,
+    /// Immutable parent generation; a rebind must not redirect this notice.
+    pub(crate) parent_engine: Weak<SessionEngine>,
+    pub(crate) parent_session_id: String,
     /// The child's own children host (its recursive descendants).
     pub(crate) child_host: Arc<InProcessRlmHost>,
     /// The settle signal `collect` waits on.
     pub(crate) settled_tx: watch::Sender<bool>,
+    /// A parked claim has exhausted its bounded retry burst; waiters may
+    /// return a diagnostic without changing its verdict.
+    parked_tx: watch::Sender<bool>,
     /// The closed signal the run task races its task prompt against: a
     /// delete or close mid-run (including before the prompt registers)
     /// tears the task down within one slice instead of letting a closed
@@ -99,10 +101,13 @@ pub(crate) struct ChildRunState {
     pub(crate) replied_since_task: bool,
     /// The terminal-notice claim: single ownership of the notice AND the
     /// settled verdict that must agree with it. `None` until claimed;
-    /// once taken, every later claimant observes `None` and defers to the
-    /// holder. `NoticeKind::Suppressed` marks `close_children`'s no-notice
-    /// verdict.
+    /// once taken, every later claimant defers to the holder. `Closed` and
+    /// `ParentGone` owe no notice.
     pub(crate) notice: Option<NoticeKind>,
+    /// Admission errors are visible on the live roster/collect while the
+    /// first-wins claim remains pending for retry.
+    pub(crate) admission_error: Option<String>,
+    pub(crate) parked: bool,
     /// The task prompt was admitted. Readers must not settle a pre-prompt
     /// child: it is idle by construction.
     pub(crate) prompt_admitted: bool,
@@ -136,9 +141,12 @@ impl InProcessChildRecord {
         label: String,
         started_at_ms: u64,
         engine: Arc<SessionEngine>,
+        parent_engine: Weak<SessionEngine>,
+        parent_session_id: String,
         child_host: Arc<InProcessRlmHost>,
     ) -> Self {
         let (settled_tx, _) = watch::channel(false);
+        let (parked_tx, _) = watch::channel(false);
         let (closed_tx, _) = watch::channel(false);
         Self {
             rlm_child_id,
@@ -148,8 +156,11 @@ impl InProcessChildRecord {
             label,
             started_at_ms,
             engine,
+            parent_engine,
+            parent_session_id,
             child_host,
             settled_tx,
+            parked_tx,
             closed_tx,
             state: Mutex::new(ChildRunState {
                 settled_status: None,
@@ -157,6 +168,8 @@ impl InProcessChildRecord {
                 error: None,
                 replied_since_task: false,
                 notice: None,
+                admission_error: None,
+                parked: false,
                 prompt_admitted: false,
                 closed_by_parent: false,
                 tool_use_count: 0,
@@ -196,25 +209,6 @@ impl InProcessChildRecord {
         self.state().await.settled_status.is_none()
     }
 
-    /// Record a terminal state. Idempotent per record: the first settle
-    /// wins (a cancelled run's later natural settle keeps the cancelled
-    /// verdict). Does NOT wake `collect` waiters — the run arm publishes
-    /// the settle signal only after its accounting and notice admission
-    /// landed (TS awaits terminal-message retention before resolving run
-    /// settlement), so a collect result never precedes the parent's
-    /// notice.
-    pub(crate) async fn settle_as(&self, status: &'static str, error: Option<String>) {
-        let mut state = self.state().await;
-        if state.settled_status.is_some() {
-            return;
-        }
-        state.settled_status = Some(status);
-        if state.error.is_none() {
-            state.error = error;
-        }
-        state.activity = None;
-    }
-
     /// Wake `collect` waiters: the terminal verdict, accounting, and
     /// notice admission have all landed.
     pub(crate) fn publish_settled(&self) {
@@ -245,38 +239,103 @@ impl InProcessChildRecord {
         }
     }
 
-    /// Claim the terminal notice. The FIRST claim wins and fixes the
-    /// settled verdict the claimant must then deliver and settle with;
-    /// every later claimant observes `None` and defers to the holder
-    /// (the delete arm waits for the holder's settle instead of racing
-    /// its own verdict). A failed claim changes nothing.
-    pub(crate) async fn claim_notice(&self, kind: NoticeKind) -> Option<NoticeKind> {
+    /// The first claim fixes both the terminal verdict and notice obligation.
+    pub(crate) async fn claim_notice(&self, kind: NoticeKind) -> bool {
         let mut state = self.state().await;
         if state.notice.is_some() {
-            return None;
+            return false;
         }
         state.notice = Some(kind);
-        Some(kind)
+        true
     }
 
-    /// Suppress the notice (close with the parent session): no delivery
-    /// and no retention; later claims observe the suppression and defer.
-    pub(crate) async fn suppress_notice(&self) {
+    /// Resolve the reply check in the same critical section as the Done claim.
+    pub(crate) async fn claim_done(&self) -> bool {
         let mut state = self.state().await;
-        if state.notice.is_none() {
-            state.notice = Some(NoticeKind::Suppressed);
+        if state.notice.is_some() {
+            return false;
+        }
+        state.notice = Some(if state.replied_since_task {
+            NoticeKind::DoneReplied
+        } else {
+            NoticeKind::Done
+        });
+        true
+    }
+
+    pub(crate) async fn claimed_kind(&self) -> Option<NoticeKind> {
+        self.state().await.notice
+    }
+
+    pub(crate) async fn admission_failed(&self, error: &anyhow::Error) {
+        let diagnostic = format!("Terminal notice admission pending: {error}");
+        tracing::error!(child_id = %self.rlm_child_id, "{diagnostic}");
+        self.state().await.admission_error = Some(diagnostic);
+    }
+
+    pub(crate) async fn publish_verdict(&self, kind: NoticeKind, error: Option<String>) {
+        let mut state = self.state().await;
+        assert_eq!(
+            state.notice,
+            Some(kind),
+            "only the terminal claimant publishes"
+        );
+        if state.settled_status.is_some() {
+            return;
+        }
+        state.settled_status = Some(match kind {
+            NoticeKind::Done | NoticeKind::DoneReplied => "done",
+            NoticeKind::Error => "error",
+            NoticeKind::Cancelled | NoticeKind::Closed | NoticeKind::ParentGone => "cancelled",
+        });
+        state.error = error;
+        state.admission_error = None;
+        state.parked = false;
+        state.activity = None;
+        drop(state);
+        self.parked_tx.send_replace(false);
+        self.publish_settled();
+    }
+
+    /// Wait for the winning claim to become public; there is no artificial
+    /// deadline that can change the terminal verdict.
+    /// Wait for the winning transaction to commit OR report a parked
+    /// admission failure. Returning false never changes its claim/verdict.
+    pub(crate) async fn await_settled_or_parked(&self) -> bool {
+        let mut settled = self.settled_tx.subscribe();
+        let mut parked = self.parked_tx.subscribe();
+        loop {
+            let state = self.state().await;
+            if state.settled_status.is_some() {
+                return true;
+            }
+            if state.parked {
+                return false;
+            }
+            drop(state);
+            tokio::select! {
+                changed = settled.changed() => {
+                    if changed.is_err() { return false; }
+                }
+                changed = parked.changed() => {
+                    if changed.is_err() { return false; }
+                }
+            }
         }
     }
 
-    /// Await the settled signal (the delete arm's lost-claim wait for the
-    /// holder's agreed verdict). `false` on the timeout, with the caller
-    /// surfacing an honest error instead of a racing receipt.
-    pub(crate) async fn await_settled(&self, timeout: Duration) -> bool {
-        let mut settled = self.settled_tx.subscribe();
-        let awaited = tokio::time::timeout(timeout, async { settled.wait_for(|v| *v).await })
-            .await
-            .is_ok();
-        awaited
+    pub(crate) async fn mark_parked(&self) {
+        self.state().await.parked = true;
+        self.parked_tx.send_replace(true);
+    }
+
+    pub(crate) async fn clear_parked(&self) {
+        self.state().await.parked = false;
+        self.parked_tx.send_replace(false);
+    }
+
+    pub(crate) async fn parked_error(&self) -> Option<String> {
+        self.state().await.admission_error.clone()
     }
 
     /// The roster row (live introspection: real activity, tool counts, the
@@ -339,7 +398,10 @@ impl InProcessChildRecord {
             status: Self::status(&state),
             settled: state.settled_status.is_some(),
             answer_preview: state.answer_preview.clone(),
-            error: state.error.clone(),
+            error: state
+                .error
+                .clone()
+                .or_else(|| state.admission_error.clone()),
             duration_ms: Some(now_ms.saturating_sub(self.started_at_ms)),
             tool_use_count: Some(state.tool_use_count),
             replied_since_task: Some(state.replied_since_task),

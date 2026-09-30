@@ -127,12 +127,29 @@ async fn teardown_closed(host: &InProcessRlmHost, record: &Arc<InProcessChildRec
 
 /// The parent-engine teardown variant (the binding weak died).
 async fn teardown_parent_gone(host: &InProcessRlmHost, record: &Arc<InProcessChildRecord>) {
+    #[cfg(not(test))]
+    let _ = host;
     record.engine.session.agent().abort();
     record.child_host.close_children().await;
-    record
-        .settle_as("cancelled", Some("Parent session ended".to_string()))
+    if record.claim_notice(NoticeKind::ParentGone).await {
+        #[cfg(test)]
+        host.pause_child_gate(super::ChildGatePoint::Claimed {
+            child_id: record.rlm_child_id.clone(),
+        })
         .await;
-    finish_run(host, record, &TaskVerdict::Cancelled).await;
+        #[cfg(test)]
+        host.pause_child_gate(super::ChildGatePoint::BeforePublish {
+            child_id: record.rlm_child_id.clone(),
+        })
+        .await;
+        record
+            .publish_verdict(
+                NoticeKind::ParentGone,
+                Some("Parent session ended".to_string()),
+            )
+            .await;
+    }
+    record.unsubscribe_listener().await;
 }
 
 /// The run's would-be terminal verdict, decided before the settled state
@@ -140,7 +157,6 @@ async fn teardown_parent_gone(host: &InProcessRlmHost, record: &Arc<InProcessChi
 enum TaskVerdict {
     Done,
     Error(String),
-    Cancelled,
 }
 
 /// The run's terminal sequence, in the order TS resolves settlement
@@ -159,29 +175,55 @@ async fn finish_run(
     record: &Arc<InProcessChildRecord>,
     verdict: &TaskVerdict,
 ) {
+    // Keep the original parent alive across the claim and admission. A
+    // rebind cannot redirect the row to a different session generation.
+    let parent = record.parent_engine.upgrade();
+    let claim = if parent.is_none() {
+        record.claim_notice(NoticeKind::ParentGone).await
+    } else {
+        match verdict {
+            TaskVerdict::Error(_) => record.claim_notice(NoticeKind::Error).await,
+            TaskVerdict::Done => record.claim_done().await,
+        }
+    };
+    if !claim {
+        // Delete/close already owns the first-wins transaction. This arm
+        // writes nothing and does not publish a competing verdict.
+        record.await_settled_or_parked().await;
+        record.unsubscribe_listener().await;
+        return;
+    }
+    #[cfg(test)]
+    host.pause_child_gate(super::ChildGatePoint::Claimed {
+        child_id: record.rlm_child_id.clone(),
+    })
+    .await;
     flush_pending_usage(host, record).await;
-    // A parent teardown settles without a notice (nobody to retain to);
-    // every other verdict claims first — a lost claim means a delete (or
-    // close) owns the notice and the verdict, and this arm defers.
-    match verdict {
-        TaskVerdict::Error(error) => {
-            if record.claim_notice(NoticeKind::Failure).await.is_some() {
-                super::notices::deliver_failure_notice(host, record, error).await;
-            }
-            record.settle_as("error", Some(error.clone())).await;
-        }
-        TaskVerdict::Done => {
-            let replied = record.state().await.replied_since_task;
-            if !replied && record.claim_notice(NoticeKind::NoReply).await.is_some() {
-                super::notices::deliver_no_reply_notice(host, record).await;
-            }
-            record.settle_as("done", None).await;
-        }
-        TaskVerdict::Cancelled => {
-            record.settle_as("cancelled", None).await;
+    let kind = record.claimed_kind().await.expect("winning claim");
+    let error = match verdict {
+        TaskVerdict::Error(error) if kind == NoticeKind::Error => Some(error.clone()),
+        _ => None,
+    };
+    let preview = record.state().await.answer_preview.clone();
+    if let Some(row) = super::notices::terminal_row(record, kind, error.as_deref(), preview) {
+        if !super::notices::admit_claimed_notice(record, parent.expect("notice has parent"), row)
+            .await
+        {
+            record.unsubscribe_listener().await;
+            return;
         }
     }
-    record.publish_settled();
+    let error = if kind == NoticeKind::ParentGone {
+        Some("Parent session ended".to_string())
+    } else {
+        error
+    };
+    #[cfg(test)]
+    host.pause_child_gate(super::ChildGatePoint::BeforePublish {
+        child_id: record.rlm_child_id.clone(),
+    })
+    .await;
+    record.publish_verdict(kind, error).await;
     record.unsubscribe_listener().await;
 }
 
@@ -597,40 +639,74 @@ pub(super) fn delete_subagent(
     Box::pin(async move {
         let record = resolve_record(&host, &target, "subagent").await?;
         let was_running = record.is_running().await;
-        // Closed first: the run task's prompt race sees the watch and
-        // tears itself down (its own descendants cascade through it).
-        record.mark_closed().await;
-        if was_running {
-            // Single notice ownership: win the cancelled claim and the
-            // verdict with it, or defer to the run arm's already-claimed
-            // notice (its retention and settle are mid-flight — the
-            // receipt reports the AGREED verdict, never a racing
-            // cancelled over a pending failure/no-reply).
-            if record.claim_notice(NoticeKind::Cancelled).await.is_some() {
-                // Retention BEFORE the settled state: the notice is
-                // retained on the parent (live admission on an idle
-                // parent, a durable session-file row on a busy one) before
-                // the cancelled verdict becomes observable.
-                super::notices::deliver_cancelled_notice(
-                    &host,
-                    &record,
-                    "Deleted by parent orchestrator",
-                )
-                .await;
-                record.settle_as("cancelled", None).await;
-            } else if !record.await_settled(Duration::from_secs(5)).await {
-                anyhow::bail!("delete timed out waiting for the child's terminal state");
-            }
+        let parent = record.parent_engine.upgrade();
+        let won = was_running && record.claim_notice(NoticeKind::Cancelled).await;
+        if won {
+            #[cfg(test)]
+            host.pause_child_gate(super::ChildGatePoint::Claimed {
+                child_id: record.rlm_child_id.clone(),
+            })
+            .await;
+            record.mark_closed().await;
             record.engine.session.agent().abort();
+            record.child_host.close_children().await;
+            flush_pending_usage(&host, &record).await;
+            if let Some(parent) = parent {
+                let row = super::notices::terminal_row(&record, NoticeKind::Cancelled, None, None)
+                    .expect("cancelled notice");
+                if !super::notices::admit_claimed_notice(&record, parent, row).await {
+                    anyhow::bail!(record
+                        .parked_error()
+                        .await
+                        .unwrap_or_else(|| "terminal notice admission is pending".to_string()));
+                }
+            } else {
+                // A dropped parent has no live delivery target. This can
+                // only occur during process teardown; the close owner must
+                // have claimed ParentGone before deletion to publish it.
+                anyhow::bail!("original parent session ended before cancellation admission");
+            }
+            #[cfg(test)]
+            host.pause_child_gate(super::ChildGatePoint::BeforePublish {
+                child_id: record.rlm_child_id.clone(),
+            })
+            .await;
+            record.publish_verdict(NoticeKind::Cancelled, None).await;
+        } else if was_running {
+            if !record.await_settled_or_parked().await {
+                // A retry of the same delete may complete its own parked
+                // Cancelled claim, but never changes a different winner.
+                if record.claimed_kind().await == Some(NoticeKind::Cancelled) {
+                    if let Some(parent) = parent {
+                        let row = super::notices::terminal_row(
+                            &record,
+                            NoticeKind::Cancelled,
+                            None,
+                            None,
+                        )
+                        .expect("cancelled notice");
+                        if super::notices::admit_claimed_notice(&record, parent, row).await {
+                            record.publish_verdict(NoticeKind::Cancelled, None).await;
+                        }
+                    }
+                }
+                if record.is_running().await {
+                    anyhow::bail!(record
+                        .parked_error()
+                        .await
+                        .unwrap_or_else(|| "terminal notice admission is pending".to_string()));
+                }
+            }
+            record.mark_closed().await;
+        } else {
+            record.mark_closed().await;
         }
-        host.remember_deleted_child(&record).await;
+        record.child_host.close_children().await;
+        record.engine.session.agent().abort();
         let entry = record.entry(now_ms()).await;
+        host.remember_deleted_child(&record).await;
         host.remove_child(&record).await;
-        // The registry dropped the record: release the event listener so
-        // the engine (and its kernel) tears down once the run task exits,
-        // and wake any collect waiter on the cancelled verdict.
         record.unsubscribe_listener().await;
-        record.publish_settled();
         Ok(RlmDeleteSubagentResult {
             subagent: entry,
             outcome: Some("deleted"),

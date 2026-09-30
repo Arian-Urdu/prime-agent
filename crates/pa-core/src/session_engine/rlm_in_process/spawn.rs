@@ -68,7 +68,9 @@ pub(super) fn spawn(
             depth,
         )
         .await?;
-        host.push_child(Arc::clone(&record)).await;
+        if !host.push_child(Arc::clone(&record)).await {
+            anyhow::bail!("the parent session closed during child admission");
+        }
         // The reservation's guard is still bound: its release at this
         // scope's end transfers the name from the pending set to the
         // registered record (a successful admission made the name
@@ -193,7 +195,7 @@ async fn admission(
         })
         .await?,
     );
-    child_host.bind_parent(Arc::clone(&engine)).await;
+    child_host.bind_parent(Arc::clone(&engine)).await?;
     let session_id = engine.session.session_id().await;
     let label = rlm_child_label(&request.prompt);
     let record = Arc::new(InProcessChildRecord::new(
@@ -204,6 +206,8 @@ async fn admission(
         label,
         super::now_ms(),
         engine,
+        Arc::downgrade(&parent_engine),
+        facts.session_id.clone(),
         child_host,
     ));
     Ok((record, resolved.selector))

@@ -635,6 +635,9 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // them.
     let (existing_messages, has_thinking_entry, has_service_tier_entry) = {
         let session = wiring.session.lock().await;
+        // The in-process host removes and re-admits unconsumed notices at
+        // bind. An engine not bound to that host must keep its original
+        // context instead of silently hiding durable rows.
         let messages = super::compact_session::rebuilt_context_after_compaction(&session);
         let has_thinking_entry = session.has_thinking_level();
         let has_service_tier_entry = session.has_service_tier();

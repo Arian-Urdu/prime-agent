@@ -16,20 +16,12 @@
 //! in-process parent/siblings/children). Divergences are documented on
 //! each seam.
 //!
-//! Terminal-notice contract (one coherent rule, no background tasks): a
-//! child's settled verdict is owned by whoever wins its notice claim,
-//! the notice is RETAINED on the parent before the verdict becomes
-//! observable (an idle parent admits it as its own turn — the loop
-//! persists the row; a busy parent gets the row appended to its session
-//! file immediately), and the settled verdict always agrees with the
-//! claimed notice. A delete that loses the claim (the run's notice is
-//! mid-flight) waits for the agreed verdict and reports it in its
-//! receipt instead of racing a cancelled over it. Reported boundary,
-//! not a hidden mechanism: live delivery into the CURRENT turn's context
-//! requires the embedding's queue pump (the daemon's lanes, a guest
-//! input surface) — a busy-parent notice is durably retained, and it
-//! enters the live context at the next admitted turn or context
-//! rebuild; this host claims no mid-run live-delivery parity.
+//! Terminal-notice contract: a first-wins claim fixes both verdict and notice
+//! obligation. The parent `AgentSession` inbox durably admits the one JSONL row
+//! and registers live delivery before publication. Its coalesced queue pump
+//! drives a notice-only turn if the running turn missed its last steering
+//! poll. On reopen, unconsumed synced rows replay from the original file row;
+//! delivery to the model is at least once, not exactly once.
 //!
 //! Remote family boundary: a resident embedding that adopts this host as
 //! its ROOT must supply the [`RlmRemoteFamily`] seam at composition time
@@ -117,6 +109,20 @@ pub struct InProcessRlmHostConfig {
     pub root_runtime_kind: Option<String>,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChildGatePoint {
+    Claimed { child_id: String },
+    BeforePublish { child_id: String },
+}
+
+#[cfg(test)]
+pub(crate) type ChildTestGate = Arc<
+    dyn Fn(ChildGatePoint) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// The parent engine a host is bound to (all weak: the parent engine owns
 /// the host through its kernel handlers, and a strong edge back would
 /// keep a released session's kernel alive forever).
@@ -144,6 +150,8 @@ struct HostInner {
     config: InProcessRlmHostConfig,
     /// This parent session's children, admission order.
     children: Mutex<Vec<Arc<InProcessChildRecord>>>,
+    /// Bind and logical close are one generation transition.
+    rebinding: Mutex<()>,
     /// Requested-name reservations held until admission is durable (TS
     /// #2396): two parallel same-name spawns cannot both admit.
     pending_spawn_names: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -152,6 +160,9 @@ struct HostInner {
     /// answer a just-deleted selector with its settled cancelled envelope.
     deleted_children: std::sync::Mutex<std::collections::HashMap<String, registry::DeletedChild>>,
     parent: std::sync::RwLock<Option<ParentBinding>>,
+    closing: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    child_test_gate: std::sync::RwLock<Option<ChildTestGate>>,
     /// The host of the parent this one spawns under (`None` for the
     /// resident root's host): the sibling roster resolves through it.
     parent_host: std::sync::Mutex<Option<Weak<HostInner>>>,
@@ -182,11 +193,37 @@ impl InProcessRlmHost {
             inner: Arc::new(HostInner {
                 config,
                 children: Mutex::new(Vec::new()),
+                rebinding: Mutex::new(()),
                 pending_spawn_names: std::sync::Mutex::new(std::collections::HashSet::new()),
                 deleted_children: std::sync::Mutex::new(std::collections::HashMap::new()),
                 parent: std::sync::RwLock::new(None),
+                closing: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                child_test_gate: std::sync::RwLock::new(None),
                 parent_host: std::sync::Mutex::new(None),
             }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_child_test_gate(&self, gate: Option<ChildTestGate>) {
+        *self
+            .inner
+            .child_test_gate
+            .write()
+            .expect("child test gate lock") = gate;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_child_gate(&self, point: ChildGatePoint) {
+        let gate = self
+            .inner
+            .child_test_gate
+            .read()
+            .expect("child test gate lock")
+            .clone();
+        if let Some(gate) = gate {
+            gate(point).await;
         }
     }
 
@@ -212,10 +249,26 @@ impl InProcessRlmHost {
     /// previous binding (a rebuilt parent session re-binds like the
     /// daemon's `set_identity`).
     ///
+    /// # Errors
+    ///
+    /// Returns a recovery error if the original parent file cannot be read
+    /// or an unconsumed terminal row cannot be re-admitted.
+    ///
     /// # Panics
     ///
     /// Panics when a host lock is poisoned.
-    pub async fn bind_parent(&self, engine: Arc<SessionEngine>) {
+    pub async fn bind_parent(&self, engine: Arc<SessionEngine>) -> anyhow::Result<()> {
+        let _binding = self.inner.rebinding.lock().await;
+        let previous = self.parent_engine();
+        if previous
+            .as_ref()
+            .is_some_and(|old| !Arc::ptr_eq(old, &engine))
+        {
+            self.close_children_inner().await;
+            if let Some(previous) = previous {
+                previous.session.close_terminal_inbox().await;
+            }
+        }
         let persistence = engine.session.shared_persistence();
         let (session_id, session_name, session_file, cwd) = {
             let session = persistence.lock().await;
@@ -235,6 +288,11 @@ impl InProcessRlmHost {
             session_file,
             cwd,
         });
+        engine.session.replay_terminal_notices().await?;
+        self.inner
+            .closing
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     /// The parent binding, split into its weak engine and the identity
@@ -326,8 +384,27 @@ impl InProcessRlmHost {
     }
 
     /// Register an admitted child.
-    pub(crate) async fn push_child(&self, record: Arc<InProcessChildRecord>) {
-        self.inner.children.lock().await.push(record);
+    pub(crate) async fn push_child(&self, record: Arc<InProcessChildRecord>) -> bool {
+        let mut children = self.inner.children.lock().await;
+        if self
+            .inner
+            .closing
+            .load(std::sync::atomic::Ordering::Acquire)
+            || !self
+                .inner
+                .parent
+                .read()
+                .expect("parent binding lock")
+                .as_ref()
+                .is_some_and(|binding| {
+                    binding.session_id == record.parent_session_id
+                        && Weak::ptr_eq(&binding.engine, &record.parent_engine)
+                })
+        {
+            return false;
+        }
+        children.push(record);
+        true
     }
 
     /// Remove one child from the registry (delete or close).
@@ -370,26 +447,56 @@ impl InProcessRlmHost {
     /// close through the same walk. Not a delete: no tombstones, no
     /// ledger markers.
     pub async fn close_children(&self) {
+        let _binding = self.inner.rebinding.lock().await;
+        self.close_children_inner().await;
+    }
+
+    async fn close_children_inner(&self) {
+        self.inner
+            .closing
+            .store(true, std::sync::atomic::Ordering::Release);
         let children = self.children().await;
         for record in &children {
-            // No notice is owed or delivered (the parent is going away):
-            // the suppression claim keeps every racing claimant deferred,
-            // and the closed watch wakes the run task's prompt race so its
-            // own descendants cascade through the teardown.
-            record.suppress_notice().await;
-            record.mark_closed().await;
-            let () = record
-                .settle_as("cancelled", Some("Closed with parent session".to_string()))
+            let won = record.claim_notice(registry::NoticeKind::Closed).await;
+            if won {
+                #[cfg(test)]
+                self.pause_child_gate(ChildGatePoint::Claimed {
+                    child_id: record.rlm_child_id.clone(),
+                })
                 .await;
-            record.engine.session.agent().abort();
-            // No notice is owed (the parent is going away), and the
-            // listener must release so the engine and its kernel tear
-            // down with the registry clear instead of leaking through
-            // the agent's listener list.
+                record.mark_closed().await;
+                record.engine.session.agent().abort();
+                // The subtree closes eagerly, including independently running
+                // grandchildren; no detached child task is needed to reach it.
+                Box::pin(record.child_host.close_children()).await;
+                #[cfg(test)]
+                self.pause_child_gate(ChildGatePoint::BeforePublish {
+                    child_id: record.rlm_child_id.clone(),
+                })
+                .await;
+                record
+                    .publish_verdict(
+                        registry::NoticeKind::Closed,
+                        Some("Closed with parent session".to_string()),
+                    )
+                    .await;
+            } else {
+                if !record.await_settled_or_parked().await {
+                    if let Some(error) = record.parked_error().await {
+                        tracing::error!(child_id = %record.rlm_child_id, %error,
+                            "closing parent with a parked terminal notice");
+                    }
+                }
+                Box::pin(record.child_host.close_children()).await;
+                record.mark_closed().await;
+                record.engine.session.agent().abort();
+            }
             record.unsubscribe_listener().await;
-            record.publish_settled();
         }
         self.inner.children.lock().await.clear();
+        if let Some(parent) = self.parent_engine() {
+            parent.session.close_terminal_inbox().await;
+        }
     }
 
     /// The composed remote family surface, when the embedding supplied

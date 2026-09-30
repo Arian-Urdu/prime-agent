@@ -24,7 +24,6 @@ use crate::session_engine::agent_messaging::{
     DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
 };
 use crate::session_engine::engine::SessionEngine;
-use crate::session_engine::session_message_to_loop;
 use pa_types::session::{AgentMessage as SessionAgentMessage, CustomMessage, FileEntry};
 
 /// The remote family surface a resident embedding composes into its root
@@ -343,37 +342,12 @@ impl InProcessFamilyController {
             pending,
             DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
         )?;
-        if agent.state().await.is_streaming {
-            steer_custom_row(session, row);
-            return Ok(AgentMessageDeliveryStatus::Queued);
-        }
-        // The admission-only prompt (TS `returnAfterAccepted: true`): the
-        // receipt lands once the receiver's turn is admitted, not after
-        // its whole model run — a sender never waits out the target's
-        // turn, so reciprocal parent/child work cannot deadlock.
-        match session.prompt_injected_message_until_accepted(row).await {
-            Ok(_) => Ok(AgentMessageDeliveryStatus::Delivered),
-            Err(error) => {
-                // A turn raced the idle check: the steering lane owns the
-                // fallback exactly like TS's busy arm.
-                if session.agent().state().await.is_streaming {
-                    steer_custom_row(session, row);
-                    return Ok(AgentMessageDeliveryStatus::Queued);
-                }
-                anyhow::bail!("Agent message was not accepted: {error}");
-            }
-        }
+        let admission = session.admit_injected_or_steer(row).await?;
+        Ok(match admission {
+            pa_agent::admission::AdmitStatus::Admitted => AgentMessageDeliveryStatus::Delivered,
+            pa_agent::admission::AdmitStatus::Busy => AgentMessageDeliveryStatus::Queued,
+        })
     }
-}
-
-/// Queue one custom row onto the agent's steering lane (the loop delivers
-/// it at the next turn boundary and persists it through `message_end`,
-/// the same lane the daemon worker's queued items ride).
-fn steer_custom_row(session: &crate::session_engine::AgentSession, row: &CustomMessage) {
-    let Some(message) = session_message_to_loop(&SessionAgentMessage::Custom(row.clone())) else {
-        return;
-    };
-    session.agent().steer(message);
 }
 
 impl AgentMessageController for InProcessFamilyController {

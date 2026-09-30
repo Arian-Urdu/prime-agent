@@ -1,120 +1,127 @@
-//! The parent's terminal notices: the retained custom rows a child
-//! run's end leaves on its parent — no-reply completion, failure, and
-//! the delete-path cancellation (TS `createRlmChildTerminalNoticeMessage`
-//! / `createRlmChildFailureMessage`).
-//!
-//! Delivery is one coherent contract, no spawns, no retries, no
-//! volatile fallbacks: the row is retained on the parent BEFORE the
-//! caller records the settled state. An idle parent receives it as its
-//! own admitted turn (the loop persists the row through its
-//! `message_end`); a busy parent gets the row appended to its session
-//! file immediately (the durable store: visible to `/resume`, the agents
-//! view, offline inspection, and the next context rebuild). Live
-//! delivery into the CURRENT turn's context is the embedding's queue
-//! pump — the daemon's lanes, a guest input surface — and is a reported
-//! boundary of this host, not a hidden untracked task.
+//! Construct one first-wins terminal row and admit it through the parent
+//! session inbox. The host never writes the parent's file or agent queue.
 
 use std::sync::Arc;
 
-use super::registry::InProcessChildRecord;
-use super::{now_ms, InProcessRlmHost};
-use crate::session_engine::engine::SessionEngine;
+use super::now_ms;
+use super::registry::{InProcessChildRecord, NoticeKind};
 use crate::session_engine::rlm_notices::{
     create_rlm_child_failure_message, create_rlm_child_terminal_notice, RlmChildTerminalNotice,
 };
 
-/// Retain one terminal notice row on the parent.
-///
-/// Idle parent: admit the row as its own turn through the admission-only
-/// prompt — the run is live, its `message_end` persists the row, and the
-/// caller's settle follows the acknowledged admission. Busy parent (or a
-/// turn racing the idle check, or a genuine admission failure): append the
-/// row to the parent's session file NOW — the durable retention TS
-/// achieves with its admitted action; no future user turn is required
-/// for the row to exist. The parent engine is held for the whole
-/// retention (a strong Arc across the append), so a concurrent parent
-/// drop cannot lose the row mid-delivery.
-async fn deliver_notice_row(host: &InProcessRlmHost, row: pa_types::session::CustomMessage) {
-    let Some(parent) = host.parent_engine() else {
-        return;
-    };
-    let session = &parent.session;
-    if !session.agent().state().await.is_streaming
-        && session
-            .prompt_injected_message_until_accepted(&row)
-            .await
-            .is_ok()
-    {
-        return;
+pub(super) fn terminal_row(
+    record: &InProcessChildRecord,
+    kind: NoticeKind,
+    error: Option<&str>,
+    preview: Option<String>,
+) -> Option<pa_types::session::CustomMessage> {
+    match kind {
+        NoticeKind::Done => Some(create_rlm_child_terminal_notice(
+            &RlmChildTerminalNotice::CompletedWithoutReply {
+                child_id: record.rlm_child_id.clone(),
+                session_name: record.session_name.clone(),
+                last_assistant_text_preview: preview,
+            },
+            now_ms(),
+        )),
+        NoticeKind::Error => Some(create_rlm_child_failure_message(
+            &record.rlm_child_id,
+            &record.session_name,
+            error.unwrap_or("Child run failed"),
+            now_ms(),
+        )),
+        NoticeKind::Cancelled => Some(create_rlm_child_terminal_notice(
+            &RlmChildTerminalNotice::Cancelled {
+                child_id: record.rlm_child_id.clone(),
+                session_name: record.session_name.clone(),
+                reason: Some("Deleted by parent orchestrator".to_string()),
+            },
+            now_ms(),
+        )),
+        NoticeKind::DoneReplied | NoticeKind::Closed | NoticeKind::ParentGone => None,
     }
-    retain_notice_row(&parent, &row).await;
 }
 
-/// Append the row to the parent's session file (the durable store for a
-/// busy or unadmittable notice). Failures are swallowed like TS swallows
-/// a failed `_deferRlmTerminalNotice` fence: the retention is
-/// best-effort against I/O, never against ownership.
-async fn retain_notice_row(parent: &Arc<SessionEngine>, row: &pa_types::session::CustomMessage) {
-    let persistence = parent.session.shared_persistence();
-    let mut session = persistence.lock().await;
-    let _ = session.append_custom_message(
-        &row.custom_type,
-        row.content.clone(),
-        row.display,
-        row.details.clone(),
-    );
-}
-
-/// The child failed: `[child-failed child:<name>]` (TS
-/// `createRlmChildFailureMessage`). The caller holds the claimed notice.
-pub(super) async fn deliver_failure_notice(
-    host: &InProcessRlmHost,
+/// Keep the winning claim pending on every admission failure. Retrying the
+/// exact same row is safe: the parent session's stable key is idempotent.
+/// A closed parent is handled by the closer's separate first-wins claim.
+pub(super) async fn admit_claimed_notice(
     record: &Arc<InProcessChildRecord>,
-    error: &str,
-) {
-    let row = create_rlm_child_failure_message(
-        &record.rlm_child_id,
-        &record.session_name,
-        error,
-        now_ms(),
-    );
-    deliver_notice_row(host, row).await;
-}
-
-/// The child finished without an agent-message reply: `[child-exited:
-/// no-reply child:<name>]` with the last assistant text (TS
-/// `completed_without_reply`). The caller holds the claimed notice.
-pub(super) async fn deliver_no_reply_notice(
-    host: &InProcessRlmHost,
-    record: &Arc<InProcessChildRecord>,
-) {
-    let preview = record.state().await.answer_preview.clone();
-    let row = create_rlm_child_terminal_notice(
-        &RlmChildTerminalNotice::CompletedWithoutReply {
-            child_id: record.rlm_child_id.clone(),
-            session_name: record.session_name.clone(),
-            last_assistant_text_preview: preview,
-        },
-        now_ms(),
-    );
-    deliver_notice_row(host, row).await;
-}
-
-/// The parent deleted a still-running child: `[child-exited: cancelled
-/// child:<name>]` (TS `completeDeletion`). The delete path holds the
-/// claimed notice.
-pub(super) async fn deliver_cancelled_notice(
-    host: &InProcessRlmHost,
-    record: &Arc<InProcessChildRecord>,
-    reason: &str,
-) {
-    let row = create_rlm_child_terminal_notice(
-        &RlmChildTerminalNotice::Cancelled {
-            child_id: record.rlm_child_id.clone(),
-            session_name: record.session_name.clone(),
-            reason: Some(reason.to_string()),
-        },
-        now_ms(),
-    );
-    deliver_notice_row(host, row).await;
+    parent: Arc<crate::session_engine::engine::SessionEngine>,
+    row: pa_types::session::CustomMessage,
+) -> bool {
+    const BURST_ATTEMPTS: u32 = 3;
+    const PARKED_RETRY_MS: u64 = 5_000;
+    let mut failures = 0_u32;
+    let mut held_parent = Some(parent);
+    let mut closed = record.closed_tx.subscribe();
+    record.clear_parked().await;
+    loop {
+        // The original parent stays alive for the whole transaction. Close
+        // waits until this transaction commits or parks; once closed, no
+        // second live registration is attempted against that generation.
+        if failures > 0 && *closed.borrow_and_update() {
+            record.mark_parked().await;
+            return false;
+        }
+        let Some(parent) = held_parent
+            .take()
+            .or_else(|| record.parent_engine.upgrade())
+        else {
+            record
+                .admission_failed(&anyhow::anyhow!(
+                    "original parent engine was released before retry; child outcome is unknown"
+                ))
+                .await;
+            record.mark_parked().await;
+            return false;
+        };
+        let result = parent
+            .session
+            .admit_terminal_notice(&record.parent_session_id, &record.rlm_child_id, &row)
+            .await;
+        drop(parent);
+        match result {
+            Ok(()) => return true,
+            Err(error) => {
+                record.admission_failed(&error).await;
+                if error.downcast_ref::<crate::session_engine::terminal_inbox::ClosedTerminalGeneration>().is_some()
+                    || error.downcast_ref::<crate::session_engine::terminal_inbox::MismatchedTerminalGeneration>().is_some()
+                    || *closed.borrow_and_update()
+                {
+                    record.mark_parked().await;
+                    return false;
+                }
+            }
+        }
+        failures += 1;
+        if failures >= BURST_ATTEMPTS {
+            // A parked record remains pending and visible. The original
+            // run task makes sparse retry attempts while the parent stays
+            // open; close wakes it and releases its listener/engine.
+            record.mark_parked().await;
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_millis(PARKED_RETRY_MS)) => {}
+                changed = closed.changed() => {
+                    if changed.is_err() || *closed.borrow_and_update() { return false; }
+                }
+            }
+            if *closed.borrow_and_update() {
+                return false;
+            }
+            record.clear_parked().await;
+            failures = 0;
+            continue;
+        }
+        let delay_ms = 250_u64 * u64::from(failures);
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
+            changed = closed.changed() => {
+                if changed.is_err() || *closed.borrow_and_update() {
+                    record.mark_parked().await;
+                    return false;
+                }
+            }
+        }
+    }
 }

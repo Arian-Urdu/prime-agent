@@ -105,13 +105,18 @@ pub(crate) fn validate_private_journal_parent(path: &Path) -> Result<()> {
 /// symlinked placements (an NFS/automount HOME, an agent-dir or
 /// `WORKER_RECOVERY_JOURNAL` override resolving through a link) FAIL
 /// CLOSED. Callers hand over the original absolute path and
-/// canonicalize legitimate symlinked placements at the call site.
+/// canonicalize ONLY legitimate platform symlinks (a temp root
+/// resolving through `/var`, for example) at the call site —
+/// canonicalization is a caller-side affordance for platform paths,
+/// never a way to launder an attacker-controlled path: the walk
+/// rejects symlink components in whatever path it receives.
 ///
 /// # Errors
 ///
 /// Returns an error when the path is not a normalized absolute path, a
-/// component is a symlink, foreign-owned, or attacker-mutable, or the
-/// final tighten fails.
+/// component is a symlink, foreign-owned, or attacker-mutable, the
+/// created NAME cannot be made durable (the containing directory sync
+/// fails), or the final tighten fails.
 #[cfg(unix)]
 pub(crate) fn establish_private_journal_parent(path: &Path) -> Result<File> {
     use std::path::Component;
@@ -121,6 +126,20 @@ pub(crate) fn establish_private_journal_parent(path: &Path) -> Result<File> {
         "journal placement {} must be an absolute path",
         parent.display()
     );
+    // Syntax first, before ANY directory is opened or created: a
+    // malformed path (a relative or `..`-bearing input) is refused
+    // with zero mutations.
+    for component in parent.components() {
+        match component {
+            Component::Normal(_) | Component::RootDir => {}
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                anyhow::bail!(
+                    "journal placement {} must be a normalized absolute path",
+                    parent.display()
+                );
+            }
+        }
+    }
     let owner = pa_core::platform::perms::effective_uid()
         .context("the effective-uid probe is required for a private journal parent")?;
     let mut current = pa_core::platform::private_fs::open_dir_no_follow(Path::new("/"))
@@ -139,6 +158,18 @@ pub(crate) fn establish_private_journal_parent(path: &Path) -> Result<File> {
                             // race would need.
                             pa_core::platform::private_fs::create_dir_private_at(&current, name)
                                 .with_context(|| format!("create ancestor {}", name.display()))?;
+                            // The created NAME is not durable until its
+                            // VERIFIED containing directory is synced — an
+                            // acknowledged append must never lose an
+                            // ancestor to a crash. Fail closed on the
+                            // sync error.
+                            #[cfg(test)]
+                            if ESTABLISH_FAIL_NEXT_MKDIR_SYNC.swap(false, Ordering::SeqCst) {
+                                anyhow::bail!("injected ancestor sync failure after mkdirat");
+                            }
+                            current
+                                .sync_all()
+                                .with_context(|| format!("sync ancestor {}", name.display()))?;
                             pa_core::platform::private_fs::open_dir_no_follow_at(&current, name)
                                 .with_context(|| format!("open ancestor {}", name.display()))?
                         }
@@ -180,6 +211,16 @@ pub(crate) fn establish_private_journal_parent(path: &Path) -> Result<File> {
     }
     Ok(current)
 }
+
+/// Test-only injection: fail the FIRST created-ancestor directory sync
+/// of the next establishment — deterministically proving the walk fails
+/// closed instead of proceeding without the durable NAME.
+#[cfg(test)]
+pub(crate) static ESTABLISH_FAIL_NEXT_MKDIR_SYNC: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 
 /// The path-based form of [`establish_private_journal_parent`] for callers
 /// that do not pin the handle (the keyed worker journal and the seam
@@ -2586,6 +2627,44 @@ mod tests {
             pa_core::platform::perms::file_mode(&victim),
             Some(0o755),
             "the shared target's mode is never tightened through the rejected placement"
+        );
+    }
+
+    /// The first-use durability belt (the reviewer's follow-up): the
+    /// created ancestor's NAME is synced in its VERIFIED containing
+    /// directory immediately after mkdirat, and a sync failure fails the
+    /// establishment closed — no acknowledged append can ever rest on a
+    /// non-durable ancestor.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_ancestor_sync_fails_the_establishment_closed() {
+        ESTABLISH_FAIL_NEXT_MKDIR_SYNC.store(true, Ordering::SeqCst);
+        let root = temp_path_root();
+        let error = establish_private_journal_parent(&root.join("fresh/nested/recovery.jsonl"))
+            .expect_err("the ancestor sync failure fails closed");
+        assert!(
+            error.to_string().contains("injected ancestor sync"),
+            "the injected sync failure refuses the establishment: {error:#}"
+        );
+    }
+
+    /// A malformed path (a `..`-bearing input) is refused by the syntax
+    /// prevalidation BEFORE any directory is opened or created — zero
+    /// mutations on malformed paths.
+    #[cfg(unix)]
+    #[test]
+    fn a_malformed_placement_is_refused_before_any_mutation() {
+        let root = temp_path_root();
+        let malformed = root.join("created-then-up/../escape/recovery.jsonl");
+        let error = establish_private_journal_parent(&malformed)
+            .expect_err("a ..-bearing placement is refused");
+        assert!(
+            error.to_string().contains("normalized absolute path"),
+            "the syntax prevalidation refuses first: {error:#}"
+        );
+        assert!(
+            !root.join("created-then-up").exists(),
+            "no component is created for a malformed path"
         );
     }
 

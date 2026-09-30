@@ -49,7 +49,13 @@ pub struct SystemRouterLoopOptions {
     pub model: RouterModelInfo,
     pub gate: RouterGateSpec,
     pub max_steps: u32,
+    /// The caller-declared segment timeout, interpolated into every timeout
+    /// summary so System 2 sees the figure it set.
     pub timeout_ms: u64,
+    /// The wall-clock budget left for the loop. The segment runner passes
+    /// what remains of the declared timeout after adapter init; `None` runs
+    /// the loop on the full `timeout_ms`.
+    pub budget_ms: Option<u64>,
     pub history_steps: u32,
     pub observation_chars: u32,
     /// External abort (host shutdown): ends the run `failed("aborted")`.
@@ -148,7 +154,8 @@ fn observation_chars(observation: &RouterObservation) -> usize {
 pub async fn run_system_router_loop(
     options: SystemRouterLoopOptions,
 ) -> anyhow::Result<SystemRouterRunResult> {
-    let deadline = Instant::now() + Duration::from_millis(options.timeout_ms);
+    let budget_ms = options.budget_ms.unwrap_or(options.timeout_ms);
+    let deadline = Instant::now() + Duration::from_millis(budget_ms);
     let result = run_loop(&options, deadline).await;
     // Adapter cleanup must not extend the segment: hand `close` the remaining
     // budget plus the bounded grace.

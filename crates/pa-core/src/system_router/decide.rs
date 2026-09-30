@@ -48,7 +48,6 @@ pub struct RouterDecisionOutcome {
     pub params: BTreeMap<String, String>,
     /// Parsed confidence in [0, 1]; `None` on parse failure.
     pub confidence: Option<f64>,
-    pub raw_text: String,
     /// Why a malformed reply was refused; counts toward the refusal streak.
     pub parse_error: Option<String>,
     /// Transport or model failure; fails the run.
@@ -57,12 +56,11 @@ pub struct RouterDecisionOutcome {
 }
 
 impl RouterDecisionOutcome {
-    fn refused(raw: &str, parse_error: String) -> Self {
+    fn refused(parse_error: String) -> Self {
         Self {
             action: None,
             params: BTreeMap::new(),
             confidence: None,
-            raw_text: raw.to_string(),
             parse_error: Some(parse_error),
             model_error: None,
             usage: None,
@@ -234,7 +232,7 @@ pub fn parse_decision(
     let candidates = extract_json_object_candidates(raw);
     let mut first_refusal: Option<RouterDecisionOutcome> = None;
     for object in &candidates {
-        let outcome = validate_decision_object(object, actions, raw);
+        let outcome = validate_decision_object(object, actions);
         if outcome.action.is_some() {
             return outcome;
         }
@@ -244,7 +242,7 @@ pub fn parse_decision(
         }
     }
     first_refusal.unwrap_or_else(|| {
-        RouterDecisionOutcome::refused(raw, "reply was not a JSON object".to_string())
+        RouterDecisionOutcome::refused("reply was not a JSON object".to_string())
     })
 }
 
@@ -252,51 +250,41 @@ pub fn parse_decision(
 fn validate_decision_object(
     object: &Map<String, Value>,
     actions: &HashMap<String, CompiledAction>,
-    raw: &str,
 ) -> RouterDecisionOutcome {
     let action_name = object.get("action").and_then(Value::as_str);
     let Some(action_name) = action_name else {
-        return RouterDecisionOutcome::refused(
-            raw,
-            format!(
-                "unknown action {}",
-                serde_json::to_string(&object.get("action").cloned().unwrap_or(Value::Null))
-                    .unwrap_or_else(|_| "null".to_string())
-            ),
-        );
+        return RouterDecisionOutcome::refused(format!(
+            "unknown action {}",
+            serde_json::to_string(&object.get("action").cloned().unwrap_or(Value::Null))
+                .unwrap_or_else(|_| "null".to_string())
+        ));
     };
     let Some(action) = actions.get(action_name) else {
-        return RouterDecisionOutcome::refused(
-            raw,
-            format!(
-                "unknown action {}",
-                serde_json::to_string(action_name).unwrap_or_else(|_| "null".to_string())
-            ),
-        );
+        return RouterDecisionOutcome::refused(format!(
+            "unknown action {}",
+            serde_json::to_string(action_name).unwrap_or_else(|_| "null".to_string())
+        ));
     };
     let mut params: BTreeMap<String, String> = BTreeMap::new();
     if let Some(raw_params) = object.get("params") {
         let Some(raw_params) = raw_params.as_object() else {
-            return RouterDecisionOutcome::refused(raw, "params must be an object".to_string());
+            return RouterDecisionOutcome::refused("params must be an object".to_string());
         };
         for (key, value) in raw_params {
             let Some(allowed) = action.params.get(key) else {
-                return RouterDecisionOutcome::refused(
-                    raw,
-                    format!("unknown param \"{key}\" for action \"{action_name}\""),
-                );
+                return RouterDecisionOutcome::refused(format!(
+                    "unknown param \"{key}\" for action \"{action_name}\""
+                ));
             };
             let Some(value) = value.as_str() else {
-                return RouterDecisionOutcome::refused(
-                    raw,
-                    format!("param \"{key}\" value must be one of its declared choices"),
-                );
+                return RouterDecisionOutcome::refused(format!(
+                    "param \"{key}\" value must be one of its declared choices"
+                ));
             };
             if !allowed.choices.contains_key(value) {
-                return RouterDecisionOutcome::refused(
-                    raw,
-                    format!("param \"{key}\" value must be one of its declared choices"),
-                );
+                return RouterDecisionOutcome::refused(format!(
+                    "param \"{key}\" value must be one of its declared choices"
+                ));
             }
             params.insert(key.clone(), value.to_string());
         }
@@ -312,29 +300,21 @@ fn validate_decision_object(
             .map(|name| name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        return RouterDecisionOutcome::refused(
-            raw,
-            format!("missing param(s) {missing} for action \"{action_name}\""),
-        );
+        return RouterDecisionOutcome::refused(format!(
+            "missing param(s) {missing} for action \"{action_name}\""
+        ));
     }
     let confidence = object.get("confidence").and_then(Value::as_f64);
     let Some(confidence) = confidence else {
-        return RouterDecisionOutcome::refused(
-            raw,
-            "confidence must be a number in [0, 1]".to_string(),
-        );
+        return RouterDecisionOutcome::refused("confidence must be a number in [0, 1]".to_string());
     };
     if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
-        return RouterDecisionOutcome::refused(
-            raw,
-            "confidence must be a number in [0, 1]".to_string(),
-        );
+        return RouterDecisionOutcome::refused("confidence must be a number in [0, 1]".to_string());
     }
     RouterDecisionOutcome {
         action: Some(action_name.to_string()),
         params,
         confidence: Some(confidence),
-        raw_text: raw.to_string(),
         parse_error: None,
         model_error: None,
         usage: None,
@@ -448,7 +428,6 @@ pub fn create_model_decision_function(context: RouterDecisionContext) -> RouterD
                     action: None,
                     params: BTreeMap::new(),
                     confidence: None,
-                    raw_text: String::new(),
                     parse_error: None,
                     model_error: Some(format!(
                         "decision model failed: {}",
@@ -465,7 +444,6 @@ pub fn create_model_decision_function(context: RouterDecisionContext) -> RouterD
                     action: None,
                     params: BTreeMap::new(),
                     confidence: None,
-                    raw_text: String::new(),
                     parse_error: None,
                     model_error: Some(format!(
                         "decision model stopped early ({})",

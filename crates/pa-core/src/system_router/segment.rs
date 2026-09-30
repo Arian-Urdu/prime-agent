@@ -165,7 +165,10 @@ async fn run_segment(
         },
         gate: spec.gate,
         max_steps: spec.max_steps,
-        timeout_ms: loop_budget_ms,
+        // The declared figure for the summaries; the leftover is only the
+        // loop's clock, so a slow init must not rewrite the reported timeout.
+        timeout_ms: spec.timeout_ms,
+        budget_ms: Some(loop_budget_ms),
         history_steps: spec.history_steps,
         observation_chars: spec.observation_chars,
         signal: options.signal.clone(),

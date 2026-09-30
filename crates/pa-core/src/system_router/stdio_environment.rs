@@ -530,6 +530,12 @@ async fn read_loop(mut stdout: ChildStdout, shared: Arc<Shared>) {
             },
         }
     }
+    if shared.closed.load(Ordering::Relaxed) {
+        // The exit is the deliberate close (the flag is stored before the
+        // close request is written): `close` records the failure itself, so
+        // a supervised shutdown must not read as an adapter crash.
+        return;
+    }
     let tail = shared.tail();
     shared.fail_all(&format!("environment adapter exited early: {tail}"));
 }

@@ -250,19 +250,6 @@ pub enum RouterRunStatus {
     Escalated,
 }
 
-impl RouterRunStatus {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            RouterRunStatus::Done => "done",
-            RouterRunStatus::Incomplete => "incomplete",
-            RouterRunStatus::Stuck => "stuck",
-            RouterRunStatus::Failed => "failed",
-            RouterRunStatus::Escalated => "escalated",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RouterUsage {

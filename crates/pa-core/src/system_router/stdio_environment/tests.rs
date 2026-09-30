@@ -192,6 +192,47 @@ async fn an_invalid_utf8_line_is_a_protocol_violation() {
     .await;
 }
 
+/// A deliberate close must not read as an early exit: the reader sees the
+/// adapter's stdout close while `close` is still waiting on the process, so
+/// the recorded failure is the close, not "exited early" (the TS exit
+/// handler's `closed` check).
+#[tokio::test]
+async fn a_deliberate_close_is_not_reported_as_an_early_exit() {
+    let (_dir, command) = adapter(
+        r#"
+import json
+import os
+import sys
+import time
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    request = json.loads(line)
+    if request.get("type") == "close":
+        # The reader sees EOF while the process still runs.
+        os.close(1)
+        time.sleep(1)
+        break
+    print(json.dumps({"id": request.get("id"), "ok": True}), flush=True)
+"#,
+    );
+    let env = StdioRouterEnvironment::new(command, None, 5_000, None);
+    env.init().await.unwrap();
+    env.close(RouterCloseOptions {
+        budget_ms: Some(3_000),
+    })
+    .await;
+    // The fail-fast message is the deliberate close, not "exited early".
+    let error = env
+        .reset("reach the overworld")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(error, "environment adapter closed");
+}
+
 #[tokio::test]
 async fn closing_an_unstarted_adapter_is_a_no_op() {
     let env = StdioRouterEnvironment::new(vec!["python3".to_string()], None, 1_000, None);

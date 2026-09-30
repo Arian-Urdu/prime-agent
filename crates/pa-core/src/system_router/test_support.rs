@@ -247,7 +247,6 @@ pub fn valid_decision(
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect(),
         confidence: Some(confidence),
-        raw_text: String::new(),
         parse_error: None,
         model_error: None,
         usage: Some(RouterUsage {
@@ -264,7 +263,6 @@ pub fn refused_decision(reason: &str) -> RouterDecisionOutcome {
         action: None,
         params: BTreeMap::new(),
         confidence: None,
-        raw_text: String::new(),
         parse_error: Some(reason.to_string()),
         model_error: None,
         usage: Some(RouterUsage {
@@ -281,7 +279,6 @@ pub fn model_error_decision(message: &str) -> RouterDecisionOutcome {
         action: None,
         params: BTreeMap::new(),
         confidence: None,
-        raw_text: String::new(),
         parse_error: None,
         model_error: Some(message.to_string()),
         usage: None,

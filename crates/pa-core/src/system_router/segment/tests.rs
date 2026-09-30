@@ -208,6 +208,40 @@ async fn the_adapter_runs_in_the_session_working_directory_by_default() {
     assert_eq!(actual, expected);
 }
 
+/// A slow adapter `init` spends part of the declared budget; every timeout
+/// summary must still report the figure System 2 set, not the leftover the
+/// loop runs on.
+#[tokio::test]
+async fn the_timeout_summary_reports_the_declared_segment_timeout() {
+    // Answers `init`, then hangs on `reset`: the loop hits the leftover budget.
+    let command = r#"read line; printf '{"id":0,"ok":true}\n'; read line; sleep 30"#;
+    let payload = json!({
+        "goal": "reach the overworld",
+        "timeoutMs": 900,
+        "actions": { "look": { "description": "Look." } },
+        "environment": { "stdio": { "command": ["sh", "-c", command] } }
+    });
+    let spec = parse_system_router_run_spec(&payload).unwrap();
+    let options = RouterSegmentOptions {
+        model: action_model(),
+        api_key: Some("test-key".to_string()),
+        headers: None,
+        session_id: None,
+        policy: crate::session_engine::provider_retry::DEFAULT_PROVIDER_RETRY_POLICY,
+        env: None,
+        decide: Some(support::scripted_decide(vec![])),
+        default_cwd: None,
+        signal: None,
+    };
+    let result = run_router_segment(&spec, options).await.unwrap();
+    assert_eq!(result.status, RouterRunStatus::Incomplete);
+    assert_eq!(result.reason, "timeout");
+    assert_eq!(
+        result.summary,
+        "Stopped before the first step: the segment timeout of 900ms elapsed during reset."
+    );
+}
+
 /// The env trait object is what the loop closes; keep the compiler honest
 /// about the `RouterSegmentEnvironment` supertrait.
 #[test]

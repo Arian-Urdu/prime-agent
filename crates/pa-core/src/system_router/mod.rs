@@ -25,30 +25,8 @@ mod types;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub use action_space::{
-    compile_action_space, compile_decision_prompt, format_history_entry, gate_threshold,
-    observation_digest, truncate_observation, CompiledAction, CompiledActionSpace,
-};
-pub use decide::{
-    create_model_decision_function, parse_decision, router_thinking_level, supports_images,
-    RouterDecisionContext, RouterDecisionFn, RouterDecisionOutcome, RouterDecisionRequest,
-    ROUTER_DECISION_MAX_TOKENS, ROUTER_DECISION_SYSTEM_PROMPT,
-};
-pub use r#loop::{
-    run_system_router_loop, SystemRouterLoopOptions, ROUTER_CLOSE_GRACE_MS,
-    ROUTER_REFUSAL_STREAK_LIMIT, ROUTER_REPETITION_LIMIT,
-};
+// The host bridge consumes the module through these three names only; the
+// rest of the subsystem stays on its internal module paths (the unit
+// batteries reach it through their parent modules' own imports).
 pub use segment::{run_router_segment, RouterSegmentOptions};
-pub use stdio_environment::StdioRouterEnvironment;
-pub use types::{
-    default_router_gate, parse_action_space, parse_environment_actions,
-    parse_system_router_run_spec, resolve_gate, RouterActionParamSpec, RouterActionRisk,
-    RouterActionSpec, RouterCloseOptions, RouterEnvironment, RouterEnvironmentSpec,
-    RouterExecution, RouterGateSpec, RouterGateTrace, RouterGateVerdict, RouterModelInfo,
-    RouterObservation, RouterRunStatus, RouterSegmentEnvironment, RouterStdioEnvironmentSpec,
-    RouterStepTrace, RouterUsage, SystemRouterRunResult, DEFAULT_ROUTER_ENV_REQUEST_TIMEOUT_MS,
-    DEFAULT_ROUTER_HISTORY_STEPS, DEFAULT_ROUTER_MAX_STEPS, DEFAULT_ROUTER_OBSERVATION_CHARS,
-    DEFAULT_ROUTER_TIMEOUT_MS, ESCALATE_ACTION, FINISH_ACTION, MAX_ROUTER_ENV_REQUEST_TIMEOUT_MS,
-    MAX_ROUTER_HISTORY_STEPS, MAX_ROUTER_OBSERVATION_CHARS, MAX_ROUTER_STEPS,
-    MAX_ROUTER_TIMEOUT_MS,
-};
+pub use types::parse_system_router_run_spec;

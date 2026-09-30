@@ -150,6 +150,31 @@ pub fn open_dir_no_follow_at(_parent: &File, _name: &std::ffi::OsStr) -> io::Res
     Err(unsupported())
 }
 
+/// Create `name` inside the pinned directory, owner-only (`0o700`),
+/// without resolving a path (`mkdirat`): the trusted-namespace walk
+/// creates a missing component ONLY inside a verified non-mutable
+/// parent, so no attacker-controlled resolution is involved.
+///
+/// # Errors
+///
+/// Returns the mkdir error (an existing component answers
+/// `AlreadyExists`).
+#[cfg(unix)]
+pub fn create_dir_private_at(parent: &File, name: &std::ffi::OsStr) -> io::Result<()> {
+    nix::sys::stat::mkdirat(
+        Some(parent.as_raw_fd()),
+        name,
+        nix::sys::stat::Mode::S_IRWXU,
+    )?;
+    Ok(())
+}
+
+/// Windows arm of [`create_dir_private_at`]: see the module note.
+#[cfg(not(unix))]
+pub fn create_dir_private_at(_parent: &File, _name: &std::ffi::OsStr) -> io::Result<()> {
+    Err(unsupported())
+}
+
 /// Windows arm of [`open_append_at`]: see the module note.
 #[cfg(not(unix))]
 pub fn open_append_at(_parent: &File, _leaf: &str) -> io::Result<File> {

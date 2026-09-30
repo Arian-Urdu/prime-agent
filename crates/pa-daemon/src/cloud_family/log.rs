@@ -78,7 +78,6 @@ impl FamilyRequestLog {
             let events_path = directory.join(EVENTS_FILE);
             let parent = crate::journal::establish_private_journal_parent(&events_path)?;
             crate::journal::validate_private_journal_parent(&events_path)?;
-            crate::journal::require_trusted_namespace(&parent, directory)?;
             let mut log = Self {
                 session_id: session_id.to_string(),
                 events: Vec::new(),
@@ -387,10 +386,6 @@ impl FamilyResultLog {
         {
             let parent = crate::journal::establish_private_journal_parent(path)?;
             crate::journal::validate_private_journal_parent(path)?;
-            let parent_path = path
-                .parent()
-                .context("the family result journal needs a parent directory")?;
-            crate::journal::require_trusted_namespace(&parent, parent_path)?;
             let Some(leaf) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
                 anyhow::bail!("the family result journal needs a file name");
             };
@@ -915,6 +910,35 @@ mod tests {
             .expect_err("a symlink component in the original path fails closed");
         FamilyResultLog::open(&link.join("outbox").join("family-results.jsonl"))
             .expect_err("a symlink component in the original path fails closed");
+    }
+
+    /// The no-mutation-on-untrusted-path invariant (the reviewer's
+    /// rejected-path side effect): an attacker symlink component
+    /// targeting an OWNED SHARED directory is refused with the victim
+    /// untouched — no 0700 tighten through the link, no created outbox
+    /// inside it — despite the pinned establishment resolving through
+    /// it before the refusal.
+    #[test]
+    fn a_rejected_symlink_path_leaves_the_shared_target_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let victim = temp_root(&root).join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = temp_root(&root).join("retargetable");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        FamilyRequestLog::open(&link, "sess_priv", 50)
+            .expect_err("the symlink component is refused");
+        assert_eq!(
+            pa_core::platform::perms::file_mode(&victim),
+            Some(0o755),
+            "the shared target's mode is never tightened through the rejected path"
+        );
+        let entries: Vec<_> = fs::read_dir(&victim).unwrap().collect();
+        assert!(
+            entries.is_empty(),
+            "nothing is created inside the target through the rejected path"
+        );
     }
 
     /// The result journal's appends ride the same pinned handle: the

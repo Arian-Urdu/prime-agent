@@ -77,60 +77,108 @@ pub(crate) fn validate_private_journal_parent(path: &Path) -> Result<()> {
     ))
 }
 
-/// Create or tighten the journal's parent to the private mode a keyed
-/// (cloud) commit requires, returning the PINNED VERIFIED DIRECTORY
-/// HANDLE: a missing parent chain is created private, and a pre-existing
-/// parent owned by the effective user is tightened to 0700 (a normal
-/// `create_dir_all` parent is 0755 under the usual umask — the commit
-/// must work against it, not quarantine over it). The directory is
-/// opened with `O_NOFOLLOW` (a symlinked parent is refused at the open
-/// itself), the path is re-statted and must still be that same inode,
-/// and every rejection — a symlink parent, a replaced parent, a parent
-/// owned by anyone else — happens before the first chmod, which applies
-/// to the opened handle. A parent owned by anyone else is left untouched
-/// and fails the validation that follows: privacy is never assumed from
-/// a directory this process does not control. The caller holds the
-/// returned handle and does every leaf operation relative to it, so no
-/// ancestor swap can redirect anything after this point.
+/// Establish the journal's parent as the PINNED VERIFIED DIRECTORY
+/// HANDLE through ONE strict handle-chained walk over the ORIGINAL
+/// absolute parent path — establishment and placement certification
+/// unified. ZERO MUTATION until verification: every component is
+/// opened no-follow (`openat` + `O_NOFOLLOW` + `O_DIRECTORY`, relative
+/// to the previous directory's handle) and checked BEFORE anything is
+/// created or changed, so an untrusted path is refused with no side
+/// effects — no component created, no mode changed, nowhere. Per
+/// component: a symlink answers `ELOOP`/`ENOTDIR` and is rejected
+/// outright (a symlink's owner can retarget it at will — no sticky or
+/// release exception applies); a missing component is created
+/// owner-only (`mkdirat`, 0700) RELATIVE TO THE VERIFIED PARENT — a
+/// parent certified non-mutable grants nobody the write rights the
+/// creation race would need — and re-opened no-follow; an existing
+/// component must be owned by the effective user or root and not be
+/// group/other-writable unless the sticky bit pins entry ownership
+/// (the POSIX `/tmp` contract). The FINAL component alone is tightened
+/// to the private mode through ITS verified handle when loose — the
+/// only chmod, reachable only after the whole chain passed. The
+/// returned handle is the walk's final directory: the certification
+/// binds by construction, and every later leaf operation resolves
+/// relative to that inode.
+///
+/// Deployment note: the strict contract now covers the keyed worker
+/// journal and the seam inbox too (they share this establishment) —
+/// symlinked placements (an NFS/automount HOME, an agent-dir or
+/// `WORKER_RECOVERY_JOURNAL` override resolving through a link) FAIL
+/// CLOSED. Callers hand over the original absolute path and
+/// canonicalize legitimate symlinked placements at the call site.
 ///
 /// # Errors
 ///
-/// Returns an error when the parent cannot be created, opened, verified,
-/// or tightened.
+/// Returns an error when the path is not a normalized absolute path, a
+/// component is a symlink, foreign-owned, or attacker-mutable, or the
+/// final tighten fails.
 #[cfg(unix)]
 pub(crate) fn establish_private_journal_parent(path: &Path) -> Result<File> {
+    use std::path::Component;
     let parent = path.parent().context("journal has no parent directory")?;
-    pa_core::platform::perms::create_dir_all_private(parent)
-        .with_context(|| format!("create private {}", parent.display()))?;
-    let handle = pa_core::platform::private_fs::open_dir_no_follow(parent)
-        .with_context(|| format!("open {}", parent.display()))?;
-    let path_metadata = fs::symlink_metadata(parent)?;
     anyhow::ensure!(
-        path_metadata.is_dir() && !path_metadata.file_type().is_symlink(),
-        "worker journal parent {} must be a real private directory",
-        parent.display()
-    );
-    let opened = handle.metadata()?;
-    anyhow::ensure!(
-        (opened.dev(), opened.ino()) == (path_metadata.dev(), path_metadata.ino()),
-        "worker journal parent {} was replaced while opening it",
+        parent.is_absolute(),
+        "journal placement {} must be an absolute path",
         parent.display()
     );
     let owner = pa_core::platform::perms::effective_uid()
         .context("the effective-uid probe is required for a private journal parent")?;
-    anyhow::ensure!(
-        opened.uid() == owner,
-        "worker journal parent {} must be owned by the current user",
-        parent.display()
-    );
-    if opened.mode() & 0o777 != pa_core::platform::perms::PRIVATE_DIR_MODE {
-        handle
+    let mut current = pa_core::platform::private_fs::open_dir_no_follow(Path::new("/"))
+        .context("open the filesystem root")?;
+    for component in parent.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                let next =
+                    match pa_core::platform::private_fs::open_dir_no_follow_at(&current, name) {
+                        Ok(next) => next,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            // Missing component: created owner-only, relative
+                            // to the VERIFIED parent — non-mutable, so no
+                            // interloper holds the write rights the creation
+                            // race would need.
+                            pa_core::platform::private_fs::create_dir_private_at(&current, name)
+                                .with_context(|| format!("create ancestor {}", name.display()))?;
+                            pa_core::platform::private_fs::open_dir_no_follow_at(&current, name)
+                                .with_context(|| format!("open ancestor {}", name.display()))?
+                        }
+                        Err(error) => {
+                            return Err(error)
+                                .with_context(|| format!("open ancestor {}", name.display()));
+                        }
+                    };
+                let metadata = next.metadata()?;
+                anyhow::ensure!(
+                    metadata.uid() == owner || metadata.uid() == 0,
+                    "journal ancestor {} must be owned by the current user or root",
+                    name.display()
+                );
+                let mode = metadata.mode();
+                anyhow::ensure!(
+                    mode & 0o022 == 0 || mode & 0o1000 != 0,
+                    "journal ancestor {} is writable by others; the placement is not durable",
+                    name.display()
+                );
+                current = next;
+            }
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                anyhow::bail!(
+                    "journal placement {} must be a normalized absolute path",
+                    parent.display()
+                );
+            }
+        }
+    }
+    // The final component alone is tightened — through ITS verified
+    // handle, reachable only after the whole chain passed.
+    if current.metadata()?.mode() & 0o777 != pa_core::platform::perms::PRIVATE_DIR_MODE {
+        current
             .set_permissions(std::fs::Permissions::from_mode(
                 pa_core::platform::perms::PRIVATE_DIR_MODE,
             ))
             .with_context(|| format!("tighten {}", parent.display()))?;
     }
-    Ok(handle)
+    Ok(current)
 }
 
 /// The path-based form of [`establish_private_journal_parent`] for callers
@@ -191,92 +239,6 @@ pub(crate) fn ensure_private_journal_file(path: &Path) -> Result<()> {
             File::open(parent)?.sync_all()?;
         }
     }
-    Ok(())
-}
-
-/// The trusted-namespace placement certification for a durable journal
-/// parent (the follow-up review's integrity finding): the pinned handle
-/// keeps the RUNNING process honest, but a placement is only durable
-/// ACROSS RESTARTS when no component of the ORIGINAL path can move or
-/// retarget between runs — an attacker with rename rights anywhere up
-/// the chain could relocate the verified directory, and an
-/// attacker-owned symlink component could retarget the lookup itself.
-/// The certification walks the ORIGINAL components from the filesystem
-/// root through HANDLE-CHAINED no-follow opens (`openat` +
-/// `O_NOFOLLOW` + `O_DIRECTORY`): symlink components are rejected
-/// outright (strict-simplest — a symlink's owner can retarget it at
-/// will; no sticky or release exception applies), and every component
-/// must be owned by the effective user or root (the identities outside
-/// the local-attacker threat model) and not attacker-mutable: no
-/// group/other write bit, unless the sticky bit pins entry ownership
-/// (the POSIX `/tmp` contract — only the entry's owner may rename it).
-/// Each component's checks run on the OPENED HANDLE's metadata — the
-/// walk re-resolves no path — and the walk's final directory is BOUND
-/// to the pinned parent handle by device and inode: the certification
-/// can never describe a different directory than the one serving the
-/// appends. This is an open-time PLACEMENT certification, not an
-/// append-time recheck.
-///
-/// Callers hand over the ORIGINAL ABSOLUTE parent path; legitimate
-/// symlinked placements (a temp root resolving through `/var`, for
-/// example) must be canonicalized at the CALLER before opening — the
-/// product keeps no symlink exception.
-///
-/// # Errors
-///
-/// Returns an error when the path is not absolute and normalized, a
-/// component is a symlink, foreign-owned, or attacker-mutable, or the
-/// walked directory is not the pinned parent's inode.
-#[cfg(unix)]
-pub(crate) fn require_trusted_namespace(parent: &File, original: &Path) -> Result<()> {
-    use std::path::Component;
-    anyhow::ensure!(
-        original.is_absolute(),
-        "journal placement {} must be an absolute path",
-        original.display()
-    );
-    let owner = pa_core::platform::perms::effective_uid()
-        .context("the effective-uid probe is required for a trusted namespace")?;
-    let mut current = pa_core::platform::private_fs::open_dir_no_follow(Path::new("/"))
-        .context("open the filesystem root")?;
-    for component in original.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(name) => {
-                let next = pa_core::platform::private_fs::open_dir_no_follow_at(&current, name)
-                    .with_context(|| format!("open ancestor {}", name.display()))?;
-                let metadata = next.metadata()?;
-                anyhow::ensure!(
-                    metadata.uid() == owner || metadata.uid() == 0,
-                    "journal ancestor {} must be owned by the current user or root",
-                    name.display()
-                );
-                let mode = metadata.mode();
-                anyhow::ensure!(
-                    mode & 0o022 == 0 || mode & 0o1000 != 0,
-                    "journal ancestor {} is writable by others; the placement is not durable",
-                    name.display()
-                );
-                current = next;
-            }
-            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
-                anyhow::bail!(
-                    "journal placement {} must be a normalized absolute path",
-                    original.display()
-                );
-            }
-        }
-    }
-    // THE BIND: the walked chain's final directory must be the pinned
-    // parent's inode — the certification cannot describe any other
-    // directory than the one serving the appends.
-    let walked = current.metadata()?;
-    let pinned = parent.metadata()?;
-    anyhow::ensure!(
-        (walked.dev(), walked.ino()) == (pinned.dev(), pinned.ino()),
-        "journal parent {} moved while its placement was certified",
-        original.display()
-    );
     Ok(())
 }
 
@@ -1756,9 +1718,18 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    fn temp_path(name: &str) -> std::path::PathBuf {
+    /// The macOS temp root resolves through /var (a symlink); the strict
+    /// no-symlink placement contract requires the ORIGINAL path to be
+    /// symlink-free, so the fixtures canonicalize their legitimate temp
+    /// roots at the call site (the product keeps no exception).
+    fn temp_path_root() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("pa-daemon-journal-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
+        fs::canonicalize(&dir).unwrap()
+    }
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let dir = temp_path_root();
         #[cfg(unix)]
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         dir.join(name)
@@ -2426,7 +2397,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn keyed_commit_tightens_a_normal_parent_instead_of_quarantining() {
-        let dir = std::env::temp_dir().join(format!("pa-daemon-journal-{}", uuid::Uuid::new_v4()));
+        let dir = temp_path_root();
         fs::create_dir_all(&dir).unwrap();
         // The umask-independent normal shape: what create_dir_all makes
         // on the usual 022 umask.
@@ -2468,7 +2439,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unkeyed_first_write_creates_the_journal_privately() {
-        let dir = std::env::temp_dir().join(format!("pa-daemon-journal-{}", uuid::Uuid::new_v4()));
+        let dir = temp_path_root();
         fs::create_dir_all(&dir).unwrap();
         // The umask-independent normal shape: what create_dir_all makes
         // on the usual 022 umask.
@@ -2508,7 +2479,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn legacy_loose_journal_moves_to_a_fresh_private_inode() {
-        let dir = std::env::temp_dir().join(format!("pa-daemon-journal-{}", uuid::Uuid::new_v4()));
+        let dir = temp_path_root();
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("recovery.jsonl");
         let mut journal = WorkerRecoveryJournal::open(&path).unwrap();
@@ -2554,7 +2525,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn keyed_commit_on_a_symlinked_parent_rejects_without_touching_the_target() {
-        let root = std::env::temp_dir().join(format!("pa-daemon-journal-{}", uuid::Uuid::new_v4()));
+        let root = temp_path_root();
         let target = root.join("target");
         fs::create_dir_all(&target).unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
@@ -2582,12 +2553,48 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// The keyed worker journal inherits the strict establishment: a
+    /// keyed commit under a symlinked placement is refused with the
+    /// shared target's mode UNTOUCHED (the deployment note — symlinked
+    /// HOME/override placements now fail closed for the keyed path
+    /// too).
+    #[cfg(unix)]
+    #[test]
+    fn keyed_establish_refuses_a_symlinked_placement_without_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_path_root();
+        let victim = root.join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = root.join("retargetable");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        let mut journal = WorkerRecoveryJournal::open(&link.join("recovery.jsonl")).unwrap();
+        journal
+            .record_queue_checkpoint(
+                "sess-v",
+                "sess-v-file",
+                None,
+                true,
+                "steer_queued",
+                &[],
+                &[],
+                Some(("msgreq_victim", &serde_json::json!({"id":"receipt"}))),
+            )
+            .expect_err("the keyed establishment refuses the symlinked placement");
+        assert!(journal.is_quarantined());
+        assert_eq!(
+            pa_core::platform::perms::file_mode(&victim),
+            Some(0o755),
+            "the shared target's mode is never tightened through the rejected placement"
+        );
+    }
+
     /// Platforms without the owner/mode probes fail closed: keyed journal
     /// privacy is never assumed from inherited ACLs.
     #[cfg(not(unix))]
     #[test]
     fn keyed_journal_privacy_fails_closed_off_unix() {
-        let dir = std::env::temp_dir().join(format!("pa-daemon-journal-{}", uuid::Uuid::new_v4()));
+        let dir = temp_path_root();
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("recovery.jsonl");
         assert!(validate_private_journal_parent(&path).is_err());

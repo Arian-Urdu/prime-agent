@@ -2,7 +2,13 @@
 use super::*;
 
 pub(super) fn test_worker() -> Arc<Worker> {
-    let dir = std::env::temp_dir().join(format!("pa-worker-am-{}", uuid::Uuid::new_v4()));
+    // The macOS temp root resolves through /var (a symlink); the strict
+    // no-symlink placement contract requires the ORIGINAL path to be
+    // symlink-free, so the fixture canonicalizes its legitimate temp
+    // root at the call site.
+    let dir = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("pa-worker-am-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let config = WorkerConfig {
         socket_path: dir.join("worker.sock"),

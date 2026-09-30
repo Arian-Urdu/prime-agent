@@ -440,11 +440,16 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    fn private_dir() -> tempfile::TempDir {
+    /// The temp root and the canonicalized placement path (the macOS temp
+    /// root resolves through /var — a symlink — and the strict
+    /// no-symlink placement contract requires the ORIGINAL path to be
+    /// symlink-free; the fixture canonicalizes at the call site).
+    fn private_dir() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         #[cfg(unix)]
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        dir
+        let path = fs::canonicalize(dir.path()).unwrap();
+        (dir, path)
     }
 
     fn message(request_id: &str, target: &str) -> IncomingCloudMessage {
@@ -473,7 +478,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn open_tightens_a_normal_parent_and_creates_missing_ones_privately() {
-        let dir = std::env::temp_dir().join(format!("pa-cloud-inbox-{}", uuid::Uuid::new_v4()));
+        let dir = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("pa-cloud-inbox-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         // The umask-independent normal shape: what create_dir_all makes
         // on the usual 022 umask.
@@ -503,7 +510,9 @@ mod tests {
     #[test]
     fn inbox_file_is_private_from_its_first_write_and_swaps_when_legacy_loose() {
         use std::os::unix::fs::MetadataExt;
-        let dir = std::env::temp_dir().join(format!("pa-cloud-inbox-{}", uuid::Uuid::new_v4()));
+        let dir = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("pa-cloud-inbox-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
         let path = dir.join("cloud-inbox.jsonl");
@@ -541,8 +550,8 @@ mod tests {
     /// `Already`.
     #[test]
     fn two_phase_round_trip_survives_the_reopen() {
-        let dir = private_dir();
-        let path = dir.path().join("cloud-inbox.jsonl");
+        let (_dir, dir) = private_dir();
+        let path = dir.join("cloud-inbox.jsonl");
         let mut log = CloudInboxLog::open(&path).unwrap();
         assert_eq!(
             log.admit(&message("msgreq_1", "target-a")).unwrap(),
@@ -569,7 +578,7 @@ mod tests {
         );
         assert!(reloaded.admission("msgreq_unknown").is_none());
         // A receipt before admission is a protocol error.
-        let mut fresh = CloudInboxLog::open(&dir.path().join("other.jsonl")).unwrap();
+        let mut fresh = CloudInboxLog::open(&dir.join("other.jsonl")).unwrap();
         assert!(fresh
             .record_receipt("never-admitted", receipt("x"))
             .is_err());
@@ -579,8 +588,8 @@ mod tests {
     /// the re-drive input, and a crash-truncated tail line is skipped.
     #[test]
     fn admitted_without_receipt_is_the_re_drive_input() {
-        let dir = private_dir();
-        let path = dir.path().join("cloud-inbox.jsonl");
+        let (_dir, dir) = private_dir();
+        let path = dir.join("cloud-inbox.jsonl");
         let mut log = CloudInboxLog::open(&path).unwrap();
         log.admit(&message("msgreq_gap", "target-b")).unwrap();
         log.record_receipt("msgreq_gap", receipt("agentmsg_gap"))
@@ -631,8 +640,8 @@ mod tests {
 
     #[test]
     fn multibyte_tail_and_missing_delimiter_are_repaired_before_append() {
-        let dir = private_dir();
-        let path = dir.path().join("cloud-inbox.jsonl");
+        let (_dir, dir) = private_dir();
+        let path = dir.join("cloud-inbox.jsonl");
         let mut log = CloudInboxLog::open(&path).unwrap();
         log.admit(&message("prior", "target")).unwrap();
         let prior = fs::read(&path).unwrap();
@@ -661,8 +670,8 @@ mod tests {
     /// silently rewritten.
     #[test]
     fn mid_file_corruption_fails_closed() {
-        let dir = private_dir();
-        let path = dir.path().join("cloud-inbox.jsonl");
+        let (_dir, dir) = private_dir();
+        let path = dir.join("cloud-inbox.jsonl");
         let mut log = CloudInboxLog::open(&path).unwrap();
         log.admit(&message("msgreq_m1", "target")).unwrap();
         drop(log);
@@ -685,8 +694,8 @@ mod tests {
     /// an admit.
     #[test]
     fn window_compaction_keeps_admits_without_receipts() {
-        let dir = private_dir();
-        let path = dir.path().join("cloud-inbox.jsonl");
+        let (_dir, dir) = private_dir();
+        let path = dir.join("cloud-inbox.jsonl");
         let mut log = CloudInboxLog::open(&path).unwrap();
         log.max_remembered = 4;
         for index in 0..6 {

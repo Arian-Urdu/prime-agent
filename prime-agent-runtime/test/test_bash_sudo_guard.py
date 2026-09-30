@@ -606,9 +606,9 @@ class SudoGuardTest(unittest.IsolatedAsyncioTestCase):
         reads = []
         real = bash_module._with_prefix
 
-        def spy(command):
+        def spy(command, prefix=None):
             reads.append(command)
-            return real(command)
+            return real(command, prefix)
 
         os.environ["PRIME_AGENT_BASH_COMMAND_PREFIX"] = "cd /tmp"
         with mock.patch.object(bash_module, "_with_prefix", spy):

@@ -3265,6 +3265,8 @@ def _guard_destructive_git(
     # length-preserving) so the patterns and the probe resolution see the
     # same argv the shell will hand to git.
     if script is None:
+        if command_prefix is None:
+            command_prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
         script = _with_prefix(command, command_prefix)
     resolved = _mask_shell_redirections(_normalize_line_continuations(script))
     # An escaped or split-spelled command word (`e\val`, `e'va'l`) still
@@ -3285,8 +3287,8 @@ def _guard_destructive_git(
         # caller's repository. Only reached when a discard is really present, so
         # a harmless `eval 'cd /tmp'` on its own still runs.
         raise DestructiveGitRefusalError(_format_relocation_refusal())
-    if command_prefix is None:
-        command_prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
+    # The caller pinned the prefix (bash() reads it once per call), so the
+    # boundary below never re-reads the environment.
     user_command_start = len(command_prefix) + 1 if command_prefix else 0
     probes: list[tuple[str, bool]] = []
     seen_probes: set[str] = set()
@@ -3306,7 +3308,7 @@ def _guard_destructive_git(
         else:
             relocation_prefix = target.relocation_prefix or ""
             git_status = target.git_status_command
-        probe_command = _with_prefix(relocation_prefix + git_status)
+        probe_command = _with_prefix(relocation_prefix + git_status, command_prefix)
         if probe_command in seen_probes:
             continue
         seen_probes.add(probe_command)
@@ -14604,7 +14606,7 @@ def bash(
     # environment change cannot make the executed script differ from the text
     # the guards scanned. `_with_prefix` is called once for the script itself.
     command_prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
-    script = _with_prefix(command)
+    script = _with_prefix(command, command_prefix)
     _run_kernel_bash_guards(
         command,
         script,
@@ -14642,6 +14644,9 @@ def _shell() -> str:
     return shell or "/bin/sh"
 
 
+_PREFIX_UNSET: Any = object()
+
+
 def _prefix_command(command: str, prefix: str | None) -> str:
     """The shell script for `command`, `prefix` prepended as its own line.
 
@@ -14651,11 +14656,12 @@ def _prefix_command(command: str, prefix: str | None) -> str:
     return f"{prefix}\n{command}" if prefix else command
 
 
-def _with_prefix(command: str, prefix: str | None = None) -> str:
+def _with_prefix(command: str, prefix: Any = _PREFIX_UNSET) -> str:
     """The command as the kernel runs it: the setup prefix on its own line,
     when one is set. `prefix` pins the value so one caller can share a single
-    environment read between the guards and the spawn."""
-    if prefix is None:
+    environment read between the guards and the spawn; pass None explicitly to
+    pin "no prefix" without re-reading the environment."""
+    if prefix is _PREFIX_UNSET:
         prefix = os.environ.get("PRIME_AGENT_BASH_COMMAND_PREFIX")
     return _prefix_command(command, prefix)
 

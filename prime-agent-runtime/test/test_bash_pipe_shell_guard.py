@@ -747,9 +747,9 @@ class PipeToShellGuardTest(unittest.IsolatedAsyncioTestCase):
         seen: list[str] = []
         real_prefix = bash_module._with_prefix
 
-        def record(command: str) -> str:
+        def record(command: str, prefix: object = None) -> str:
             seen.append(command)
-            return real_prefix(command)
+            return real_prefix(command, prefix)
 
         with mock.patch.dict(
             os.environ, {"PRIME_AGENT_BASH_COMMAND_PREFIX": "echo prefixed"}

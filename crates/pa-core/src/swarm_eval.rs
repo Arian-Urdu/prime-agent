@@ -339,7 +339,9 @@ pub fn parse_eval_args(argv: &[String]) -> Result<SwarmEvalConfig, EvalArgsError
                 // mid-run. Every other unparsable or sub-minute value keeps
                 // the clamped default.
                 config.timeout_minutes = match raw.trim().to_ascii_lowercase().as_str() {
-                    "inf" | "+inf" | "infinity" | "+infinity" => f64::INFINITY,
+                    "inf" | "+inf" | "-inf" | "infinity" | "+infinity" | "-infinity" => {
+                        f64::INFINITY
+                    }
                     _ => raw.parse::<f64>().unwrap_or(1.0).max(1.0),
                 };
             }
@@ -371,9 +373,16 @@ pub fn parse_eval_args(argv: &[String]) -> Result<SwarmEvalConfig, EvalArgsError
     }
     // The driver derives each trial's seed as `seed + 31 * size + trial`
     // (i64); reject a sweep whose largest trial cannot be represented
-    // before the first real-token request is ever sent. The i128 math is
-    // total, so an absurd trial count is caught by the same rule.
-    let max_trial = i64::try_from(config.trials).unwrap_or(i64::MAX);
+    // before the first real-token request is ever sent. A trial count that
+    // cannot convert to i64 is its own error — clamping it would let a
+    // negative-extreme seed hide the unrepresentable sweep (an effectively
+    // unbounded trial loop through real tokens).
+    let max_trial = i64::try_from(config.trials).map_err(|_| {
+        EvalArgsError::Message(format!(
+            "--trials {} cannot be represented in the derived trial seed (seed + 31 * size + trial)",
+            config.trials
+        ))
+    })?;
     for &size in &config.sizes {
         let size_offset = i64::try_from(size).unwrap_or(i64::MAX);
         let derived =

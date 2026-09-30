@@ -114,8 +114,18 @@ impl Client {
         self.writer
             .flush()
             .map_err(|error| format!("failed to flush command: {error}"))?;
+        // One fixed budget for the whole command: the daemon broadcasts
+        // unsolicited frames (heartbeats_changed and friends) to attached
+        // clients, and a full-timeout retry per frame would let a steady
+        // broadcast stream delay the response — and the trial cleanup
+        // behind it — indefinitely. Each read gets only what remains.
+        let deadline = Instant::now() + timeout;
         loop {
-            let response = self.read_line(timeout)?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("timed out waiting for the command response".to_string());
+            }
+            let response = self.read_line(remaining)?;
             if response.get("id").and_then(Value::as_str) == Some(id.as_str()) {
                 return Ok(response);
             }
@@ -666,6 +676,44 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn a_broadcast_stream_never_extends_the_command_timeout() {
+        // The daemon broadcasts unsolicited frames (heartbeats_changed and
+        // friends) to attached clients; a full-timeout retry per frame
+        // would let a steady stream delay the command response — and the
+        // trial cleanup behind it — indefinitely. The command budget is
+        // one fixed deadline.
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let socket = dir.path().join("stream.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let started = Instant::now();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut writer = stream.try_clone().expect("clone");
+            let _ = writeln!(writer, r#"{{"type":"daemon_hello"}}"#);
+            // One unsolicited frame every 100ms for ~4s: far longer than
+            // the command's 300ms budget, and never the awaited response.
+            for _ in 0..40 {
+                let _ = writeln!(writer, r#"{{"type":"heartbeats_changed"}}"#);
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let mut client = Client::connect(&socket).expect("connect");
+        let error = client
+            .command(
+                &json!({ "type": "get_session_stats", "activeSessionId": "s" }),
+                Duration::from_millis(300),
+            )
+            .expect_err("the command must hit its fixed budget");
+        assert!(error.contains("timed out"), "{error}");
+        // The budget fired long before the broadcast stream (~4s) ended.
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the command deadline must hold under a broadcast stream, waited {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

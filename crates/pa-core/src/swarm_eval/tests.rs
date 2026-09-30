@@ -199,7 +199,7 @@ fn parses_arguments_with_defaults_and_validates_the_model() {
 fn timeout_minutes_inf_parses_to_an_unbounded_wait() {
     // `--timeout-minutes inf` must become an explicit unbounded wait instead
     // of reaching a `Duration` conversion that panics mid-run.
-    for raw in ["inf", "Infinity", "+INF", " infinity "] {
+    for raw in ["inf", "Infinity", "+INF", " infinity ", "-inf", "-INFINITY"] {
         let config =
             parse_eval_args(&args(&["--model", "m", "--timeout-minutes", raw])).expect("parses");
         assert!(
@@ -309,6 +309,27 @@ fn rejects_a_sweep_that_overflows_the_derived_trial_seed() {
             Err(EvalArgsError::Message(_))
         ),
         "an unrepresentable trial count must be rejected"
+    );
+    // The exact clamp-hiding combination: a negative-extreme seed plus an
+    // unrepresentable trial count used to pass validation because
+    // `unwrap_or(i64::MAX)` hid the failed `i64::try_from`, starting an
+    // effectively unbounded sweep.
+    assert_eq!(
+        parse_eval_args(&args(&[
+            "--model",
+            "m",
+            "--seed",
+            "-9223372036854775808",
+            "--sizes",
+            "2",
+            "--trials",
+            "18446744073709551615"
+        ]))
+        .unwrap_err(),
+        EvalArgsError::Message(
+            "--trials 18446744073709551615 cannot be represented in the derived trial seed (seed + 31 * size + trial)"
+                .to_string()
+        )
     );
     // Sane sweeps (including every default size and a negative seed) still
     // parse.

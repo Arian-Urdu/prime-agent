@@ -1412,6 +1412,7 @@ const COMPUTER_USE_ACTION: EventRule = EventRule {
                     "paste",
                     "get_state",
                     "get_app",
+                    "activate",
                     "unknown",
                 ],
                 "unknown",
@@ -2076,6 +2077,18 @@ mod tests {
         properties.set("duration_ms", json!(7u64));
         assert_eq!(sanitize("computer_use_action", &mut properties), 0);
         assert_eq!(properties.get("error_code"), Some(&json!("ELEMENT_STALE")));
+        // Out-of-vocabulary action, outcome, and error code fall back;
+        // duration clamps to the shared duration cap. No free string
+        // rides the event: every property is a fixed vocabulary or a
+        // clamped number.
+        // The activate action round-trips (App.activate telemetry).
+        let mut properties = Properties::new();
+        properties.set("action", json!("activate"));
+        properties.set("outcome", json!("ok"));
+        properties.set("error_code", Value::Null);
+        properties.set("duration_ms", json!(12u64));
+        assert_eq!(sanitize("computer_use_action", &mut properties), 0);
+        assert_eq!(properties.get("action"), Some(&json!("activate")));
         // Out-of-vocabulary action, outcome, and error code fall back;
         // duration clamps to the shared duration cap. No free string
         // rides the event: every property is a fixed vocabulary or a

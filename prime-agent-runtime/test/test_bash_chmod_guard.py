@@ -319,9 +319,21 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
                 await self._refused(command, home=home.name)
         self.assertIn("to be refused", str(caught.exception))
         [handle] = spawned
-        self.assertIsNotNone(handle.poll())
+        # `await handle` only proves the result was delivered; the watch
+        # thread sets the reaped flag right after, so wait for the reap
+        # instead of sampling it once. It must land inside the kill's
+        # window: a live group here means the helper leaked the process.
+        deadline = time.monotonic() + AWAIT_TIMEOUT
+        while handle.running and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
         self.assertFalse(handle.running)
-        self.assertLess(handle.poll().exit_code, 0)
+        result = handle.poll()
+        self.assertIsNotNone(result)
+        # `sleep 30` cannot finish inside the kill window, so the wrapper
+        # died by a signal: wait() spells that negative, while a shell that
+        # first observed its child's death exits 128+signal. Either
+        # spelling proves the process was killed, never completed.
+        self.assertTrue(result.exit_code < 0 or result.exit_code >= 128)
 
     async def test_refuses_escapes_to_home_root_and_outside_trees(self):
         home = tempfile.TemporaryDirectory()

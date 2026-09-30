@@ -479,7 +479,7 @@ fn run_doctor(args: &[String]) -> PublicCommandResult {
             &daemon_discovery::current_state_root(),
         );
         // `doctor --json` stays pure JSON; the tailscale detection fact is a
-        // human-mode line only (TS `runDoctor`'s tailscaleDoctorFacts loop).
+        // human-mode line only.
         if !options.contains("--json") {
             for fact in crate::tailscale::tailscale_doctor_facts() {
                 println!("{fact}");

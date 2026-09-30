@@ -1,0 +1,177 @@
+//! Detection: probe the `tailscale` CLI for this node's tailnet state,
+//! produce the `doctor` fact lines, and resolve the CLI to the absolute
+//! trusted path every public spawn goes through.
+
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+
+use serde_json::Value;
+
+use super::{run_tailscale, trim_trailing_dots, TailscaleProbe, TAILSCALE_BINARY};
+
+/// Detect the CLI at `program` and, when present, this node's tailnet
+/// state. The detection seam the mesh builds on: the public commands pass
+/// [`trusted_tailscale_path`]'s resolution, tests and the mesh pass their
+/// own path.
+pub(crate) async fn probe_tailscale(program: &OsStr) -> TailscaleProbe {
+    let version = run_tailscale(program, &["version"]).await;
+    if let Some(kind) = version.spawn_error {
+        // A binary-absent spawn is genuinely absent; any other failure (a
+        // permission problem, a hung CLI) is an installed-but-unusable CLI
+        // and must say so instead of "not found".
+        if kind == std::io::ErrorKind::NotFound {
+            return TailscaleProbe::default();
+        }
+        return TailscaleProbe {
+            cli_path: Some(TAILSCALE_BINARY.to_string()),
+            error: Some(format!("tailscale CLI could not be run ({kind:?})")),
+            ..TailscaleProbe::default()
+        };
+    }
+    let cli_path = Some(TAILSCALE_BINARY.to_string());
+    let status = run_tailscale(program, &["status", "--json"]).await;
+    if status.code != 0 {
+        let first_line = status.stderr.split('\n').next().unwrap_or_default().trim();
+        let error = if first_line.is_empty() {
+            "tailscale status failed with no diagnostic".to_string()
+        } else {
+            first_line.to_string()
+        };
+        return TailscaleProbe {
+            cli_path,
+            error: Some(error),
+            ..TailscaleProbe::default()
+        };
+    }
+    match serde_json::from_str::<Value>(&status.stdout) {
+        Ok(parsed) => {
+            // BackendState distinguishes a stopped/logged-out daemon from a node
+            // that is up but temporarily unreachable; only Running serves.
+            let backend = parsed
+                .get("BackendState")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let self_field = parsed.get("Self");
+            let online = self_field
+                .and_then(|value| value.get("Online"))
+                .and_then(Value::as_bool);
+            let dns_name = self_field
+                .and_then(|value| value.get("DNSName"))
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    self_field
+                        .and_then(|value| value.get("HostName"))
+                        .and_then(Value::as_str)
+                });
+            // Top-level MagicDNSSuffix is deprecated upstream; prefer
+            // CurrentTailnet's.
+            let suffix = parsed
+                .get("CurrentTailnet")
+                .and_then(|value| value.get("MagicDNSSuffix"))
+                .and_then(Value::as_str)
+                .or_else(|| parsed.get("MagicDNSSuffix").and_then(Value::as_str))
+                .map(str::to_string);
+            let hostname = dns_name.filter(|name| !name.is_empty()).map(|name| {
+                let mut host = trim_trailing_dots(name).to_string();
+                if let Some(suffix) = &suffix {
+                    let suffix = trim_trailing_dots(suffix);
+                    if let Some(stripped) = host.strip_suffix(&format!(".{suffix}")) {
+                        host = stripped.to_string();
+                    }
+                }
+                host
+            });
+            TailscaleProbe {
+                cli_path,
+                on_tailnet: online == Some(true) || backend == "Running",
+                magic_dns_suffix: suffix,
+                hostname,
+                offline_but_up: backend == "Running" && online == Some(false),
+                error: None,
+            }
+        }
+        Err(error) => TailscaleProbe {
+            cli_path,
+            error: Some(format!("unparseable status output: {error}")),
+            ..TailscaleProbe::default()
+        },
+    }
+}
+
+/// One-line doctor facts for `prime-agent doctor` (TS `tailscaleDoctorFacts`).
+pub(crate) async fn doctor_facts(program: &OsStr) -> Vec<String> {
+    let probe = probe_tailscale(program).await;
+    if let Some(error) = &probe.error {
+        return vec![format!("tailscale: CLI present but erroring ({error})")];
+    }
+    if probe.cli_path.is_none() {
+        return vec![
+            "tailscale: CLI not found (optional; install from https://tailscale.com/download)"
+                .to_string(),
+        ];
+    }
+    if !probe.on_tailnet {
+        return vec!["tailscale: installed but not up on a tailnet (tailscale up)".to_string()];
+    }
+    let offline = if probe.offline_but_up {
+        " (currently offline)"
+    } else {
+        ""
+    };
+    vec![format!(
+        "tailscale: on tailnet (node {}, MagicDNS {}{offline})",
+        probe.hostname.as_deref().unwrap_or("unknown"),
+        probe.magic_dns_suffix.as_deref().unwrap_or("unknown")
+    )]
+}
+
+/// A spawn target that cannot exist: the stand-in the public commands pass
+/// when no trusted `PATH` entry holds the CLI, so the probe reports the CLI
+/// as absent instead of executing anything untrusted.
+const NO_TRUSTED_TAILSCALE: &str = "/nonexistent/tailscale-cli-not-found-on-a-trusted-path";
+
+/// The `tailscale` CLI the public commands spawn: [`resolve_tailscale_binary`]
+/// over the ambient `PATH`, or [`NO_TRUSTED_TAILSCALE`] when no trusted entry
+/// holds it.
+pub(super) fn trusted_tailscale_path() -> PathBuf {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::new());
+    resolve_tailscale_binary(&path, &cwd).unwrap_or_else(|| PathBuf::from(NO_TRUSTED_TAILSCALE))
+}
+
+/// Resolve the `tailscale` CLI over `path_env` to the absolute path the
+/// public commands spawn. Which-style first match, but fail closed:
+///
+/// - only absolute `PATH` entries are considered; a relative entry (including
+///   the empty entry) resolves to the current directory, whose contents are
+///   not this command's to trust;
+/// - an entry that *is* the current directory is skipped the same way, so a
+///   `./tailscale` planted in the working directory can never supply the
+///   binary that runs with the CLI's credentials and environment.
+pub(crate) fn resolve_tailscale_binary(path_env: &OsStr, cwd: &Path) -> Option<PathBuf> {
+    let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    std::env::split_paths(path_env)
+        .filter(|entry| entry.is_absolute())
+        .filter(|entry| std::fs::canonicalize(entry).map_or(true, |real| real != cwd))
+        .map(|entry| entry.join(TAILSCALE_BINARY))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+/// Whether `path` is a regular file the current user can execute.
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}

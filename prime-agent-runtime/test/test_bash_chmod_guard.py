@@ -274,9 +274,54 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
 
     async def _refused(self, command: str, home: str | None = None):
         with mock.patch.dict(os.environ, {"HOME": home} if home else {}):
-            with self.assertRaises(DestructiveChmodRefusalError) as caught:
-                bash(command)
-        return str(caught.exception)
+            try:
+                handle = bash(command)
+            except DestructiveChmodRefusalError as caught:
+                return str(caught)
+            # The refusal is synchronous: a refused command never reaches
+            # BashHandle. If bash() returned a handle the guard missed and
+            # the command is running: kill and reap that process before the
+            # failure aborts the test, so a missed refusal can never leave
+            # a live recursive chmod behind.
+            handle.kill()
+            await asyncio.wait_for(handle, AWAIT_TIMEOUT)
+            self.fail(f"expected {command!r} to be refused; bash() ran it")
+
+    async def test_a_guard_miss_fails_and_reaps_the_spawned_process(self):
+        # If a regression ever makes the guard miss, _refused must fail the
+        # test AND reap the process bash() spawned, so a live recursive
+        # chmod can never outlive the test meant to catch it.
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "target").mkdir()
+        Path(home.name, "target", "keep.txt").write_text("keep\n")
+        command = "chmod -R 755 ~/target && sleep 30"
+        # The compound command is refused for the recursive-chmod reason.
+        message = await self._refused(command, home=home.name)
+        self.assertIn("Refusing to run this recursive chmod/chown command", message)
+        # Simulate the miss: the chmod guard lets the command through, bash()
+        # spawns a live handle, and the helper must kill and reap it before
+        # failing. HOME stays pinned to the temp home, so even the simulated
+        # miss cannot touch the runner's real home.
+        spawned = []
+        real_bash = bash
+
+        def spying_bash(cmd, **kwargs):
+            handle = real_bash(cmd, **kwargs)
+            spawned.append(handle)
+            return handle
+
+        with (
+            mock.patch.object(bash_module, "_guard_destructive_chmod"),
+            mock.patch(f"{__name__}.bash", spying_bash),
+        ):
+            with self.assertRaises(AssertionError) as caught:
+                await self._refused(command, home=home.name)
+        self.assertIn("to be refused", str(caught.exception))
+        [handle] = spawned
+        self.assertIsNotNone(handle.poll())
+        self.assertFalse(handle.running)
+        self.assertLess(handle.poll().exit_code, 0)
 
     async def test_refuses_escapes_to_home_root_and_outside_trees(self):
         home = tempfile.TemporaryDirectory()
@@ -479,19 +524,23 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.exit_code, 0)
 
     async def test_frozen_bypass_zero_still_refuses(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
         with mock.patch.object(
             bash_module, "_DESTRUCTIVE_CHMOD_BYPASS_AT_KERNEL_START", False
         ):
-            message = await self._refused("chmod -R 755 ~")
+            message = await self._refused("chmod -R 755 ~", home=home.name)
         self.assertIn("Refusing to run this recursive chmod/chown command", message)
 
     async def test_mid_session_env_write_does_not_unlock(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
         stderr = io.StringIO()
         with (
             mock.patch.dict(os.environ, {BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV: "1"}),
             redirect_stderr(stderr),
         ):
-            message = await self._refused("chmod -R 755 ~")
+            message = await self._refused("chmod -R 755 ~", home=home.name)
         self.assertIn("Refusing to run this recursive chmod/chown command", message)
         warning = stderr.getvalue()
         self.assertIn(BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV, warning)
@@ -502,11 +551,13 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
             mock.patch.dict(os.environ, {BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV: "0"}),
             redirect_stderr(second),
         ):
-            await self._refused("chmod -R 755 /")
+            await self._refused("chmod -R 755 /", home=home.name)
         self.assertEqual(second.getvalue(), "")
 
     async def test_refuses_eval_wrapped_recursion(self):
         self._make_tree()
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
         for command in [
             "eval 'chmod -R 755 ~'",
             'eval "chown -R user ~"',
@@ -516,7 +567,7 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
             "eval $(echo 'chmod -R 755 ~')",
         ]:
             with self.subTest(command=command):
-                message = await self._refused(command)
+                message = await self._refused(command, home=home.name)
                 self.assertIn("wraps a recursive chmod/chown in eval", message)
                 self.assertTrue(self._tracked("sub", "nested", "file.txt").exists())
 
@@ -1650,12 +1701,16 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.exit_code, 0)
 
     async def test_refusal_lists_both_bypasses(self):
-        message = await self._refused("chmod -R 755 ~")
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        message = await self._refused("chmod -R 755 ~", home=home.name)
         self.assertIn("allow_destructive_chmod=True", message)
         self.assertIn(BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV, message)
 
     async def test_guard_only_resolves_on_pattern_match(self):
         self._make_tree()
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
         resolver = mock.Mock(return_value=None)
         with mock.patch.object(bash_module, "_resolve_chmod_effective_cwd", resolver):
             result = await self._run("echo hi")
@@ -1663,7 +1718,7 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
             result = await self._run("chmod 755 sub")
             self.assertEqual(result.exit_code, 0)
             resolver.assert_not_called()
-            await self._refused("chmod -R 755 ~")
+            await self._refused("chmod -R 755 ~", home=home.name)
         resolver.assert_called_once()
 
     async def test_command_prefix_chmod_is_guarded(self):

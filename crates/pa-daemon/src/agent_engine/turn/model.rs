@@ -58,7 +58,7 @@ impl AgentSessionEngine {
         if self.config.faux_script.is_none()
             && preflight_model.provider == pa_core::auth::PRIME_INFERENCE_PROVIDER_ID
         {
-            if let Err(error) = self.session_auth().prime_directory_team() {
+            if let Err(error) = self.session_auth().prime_directory_selection() {
                 return TurnResult::Error {
                     error: format!(
                         "Invalid Prime team selection: {error}\n\nFix it, or run `prime config unpin` in this directory."

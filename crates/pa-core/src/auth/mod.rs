@@ -11,7 +11,7 @@ pub(crate) mod storage;
 pub(crate) mod types;
 
 pub use manager::{AuthApiKeyResult, AuthStorage, NoOAuth, OAuthIntegration};
-pub use prime_directory::PrimeDirectoryTeam;
+pub use prime_directory::PrimeDirectorySelection;
 pub use prime_inference::{
     check_prime_inference_access, default_prime_cli_config_path, fetch_prime_teams,
     read_prime_cli_config, resolve_prime_inference_auth_config, PrimeAccessError,

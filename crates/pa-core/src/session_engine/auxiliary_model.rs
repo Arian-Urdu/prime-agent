@@ -31,9 +31,7 @@ pub(crate) fn session_fallback_with_headers(
     session_model: &Model,
     session_api_key: Option<String>,
 ) -> ResolvedAuxiliaryModel {
-    let auth = crate::auth::AuthStorage::create(&context.agent_dir).with_project_dir(&context.cwd);
-    let mut registry =
-        crate::models::ModelRegistry::create(auth, context.agent_dir.join("models.json"));
+    let mut registry = crate::models::ModelRegistry::for_session(&context.agent_dir, &context.cwd);
     let resolved = registry.get_api_key_and_headers(session_model, session_model.headers.as_ref());
     ResolvedAuxiliaryModel {
         model: session_model.clone(),
@@ -110,9 +108,7 @@ pub fn resolve_auxiliary_model(
     // The TS find runs over the authenticated, non-stale catalog
     // (`_authenticatedRlmModels`); the registry's searchable set is the
     // same filter.
-    let auth = crate::auth::AuthStorage::create(&context.agent_dir).with_project_dir(&context.cwd);
-    let mut registry =
-        crate::models::ModelRegistry::create(auth, context.agent_dir.join("models.json"));
+    let mut registry = crate::models::ModelRegistry::for_session(&context.agent_dir, &context.cwd);
     registry.load_private_authorization_from_cache();
     let model = registry
         .get_rlm_searchable_models()

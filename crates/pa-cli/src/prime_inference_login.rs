@@ -260,10 +260,10 @@ async fn complete_login(
     if ui.is_cancelled() {
         return ProviderAuthOutcome::Cancelled;
     }
-    let mut auth = AuthStorage::create(inputs.agent_dir);
-    if let Some(cwd) = inputs.cwd {
-        auth = auth.with_project_dir(cwd);
-    }
+    let mut auth = match inputs.cwd {
+        Some(cwd) => AuthStorage::for_session(inputs.agent_dir, cwd),
+        None => AuthStorage::create(inputs.agent_dir),
+    };
     auth.set_prime_inference_api_key(api_key, team);
     if let Some(error) = auth.drain_errors().pop() {
         return ProviderAuthOutcome::Error(format!(
@@ -297,7 +297,7 @@ async fn select_team(
         .map(str::trim)
         .as_ref()
         .is_some_and(|value| !value.is_empty())
-        || !matches!(auth.prime_directory_team(), Ok(None))
+        || !matches!(auth.prime_directory_selection(), Ok(None))
     {
         auth.reload();
         return default_team_status(auth, inputs.prime_team_id);
@@ -360,7 +360,9 @@ async fn select_team(
 /// TS `getPrimeInferenceDefaultTeamStatus`: the env pin, the stored
 /// selection, else the personal account. Between the env pin and the
 /// stored selection, the session directory's prime CLI context (no TS
-/// equivalent).
+/// equivalent). A saved context with its own key replaces the saved login
+/// in this directory, so the status says so instead of implying the key
+/// just saved is the one in use.
 fn default_team_status(auth: &AuthStorage, prime_team_id: Option<&str>) -> String {
     if prime_team_id
         .map(str::trim)
@@ -369,13 +371,19 @@ fn default_team_status(auth: &AuthStorage, prime_team_id: Option<&str>) -> Strin
     {
         return "Using team from PRIME_TEAM_ID.".to_string();
     }
-    match auth.prime_directory_team() {
+    match auth.prime_directory_selection() {
         Ok(Some(directory)) => {
             let account = match (directory.team_id, directory.name) {
                 (Some(_), Some(name)) => format!("team \"{name}\""),
                 (Some(team_id), None) => format!("team {team_id}"),
                 (None, _) => "personal account".to_string(),
             };
+            if let (Some(context), Some(_)) = (directory.context, directory.api_key) {
+                return format!(
+                    "In this directory, Prime context '{context}' from {} supplies the API key and {account}; the saved login applies elsewhere.",
+                    directory.source
+                );
+            }
             return format!("Using {account} from {}.", directory.source);
         }
         Ok(None) => {}

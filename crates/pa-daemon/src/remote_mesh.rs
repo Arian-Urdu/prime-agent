@@ -232,7 +232,11 @@ struct MeshInner {
 /// single in-flight scan. Hosts that drop from a scan keep their last
 /// known sessions, marked offline, so the agents view reads "offline"
 /// instead of losing rows.
-pub struct RemoteAgentMeshState {
+/// The shared mesh state (the scan task is detached: a caller that drops
+/// its bounded wait never cancels the in-flight scan - TS
+/// `refreshAwaiting`'s contract that a slow scan "completes in the
+/// background as a roster push").
+struct MeshShared {
     source: MeshSource,
     transport: MeshTransport,
     refresh_ttl: Duration,
@@ -241,87 +245,149 @@ pub struct RemoteAgentMeshState {
     on_scan_error: Option<MeshScanError>,
     now: MeshNow,
     inner: Mutex<MeshInner>,
-    /// Serializes scans: the in-flight scan holds the gate, and a caller
-    /// that arrives mid-scan waits for its completion (then re-checks the
-    /// TTL) instead of starting a second one.
-    scan_gate: tokio::sync::Mutex<()>,
+    /// The single in-flight scan (detached): the scan task takes this
+    /// gate, so a caller that arrives mid-scan joins its completion
+    /// instead of starting a second one, and a caller that drops its
+    /// wait releases only the wait - the scan keeps running.
+    scan_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Broadcasts each completed scan's epoch: joiners of an in-flight
+    /// scan wait on it (the task itself is not cancellable).
+    scan_done: tokio::sync::broadcast::Sender<u64>,
+}
+
+pub struct RemoteAgentMeshState {
+    shared: std::sync::Arc<MeshShared>,
 }
 
 impl RemoteAgentMeshState {
     /// Build the mesh state from the options.
     #[must_use]
     pub fn new(options: RemoteAgentMeshOptions) -> Self {
+        let (scan_done, _) = tokio::sync::broadcast::channel(8);
         RemoteAgentMeshState {
-            source: options.source,
-            transport: options.transport,
-            refresh_ttl: options.refresh_ttl.unwrap_or(DEFAULT_REFRESH_TTL),
-            offline_ttl: options.offline_ttl.unwrap_or(DEFAULT_OFFLINE_TTL),
-            on_roster_change: options.on_roster_change,
-            on_scan_error: options.on_scan_error,
-            now: options.now.unwrap_or_else(|| Arc::new(crate::util::now_ms)),
-            inner: Mutex::new(MeshInner {
-                hosts: HashMap::new(),
-                entries: HashMap::new(),
-                last_scan_at: None,
-                scan_epoch: 0,
+            shared: std::sync::Arc::new(MeshShared {
+                source: options.source,
+                transport: options.transport,
+                refresh_ttl: options.refresh_ttl.unwrap_or(DEFAULT_REFRESH_TTL),
+                offline_ttl: options.offline_ttl.unwrap_or(DEFAULT_OFFLINE_TTL),
+                on_roster_change: options.on_roster_change,
+                on_scan_error: options.on_scan_error,
+                now: options.now.unwrap_or_else(|| Arc::new(crate::util::now_ms)),
+                inner: Mutex::new(MeshInner {
+                    hosts: HashMap::new(),
+                    entries: HashMap::new(),
+                    last_scan_at: None,
+                    scan_epoch: 0,
+                }),
+                scan_gate: Arc::new(tokio::sync::Mutex::new(())),
+                scan_done,
             }),
-            scan_gate: tokio::sync::Mutex::new(()),
         }
     }
 
     /// Whether a discovery source is configured (TS `enabled()`).
     #[must_use]
     pub fn enabled(&self) -> bool {
-        self.source.is_some()
+        self.shared.source.is_some()
     }
 
     fn now_ms(&self) -> u64 {
-        (self.now)()
+        (self.shared.now)()
     }
 
-    /// On-demand refresh bounded by the TTL. Concurrent callers share one
-    /// scan: a caller that arrives inside the TTL (or joins an in-flight
-    /// scan) does not trigger another. Returns whether a scan completed
-    /// for this call.
+    fn ttl_fresh(&self, inner: &MeshInner) -> bool {
+        match inner.last_scan_at {
+            Some(last) => {
+                self.now_ms().saturating_sub(last) < self.shared.refresh_ttl.as_millis() as u64
+            }
+            None => false,
+        }
+    }
+
+    /// On-demand refresh bounded by the TTL (TS `refreshIfStale`).
+    /// Concurrent callers share one scan: a caller that arrives inside
+    /// the TTL returns without another, and a caller that arrives
+    /// mid-scan joins the in-flight scan's completion (the scan itself is
+    /// detached, so joining cannot cancel it). Returns whether a scan
+    /// completed for this call.
     pub async fn refresh_if_stale(&self) -> bool {
-        let Some(source) = self.source.clone() else {
+        let Some(source) = self.shared.source.clone() else {
             return false;
         };
         let epoch_before = {
-            let inner = self.inner.lock().unwrap();
-            if let Some(last) = inner.last_scan_at {
-                if self.now_ms().saturating_sub(last) < self.refresh_ttl.as_millis() as u64 {
-                    return false;
-                }
+            let inner = self.shared.inner.lock().unwrap();
+            if self.ttl_fresh(&inner) {
+                return false;
             }
             inner.scan_epoch
         };
-        // The gate is the coalescing seam: the in-flight scan holds it,
-        // and a concurrent caller waits here, then re-checks freshness
-        // (the winner's scan just landed) instead of scanning again.
-        let _gate = self.scan_gate.lock().await;
-        {
-            let inner = self.inner.lock().unwrap();
-            if let Some(last) = inner.last_scan_at {
-                if self.now_ms().saturating_sub(last) < self.refresh_ttl.as_millis() as u64 {
-                    // A scan completed while we waited on the gate; report
-                    // that it completed for this call (TS: the concurrent
-                    // caller awaits the in-flight scan's promise).
-                    return inner.scan_epoch != epoch_before;
+        // Become the scanner, or join the in-flight one. The gate is the
+        // coalescing seam: a non-blocking take makes this caller spawn the
+        // (detached) scan task; a held gate means one is already running
+        // and this caller only waits for it.
+        if let Ok(gate) = Arc::clone(&self.shared.scan_gate).try_lock_owned() {
+            let shared = std::sync::Arc::clone(&self.shared);
+            // The scan task is detached on purpose: a caller that
+            // drops its bounded wait cancels only the WAIT - the scan
+            // runs to completion and publishes (TS's
+            // background-completion contract).
+            tokio::spawn(async move {
+                let _gate = gate;
+                // Double-check the TTL inside the gate: a rival's scan
+                // may have completed while this caller was spawned.
+                let fresh = shared
+                    .inner
+                    .lock()
+                    .is_ok_and(|inner| Self::ttl_fresh_shared(&shared, &inner));
+                if !fresh {
+                    Self::run_scan_shared(&shared, &source).await;
+                }
+            });
+        }
+        // Wait for the scan this call belongs to (its own, or the one it
+        // joined): the epoch advances when the task completes.
+        self.wait_for_scan(epoch_before).await
+    }
+
+    fn ttl_fresh_shared(shared: &MeshShared, inner: &MeshInner) -> bool {
+        match inner.last_scan_at {
+            Some(last) => {
+                (shared.now)().saturating_sub(last) < shared.refresh_ttl.as_millis() as u64
+            }
+            None => false,
+        }
+    }
+
+    /// Wait until the scan named by `epoch_before` completes: the epoch
+    /// advance (published on the completion channel) ends the wait.
+    async fn wait_for_scan(&self, epoch_before: u64) -> bool {
+        let mut completions = self.shared.scan_done.subscribe();
+        loop {
+            {
+                let inner = self.shared.inner.lock().unwrap();
+                if inner.scan_epoch != epoch_before {
+                    return true;
                 }
             }
+            match completions.recv().await {
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return false,
+            }
         }
-        self.run_scan(&source).await
     }
 
     /// On-demand refresh with a bounded wait (TS `refreshAwaiting`):
     /// callers answer with whatever the scan produced inside the budget,
-    /// and a scan that outruns it lands as a roster push when it
-    /// completes. The wait never starts a second scan. The wait timer is
-    /// the select's sleep arm: it is dropped when the refresh settles
-    /// first, so frequent polling retains no timer per request (the TS
-    /// review round that cleared the race timer).
+    /// and a scan that outruns it KEEPS RUNNING - it lands as a roster
+    /// push when it completes (the caller's dropped wait cancels nothing;
+    /// the scan task is detached). The wait never starts a second scan.
+    /// The wait timer is the select's sleep arm: it is dropped when the
+    /// refresh settles first, so frequent polling retains no timer per
+    /// request (the TS review round that cleared the race timer).
     pub async fn refresh_awaiting(&self, wait: Duration) {
+        if !self.enabled() {
+            return;
+        }
         let refresh = self.refresh_if_stale();
         tokio::pin!(refresh);
         tokio::select! {
@@ -330,33 +396,40 @@ impl RemoteAgentMeshState {
         }
     }
 
-    /// Run one scan and apply it (the caller holds the scan gate).
-    async fn run_scan(&self, source: &Arc<dyn RemoteAgentMeshSource>) -> bool {
+    /// Run one scan and publish its completion (the caller holds the scan
+    /// gate).
+    async fn run_scan_shared(shared: &MeshShared, source: &Arc<dyn RemoteAgentMeshSource>) -> bool {
         let hosts = match source.list_remote_agents().await {
             Ok(hosts) => hosts,
             Err(error) => {
-                if let Some(on_scan_error) = &self.on_scan_error {
+                if let Some(on_scan_error) = &shared.on_scan_error {
                     on_scan_error(&error);
                 }
-                let mut inner = self.inner.lock().unwrap();
-                inner.last_scan_at = Some(self.now_ms());
-                inner.scan_epoch += 1;
+                let mut inner = shared.inner.lock().unwrap();
+                inner.last_scan_at = Some((shared.now)());
+                let epoch = inner.scan_epoch + 1;
+                inner.scan_epoch = epoch;
+                let _ = shared.scan_done.send(epoch);
                 return false;
             }
         };
-        let mut inner = self.inner.lock().unwrap();
-        inner.last_scan_at = Some(self.now_ms());
-        inner.scan_epoch += 1;
-        self.apply_scan(&mut inner, &hosts);
+        let mut inner = shared.inner.lock().unwrap();
+        inner.last_scan_at = Some((shared.now)());
+        let epoch = inner.scan_epoch + 1;
+        inner.scan_epoch = epoch;
+        shared.apply_scan(&mut inner, &hosts);
+        let _ = shared.scan_done.send(epoch);
         true
     }
+}
 
+impl MeshShared {
     /// Apply one scan's hosts (TS `applyScan`): one row per host (a
     /// malformed duplicate never wins over a usable one), usable hosts
     /// replace their roster wholesale, dropped hosts keep their last known
     /// rows marked offline until the offline TTL forgets them, and a
     /// brand-new host's sessions seed its state.
-    fn apply_scan(&self, inner: &mut MeshInner, hosts: &[RemoteAgentHost]) {
+    fn apply_scan(self: &MeshShared, inner: &mut MeshInner, hosts: &[RemoteAgentHost]) {
         let mut scanned: HashMap<String, RemoteAgentHost> = HashMap::new();
         for host in hosts {
             if host.tailnet_host.is_empty() {
@@ -369,7 +442,7 @@ impl RemoteAgentMeshState {
                 }
             }
         }
-        let now = self.now_ms();
+        let now = (self.now)();
         let mut forget: Vec<String> = Vec::new();
         for (tailnet_host, state) in &mut inner.hosts {
             match scanned.get(tailnet_host) {
@@ -420,7 +493,7 @@ impl RemoteAgentMeshState {
     /// compared structurally (JSON equality - the entries are small), so
     /// an identical roster row is not marked changed on every scan (the
     /// TS review round that stopped the roster churn).
-    fn publish_entries(&self, inner: &mut MeshInner) {
+    fn publish_entries(self: &MeshShared, inner: &mut MeshInner) {
         let mut entries = HashMap::new();
         for state in inner.hosts.values() {
             for session in state.sessions.values() {
@@ -453,12 +526,15 @@ impl RemoteAgentMeshState {
             }
         }
     }
+}
 
+impl RemoteAgentMeshState {
     /// The roster projection pushed to subscribed clients (TS
     /// `entriesForClients`). Remote mesh rows have no worker, so
     /// visibility is unconditional.
     pub fn entries_for_clients(&self) -> Vec<AgentRosterEntry> {
-        self.inner
+        self.shared
+            .inner
             .lock()
             .unwrap()
             .entries
@@ -470,12 +546,19 @@ impl RemoteAgentMeshState {
     /// One entry by roster id (TS `entryById`).
     #[must_use]
     pub fn entry_by_id(&self, agent_id: &str) -> Option<AgentRosterEntry> {
-        self.inner.lock().unwrap().entries.get(agent_id).cloned()
+        self.shared
+            .inner
+            .lock()
+            .unwrap()
+            .entries
+            .get(agent_id)
+            .cloned()
     }
 
     /// `list` response rows (TS `sessionSummaries`): the roster summaries.
     pub fn session_summaries(&self) -> Vec<Value> {
-        self.inner
+        self.shared
+            .inner
             .lock()
             .unwrap()
             .entries
@@ -488,7 +571,8 @@ impl RemoteAgentMeshState {
     /// agent-message peer shape, with `remoteHost` so the worker-side
     /// family view labels them.
     pub fn peer_summaries(&self) -> Vec<Value> {
-        self.inner
+        self.shared
+            .inner
             .lock()
             .unwrap()
             .entries
@@ -543,7 +627,7 @@ impl RemoteAgentMeshState {
     /// suffix, so a copied table id reaches a remote row the same way.
     #[must_use]
     pub fn find_message_targets(&self, selector: &str) -> Vec<RemoteAgentMessageTarget> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.shared.inner.lock().unwrap();
         let rows: Vec<Value> = inner
             .entries
             .values()
@@ -617,7 +701,7 @@ impl RemoteAgentMeshState {
         message: &str,
         sender: Option<Value>,
     ) -> anyhow::Result<Value> {
-        let Some(transport) = &self.transport else {
+        let Some(transport) = &self.shared.transport else {
             return Err(anyhow::anyhow!(
                 "Cannot message the remote agent on {}: remote agent messaging is not available on this daemon",
                 target.host.tailnet_host
@@ -1361,5 +1445,64 @@ mod tests {
                 inner.list_remote_agents().await
             })
         }
+    }
+    /// The bounded wait cancels nothing (TS `refreshAwaiting`'s contract,
+    /// the Bugbot round: "a scan that outruns [the budget] completes in
+    /// the background as a roster push"): a slow first scan outlives its
+    /// caller's budget, still applies, publishes, and marks the TTL
+    /// fresh - the next caller NEVER rescans.
+    #[tokio::test(start_paused = true)]
+    async fn a_scan_that_outruns_the_budget_still_completes_in_the_background() {
+        struct SlowSource {
+            scans: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            gate: tokio::sync::Mutex<()>,
+        }
+        impl RemoteAgentMeshSource for SlowSource {
+            fn list_remote_agents(
+                &self,
+            ) -> futures::future::BoxFuture<'_, anyhow::Result<Vec<RemoteAgentHost>>> {
+                Box::pin(async {
+                    self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _gate = self.gate.lock().await;
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok(vec![host("milk.tailnet.ts.net", vec![session("s1", None)])])
+                })
+            }
+        }
+        let scans = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = Arc::new(SlowSource {
+            scans: Arc::clone(&scans),
+            gate: tokio::sync::Mutex::new(()),
+        });
+        let mesh = mesh_with(Some(source as Arc<dyn RemoteAgentMeshSource>), None);
+        // The budget expires long before the 60s scan completes.
+        mesh.refresh_awaiting(Duration::from_millis(500)).await;
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the slow scan is running (detached)"
+        );
+        assert!(
+            mesh.entries_for_clients().is_empty(),
+            "the budget returned before the scan applied"
+        );
+        // The background scan completes: the entries publish and the TTL
+        // marks the scan fresh, so the next caller does NOT rescan.
+        tokio::time::sleep(Duration::from_secs(70)).await;
+        assert_eq!(
+            mesh.entries_for_clients().len(),
+            1,
+            "the background scan applied"
+        );
+        let completed = mesh.refresh_if_stale().await;
+        assert!(
+            !completed,
+            "the completed background scan made the TTL fresh"
+        );
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the background completion is the ONE scan; no second scan runs"
+        );
     }
 }

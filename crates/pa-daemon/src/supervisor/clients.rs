@@ -157,6 +157,48 @@ impl Supervisor {
     ) -> Result<()> {
         let (reader, mut writer) = stream.split();
         let client_id = util::new_display_id();
+        // The untrusted admission deadline (TS #2517's review rounds):
+        // an absolute pre-ready budget armed from ACCEPT - BEFORE the
+        // greeting write - so a peer that accepts but never reads the
+        // banner is still bounded by the budget (the write below, and
+        // everything else, run inside it). The budget re-arms to the short
+        // auth window at `daemon_hello` (the handshake write below), and
+        // switches to the traffic-resetting idle window on the first
+        // authenticated line. The deadline is an explicit timer, not a
+        // socket timeout: a peer dribbling bytes without ever completing
+        // a line must not renew its own admission window.
+        let mut tcp_deadline_tx = None;
+        let mut tcp_expired_rx = None;
+        let mut tcp_authenticated = false;
+        if let ClientTrust::Remote { .. } = trust {
+            let (deadline_tx, deadline_rx) = tokio::sync::watch::channel(
+                tokio::time::Instant::now() + crate::tcp::DAEMON_TCP_PRE_READY_TIMEOUT,
+            );
+            let (expired_tx, expired_rx) = tokio::sync::mpsc::channel::<()>(1);
+            let watchdog = tokio::spawn(async move {
+                let mut deadline_rx = deadline_rx;
+                loop {
+                    let deadline = *deadline_rx.borrow_and_update();
+                    let changed = tokio::time::timeout_at(deadline, deadline_rx.changed()).await;
+                    match changed {
+                        Err(_expired) => {
+                            let _ = expired_tx.send(()).await;
+                            return;
+                        }
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => return,
+                    }
+                }
+            });
+            // The watchdog ends with its channel ends: this connection
+            // dropping its deadline sender makes `changed()` error and the
+            // task return (the TS `clearTimeout` on close). Dropping the
+            // handle does not abort the spawned task.
+            drop(watchdog);
+            tcp_deadline_tx = Some(deadline_tx);
+            tcp_expired_rx = Some(expired_rx);
+        }
+
         // The connect greeting's trust split (TS #2517 `daemonHello`): a
         // TCP peer is untrusted until it authenticates, so it receives the
         // protocol banner only - the supervisor's ownership token, pid,
@@ -212,49 +254,17 @@ impl Supervisor {
             rest: Map::default(),
         };
         write_line(&mut writer, &serde_json::to_value(&hello)?).await?;
-        // The untrusted admission deadline (TS #2517's review rounds):
-        // an absolute pre-ready budget from accept - the listener binds
-        // before the boot passes complete, and mesh clients wait for hello
-        // before sending their first token - re-armed to the short auth
-        // window at `daemon_hello` (the handshake is written above), and
-        // switched to the traffic-resetting idle window on the first
-        // authenticated line. The deadline is an explicit timer, not a
-        // socket timeout: a peer dribbling bytes without ever completing
-        // a line must not renew its own admission window.
-        let mut tcp_deadline_tx = None;
-        let mut tcp_expired_rx = None;
-        let mut tcp_authenticated = false;
-        if let ClientTrust::Remote { .. } = trust {
-            let (deadline_tx, deadline_rx) = tokio::sync::watch::channel(
-                tokio::time::Instant::now() + crate::tcp::DAEMON_TCP_PRE_READY_TIMEOUT,
-            );
-            deadline_tx
-                .send_replace(tokio::time::Instant::now() + crate::tcp::DAEMON_TCP_AUTH_TIMEOUT);
-            let (expired_tx, expired_rx) = tokio::sync::mpsc::channel::<()>(1);
-            let watchdog = tokio::spawn(async move {
-                let mut deadline_rx = deadline_rx;
-                loop {
-                    let deadline = *deadline_rx.borrow_and_update();
-                    let changed = tokio::time::timeout_at(deadline, deadline_rx.changed()).await;
-                    match changed {
-                        Err(_expired) => {
-                            let _ = expired_tx.send(()).await;
-                            return;
-                        }
-                        Ok(Ok(())) => {}
-                        Ok(Err(_)) => return,
-                    }
-                }
-            });
-            // The watchdog ends with its channel ends: this connection
-            // dropping its deadline sender makes `changed()` error and the
-            // task return (the TS `clearTimeout` on close). Dropping the
-            // handle does not abort the spawned task.
-            drop(watchdog);
-            tcp_deadline_tx = Some(deadline_tx);
-            tcp_expired_rx = Some(expired_rx);
+        // `daemon_hello` is written: the admission deadline re-arms to the
+        // short auth window (TS #2517's review fix: the auth window runs
+        // from the handshake, not from accept, so a pre-ready client is
+        // not closed before it ever saw the greeting).
+        if let Some(deadline_tx) = tcp_deadline_tx.as_ref() {
+            if !tcp_authenticated {
+                deadline_tx.send_replace(
+                    tokio::time::Instant::now() + crate::tcp::DAEMON_TCP_AUTH_TIMEOUT,
+                );
+            }
         }
-
         let mut reader = BufReader::new(reader);
         let mut line = String::new();
         let mut events = self.events.subscribe();

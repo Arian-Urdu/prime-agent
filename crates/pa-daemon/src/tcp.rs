@@ -293,43 +293,75 @@ fn daemon_tcp_tokens_match(actual: &str, expected: &str) -> bool {
     mismatch == 0
 }
 
+/// Why a token read failed (the load distinguishes the cases): an empty
+/// file may be a concurrent creator's in-flight open (the exclusive
+/// create's window between the open and the write), while invalid content
+/// is corruption the load must refuse.
+#[derive(Debug)]
+enum TokenReadError {
+    /// The file exists but reads empty: a concurrent creator may still be
+    /// mid-write.
+    Empty,
+    /// The file carries content that is not the token record.
+    Corrupt(String),
+    /// The read itself failed.
+    Io(std::io::Error),
+}
+
+/// Render the token-read failure with the TS refusal wording.
+fn token_read_error(agent_dir: &Path, error: TokenReadError) -> anyhow::Error {
+    let token_path = daemon_tcp_token_path(agent_dir);
+    match error {
+        TokenReadError::Empty => anyhow!("daemon TCP token file {} is empty", token_path.display()),
+        TokenReadError::Corrupt(message) => anyhow!("{message}"),
+        TokenReadError::Io(error) => {
+            anyhow!("daemon TCP token file {}: {error}", token_path.display())
+        }
+    }
+}
+
 /// Read the existing token without creating one. Returns `Ok(None)` when
-/// unset; a corrupt file (empty, invalid JSON, missing token) is a named
-/// error the caller refuses to overwrite (TS `readDaemonTcpToken`).
+/// unset; a corrupt file (invalid JSON, missing token) is a named error
+/// the caller refuses to overwrite, and an empty file is its own case -
+/// under a concurrent start it is the winner's in-flight open (TS
+/// `readDaemonTcpToken` throws on it because `writeFileSync`'s
+/// create-and-write is one call; Rust's open-then-write widens that
+/// window, so the load treats empty as a fall-through to the create
+/// path, which converges on the winner or refuses after its budget).
 ///
 /// # Errors
 ///
 /// Returns an error when the token file exists but cannot be read, is
 /// empty, is not valid JSON, or carries no token string.
-fn read_daemon_tcp_token(agent_dir: &Path) -> Result<Option<String>> {
+fn read_daemon_tcp_token(agent_dir: &Path) -> Result<Option<String>, TokenReadError> {
     let token_path = daemon_tcp_token_path(agent_dir);
     if !token_path.exists() {
         return Ok(None);
     }
-    let raw = std::fs::read_to_string(&token_path)?.trim().to_string();
+    let raw = std::fs::read_to_string(&token_path)
+        .map_err(TokenReadError::Io)?
+        .trim()
+        .to_string();
     if raw.is_empty() {
-        return Err(anyhow!(
-            "daemon TCP token file {} is empty",
-            token_path.display()
-        ));
+        return Err(TokenReadError::Empty);
     }
     let parsed: Value = serde_json::from_str(&raw).map_err(|_| {
-        anyhow!(
+        TokenReadError::Corrupt(format!(
             "daemon TCP token file {} is not valid JSON",
             token_path.display()
-        )
+        ))
     })?;
     let token = parsed
         .get("token")
         .and_then(Value::as_str)
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| {
-            anyhow!(
-                "daemon TCP token file {} is missing its token",
-                token_path.display()
-            )
-        })?;
-    Ok(Some(token.to_string()))
+        .filter(|token| !token.is_empty());
+    match token {
+        Some(token) => Ok(Some(token.to_string())),
+        None => Err(TokenReadError::Corrupt(format!(
+            "daemon TCP token file {} is missing its token",
+            token_path.display()
+        ))),
+    }
 }
 
 /// Load or create the per-machine token used to authenticate TCP lines.
@@ -348,20 +380,41 @@ pub fn load_or_create_daemon_tcp_token(agent_dir: &Path) -> Result<DaemonTcpToke
     let token_path = daemon_tcp_token_path(agent_dir);
     // Refuse to overwrite a corrupt token file (the TS contract: the
     // daemon fails loudly instead of silently rotating the credential).
-    if let Some(token) = read_daemon_tcp_token(agent_dir)? {
-        return Ok(DaemonTcpTokenRecord {
-            token,
-            token_path,
-            created: false,
-        });
+    match read_daemon_tcp_token(agent_dir) {
+        Ok(Some(token)) => {
+            // The owner-only restriction is idempotent: a file created
+            // with wider permissions (or restored by a backup that
+            // widened them) is re-restricted here, so the credential
+            // never stays readable by a later start that merely reuses
+            // it (the Bugbot round).
+            let _ = pa_core::platform::perms::restrict_file(&token_path);
+            return Ok(DaemonTcpTokenRecord {
+                token,
+                token_path,
+                created: false,
+            });
+        }
+        // An absent file, or an empty one, falls through to the create
+        // path: under a concurrent start an empty file is the winner's
+        // in-flight open (the exclusive create converges on the winner's
+        // token, or refuses after the loser budget - never regenerates
+        // over it); a lone empty file refuses on that same budget.
+        Ok(None) | Err(TokenReadError::Empty) => {}
+        Err(other) => return Err(token_read_error(agent_dir, other)),
     }
     std::fs::create_dir_all(agent_dir)?;
     let token = generate_token();
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&token_path)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    // The credential is owner-only FROM CREATION (TS's `{ mode: 0o600 }`):
+    // an open with the default umask would leave the secret world-readable
+    // for the window between the open and the post-write restriction.
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&token_path) {
         Ok(mut file) => {
             let payload = format!("{}\n", serde_json::json!({ "token": token }));
             file.write_all(payload.as_bytes())?;
@@ -383,10 +436,14 @@ pub fn load_or_create_daemon_tcp_token(agent_dir: &Path) -> Result<DaemonTcpToke
                         })
                     }
                     // The winner's open landed but its write is still in
-                    // flight: the file reads empty; retry briefly.
-                    Ok(None) | Err(_) => {
+                    // flight: the file reads empty (or not yet exists);
+                    // retry briefly.
+                    Ok(None) | Err(TokenReadError::Empty) => {
                         std::thread::sleep(std::time::Duration::from_millis(25));
                     }
+                    // Real corruption in the winner's file: never
+                    // clobber it (the TS refusal contract).
+                    Err(other) => return Err(token_read_error(agent_dir, other)),
                 }
             }
             return Err(anyhow!(
@@ -897,5 +954,34 @@ mod tests {
         let verdict = check_daemon_tcp_line_auth(&envelope("s", "list", "aaaaaaaa"), "bbbbbbbb");
         assert!(!verdict.ok);
         assert_eq!(verdict.reason, "wrong_token");
+    }
+    /// A token file with wider permissions is re-restricted on reuse (the
+    /// Bugbot round: a later start that merely reuses the existing file
+    /// must never leave the mesh credential readable), and a fresh create
+    /// is owner-only from the open (the TS `{ mode: 0o600 }` shape, not a
+    /// post-write chmod).
+    #[cfg(unix)]
+    #[test]
+    fn token_file_permissions_are_owner_only_from_creation_and_on_reuse() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let record = load_or_create_daemon_tcp_token(dir.path()).unwrap();
+        let mode = std::fs::metadata(&record.token_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "the fresh token is 0600");
+        // Widen the file (a backup restore or a manual chmod): the next
+        // load re-restricts it instead of silently reusing the readable
+        // credential.
+        let mut perms = std::fs::metadata(&record.token_path).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&record.token_path, perms).unwrap();
+        let reloaded = load_or_create_daemon_tcp_token(dir.path()).unwrap();
+        let mode = std::fs::metadata(&reloaded.token_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "the reuse re-restricts the token file");
     }
 }

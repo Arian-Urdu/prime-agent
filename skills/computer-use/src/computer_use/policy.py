@@ -8,13 +8,22 @@ data and stay IO-free; the thin shells touch disk or Quartz.
 
 from __future__ import annotations
 
+import os
+
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict
 
-SETTINGS_PATH = Path.home() / ".prime" / "agent" / "settings" / "computer-use.toml"
+def _agent_dir() -> Path:
+    """The agent state dir: PRIME_AGENT_CODING_AGENT_DIR overrides the default."""
+    override = os.environ.get("PRIME_AGENT_CODING_AGENT_DIR")
+    return Path(override).expanduser() if override else Path.home() / ".prime" / "agent"
+
+
+SETTINGS_PATH = _agent_dir() / "settings" / "computer-use.toml"
+STATE_DIR = _agent_dir() / "state" / "computer-use"
 
 SYSTEM_DENY: tuple[str, ...] = ("com.apple.loginwindow", "com.apple.ScreenSaver")
 RISK_LABELS: tuple[str, ...] = ("low", "medium", "high")

@@ -301,12 +301,12 @@ UNLOCKED_SESSION: dict[str, Any] = {"CGSSessionScreenIsLocked": False}
 
 
 class RecordingBackend:
-    """Recording stand-in for the sync inject and capture surface.
+    """Recording stand-in for the sync inject, capture, and apps surface.
 
     Method names, signatures, and call style mirror the landed
-    computer_use.inject and computer_use.capture modules exactly: pid-keyed,
-    CG screen-space coordinates, sync calls the App layer wraps, and the
-    async attach hook.
+    computer_use.inject, computer_use.capture, and computer_use.apps modules
+    exactly: pid-keyed, CG screen-space coordinates, sync calls the App layer
+    wraps, and the async attach hook.
     """
 
     def __init__(self, screenshot: dict[str, str | int] | None = None) -> None:
@@ -351,6 +351,10 @@ class RecordingBackend:
         """Record typing without posting events."""
         self.calls.append(("type_text", {"pid": pid, "text": text}))
 
+    def _activate(self, pid: int) -> None:
+        """Record an activation dispatch without touching NSWorkspace."""
+        self.calls.append(("activate", {"pid": pid}))
+
     def _screenshot_window(
         self, origin: tuple[int, int], size: tuple[int, int], window_id: int | None = None
     ) -> dict[str, str | int]:
@@ -374,17 +378,19 @@ class RecordingBackend:
 
 INJECT_SEAMS = ("_click", "_drag", "_scroll", "_press_key", "_type_text")
 CAPTURE_SEAMS = ("_screenshot_window", "_attach_image_if_available", "_attach")
+APPS_SEAMS = ("_activate",)
 
 
 @contextlib.contextmanager
 def recording_backend(_backend: RecordingBackend | None = None) -> Iterator[RecordingBackend]:
-    """Patch the inject and capture module seams with one RecordingBackend."""
-    from computer_use import capture, inject
+    """Patch the inject, capture, and apps module seams with one RecordingBackend."""
+    from computer_use import apps, capture, inject
 
     _backend = _backend or RecordingBackend()
-    modules = {"inject": inject, "capture": capture}
+    modules = {"apps": apps, "inject": inject, "capture": capture}
     seams: list[tuple[str, str]] = [("inject", name) for name in INJECT_SEAMS]
     seams.extend(("capture", name) for name in CAPTURE_SEAMS)
+    seams.extend(("apps", name) for name in APPS_SEAMS)
     saved: dict[tuple[str, str], Any] = {}
     patched: list[tuple[str, str]] = []
     for module_name, attr in seams:
@@ -443,11 +449,11 @@ class FakeAttach:
 class AppEnvironment:
     """One fully faked computer-use environment for App-level tests.
 
-    Patches every _backend seam: platform dispatch, app listing and launch, AX
-    observation and element actions, the allowlist gate and lock probe, TCC
-    status, inject/capture, telemetry, the clipboard helpers, and the
-    kernel-resident module state. No display, TCC grant, real app, or live
-    framework is ever touched.
+    Patches every _backend seam: platform dispatch, app listing, launch,
+    activation, and frontmost focus, AX observation and element actions, the
+    allowlist gate and lock probe, TCC status, inject/capture, telemetry, the
+    clipboard helpers, and the kernel-resident module state. No display, TCC
+    grant, real app, or live framework is ever touched.
     """
 
     def __init__(
@@ -477,6 +483,7 @@ class AppEnvironment:
         self.running_error: BaseException | None = None
         self.launch_result: Any = None
         self.launch_calls: list[Any] = []
+        self.frontmost: int | None = None  # the pid _frontmost_pid reports; None = unknown
         self.recorder = RecordingBackend()
         self.telemetry_recorder = TelemetryRecorder()
         self.attach = FakeAttach()
@@ -514,6 +521,22 @@ class AppEnvironment:
         self.launch_calls.append(spec)
         return self.launch_result
 
+    def _activate(self, pid: int) -> None:
+        """Fake apps._activate: record through the recorder, fail like the real seam for an absent pid."""
+        from computer_use.errors import ComputerUseError
+
+        if not any(app.pid == pid for app in self._running_apps()):
+            raise ComputerUseError(
+                "APP_NOT_RUNNING",
+                "the app is no longer running; bind it again with get_app()",
+                {"pid": pid},
+            )
+        self.recorder._activate(pid)
+
+    def _frontmost_pid(self) -> int | None:
+        """Fake apps._frontmost_pid: the configured pid, or None when unknown."""
+        return self.frontmost
+
     def _save_clipboard(self) -> dict[str, Any]:
         self.clipboard_calls.append(("save", None))
         return {"string": "saved"}
@@ -546,6 +569,8 @@ class AppEnvironment:
         patch(computer_use, "_require_mac", _never_require_mac)
         patch(apps, "_running_apps", self._running_apps)
         patch(apps, "_launch", self._launch)
+        patch(apps, "_activate", self._activate)
+        patch(apps, "_frontmost_pid", self._frontmost_pid)
         patch(policy, "SETTINGS_PATH", self.settings_file)
         patch(policy, "_screen_locked", lambda: self.locked)
         patch(permissions, "_status", lambda: dict(status))

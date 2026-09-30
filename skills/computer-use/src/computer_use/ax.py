@@ -106,13 +106,14 @@ def _observe(pid: int) -> Observation:
     tree: list[dict[str, Any]] = []
     refs: list[Any] = []
     _walk(app_services, window, 1, tree, refs)
+    window_id = _window_id(app_services, window)
     return Observation(
         window_title=_text(_copy_value(app_services, window, "AXTitle")),
         tree=tree,
         refs=refs,
-        window_rect=_window_rect(app_services, window),
+        window_rect=_window_rect(app_services, window) or _window_server_rect(window_id),
         focused_index=_focused_index(app_services, app_element, refs),
-        window_id=_window_id(app_services, window),
+        window_id=window_id,
     )
 
 
@@ -338,6 +339,33 @@ def _window_rect(app_services: Any, window: Any) -> tuple[float, float, float, f
     if position is None or size is None:
         return None
     return (position[0], position[1], size[0], size[1])
+
+
+def _window_server_rect(window_id: int | None) -> tuple[float, float, float, float] | None:
+    """Read one window's bounds from the window server by its CGWindowID.
+
+    Electron windows often omit AXPosition/AXSize on the AX element while
+    the window server always knows the bounds; the CGWindowID comes from
+    the private _AXWindowID attribute. Returns None when unknown.
+    """
+    if window_id is None:
+        return None
+    try:
+        quartz = _require_mac().quartz
+        options = quartz.kCGWindowListOptionOnScreenOnly | quartz.kCGWindowListExcludeDesktopElements
+        for info in quartz.CGWindowListCopyWindowInfo(options, window_id):
+            bounds = info.get("kCGWindowBounds")
+            if bounds is None:
+                continue
+            return (
+                float(bounds.get("X", 0.0)),
+                float(bounds.get("Y", 0.0)),
+                float(bounds.get("Width", 0.0)),
+                float(bounds.get("Height", 0.0)),
+            )
+    except Exception:
+        return None
+    return None
 
 
 def _set_messaging_timeout(app_services: Any, element: Any) -> None:

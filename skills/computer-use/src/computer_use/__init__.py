@@ -21,6 +21,7 @@ from .errors import ComputerUseError
 __all__ = ["App", "ComputerUseError", "get_app", "get_state", "list_apps", "permissions_status"]
 
 _PASTE_SETTLE_SECONDS = 0.1
+_ACTION_SETTLE_SECONDS = 0.12  # bounded post-action settle: input lands before the next observe
 _PASTE_FORMATS = ("text", "md", "html")
 _MAX_CLICK_COUNT = 10
 _SECURE_HANDOFF = "this element is a secure field; Prime Agent never types into it — ask the user to enter the value"
@@ -368,6 +369,51 @@ class App:
             await capture._attach_image_if_available(str(result["path"]))
         return result
 
+    async def get_text_regions(self, attach: bool = False) -> dict[str, Any]:
+        """Read the focused window with OCR and return its text regions.
+
+        The non-vision screen-reading path: regions carry text, confidence,
+        and window-screenshot-relative pixel coordinates, so click targets
+        can be derived directly. attach=True also attaches the screenshot
+        for vision-capable models. Same guards as get_screenshot.
+        """
+        self._guard()
+        from . import capture, ocr, permissions
+
+        status = permissions._status()
+        if status.get("screen_recording") != "ok":
+            raise ComputerUseError(
+                "PERMISSIONS_NOT_GRANTED",
+                "the Screen Recording grant is missing or unknown; allow Prime Agent in System Settings > Privacy & Security > Screen Recording, then retry",
+                {"permission": "screen_recording", "reported": str(status.get("screen_recording"))[:16]},
+            )
+        rect = self._observation.window_rect if self._observation is not None else None
+        if rect is None:
+            raise ComputerUseError(
+                "TRANSPORT_ERROR",
+                "no focused window observed; call get_ax_state() first",
+            )
+        result = capture._screenshot_window(
+            (int(round(rect[0])), int(round(rect[1]))),
+            (int(round(rect[2])), int(round(rect[3]))),
+            window_id=self._observation.window_id,
+        )
+        regions = await ocr._get_text_regions(str(result["path"]))
+        scaled = [
+            {
+                "text": region["text"],
+                "confidence": region["confidence"],
+                "x": region["x"] * result["width"],
+                "y": region["y"] * result["height"],
+                "width": region["width"] * result["width"],
+                "height": region["height"] * result["height"],
+            }
+            for region in regions
+        ]
+        if attach:
+            await capture._attach_image_if_available(str(result["path"]))
+        return {"regions": scaled, "width": result["width"], "height": result["height"]}
+
     async def get_state_and_screenshot(self, diff: bool = True, attach: bool = True) -> dict[str, Any]:
         """Return {"state", "screenshot"} in one call; the screenshot is None when capture fails."""
         state = await self.get_ax_state(diff)
@@ -660,6 +706,20 @@ class App:
 
         await self._action("paste", dispatch)
 
+    async def activate(self) -> None:
+        """Bring the app's frontmost window to the foreground.
+
+        App-scoped keyboard shortcuts (menus, quick switchers) only fire
+        while the app is key, so call this before shortcut-driven flows;
+        it replaces the `open -a`/osascript detours the model would
+        otherwise improvise from bash.
+        """
+        await self._action("activate", lambda: apps._activate(self._pid))
+
+    def is_frontmost(self) -> bool:
+        """Report whether the app is the frontmost (key) application."""
+        return apps._frontmost_pid() == self._pid
+
     async def _refresh(self, diff_on: bool = True) -> str:
         """Observe the app and store the new snapshot, returning its text."""
         observation = ax._observe(self._pid)
@@ -694,7 +754,7 @@ class App:
         return "\n".join(part for part in (header, body) if part) + instructions
 
     async def _action(self, action: str, dispatch: Callable[[], None]) -> None:
-        """Run one guarded action and emit its outcome telemetry."""
+        """Run one guarded action, settle briefly, and emit its outcome telemetry."""
         started = time.perf_counter()
         try:
             self._guard()
@@ -702,6 +762,7 @@ class App:
         except ComputerUseError as error:
             await _emit_action(action, "error", started, error_code=error.code)
             raise
+        time.sleep(_ACTION_SETTLE_SECONDS)
         await _emit_action(action, "ok", started)
 
     def _guard(self) -> None:
@@ -770,7 +831,9 @@ class App:
         if not position or not size:
             raise ComputerUseError(
                 "ACTION_UNSUPPORTED",
-                f"element {element_index} has no on-screen position to click",
+                f"element {element_index} has no on-screen position (web views often omit "
+                "element geometry); use keyboard navigation, or window-screenshot "
+                "coordinates from get_screenshot()",
                 {"element_index": element_index},
             )
         return (

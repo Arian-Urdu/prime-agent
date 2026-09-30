@@ -62,6 +62,31 @@ def _running_apps() -> list[RunningApp]:
     return apps
 
 
+def _frontmost_pid() -> int | None:
+    """The frontmost regular app's pid, or None when unknown."""
+    from computer_use import _compat
+
+    cocoa = _compat._require_mac().cocoa
+    frontmost = cocoa.NSWorkspace.sharedWorkspace().frontmostApplication()
+    return int(frontmost.processIdentifier()) if frontmost is not None else None
+
+
+def _activate(pid: int) -> None:
+    """Make one running app key (its frontmost window takes the foreground)."""
+    from computer_use import _compat
+
+    cocoa = _compat._require_mac().cocoa
+    for application in cocoa.NSWorkspace.sharedWorkspace().runningApplications():
+        if application.processIdentifier() == pid:
+            application.activateWithOptions_(cocoa.NSApplicationActivateIgnoringOtherApps)
+            return
+    raise ComputerUseError(
+        "APP_NOT_RUNNING",
+        "the app is no longer running; bind it again with get_app()",
+        {"pid": pid},
+    )
+
+
 def _running_bundle_id(pid: int) -> str | None:
     """Report the bundle id currently owning one pid, or None when it is not a running app.
 
@@ -165,11 +190,14 @@ def _open_command(spec: str | dict[str, str]) -> list[str]:
         kind = "bundle_id" if "." in spec else "name"
     else:
         kind, value = _spec_value(spec)
+    # -g launches the app in the background: the agent binds and observes
+    # without stealing the user's screen; only an explicit App.activate()
+    # brings it forward, and keyboard flows announce that takeover.
     if kind == "bundle_id":
-        return ["open", "-b", value]
+        return ["open", "-g", "-b", value]
     if kind == "name":
-        return ["open", "-a", value]
-    return ["open", value]
+        return ["open", "-g", "-a", value]
+    return ["open", "-g", value]
 
 
 def _await_running(spec: str | dict[str, str]) -> RunningApp:

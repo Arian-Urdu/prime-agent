@@ -19,7 +19,14 @@ from .errors import ComputerUseError
 
 _TIMEOUT_SECONDS = 10.0
 _ERROR_LIMIT = 200
-_SCREENSHOTS_DIR = Path.home() / ".prime" / "agent" / "tmp" / "computer-use"
+def _screenshots_dir() -> Path:
+    """The capture tmp dir under the agent state dir (env-overridable)."""
+    override = os.environ.get("PRIME_AGENT_CODING_AGENT_DIR")
+    base = Path(override).expanduser() if override else Path.home() / ".prime" / "agent"
+    return base / "tmp" / "computer-use"
+
+
+_SCREENSHOTS_DIR = _screenshots_dir()
 _SCREENCAPTURE_TOOL = "/usr/sbin/screencapture"
 _SWEEP_MAX_FILES = 20
 _SWEEP_MAX_AGE_SECONDS = 24 * 60 * 60

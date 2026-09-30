@@ -90,7 +90,7 @@ env:
 
 jobs:
   cut:
-    name: "cut the nightly beta tag (tag-only commit, never a branch change)"
+    name: cut beta tag
     runs-on: ubuntu-latest
     # THE WAIT'S BUDGET: the pushed commit's continuous run must conclude
     # (the CI-green wait polls up to 75 minutes for a busy queue), and the

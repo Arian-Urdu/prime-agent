@@ -54,7 +54,7 @@ pub struct RemoteModel {
 /// `RemoteAgentHost`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RemoteAgentHost {
-    /// MagicDNS hostname, e.g. "milk.tailnet.ts.net"; the agents-view
+    /// `MagicDNS` hostname, e.g. "milk.tailnet.ts.net"; the agents-view
     /// label source.
     pub tailnet_host: String,
     /// The peer is present in `tailscale status`.
@@ -129,13 +129,23 @@ pub struct RemoteDeliveryTarget {
     pub session_name: Option<String>,
 }
 
+/// The optional discovery-source seam.
+pub type MeshSource = Option<Arc<dyn RemoteAgentMeshSource>>;
+/// The optional cross-machine delivery seam.
+pub type MeshTransport = Option<Arc<dyn RemoteAgentMessageTransport>>;
+/// The roster-change callback (changed, removed ids).
+pub type MeshRosterChange = Arc<dyn Fn(&[String], &[String]) + Send + Sync>;
+/// The scan-failure callback.
+pub type MeshScanError = Arc<dyn Fn(&anyhow::Error) + Send + Sync>;
+/// The time source (ms since epoch).
+pub type MeshNow = Arc<dyn Fn() -> u64 + Send + Sync>;
+
 /// The supervisor's mesh configuration (TS `RemoteAgentMeshOptions`):
 /// the discovery source, the delivery transport, and the TTL bounds.
-#[derive(Clone)]
-#[allow(missing_docs)]
+#[derive(Clone, Default)]
 pub struct RemoteAgentMeshOptions {
-    pub source: Option<Arc<dyn RemoteAgentMeshSource>>,
-    pub transport: Option<Arc<dyn RemoteAgentMessageTransport>>,
+    pub source: MeshSource,
+    pub transport: MeshTransport,
     /// Minimum age before a scan may run again; roster queries share one
     /// scan (TS `refreshTtlMs`, default 30s).
     pub refresh_ttl: Option<Duration>,
@@ -143,11 +153,11 @@ pub struct RemoteAgentMeshOptions {
     /// forgotten (TS `offlineTtlMs`, default 24h).
     pub offline_ttl: Option<Duration>,
     /// Roster change callback (changed, removed agent ids).
-    pub on_roster_change: Option<Arc<dyn Fn(&[String], &[String]) + Send + Sync>>,
+    pub on_roster_change: Option<MeshRosterChange>,
     /// Scan failure callback.
-    pub on_scan_error: Option<Arc<dyn Fn(&anyhow::Error) + Send + Sync>>,
+    pub on_scan_error: Option<MeshScanError>,
     /// Time source (ms since epoch) for tests.
-    pub now: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+    pub now: Option<MeshNow>,
 }
 
 impl std::fmt::Debug for RemoteAgentMeshOptions {
@@ -161,27 +171,10 @@ impl std::fmt::Debug for RemoteAgentMeshOptions {
     }
 }
 
-impl Default for RemoteAgentMeshOptions {
-    fn default() -> Self {
-        RemoteAgentMeshOptions {
-            source: None,
-            transport: None,
-            refresh_ttl: None,
-            offline_ttl: None,
-            on_roster_change: None,
-            on_scan_error: None,
-            now: None,
-        }
-    }
-}
-
 impl RemoteAgentMeshOptions {
     /// Build the options from a source and a transport.
     #[must_use]
-    pub fn new(
-        source: Option<Arc<dyn RemoteAgentMeshSource>>,
-        transport: Option<Arc<dyn RemoteAgentMessageTransport>>,
-    ) -> Self {
+    pub fn new(source: MeshSource, transport: MeshTransport) -> Self {
         RemoteAgentMeshOptions {
             source,
             transport,
@@ -191,12 +184,12 @@ impl RemoteAgentMeshOptions {
 }
 
 /// Minimum scan age default (TS `DEFAULT_REMOTE_MESH_REFRESH_TTL_MS`).
-const DEFAULT_REFRESH_TTL: Duration = Duration::from_millis(30_000);
+const DEFAULT_REFRESH_TTL: Duration = Duration::from_secs(30);
 /// Offline rows are kept so unreachable peers read "offline" instead of
 /// vanishing, but a peer that stays gone is eventually forgotten: mesh
 /// state must stay bounded when a tailnet churns through transient
 /// devices (TS `DEFAULT_REMOTE_MESH_OFFLINE_TTL_MS`).
-const DEFAULT_OFFLINE_TTL: Duration = Duration::from_millis(24 * 60 * 60_000);
+const DEFAULT_OFFLINE_TTL: Duration = Duration::from_hours(24);
 
 /// A peer publishes its own session ids, so one id is only unique inside
 /// one daemon. Roster ids and send checks namespace a remote row's ids
@@ -240,13 +233,13 @@ struct MeshInner {
 /// known sessions, marked offline, so the agents view reads "offline"
 /// instead of losing rows.
 pub struct RemoteAgentMeshState {
-    source: Option<Arc<dyn RemoteAgentMeshSource>>,
-    transport: Option<Arc<dyn RemoteAgentMessageTransport>>,
+    source: MeshSource,
+    transport: MeshTransport,
     refresh_ttl: Duration,
     offline_ttl: Duration,
-    on_roster_change: Option<Arc<dyn Fn(&[String], &[String]) + Send + Sync>>,
-    on_scan_error: Option<Arc<dyn Fn(&anyhow::Error) + Send + Sync>>,
-    now: Arc<dyn Fn() -> u64 + Send + Sync>,
+    on_roster_change: Option<MeshRosterChange>,
+    on_scan_error: Option<MeshScanError>,
+    now: MeshNow,
     inner: Mutex<MeshInner>,
     /// Serializes scans: the in-flight scan holds the gate, and a caller
     /// that arrives mid-scan waits for its completion (then re-checks the
@@ -775,10 +768,10 @@ fn classify_remote_status(
     activity: &str,
     session_active: bool,
 ) -> &'static str {
-    match (residency_id.is_some(), activity, session_active) {
-        (true, "working", _) => "running",
-        (true, "idle", true) => "running",
-        (true, "idle", false) => "idle",
+    match (residency_id.is_some(), activity) {
+        (true, "working") => "running",
+        (true, "idle") if session_active => "running",
+        (true, "idle") => "idle",
         _ => "inactive",
     }
 }

@@ -60,7 +60,7 @@ pub struct AgentsViewRow {
     /// The remote row's always-visible machine label
     /// ("on <tailnet-host>", "on <tailnet-host> (offline)"): local rows
     /// render none (TS #2516 `remoteHostLabel`; the label renders in its
-    /// own host column, sized to its content, so a MagicDNS hostname is
+    /// own host column, sized to its content, so a `MagicDNS` hostname is
     /// never truncated away).
     pub host_label: Option<String>,
     /// Own usage cost plus every descendant's (TS `recursiveCost`).
@@ -124,7 +124,7 @@ impl AgentsViewRow {
 pub struct SelectionKey {
     pub session_id: Option<String>,
     pub active_session_id: Option<String>,
-    /// MagicDNS host of a remote row: the id fallbacks only match inside
+    /// `MagicDNS` host of a remote row: the id fallbacks only match inside
     /// that host (TS #2516).
     pub remote_host: Option<String>,
 }

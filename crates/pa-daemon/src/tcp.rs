@@ -41,7 +41,7 @@ pub const DAEMON_TCP_MAX_CONNECTIONS: usize = 256;
 pub const DAEMON_TCP_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Idle window for an authenticated TCP socket; any traffic resets it (TS
 /// #2517's `DAEMON_TCP_IDLE_TIMEOUT_MS`).
-pub const DAEMON_TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+pub const DAEMON_TCP_IDLE_TIMEOUT: Duration = Duration::from_mins(10);
 /// Absolute admission budget for a TCP socket accepted before
 /// `daemon_hello` can be written: the listener binds before the boot
 /// passes complete, and mesh clients wait for hello before sending their
@@ -468,18 +468,19 @@ pub fn check_daemon_tcp_line_auth(line: &str, expected_token: &str) -> DaemonTcp
         .or_else(|| object.get("type").and_then(Value::as_str))
         .map(str::to_string);
     let token = object.get("auth").and_then(|auth| auth.get("token"));
-    match token {
+    let authenticated = match token {
         Some(Value::String(token)) if !token.is_empty() => {
-            if daemon_tcp_tokens_match(token, expected_token) {
-                return DaemonTcpAuthVerdict {
-                    ok: true,
-                    id,
-                    command,
-                    reason: "",
-                };
-            }
+            daemon_tcp_tokens_match(token, expected_token)
         }
-        _ => {}
+        _ => false,
+    };
+    if authenticated {
+        return DaemonTcpAuthVerdict {
+            ok: true,
+            id,
+            command,
+            reason: "",
+        };
     }
     let reason = match token {
         None | Some(Value::Null) => "missing_token",
@@ -561,7 +562,7 @@ mod tests {
                 .to_string();
             assert!(!error.is_empty(), "{name} must refuse");
             assert!(
-                !load_or_create_daemon_tcp_token(dir.path()).is_ok(),
+                load_or_create_daemon_tcp_token(dir.path()).is_err(),
                 "{name} must not regenerate"
             );
             // The corrupt file survives: the daemon never clobbers it.
@@ -673,7 +674,7 @@ mod tests {
         env_map: &HashMap<String, String>,
         probe: Option<&str>,
     ) -> Result<IpAddr> {
-        let probe_addr = probe.map(|ip| ip.parse::<IpAddr>().ok()).unwrap_or(None);
+        let probe_addr = probe.and_then(|ip| ip.parse::<IpAddr>().ok());
         resolve_daemon_tcp_listener_host(explicit, settings, env_map, &move || probe_addr)
     }
 

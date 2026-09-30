@@ -241,7 +241,7 @@ impl Supervisor {
                             let _ = expired_tx.send(()).await;
                             return;
                         }
-                        Ok(Ok(())) => continue,
+                        Ok(Ok(())) => {}
                         Ok(Err(_)) => return,
                     }
                 }

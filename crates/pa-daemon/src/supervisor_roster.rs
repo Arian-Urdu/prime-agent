@@ -40,7 +40,7 @@ pub(crate) struct WorkerRosterDelta {
 /// peer; `list` waits no longer than this for it and serves last-known
 /// rows instead (TS `REMOTE_MESH_LIST_REFRESH_WAIT_MS`).
 pub(crate) const REMOTE_MESH_LIST_REFRESH_WAIT: Duration = Duration::from_millis(5_000);
-/// The send_message fallback shares the bounded refresh on a tighter
+/// The `send_message` fallback shares the bounded refresh on a tighter
 /// budget: the sender is waiting on an error path, so discovery must not
 /// hold it for `list`'s span (TS `REMOTE_MESH_MESSAGE_REFRESH_WAIT_MS`).
 pub(crate) const REMOTE_MESH_MESSAGE_REFRESH_WAIT: Duration = Duration::from_millis(2_000);
@@ -92,7 +92,7 @@ impl Supervisor {
     /// changed rows publish through the same content-diff guard as worker
     /// rows, so an identical remote row broadcasts nothing (the TS
     /// roster-churn fix rides the supervisor's existing guard).
-    pub(crate) fn push_mesh_roster_update(&self, changed: Vec<String>, removed: Vec<String>) {
+    pub(crate) fn push_mesh_roster_update(&self, changed: &[String], removed: Vec<String>) {
         let entries: Vec<AgentRosterEntry> = changed
             .iter()
             .filter_map(|agent_id| {
@@ -2082,6 +2082,7 @@ mod mesh_tests {
                 vec![remote_session("r1", Some("worker"))],
             )],
         );
+        // The temp dir stays alive for the supervisor's agent dir.
         let dir = tempfile::TempDir::new().unwrap();
         let supervisor = mesh_supervisor(dir.path(), Arc::clone(&source), Arc::clone(&transport));
         let response = supervisor
@@ -2114,11 +2115,11 @@ mod mesh_tests {
                 vec![remote_session("r1", Some("worker"))],
             )],
         );
+        // The temp dir stays alive for the supervisor's agent dir.
         let dir = tempfile::TempDir::new().unwrap();
         let supervisor = mesh_supervisor(dir.path(), Arc::clone(&source), Arc::clone(&transport));
         // A saved session named "worker", hosted by a registered resident:
         // the wake resolves the local file BEFORE the mesh is consulted.
-        let dir = tempfile::TempDir::new().unwrap();
         let sessions = crate::paths::sessions_dir(&supervisor.options.agent_dir).unwrap();
         std::fs::create_dir_all(&sessions).unwrap();
         let mut session = crate::session_store::SessionFile::create("/tmp", None, 0);
@@ -2170,6 +2171,7 @@ mod mesh_tests {
                 ),
             ],
         );
+        // The temp dir stays alive for the supervisor's agent dir.
         let dir = tempfile::TempDir::new().unwrap();
         let supervisor = mesh_supervisor(dir.path(), Arc::clone(&source), Arc::clone(&transport));
         let response = supervisor
@@ -2198,6 +2200,7 @@ mod mesh_tests {
                 vec![remote_session("r1", Some("twin"))],
             )],
         );
+        // The temp dir stays alive for the supervisor's agent dir.
         let dir = tempfile::TempDir::new().unwrap();
         let supervisor = mesh_supervisor(dir.path(), Arc::clone(&source), Arc::clone(&transport));
         // Two saved sessions named "twin": the catalog's ambiguity error.
@@ -2243,6 +2246,7 @@ mod mesh_tests {
                 ),
             ],
         );
+        // The temp dir stays alive for the supervisor's agent dir.
         let dir = tempfile::TempDir::new().unwrap();
         let supervisor = mesh_supervisor(dir.path(), Arc::clone(&source), Arc::clone(&transport));
         supervisor.refresh_remote_mesh(Duration::ZERO).await;
@@ -2284,6 +2288,7 @@ mod mesh_tests {
                 vec![remote_session("r1", Some("worker"))],
             )],
         );
+        // The temp dir stays alive for the supervisor's agent dir.
         let dir = tempfile::TempDir::new().unwrap();
         let supervisor = mesh_supervisor(dir.path(), Arc::clone(&source), Arc::clone(&transport));
         supervisor.refresh_remote_mesh(Duration::ZERO).await;
@@ -2320,6 +2325,7 @@ mod mesh_tests {
                 vec![remote_session("shared-id", None)],
             )],
         );
+        // The temp dir stays alive for the supervisor's agent dir.
         let dir = tempfile::TempDir::new().unwrap();
         let supervisor = mesh_supervisor(dir.path(), Arc::clone(&source), Arc::clone(&transport));
         // The remote target's active id equals the local source's: with
@@ -2354,6 +2360,7 @@ mod mesh_tests {
                 vec![remote_session("r1", Some("worker"))],
             )],
         );
+        // The temp dir stays alive for the supervisor's agent dir.
         let dir = tempfile::TempDir::new().unwrap();
         let supervisor = mesh_supervisor(dir.path(), Arc::clone(&source), Arc::clone(&transport));
         let plain = supervisor
@@ -2404,6 +2411,7 @@ mod mesh_tests {
                 vec![remote_session("r1", Some("worker"))],
             )],
         );
+        // The temp dir stays alive for the supervisor's agent dir.
         let dir = tempfile::TempDir::new().unwrap();
         let supervisor = mesh_supervisor(dir.path(), Arc::clone(&source), Arc::clone(&transport));
         // The peers budget stays strictly below the shared worker request
@@ -2437,7 +2445,7 @@ mod mesh_tests {
     }
 
     /// The roster snapshot includes the remote mesh rows (TS #2516's
-    /// roster_subscribe arm), and the mesh rows never enter the local
+    /// `roster_subscribe` arm), and the mesh rows never enter the local
     /// roster store - the structural isolation that keeps remote rows
     /// out of the supervisor's local name-availability checks.
     #[tokio::test]
@@ -2451,6 +2459,7 @@ mod mesh_tests {
                 vec![remote_session("r1", Some("worker"))],
             )],
         );
+        // The temp dir stays alive for the supervisor's agent dir.
         let dir = tempfile::TempDir::new().unwrap();
         let supervisor = mesh_supervisor(dir.path(), Arc::clone(&source), Arc::clone(&transport));
         supervisor.refresh_remote_mesh(Duration::ZERO).await;
@@ -2488,22 +2497,18 @@ mod mesh_tests {
                 vec![remote_session("r1", None)],
             )],
         );
+        // The temp dir stays alive for the supervisor's agent dir.
         let dir = tempfile::TempDir::new().unwrap();
         let supervisor = mesh_supervisor(dir.path(), Arc::clone(&source), Arc::clone(&transport));
         supervisor.refresh_remote_mesh(Duration::ZERO).await;
         let entries = supervisor.remote_roster_entries();
         assert_eq!(entries.len(), 1);
         let mut events = supervisor.events.subscribe();
-        supervisor.push_mesh_roster_update(
-            entries.iter().map(|entry| entry.agent_id.clone()).collect(),
-            Vec::new(),
-        );
+        let ids: Vec<String> = entries.iter().map(|entry| entry.agent_id.clone()).collect();
+        supervisor.push_mesh_roster_update(&ids, Vec::new());
         let first = drain_roster_pushes(&mut events);
         assert_eq!(first.len(), 1, "the first push broadcasts");
-        supervisor.push_mesh_roster_update(
-            entries.iter().map(|entry| entry.agent_id.clone()).collect(),
-            Vec::new(),
-        );
+        supervisor.push_mesh_roster_update(&ids, Vec::new());
         let second = drain_roster_pushes(&mut events);
         assert!(
             second.is_empty(),

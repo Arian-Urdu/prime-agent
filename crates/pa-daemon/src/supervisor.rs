@@ -57,6 +57,12 @@ use update_restart::{salvage_command_type, salvage_id, streamed_attach_lines};
 pub(crate) use clients::client_command_payload;
 pub(crate) use tcp::ClientTrust;
 
+/// One batch of mesh roster changes forwarded to the drain task
+/// (changed ids, removed ids).
+pub(crate) type MeshRosterChanges = (Vec<String>, Vec<String>);
+/// The mesh roster-change queue's receiver side.
+pub(crate) type MeshRosterRx = tokio::sync::mpsc::UnboundedReceiver<MeshRosterChanges>;
+
 // The routing consts and refusal string keep their crate::supervisor::* paths stable
 // (external callers: supervisor_parent_death, create_reuse, prompt_admission, update_restore).
 pub(crate) use routing::{LONG_ROUTE_TIMEOUT_MS, ROUTE_TIMEOUT_MS, WORKER_NOT_CONNECTED};
@@ -261,8 +267,7 @@ pub struct Supervisor {
     /// drain task spawned in [`Supervisor::run`] turns them into
     /// `roster_update` pushes through the same content-diff guard as
     /// worker rows.
-    pub(crate) mesh_roster_rx:
-        std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<(Vec<String>, Vec<String>)>>>,
+    pub(crate) mesh_roster_rx: std::sync::Mutex<Option<MeshRosterRx>>,
 }
 
 impl Supervisor {
@@ -304,7 +309,7 @@ impl Supervisor {
         // callback cannot capture `Arc<Self>` this early, so changes ride
         // the queue; the drain task in `run` publishes them.
         let (mesh_roster_tx, mesh_roster_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(Vec<String>, Vec<String>)>();
+            tokio::sync::mpsc::unbounded_channel::<MeshRosterChanges>();
         let remote_mesh = options.remote_agent_mesh.clone().map(|mut mesh| {
             mesh.on_roster_change = Some(Arc::new(move |changed, removed| {
                 let _ = mesh_roster_tx.send((changed.to_vec(), removed.to_vec()));
@@ -529,7 +534,7 @@ impl Supervisor {
                 let receiver = supervisor.mesh_roster_rx.lock().unwrap().take();
                 if let Some(mut receiver) = receiver {
                     while let Some((changed, removed)) = receiver.recv().await {
-                        supervisor.push_mesh_roster_update(changed, removed);
+                        supervisor.push_mesh_roster_update(&changed, removed);
                     }
                 }
             });

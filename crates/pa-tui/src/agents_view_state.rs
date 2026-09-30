@@ -1422,7 +1422,7 @@ mod tests {
     }
 
     /// The picker's match targets carry the remote host and display model
-    /// (TS #2516's review fix: filtering by the MagicDNS hostname must
+    /// (TS #2516's review fix: filtering by the `MagicDNS` hostname must
     /// surface every remote agent on that machine).
     #[test]
     fn search_text_carries_the_remote_host_and_model() {

@@ -26,7 +26,7 @@ pub(crate) struct SessionSummary {
     /// `remoteModel`); the daemon's full model object never crosses the
     /// wire.
     remote_model: Option<(String, String)>,
-    /// MagicDNS hostname of the remote daemon owning this session; local
+    /// `MagicDNS` hostname of the remote daemon owning this session; local
     /// rows carry none (TS #2516 `remoteHost`).
     remote_host: Option<String>,
     /// True when the owning remote daemon was unreachable at the last

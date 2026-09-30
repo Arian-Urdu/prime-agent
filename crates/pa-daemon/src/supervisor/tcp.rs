@@ -224,7 +224,6 @@ mod integration_tests {
     use serde_json::Value;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    use super::super::ClientTrust;
     use crate::supervisor::{Supervisor, SupervisorOptions};
 
     fn tcp_supervisor(agent_dir: &std::path::Path, port: u16) -> Arc<Supervisor> {
@@ -434,9 +433,10 @@ mod integration_tests {
                     stream.write_all(b"x").await.unwrap();
                 }
             }
-            if std::time::Instant::now() - start > Duration::from_secs(60) {
-                panic!("the admission deadline never fired");
-            }
+            assert!(
+                start.elapsed() <= Duration::from_secs(60),
+                "the admission deadline never fired"
+            );
         }
     }
 

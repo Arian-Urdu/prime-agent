@@ -36,7 +36,7 @@ pub struct SessionSearchText {
     /// The session working directory.
     pub cwd: String,
     /// The remote row's tailnet host and display model (TS #2516): the
-    /// picker matches remote agents by MagicDNS hostname and remote
+    /// picker matches remote agents by `MagicDNS` hostname and remote
     /// model id.
     pub host: String,
 }
@@ -548,7 +548,7 @@ mod tests {
         let lookahead = parse_search_query("re:gateway(?=worker)");
         assert!(score_search(&targets(), &lookahead).is_some());
     }
-    /// A remote mesh row is findable by its MagicDNS hostname and its
+    /// A remote mesh row is findable by its `MagicDNS` hostname and its
     /// display model id (TS #2516's review fix: filtering by the tailnet
     /// host must surface every remote agent on that machine).
     #[test]

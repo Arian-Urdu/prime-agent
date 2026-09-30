@@ -1,13 +1,14 @@
 //! The installer-takeover update funnel: `prime-agent update` and the TUI's
-//! `/update` download the `rust` branch's `install-rust.sh` and run it.
-//! The script is the single source of truth for the whole move — it
-//! resolves and downloads the latest `continuous` build, uninstalls the
-//! TypeScript version, publishes the payload, and never touches
-//! `~/.prime/agent` (the sessions and configuration the products share).
-//! This module only fetches and execs the script, then reports what
-//! landed; every install/uninstall decision stays in the script the
-//! installer-takeover lane owns, so the two surfaces can never drift from
-//! it.
+//! `/update` download the installer from the OFFICIAL DOMAIN endpoint and
+//! run it — never a GitHub raw or workflow URL. The script is the single
+//! source of truth for the whole move — it resolves and downloads the
+//! latest build, uninstalls the TypeScript version, publishes the payload,
+//! and never touches `~/.prime/agent` (the sessions and configuration the
+//! products share). The command's contract is "fetch from the official
+//! source, run it". This module only fetches and execs the script, then
+//! reports what landed; every install/uninstall decision stays in the
+//! script the installer-takeover lane owns, so the two surfaces can never
+//! drift from it.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -25,20 +26,28 @@ pub const ENV_PREFIX: &str = "PRIME_AGENT_RUST_PREFIX";
 /// `PRIME_AGENT_RUST_INSTALLER_URL`: the installer script URL override —
 /// tests serve their own script, a pinned install can point elsewhere.
 pub const ENV_INSTALLER_URL: &str = "PRIME_AGENT_RUST_INSTALLER_URL";
+/// The installer's release-channel knob (the publish-rendered default the
+/// served script carries; the env override pins it — the funnel passes the
+/// INSTALLED channel so a beta install updates on beta).
+pub const ENV_RELEASE_CHANNEL: &str = "PRIME_AGENT_RELEASE_CHANNEL";
 /// `GITHUB_TOKEN`: the installer's own artifact-auth knob, sent on the
 /// run-list request when set (the run list is public; the token only lifts
 /// the anonymous rate limit).
 pub const ENV_GITHUB_TOKEN: &str = "GITHUB_TOKEN";
 
-/// The repo the installer and the run report resolve from.
+/// The official domain's install endpoint — the one source the funnel
+/// fetches the installer from; never a GitHub raw or workflow URL (the
+/// override env var stays for tests and pinned installs).
+pub const OFFICIAL_INSTALLER_URL: &str = "https://app.primeintellect.ai/prime-agent/install.sh";
+/// The repo the run report resolves from (the run-list query's owner; the
+/// installer fetch itself never derives from it).
 pub const DEFAULT_REPO: &str = "PrimeIntellect-ai/prime-agent";
 /// The workflow whose artifacts the installer downloads (the same name
 /// the script's run-list query uses).
 pub const WORKFLOW: &str = "continuous";
-/// The branch the installer script and the continuous runs resolve from.
+/// The branch the continuous runs resolve from (the run-list query's
+/// branch).
 pub const BRANCH: &str = "rust";
-/// The installer script's file name on the branch.
-pub const SCRIPT_NAME: &str = "install-rust.sh";
 
 /// The small-file budget for the script download (the script is a few KB;
 /// a hung fetch must not hang the update).
@@ -59,8 +68,9 @@ pub fn repo() -> String {
         .unwrap_or_else(|| DEFAULT_REPO.to_string())
 }
 
-/// The installer script URL: the branch's raw file by default
-/// (`PRIME_AGENT_RUST_INSTALLER_URL` overrides it).
+/// The installer script URL: the official domain's install endpoint by
+/// default (`PRIME_AGENT_RUST_INSTALLER_URL` overrides it — tests serve
+/// their own script, a pinned install can point elsewhere).
 #[must_use]
 pub fn installer_script_url() -> String {
     if let Ok(url) = std::env::var(ENV_INSTALLER_URL) {
@@ -68,10 +78,7 @@ pub fn installer_script_url() -> String {
             return url;
         }
     }
-    format!(
-        "https://raw.githubusercontent.com/{}/{BRANCH}/{SCRIPT_NAME}",
-        repo()
-    )
+    OFFICIAL_INSTALLER_URL.to_string()
 }
 
 /// The install prefix the launcher probe reads (`PRIME_AGENT_RUST_PREFIX`,
@@ -269,6 +276,33 @@ pub async fn run_installer_from(
     Ok(Installed { version })
 }
 
+/// The installed payload's channel, read from the install marker (the
+/// installer's own `.prime-agent-install` under the prefix's share dir;
+/// its first line is "channel <name>"). `None` when the marker is absent
+/// (a pre-marker install or a foreign tree) or carries no known channel —
+/// the update then rides the fetched script's own default.
+#[must_use]
+pub fn installed_channel(prefix: &Path) -> Option<&'static str> {
+    let marker =
+        std::fs::read_to_string(prefix.join("share/prime-agent/.prime-agent-install")).ok()?;
+    // The marker's first line must be the installer's OWN write shape —
+    // "install-rust.sh channel <name>" — not merely any line that ends in
+    // a channel claim: a foreign marker ("other installer channel beta")
+    // must never steer the update onto a channel; the exact prefix is the
+    // ownership proof, exactly like the share tree's own marker file.
+    let channel = marker
+        .lines()
+        .next()?
+        .trim()
+        .strip_prefix("install-rust.sh channel ")?
+        .trim();
+    match channel {
+        "stable" => Some("stable"),
+        "beta" => Some("beta"),
+        _ => None,
+    }
+}
+
 /// Fetch the installer script to a per-run temp file (the small-file
 /// budget; the file is the exact bytes the branch serves).
 ///
@@ -322,6 +356,15 @@ async fn execute_script(
 ) -> std::result::Result<(), UpdateFailure> {
     let mut command = tokio::process::Command::new("/bin/sh");
     command.arg(script).env(ENV_PREFIX, prefix);
+    // THE CHANNEL-STICKINESS: an install made through install-beta.sh
+    // (the beta render) records its channel in the install marker, and
+    // the update must STAY on it — the fetched script's own default is
+    // the stable render, so without the override a beta user's `update`
+    // would silently switch channels. The marker's first line is
+    // "channel <name>" (the installer writes it at publish).
+    if let Some(channel) = installed_channel(prefix) {
+        command.env(ENV_RELEASE_CHANNEL, channel);
+    }
     match output {
         InstallerOutput::Inherit => {
             let status = command.status().await.map_err(|error| UpdateFailure {
@@ -429,6 +472,49 @@ async fn launcher_version(prefix: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// The installed-marker channel read: a beta install's update must
+    /// stay on beta (the marker the installer writes at publish carries
+    /// the channel), a stable or pre-marker install rides the script's
+    /// own default, and a foreign marker is never treated as a channel.
+    #[test]
+    fn installed_channel_reads_the_publish_marker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let prefix = dir.path().join("prefix");
+        // No marker at all: no channel (the script's default rides).
+        assert_eq!(installed_channel(&prefix), None);
+        // The installer's ACTUAL write shape: "install-rust.sh channel
+        // <name>" then "version <v>" (the publish's printf).
+        let share = prefix.join("share/prime-agent");
+        std::fs::create_dir_all(&share).unwrap();
+        std::fs::write(
+            share.join(".prime-agent-install"),
+            "install-rust.sh channel beta\nversion 0.10.0\n",
+        )
+        .unwrap();
+        assert_eq!(installed_channel(&prefix), Some("beta"));
+        std::fs::write(
+            share.join(".prime-agent-install"),
+            "install-rust.sh channel stable\nversion 0.10.0\n",
+        )
+        .unwrap();
+        assert_eq!(installed_channel(&prefix), Some("stable"));
+        // A foreign/garbage marker: never a channel claim.
+        std::fs::write(share.join(".prime-agent-install"), "nightly\n").unwrap();
+        assert_eq!(installed_channel(&prefix), None);
+        // A FOREIGN channel claim (not the installer's own write shape):
+        // never a channel — the exact prefix is the ownership proof.
+        std::fs::write(
+            share.join(".prime-agent-install"),
+            "other installer channel beta\n",
+        )
+        .unwrap();
+        assert_eq!(installed_channel(&prefix), None);
+        // A bare channel line (not the installer's shape): also None —
+        // the update rides the fetched script's own default.
+        std::fs::write(share.join(".prime-agent-install"), "channel beta\n").unwrap();
+        assert_eq!(installed_channel(&prefix), None);
+    }
+
     /// Serve `body` over one plain HTTP request (the hermetic source the
     /// funnel fetches its mock installer from): bind an ephemeral loopback
     /// socket, answer the first request, return the URL the funnel uses.
@@ -460,7 +546,7 @@ mod tests {
                 let _ = stream.flush();
             }
         });
-        format!("http://{address}/{SCRIPT_NAME}")
+        format!("http://{address}/install.sh")
     }
 
     /// The sandboxed preserve fixture: a session file under a home the
@@ -538,6 +624,32 @@ echo "installed: 9.9.8-continuous.fedcba9876543210"
         let prefix = root.path().join("prefix/.local");
         std::fs::create_dir_all(&prefix).expect("prefix");
         (root, preserve, prefix)
+    }
+
+    /// The default funnel URL is the official domain's install endpoint —
+    /// never a GitHub raw or workflow URL (the operator ships the Rust
+    /// installer through the domain itself; the override stays for tests
+    /// and pinned installs).
+    #[test]
+    fn the_default_installer_url_is_the_official_domain_endpoint() {
+        // The override is SAVED and RESTORED around the probe: the test
+        // asserts the default resolution, but a pinned value in the
+        // surrounding environment (a test or a pinned install) must
+        // survive it (the env is process-global — leave it as found).
+        let prior_override = std::env::var(ENV_INSTALLER_URL).ok();
+        std::env::remove_var(ENV_INSTALLER_URL);
+        assert_eq!(installer_script_url(), OFFICIAL_INSTALLER_URL);
+        assert_eq!(
+            OFFICIAL_INSTALLER_URL,
+            "https://app.primeintellect.ai/prime-agent/install.sh"
+        );
+        assert!(
+            !OFFICIAL_INSTALLER_URL.contains("github"),
+            "the official endpoint never points at GitHub"
+        );
+        if let Some(value) = prior_override {
+            std::env::set_var(ENV_INSTALLER_URL, value);
+        }
     }
 
     #[test]

@@ -4197,6 +4197,45 @@ class FactoryExecutorTest(unittest.TestCase):
         self.assertEqual(self.host.deleted_targets(), ["child-2"])
 
     @async_test
+    async def test_resident_saturated_cap_fails_the_run_instead_of_wedging(self) -> None:
+        # Cursor review finding (PR #3199): with every max_parallel slot held
+        # by resident instances, queued work can never be admitted -- a
+        # resident never settles, so no slot ever frees, _run_complete stays
+        # false, and the residents keep children in flight so the no-in-flight
+        # stall detector never fires. The loop would poll forever; it now
+        # fails the run with a deterministic executor error instead.
+        self.host.outcomes["r1"] = {"status": "running"}  # residents never settle
+        self.host.outcomes["r2"] = {"status": "running"}
+        self.store_machine(
+            {
+                "run": {"max_parallel": 1},
+                "states": [
+                    {"id": "r1", "entry": True, "subagent": "worker", "lifecycle": "resident"},
+                    {"id": "r2", "entry": True, "subagent": "worker", "lifecycle": "resident"},
+                ],
+                "transitions": [],
+            }
+        )
+        result = await self.start()
+        self.assertEqual(result["started"], ["r1"])  # the second resident queues behind the cap
+        status = await self.settle(result)  # never leaves "running" without the fix
+        self.assertEqual(status["state"], "failed")
+        errors = self.events_of(status, "executor_error")
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(
+            errors[0]["error"],
+            "control loop stalled: resident instances hold every max_parallel 1 slot; "
+            "queued instances can never be admitted",
+        )
+        self.assertIn("failed", self.host.notice_kinds())
+        # The queued resident was never admitted; stop() still cancels its
+        # queued entry and tears the admitted child down.
+        self.assertEqual(self.host.spawn_calls("r2"), [])
+        stopped = await rlm_module.rlm.factory.stop(result["run_id"])
+        self.assertEqual(stopped["cancelled"], ["r1", "r2"])
+        self.assertEqual(self.host.deleted_targets(), ["child-1"])
+
+    @async_test
     async def test_resume_bumps_the_loop_generation_no_double_admission(self) -> None:
         # Review finding (resume race): the pause-path control loop can still
         # be winding down (an in-flight milestone await) when resume() lands.

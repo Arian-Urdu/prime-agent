@@ -2362,6 +2362,24 @@ class FactoryExecutor:
                 remaining = run.admission_backoff_until - self._now_fn()
                 await self._sleep_fn(min(remaining, POLL_TIMEOUT_MS / 1000))
                 continue
+            if not run.pending_evaluations and self._resident_cap_starved(run):
+                # Residents never settle, so a max_parallel cap held entirely
+                # by resident instances never frees a slot: the queued work
+                # would wait forever, and the no-in-flight stall check below
+                # never fires because the residents keep children in flight.
+                # End the run instead of polling a dead end; stop() still
+                # tears the resident children down.
+                reason = (
+                    f"control loop stalled: resident instances hold every max_parallel {run.max_parallel} slot; "
+                    "queued instances can never be admitted"
+                )
+                self._event(run, "executor_error", error=reason)
+                run.state = "failed"
+                try:
+                    await self._milestone(run, "failed", reason)
+                except Exception:
+                    pass
+                return
             if (
                 not in_flight
                 and not started
@@ -2407,6 +2425,27 @@ class FactoryExecutor:
             for instance in entry.instances
             if instance.status == "running"
         )
+
+    def _resident_cap_starved(self, run: FactoryRun) -> bool:
+        """True when queued instances can never be admitted: every
+        ``max_parallel`` slot is held by a never-settling resident instance.
+
+        Residents stay running until ``stop()`` tears them down, so a cap
+        held entirely by resident instances never frees a slot and pending
+        instances behind that cap would wait forever. One task instance in
+        flight means a slot can still open on its settle, so that is not a
+        dead end.
+        """
+        running = [
+            state.lifecycle == "resident"
+            for state in run.states.values()
+            for entry in state.entries
+            for instance in entry.instances
+            if instance.status == "running"
+        ]
+        if len(running) < run.max_parallel or not self._has_pending_instance(run):
+            return False
+        return all(running)
 
     def _has_pending_instance(self, run: FactoryRun) -> bool:
         return any(

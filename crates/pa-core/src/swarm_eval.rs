@@ -35,6 +35,12 @@ pub mod transcript;
 /// The default crew sizes the eval sweeps.
 pub const DEFAULT_SIZES: &[usize] = &[2, 5, 10, 20, 40];
 
+/// The largest supported crew size. The secrets are 3-digit (100..1000),
+/// so at most 900 children can hold pairwise-unique secrets; past that the
+/// ANSWER verification the harness is built on degrades, and a sweep that
+/// large could not hold a real context window anyway.
+pub const MAX_CREW_SIZE: usize = 900;
+
 /// Pre-registered defense lines for the swarm starvation eval: a config is
 /// defensible only if all three lines hold.
 pub const MESSAGING_DEFENSE_LINE_LIMITS: MessagingDefenseLineLimits = MessagingDefenseLineLimits {
@@ -277,7 +283,9 @@ pub enum EvalArgsError {
 ///
 /// Returns [`EvalArgsError::Help`] for `--help`/`-h`, and
 /// [`EvalArgsError::Message`] for an unknown flag, a flag missing its value,
-/// a missing `--model`, or a `--sizes` list with no positive size.
+/// a missing `--model`, a `--sizes` list with no positive size, a size
+/// above [`MAX_CREW_SIZE`], or a sweep whose derived trial seed
+/// (`seed + 31 * size + trial`) cannot be represented in `i64`.
 pub fn parse_eval_args(argv: &[String]) -> Result<SwarmEvalConfig, EvalArgsError> {
     let mut config = default_eval_config();
     let mut index = 0;
@@ -345,6 +353,27 @@ pub fn parse_eval_args(argv: &[String]) -> Result<SwarmEvalConfig, EvalArgsError
         return Err(EvalArgsError::Message(
             "--sizes must contain at least one positive size".to_string(),
         ));
+    }
+    if let Some(&size) = config.sizes.iter().find(|&&size| size > MAX_CREW_SIZE) {
+        return Err(EvalArgsError::Message(format!(
+            "--sizes {size} exceeds the supported maximum crew size {MAX_CREW_SIZE}"
+        )));
+    }
+    // The driver derives each trial's seed as `seed + 31 * size + trial`
+    // (i64); reject a sweep whose largest trial cannot be represented
+    // before the first real-token request is ever sent. The i128 math is
+    // total, so an absurd trial count is caught by the same rule.
+    let max_trial = i64::try_from(config.trials).unwrap_or(i64::MAX);
+    for &size in &config.sizes {
+        let size_offset = i64::try_from(size).unwrap_or(i64::MAX);
+        let derived =
+            i128::from(config.seed) + i128::from(size_offset) * 31 + i128::from(max_trial);
+        if derived > i128::from(i64::MAX) {
+            return Err(EvalArgsError::Message(format!(
+                "--seed {} with size {size} and {} trials overflows the derived trial seed (seed + 31 * size + trial)",
+                config.seed, config.trials
+            )));
+        }
     }
     if config.out_dir.is_empty() {
         config.out_dir = default_out_dir();

@@ -247,6 +247,68 @@ fn drops_non_positive_sizes_and_requires_at_least_one() {
 }
 
 #[test]
+fn rejects_sizes_above_the_supported_maximum() {
+    // The 900-value 3-digit secret space bounds a crew whose ANSWER can
+    // be verified; a huge size would also abort the driver's secret
+    // allocation mid-run.
+    let at_cap = parse_eval_args(&args(&["--model", "m", "--sizes", "900"])).expect("parses");
+    assert_eq!(at_cap.sizes, vec![MAX_CREW_SIZE]);
+    assert_eq!(
+        parse_eval_args(&args(&["--model", "m", "--sizes", "901"])),
+        Err(EvalArgsError::Message(
+            "--sizes 901 exceeds the supported maximum crew size 900".to_string()
+        ))
+    );
+    assert_eq!(
+        parse_eval_args(&args(&["--model", "m", "--sizes", "18446744073709551615"])),
+        Err(EvalArgsError::Message(
+            "--sizes 18446744073709551615 exceeds the supported maximum crew size 900".to_string()
+        ))
+    );
+}
+
+#[test]
+fn rejects_a_sweep_that_overflows_the_derived_trial_seed() {
+    // The driver derives each trial's seed as `seed + 31 * size + trial`
+    // (i64); `--seed 9223372036854775807 --sizes 2` overflows it before
+    // the first real-token request, so the parser rejects it up front.
+    assert_eq!(
+        parse_eval_args(&args(&[
+            "--model",
+            "m",
+            "--seed",
+            "9223372036854775807",
+            "--sizes",
+            "2"
+        ]))
+        .unwrap_err(),
+        EvalArgsError::Message(
+            "--seed 9223372036854775807 with size 2 and 1 trials overflows the derived trial seed (seed + 31 * size + trial)"
+                .to_string()
+        )
+    );
+    // An absurd trial count is caught by the same derived-seed rule.
+    assert!(
+        matches!(
+            parse_eval_args(&args(&["--model", "m", "--trials", "18446744073709551615"])),
+            Err(EvalArgsError::Message(_))
+        ),
+        "an unrepresentable trial count must be rejected"
+    );
+    // Sane sweeps (including every default size and a negative seed) still
+    // parse.
+    assert!(parse_eval_args(&args(&[
+        "--model",
+        "m",
+        "--seed",
+        "-9223372036854775808",
+        "--sizes",
+        "2,5,10,20,40"
+    ]))
+    .is_ok());
+}
+
+#[test]
 fn default_out_dir_is_stamped_when_omitted() {
     let config = parse_eval_args(&args(&["--model", "m"])).expect("parses");
     assert!(
@@ -318,7 +380,14 @@ fn seeds_a_unique_secret_for_every_child() {
         let mut unique = secrets.clone();
         unique.sort_unstable();
         unique.dedup();
-        assert_eq!(unique.len(), secrets.len(), "seed {seed}: {secrets:?}");
+        // (The drawn values are not written into the assert message: they
+        // are deterministic for the named seed, and CodeQL's cleartext
+        // logger flags them by name.)
+        assert_eq!(
+            unique.len(),
+            secrets.len(),
+            "seed {seed} must draw pairwise-unique secrets"
+        );
     }
     // The default sweep's largest crew stays unique as well.
     let size = 40;

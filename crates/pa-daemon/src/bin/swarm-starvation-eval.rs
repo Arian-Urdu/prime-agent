@@ -125,11 +125,13 @@ impl Client {
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let (socket, argv) = extract_flag(&argv, "--socket");
-    let socket = socket.map_or_else(
-        pa_daemon::platform::default_daemon_socket_path,
-        PathBuf::from,
-    );
+    let (socket, argv) = match socket_from_args(&argv) {
+        Ok((socket, argv)) => (socket, argv),
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+    };
     let config = match pa_core::swarm_eval::parse_eval_args(&argv) {
         Ok(config) => config,
         Err(EvalArgsError::Help) => {
@@ -150,13 +152,32 @@ fn main() {
     }
 }
 
-/// Pull one `--flag <value>` pair out of argv, leaving the rest.
-fn extract_flag(argv: &[String], flag: &str) -> (Option<String>, Vec<String>) {
+/// The `--socket` flag overrides the daemon socket; it is extracted before
+/// the shared parser because it addresses the driver itself, not the eval.
+/// A trailing `--socket` without a value is an incomplete option, not an
+/// omitted one: silently connecting to the default socket would spend real
+/// tokens against the wrong daemon.
+fn socket_from_args(argv: &[String]) -> Result<(PathBuf, Vec<String>), String> {
+    let (socket, given, rest) = extract_flag(argv, "--socket");
+    match (socket, given) {
+        (Some(socket), _) => Ok((PathBuf::from(socket), rest)),
+        (None, false) => Ok((pa_daemon::platform::default_daemon_socket_path(), rest)),
+        (None, true) => Err("Missing value for --socket".to_string()),
+    }
+}
+
+/// Pull one `--flag <value>` pair out of argv, leaving the rest. Returns
+/// the value (absent when the flag is missing entirely or trails without
+/// one) and whether the flag was present at all, so an incomplete option
+/// can be told apart from an omitted one.
+fn extract_flag(argv: &[String], flag: &str) -> (Option<String>, bool, Vec<String>) {
     let mut value = None;
+    let mut given = false;
     let mut rest = Vec::new();
     let mut index = 0;
     while index < argv.len() {
         if argv[index] == flag {
+            given = true;
             value = argv.get(index + 1).cloned();
             index += 2;
         } else {
@@ -164,7 +185,7 @@ fn extract_flag(argv: &[String], flag: &str) -> (Option<String>, Vec<String>) {
             index += 1;
         }
     }
-    (value, rest)
+    (value, given, rest)
 }
 
 fn run(socket: &Path, config: &SwarmEvalConfig) -> Result<(), String> {
@@ -246,9 +267,25 @@ fn run_trial(
     let sessions_dir = trial_root.join("sessions");
     fs::create_dir_all(&sessions_dir).map_err(|error| format!("create trial dir: {error}"))?;
 
-    let seed = config.seed
-        + 31 * i64::try_from(size).unwrap_or(i64::MAX)
-        + i64::try_from(trial).unwrap_or(i64::MAX);
+    // The derived trial seed is `seed + 31 * size + trial` (i64). The
+    // argument parser rejects a sweep that cannot represent it, but a
+    // hand-built config still reaches here: the checked arithmetic fails
+    // this trial cleanly instead of panicking (or silently wrapping the
+    // seed in release builds).
+    let size_seed = i64::try_from(size)
+        .map_err(|_| format!("crew size {size} is too large to derive a trial seed"))?;
+    let trial_seed = i64::try_from(trial)
+        .map_err(|_| format!("trial {trial} is too large to derive a trial seed"))?;
+    let seed = 31_i64
+        .checked_mul(size_seed)
+        .and_then(|offset| config.seed.checked_add(offset))
+        .and_then(|seed| seed.checked_add(trial_seed))
+        .ok_or_else(|| {
+            format!(
+                "seed {} with size {size} and trial {trial} overflows the derived trial seed",
+                config.seed
+            )
+        })?;
     let secrets = seeded_secrets(seed, size);
     let prompt = build_orchestrator_prompt(config, size, &secrets);
 
@@ -435,7 +472,7 @@ mod tests {
     use pa_core::swarm_eval::{seeded_secrets, ArrivalPattern, MessageSize, SwarmEvalConfig};
     use serde_json::{json, Value};
 
-    use super::run;
+    use super::{run, run_trial, socket_from_args, Client};
 
     /// A scripted daemon socket: greets the client, then answers each
     /// command by its `type` from `script`, recording every command in
@@ -507,9 +544,11 @@ mod tests {
                 }) {
                     return commands;
                 }
+                // (The session id is not written into the assert message;
+                // CodeQL's cleartext logger flags it by name.)
                 assert!(
                     Instant::now() < deadline,
-                    "no kill for {session_id} arrived; commands so far: {commands:?}"
+                    "the kill never arrived; commands so far: {commands:?}"
                 );
                 thread::sleep(Duration::from_millis(10));
             }
@@ -615,5 +654,52 @@ mod tests {
         let report = std::fs::read_to_string(out_dir.path().join("report.md")).expect("report.md");
         assert!(report.contains("| 1 | 1 |"), "{report}");
         assert!(report.contains("inconclusive"), "{report}");
+    }
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn a_trailing_socket_flag_without_a_value_is_rejected() {
+        // A trailing `--socket` must not fall back to the default socket:
+        // the driver would spend real tokens against the wrong daemon.
+        assert_eq!(
+            socket_from_args(&args(&["--socket"])),
+            Err("Missing value for --socket".to_string())
+        );
+        // An omitted flag keeps the default, and the rest is untouched.
+        let (socket, rest) =
+            socket_from_args(&args(&["--model", "x/y"])).expect("an omitted flag is fine");
+        assert_eq!(socket, pa_daemon::platform::default_daemon_socket_path());
+        assert_eq!(rest, args(&["--model", "x/y"]));
+        // A value is honored and peeled off for the shared parser.
+        let (socket, rest) =
+            socket_from_args(&args(&["--socket", "/tmp/eval.sock", "--model", "x/y"]))
+                .expect("parses");
+        assert_eq!(socket, std::path::PathBuf::from("/tmp/eval.sock"));
+        assert_eq!(rest, args(&["--model", "x/y"]));
+    }
+
+    #[test]
+    fn an_overflowing_derived_seed_fails_the_trial_cleanly() {
+        // A hand-built config can bypass the argument parser's sweep
+        // validation; the trial must return a configuration error instead
+        // of panicking on `seed + 31 * size + trial`.
+        let daemon = fake_daemon(Vec::new());
+        let out_dir = tempfile::TempDir::new().expect("out dir");
+        let config = test_config(out_dir.path(), 2, 15.0);
+        let config = SwarmEvalConfig {
+            seed: i64::MAX,
+            ..config
+        };
+        let runs_root = out_dir.path().join("runs");
+        let mut client = Client::connect(&daemon.socket).expect("connect");
+        let error = run_trial(&mut client, &config, 2, 1, &runs_root)
+            .expect_err("the overflowing seed must fail the trial");
+        assert!(
+            error.contains("overflows the derived trial seed"),
+            "{error}"
+        );
     }
 }

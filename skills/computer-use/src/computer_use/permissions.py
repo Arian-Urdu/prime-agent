@@ -63,17 +63,17 @@ def _screen_probe() -> bool | None:
         return None
 
 
-def state_from_probe(result: bool | None) -> PermissionState:
+def _state_from_probe(result: bool | None) -> PermissionState:
     """Map one probe result to its permission state."""
     if result is None:
         return "unknown"
     return "ok" if result else "missing"
 
 
-def status(ax_probe: Probe = _ax_probe, screen_probe: Probe = _screen_probe) -> Status:
+def _status(ax_probe: Probe = _ax_probe, screen_probe: Probe = _screen_probe) -> Status:
     """Report both TCC grants plus the guidance lines, with injectable probes."""
     return Status(
-        accessibility=state_from_probe(ax_probe()),
-        screen_recording=state_from_probe(screen_probe()),
+        accessibility=_state_from_probe(ax_probe()),
+        screen_recording=_state_from_probe(screen_probe()),
         help=list(HELP_LINES),
     )

@@ -1,7 +1,7 @@
-"""Allowlist gate, deny-lists, risk labels, and the locked-screen check.
+"""Allowlist _gate, deny-lists, risk labels, and the locked-screen check.
 
 The user-edited settings file at ``~/.prime/agent/settings/computer-use.toml``
-is the hard gate of the computer-use safety model: every app binding and every
+is the hard _gate of the computer-use safety model: every app binding and every
 action re-checks it, and the skill never writes it. Decision cores take plain
 data and stay IO-free; the thin shells touch disk or Quartz.
 """
@@ -33,7 +33,7 @@ class Settings:
 
 @dataclass(frozen=True)
 class GateResult:
-    """One gate decision; ``reason`` is the actionable denial text, empty when allowed."""
+    """One _gate decision; ``reason`` is the actionable denial text, empty when allowed."""
 
     allowed: bool
     reason: str
@@ -50,7 +50,7 @@ def _bundle_list(value: object, base: tuple[str, ...] = ()) -> tuple[str, ...]:
     return tuple(kept)
 
 
-def parse_settings(raw: object) -> Settings:
+def _parse_settings(raw: object) -> Settings:
     """Normalize a decoded settings document, ignoring every invalid piece."""
     if not isinstance(raw, Mapping):
         return Settings()
@@ -71,7 +71,7 @@ def parse_settings(raw: object) -> Settings:
     )
 
 
-def load_settings(path: Path | str | None = None) -> Settings:
+def _load_settings(path: Path | str | None = None) -> Settings:
     """Load the settings file, falling back to the tolerant defaults on any read or parse error."""
     settings_path = Path(path) if path is not None else SETTINGS_PATH
     try:
@@ -79,10 +79,10 @@ def load_settings(path: Path | str | None = None) -> Settings:
             raw = tomllib.load(handle)
     except (OSError, tomllib.TOMLDecodeError):
         return Settings()
-    return parse_settings(raw)
+    return _parse_settings(raw)
 
 
-def gate(bundle_id: str, settings: Settings) -> GateResult:
+def _gate(bundle_id: str, settings: Settings) -> GateResult:
     """Decide one bundle id against settings; the deny-lists win over the allowlist."""
     risk = settings.risk.get(bundle_id, DEFAULT_RISK)
     if bundle_id in settings.system_deny:
@@ -109,9 +109,9 @@ def gate(bundle_id: str, settings: Settings) -> GateResult:
     return GateResult(False, reason, risk)
 
 
-def gate_app(bundle_id: str) -> GateResult:
+def _gate_app(bundle_id: str) -> GateResult:
     """Gate one app against the settings file on disk."""
-    return gate(bundle_id, load_settings())
+    return _gate(bundle_id, _load_settings())
 
 
 class AllowlistSummary(TypedDict):
@@ -123,9 +123,9 @@ class AllowlistSummary(TypedDict):
     risk: dict[str, str]
 
 
-def allowlist_summary() -> AllowlistSummary:
+def _allowlist_summary() -> AllowlistSummary:
     """Read a JSON-shaped view of the current settings for get_state()."""
-    settings = load_settings()
+    settings = _load_settings()
     return AllowlistSummary(
         allowed=list(settings.allowed),
         blocked=list(settings.blocked),
@@ -134,7 +134,7 @@ def allowlist_summary() -> AllowlistSummary:
     )
 
 
-def locked_from_session(session: object) -> bool:
+def _locked_from_session(session: object) -> bool:
     """Decide lock state from one session dictionary; absent or unreadable reads as unlocked.
 
     ``session`` is what ``CGSessionCopyCurrentDictionary`` returns: a mapping
@@ -146,10 +146,10 @@ def locked_from_session(session: object) -> bool:
     return bool(session.get("CGSSessionScreenIsLocked"))
 
 
-def screen_locked() -> bool:
+def _screen_locked() -> bool:
     """Report whether the session screen is locked, failing open when unavailable.
 
-    The check is advisory UX on top of the allowlist hard gate, so a session
+    The check is advisory UX on top of the allowlist hard _gate, so a session
     that cannot be read (non-mac host, missing Quartz, API error) reads as
     unlocked and never blocks allowed work on its own.
     """
@@ -157,7 +157,7 @@ def screen_locked() -> bool:
         from computer_use import _compat
 
         # pyobjc binds CGSessionCopyCurrentDictionary with no arguments.
-        session = _compat.require_mac().quartz.CGSessionCopyCurrentDictionary()
+        session = _compat._require_mac().quartz.CGSessionCopyCurrentDictionary()
     except Exception:
         return False
-    return locked_from_session(session)
+    return _locked_from_session(session)

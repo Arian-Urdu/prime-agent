@@ -1,4 +1,4 @@
-"""Tests for the computer-use API surface and its backend seams.
+"""Tests for the computer-use API surface and its _backend seams.
 
 Covers telemetry caps, the permissions snapshot with injected probes, the
 capture surface with a stubbed screencapture, and the inject surface's
@@ -29,7 +29,7 @@ from computer_use import errors
 class TelemetryEmitTests(unittest.IsolatedAsyncioTestCase):
     async def test_emit_passes_name_and_properties(self) -> None:
         with fakes.telemetry_recorder() as recorder:
-            await telemetry.emit("computer_use_action", action="click", outcome="ok", duration_ms=12)
+            await telemetry._emit("computer_use_action", action="click", outcome="ok", duration_ms=12)
         self.assertEqual(
             recorder.events,
             [{"name": "computer_use_action", "properties": {"action": "click", "outcome": "ok", "duration_ms": 12}}],
@@ -37,31 +37,31 @@ class TelemetryEmitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_emit_drops_long_name(self) -> None:
         with fakes.telemetry_recorder() as recorder:
-            await telemetry.emit("x" * 65, platform="mac")
+            await telemetry._emit("x" * 65, platform="mac")
         self.assertEqual(recorder.events, [])
 
     async def test_emit_drops_empty_and_non_string_name(self) -> None:
         with fakes.telemetry_recorder() as recorder:
-            await telemetry.emit("", platform="mac")
-            await telemetry.emit(42, platform="mac")
+            await telemetry._emit("", platform="mac")
+            await telemetry._emit(42, platform="mac")
         self.assertEqual(recorder.events, [])
 
     async def test_emit_keeps_first_twelve_properties(self) -> None:
         properties = {f"prop_{index}": index for index in range(14)}
         with fakes.telemetry_recorder() as recorder:
-            await telemetry.emit("computer_use_session_started", **properties)
+            await telemetry._emit("computer_use_session_started", **properties)
         kept = recorder.events[0]["properties"]
         self.assertEqual(len(kept), 12)
         self.assertEqual(sorted(kept), sorted(f"prop_{index}" for index in range(12)))
 
     async def test_emit_truncates_long_string_values(self) -> None:
         with fakes.telemetry_recorder() as recorder:
-            await telemetry.emit("computer_use_session_started", platform="p" * 70)
+            await telemetry._emit("computer_use_session_started", platform="p" * 70)
         self.assertEqual(recorder.events[0]["properties"]["platform"], "p" * 64)
 
     async def test_emit_drops_non_primitive_values_and_keeps_primitives(self) -> None:
         with fakes.telemetry_recorder() as recorder:
-            await telemetry.emit(
+            await telemetry._emit(
                 "computer_use_action",
                 action="click",
                 junk_list=[1, 2],
@@ -79,7 +79,7 @@ class TelemetryEmitTests(unittest.IsolatedAsyncioTestCase):
     async def test_emit_swallows_bridge_errors(self) -> None:
         with fakes.telemetry_recorder() as recorder:
             recorder.error = RuntimeError("bridge down")
-            await telemetry.emit("computer_use_session_started", platform="mac")
+            await telemetry._emit("computer_use_session_started", platform="mac")
 
     async def test_emit_bounds_a_stalled_bridge(self) -> None:
         async def stalled_host(request_type: str, payload: dict | None = None) -> dict:
@@ -90,7 +90,7 @@ class TelemetryEmitTests(unittest.IsolatedAsyncioTestCase):
         telemetry.host_request = stalled_host
         try:
             start = time.monotonic()
-            await telemetry.emit("computer_use_session_started", platform="mac")
+            await telemetry._emit("computer_use_session_started", platform="mac")
             self.assertLess(time.monotonic() - start, 1.0)
         finally:
             telemetry.host_request = saved
@@ -99,28 +99,28 @@ class TelemetryEmitTests(unittest.IsolatedAsyncioTestCase):
         saved = telemetry.host_request
         telemetry.host_request = None
         try:
-            await telemetry.emit("computer_use_session_started", platform="mac")
+            await telemetry._emit("computer_use_session_started", platform="mac")
         finally:
             telemetry.host_request = saved
 
 
 class PermissionsTests(unittest.TestCase):
     def test_status_maps_probe_results(self) -> None:
-        status = permissions.status(ax_probe=fakes.probe(True), screen_probe=fakes.probe(None))
+        status = permissions._status(ax_probe=fakes.probe(True), screen_probe=fakes.probe(None))
         self.assertEqual(
             status,
             {"accessibility": "ok", "screen_recording": "unknown", "help": list(permissions.HELP_LINES)},
         )
 
     def test_status_missing_grants(self) -> None:
-        status = permissions.status(ax_probe=fakes.probe(False), screen_probe=fakes.probe(False))
+        status = permissions._status(ax_probe=fakes.probe(False), screen_probe=fakes.probe(False))
         self.assertEqual(status["accessibility"], "missing")
         self.assertEqual(status["screen_recording"], "missing")
 
     def test_state_from_probe_mapping(self) -> None:
-        self.assertEqual(permissions.state_from_probe(True), "ok")
-        self.assertEqual(permissions.state_from_probe(False), "missing")
-        self.assertEqual(permissions.state_from_probe(None), "unknown")
+        self.assertEqual(permissions._state_from_probe(True), "ok")
+        self.assertEqual(permissions._state_from_probe(False), "missing")
+        self.assertEqual(permissions._state_from_probe(None), "unknown")
 
     def test_help_names_settings_paths_and_brand(self) -> None:
         joined = "\n".join(permissions.HELP_LINES)
@@ -169,7 +169,7 @@ class CaptureTests(unittest.TestCase):
 
     def test_screenshot_window_runs_screencapture_and_returns_region(self) -> None:
         recorder = self.capture_run()
-        result = capture.screenshot_window((10, 20), (400, 300))
+        result = capture._screenshot_window((10, 20), (400, 300))
         argv = recorder.call_args[0][0]
         self.assertEqual(argv[:5], [str(self.tool), "-x", "-o", "-R", "10,20,400,300"])
         path = Path(argv[5])
@@ -185,19 +185,19 @@ class CaptureTests(unittest.TestCase):
             ((10, 20), (400, 300, 1)),
         ):
             with self.subTest(origin=origin, size=size), self.assertRaises(errors.ComputerUseError) as caught:
-                capture.screenshot_window(origin, size)
+                capture._screenshot_window(origin, size)
             self.assertEqual(caught.exception.code, "INVALID_ARGUMENT")
 
     def test_screenshot_window_missing_window_maps_to_app_not_running(self) -> None:
         self.capture_run(returncode=1, stderr=b"screencapture: window not found")
         with self.assertRaises(errors.ComputerUseError) as caught:
-            capture.screenshot_window((10, 20), (400, 300))
+            capture._screenshot_window((10, 20), (400, 300))
         self.assertEqual(caught.exception.code, "APP_NOT_RUNNING")
 
     def test_screenshot_window_other_failure_maps_to_transport_error(self) -> None:
         self.capture_run(returncode=1, stderr=b"screencapture: bad flags")
         with self.assertRaises(errors.ComputerUseError) as caught:
-            capture.screenshot_window((10, 20), (400, 300))
+            capture._screenshot_window((10, 20), (400, 300))
         self.assertEqual(caught.exception.code, "TRANSPORT_ERROR")
 
     def test_screenshot_window_timeout_maps_to_transport_error(self) -> None:
@@ -207,7 +207,7 @@ class CaptureTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         with self.assertRaises(errors.ComputerUseError) as caught:
-            capture.screenshot_window((10, 20), (400, 300))
+            capture._screenshot_window((10, 20), (400, 300))
         self.assertEqual(caught.exception.code, "TRANSPORT_ERROR")
 
 
@@ -218,32 +218,32 @@ class InjectValidationTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "INVALID_ARGUMENT")
 
     def test_click_rejects_bad_button_count_and_point(self) -> None:
-        self.assert_invalid(inject.click, 123, (10, 20), "side")
-        self.assert_invalid(inject.click, 123, (10, 20), "left", 0)
-        self.assert_invalid(inject.click, 123, (10, 20), "left", True)
-        self.assert_invalid(inject.click, 123, (10, "20"))
-        self.assert_invalid(inject.click, 123, [10, 20])
+        self.assert_invalid(inject._click, 123, (10, 20), "side")
+        self.assert_invalid(inject._click, 123, (10, 20), "left", 0)
+        self.assert_invalid(inject._click, 123, (10, 20), "left", True)
+        self.assert_invalid(inject._click, 123, (10, "20"))
+        self.assert_invalid(inject._click, 123, [10, 20])
 
     def test_drag_rejects_bad_points(self) -> None:
-        self.assert_invalid(inject.drag, 123, (10, 20), (30,))
-        self.assert_invalid(inject.drag, 123, "10,20", (30, 40))
+        self.assert_invalid(inject._drag, 123, (10, 20), (30,))
+        self.assert_invalid(inject._drag, 123, "10,20", (30, 40))
 
     def test_scroll_rejects_bad_direction_pages_and_point(self) -> None:
-        self.assert_invalid(inject.scroll, 123, "diagonal")
-        self.assert_invalid(inject.scroll, 123, "up", 0)
-        self.assert_invalid(inject.scroll, 123, "up", 1.5)
-        self.assert_invalid(inject.scroll, 123, "up", 1, "10,20")
+        self.assert_invalid(inject._scroll, 123, "diagonal")
+        self.assert_invalid(inject._scroll, 123, "up", 0)
+        self.assert_invalid(inject._scroll, 123, "up", 1.5)
+        self.assert_invalid(inject._scroll, 123, "up", 1, "10,20")
 
     def test_press_key_propagates_invalid_chord(self) -> None:
-        self.assert_invalid(inject.press_key, 123, "cmd++c")
-        self.assert_invalid(inject.press_key, 123, "notakey")
+        self.assert_invalid(inject._press_key, 123, "cmd++c")
+        self.assert_invalid(inject._press_key, 123, "notakey")
 
     def test_type_text_rejects_non_string(self) -> None:
-        self.assert_invalid(inject.type_text, 123, 42)
+        self.assert_invalid(inject._type_text, 123, 42)
 
     def test_type_text_empty_is_a_noop(self) -> None:
-        with mock.patch.object(inject, "require_mac", side_effect=AssertionError("must not post events")):
-            self.assertIsNone(inject.type_text(123, ""))
+        with mock.patch.object(inject, "_require_mac", side_effect=AssertionError("must not post events")):
+            self.assertIsNone(inject._type_text(123, ""))
 
 
 class ScrollPointTests(unittest.TestCase):
@@ -256,37 +256,38 @@ class ScrollPointTests(unittest.TestCase):
             CGEventPostToPid=lambda pid, event: None,
         )
         fake_mac = types.SimpleNamespace(quartz=quartz)
-        with mock.patch.object(inject, "require_mac", return_value=fake_mac):
-            inject.scroll(123, "down", 2, point=(140, 160))
-            inject.scroll(123, "down", 2)
+        with mock.patch.object(inject, "_require_mac", return_value=fake_mac):
+            inject._scroll(123, "down", 2, point=(140, 160))
+            inject._scroll(123, "down", 2)
         self.assertEqual(len(locations), 1)
         self.assertEqual(locations[0][1], (140, 160))
 
 
 class InjectionFailureTests(unittest.TestCase):
     def test_click_wraps_cg_error_as_injection_failed(self) -> None:
-        with mock.patch.object(inject, "require_mac", side_effect=RuntimeError("boom")):
+        with mock.patch.object(inject, "_require_mac", side_effect=RuntimeError("boom")):
             with self.assertRaises(errors.ComputerUseError) as caught:
-                inject.click(123, (10, 20))
+                inject._click(123, (10, 20))
         self.assertEqual(caught.exception.code, "INJECTION_FAILED")
         self.assertIn("click failed", caught.exception.message)
         self.assertIn("boom", caught.exception.message)
         self.assertEqual(caught.exception.details, {"pid": 123})
 
     def test_click_caps_wrapped_error_at_200_chars(self) -> None:
-        with mock.patch.object(inject, "require_mac", side_effect=RuntimeError("e" * 500)):
+        with mock.patch.object(inject, "_require_mac", side_effect=RuntimeError("e" * 500)):
             with self.assertRaises(errors.ComputerUseError) as caught:
-                inject.click(123, (10, 20))
-        self.assertLessEqual(len(caught.exception.message), len("click failed: ") + 200)
+                inject._click(123, (10, 20))
+        underlying = caught.exception.message.split("failed: ", 1)[-1]
+        self.assertLessEqual(len(underlying), 200)
 
     def test_drag_and_scroll_wrap_cg_errors(self) -> None:
         for name in ("drag", "scroll"):
-            with self.subTest(action=name), mock.patch.object(inject, "require_mac", side_effect=RuntimeError("boom")):
+            with self.subTest(action=name), mock.patch.object(inject, "_require_mac", side_effect=RuntimeError("boom")):
                 with self.assertRaises(errors.ComputerUseError) as caught:
                     if name == "drag":
-                        inject.drag(123, (10, 20), (30, 40))
+                        inject._drag(123, (10, 20), (30, 40))
                     else:
-                        inject.scroll(123, "down", 2)
+                        inject._scroll(123, "down", 2)
                 self.assertEqual(caught.exception.code, "INJECTION_FAILED")
 
 
@@ -467,11 +468,11 @@ class GetAppTests(AppTestCase):
         from computer_use import errors
 
         self.make_env()
-        computer_use.backend = lambda: None
+        computer_use._backend = lambda: None
         with self.assertRaises(errors.ComputerUseError) as caught:
             await computer_use.get_app("Example")
         self.assertEqual(caught.exception.code, "TRANSPORT_ERROR")
-        self.assertIn("computer use backend unavailable", caught.exception.message)
+        self.assertIn("computer use _backend unavailable", caught.exception.message)
 
 
 class AppDispatchTests(AppTestCase):

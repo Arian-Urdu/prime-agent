@@ -39,7 +39,7 @@ _NAMED_KEYS = {
 for _index in range(1, 13):
     _NAMED_KEYS[f"f{_index}"] = f"F{_index}"
 
-# Standard macOS VirtualKeycodes, keyed by canonical parse_chord key names.
+# Standard macOS VirtualKeycodes, keyed by canonical _parse_chord key names.
 KEYCODES: dict[str, int] = {
     "Return": 36,
     "Enter": 36,
@@ -134,7 +134,7 @@ class ParsedChord:
     key: str
 
 
-def parse_chord(key: str) -> ParsedChord:
+def _parse_chord(key: str) -> ParsedChord:
     """Parse a key chord such as "cmd+shift+f" or "Return" into its parts.
 
     Tokens are joined with "+" and no whitespace is stripped, so a lone " " means

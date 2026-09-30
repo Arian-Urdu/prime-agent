@@ -1,4 +1,4 @@
-"""App discovery, binding, and launch for macOS apps."""
+"""App discovery, binding, and _launch for macOS apps."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from ._compat import backend, require_mac
+from ._compat import _backend, _require_mac
 from .errors import ComputerUseError
 
 _OPEN_TIMEOUT_SECONDS = 10.0
@@ -28,22 +28,22 @@ class RunningApp(NamedTuple):
     path: str | None
 
 
-def list_apps() -> list[dict[str, Any]]:
+def _list_apps() -> list[dict[str, Any]]:
     """List the running regular apps as {"id", "name", "running"} dicts."""
     return [
         {"id": app.bundle_id, "name": app.name, "running": True}
-        for app in running_apps()
+        for app in _running_apps()
     ]
 
 
-def running_apps() -> list[RunningApp]:
+def _running_apps() -> list[RunningApp]:
     """Read the running regular apps through NSWorkspace."""
-    if backend() != "mac":
+    if _backend() != "mac":
         raise ComputerUseError(
             "TRANSPORT_ERROR",
-            "computer use backend unavailable: listing apps needs the macOS workspace",
+            "computer use _backend unavailable: listing apps needs the macOS workspace",
         )
-    cocoa = require_mac().cocoa
+    cocoa = _require_mac().cocoa
     apps: list[RunningApp] = []
     for application in cocoa.NSWorkspace.sharedWorkspace().runningApplications():
         if application.activationPolicy() != cocoa.NSApplicationActivationPolicyRegular:
@@ -62,19 +62,19 @@ def running_apps() -> list[RunningApp]:
     return apps
 
 
-def running_bundle_id(pid: int) -> str | None:
+def _running_bundle_id(pid: int) -> str | None:
     """Report the bundle id currently owning one pid, or None when it is not a running app.
 
     Guards against pid reuse: a bound app's pid may now belong to a different
     process or nothing at all.
     """
-    for app in running_apps():
+    for app in _running_apps():
         if app.pid == pid:
             return app.bundle_id
     return None
 
 
-def bundle_for_name(name: str) -> str | None:
+def _bundle_for_name(name: str) -> str | None:
     """Resolve an installed app's bundle id by display name through Spotlight.
 
     Queries mdfind without launching anything, caps the results, and reads the
@@ -102,7 +102,7 @@ def bundle_for_name(name: str) -> str | None:
     return None
 
 
-def resolve(spec: str | dict[str, str]) -> list[RunningApp]:
+def _resolve(spec: str | dict[str, str]) -> list[RunningApp]:
     """Match one app spec against the running apps.
 
     A string matches a bundle id exactly or an app name case-insensitively; a
@@ -116,18 +116,18 @@ def resolve(spec: str | dict[str, str]) -> list[RunningApp]:
         wanted = spec.casefold()
         return [
             app
-            for app in running_apps()
+            for app in _running_apps()
             if app.bundle_id == spec or app.name.casefold() == wanted
         ]
     kind, value = _spec_value(spec)
     if kind == "bundle_id":
-        return [app for app in running_apps() if app.bundle_id == value]
+        return [app for app in _running_apps() if app.bundle_id == value]
     if kind == "name":
-        return [app for app in running_apps() if app.name.casefold() == value.casefold()]
-    return [app for app in running_apps() if _same_path(app.path, value)]
+        return [app for app in _running_apps() if app.name.casefold() == value.casefold()]
+    return [app for app in _running_apps() if _same_path(app.path, value)]
 
 
-def launch(spec: str | dict[str, str]) -> RunningApp:
+def _launch(spec: str | dict[str, str]) -> RunningApp:
     """Open the app the spec names and wait for it to start running.
 
     A string spec containing a dot launches by bundle id with open -b, any
@@ -177,7 +177,7 @@ def _await_running(spec: str | dict[str, str]) -> RunningApp:
     key, value = _launch_target(spec)
     deadline = time.monotonic() + _APPEAR_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        for app in running_apps():
+        for app in _running_apps():
             if _launch_match(key, value, app):
                 return app
         time.sleep(_APPEAR_POLL_SECONDS)
@@ -189,7 +189,7 @@ def _await_running(spec: str | dict[str, str]) -> RunningApp:
 
 
 def _launch_target(spec: str | dict[str, str]) -> tuple[str, str]:
-    """Normalize one spec into its launch-match kind and value."""
+    """Normalize one spec into its _launch-match kind and value."""
     if isinstance(spec, str):
         return ("bundle_id", spec) if "." in spec else ("name", spec)
     return _spec_value(spec)

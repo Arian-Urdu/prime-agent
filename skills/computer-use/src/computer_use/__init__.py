@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from . import apps, ax, diff, errors
-from ._compat import backend, require_mac
+from ._compat import _backend, _require_mac
 from .errors import ComputerUseError
 
 __all__ = ["App", "ComputerUseError", "get_app", "get_state", "list_apps", "permissions_status"]
@@ -47,12 +47,12 @@ async def get_state(emit: bool = True) -> dict[str, Any]:
     except ComputerUseError as error:
         if error.code != "TRANSPORT_ERROR":
             raise
-    status = permissions.status()
+    status = permissions._status()
     state: dict[str, Any] = {
         "apps": apps_list,
         "permissions": status,
-        "allowlist": policy.allowlist_summary(),
-        "platform": backend(),
+        "allowlist": policy._allowlist_summary(),
+        "platform": _backend(),
     }
     if emit:
         _print_missing_grants(status)
@@ -60,14 +60,14 @@ async def get_state(emit: bool = True) -> dict[str, Any]:
             _session_started = True
             from . import telemetry
 
-            await telemetry.emit(telemetry.SESSION_STARTED, platform=backend() or "unknown")
+            await telemetry._emit(telemetry.SESSION_STARTED, platform=_backend() or "unknown")
         await _emit_action("get_state", "ok", started)
     return state
 
 
 async def list_apps() -> list[dict[str, Any]]:
     """List the running apps as {"id", "name", "running"} dicts."""
-    return apps.list_apps()
+    return apps._list_apps()
 
 
 async def get_app(app: str | dict[str, str]) -> App:
@@ -75,27 +75,27 @@ async def get_app(app: str | dict[str, str]) -> App:
 
     Runs the allowlist gate, checks the locked screen and the macOS grants,
     launches the app when it is not running, and loads the first accessibility
-    state. Raises ComputerUseError TRANSPORT_ERROR without a backend,
+    state. Raises ComputerUseError TRANSPORT_ERROR without a _backend,
     SCREEN_LOCKED, APP_NOT_ALLOWED, AMBIGUOUS_APP, APP_LAUNCH_FAILED,
     APP_NOT_RUNNING, PERMISSIONS_NOT_GRANTED, or INVALID_ARGUMENT.
     """
     from . import permissions, policy
 
-    if backend() is None:
+    if _backend() is None:
         raise ComputerUseError(
             "TRANSPORT_ERROR",
-            "computer use backend unavailable: no macOS frameworks and no Linux X11 tools on this host",
+            "computer use _backend unavailable: no macOS frameworks and no Linux X11 tools on this host",
         )
-    if policy.screen_locked():
+    if policy._screen_locked():
         raise ComputerUseError(
             "SCREEN_LOCKED",
             "the screen is locked; ask the user to unlock it before driving apps",
         )
-    candidates = apps.resolve(app)
+    candidates = apps._resolve(app)
     allowed: list[apps.RunningApp] = []
     gate_errors: list[ComputerUseError] = []
     for candidate in candidates:
-        result = policy.gate_app(candidate.bundle_id)
+        result = policy._gate_app(candidate.bundle_id)
         if result.allowed:
             allowed.append(candidate)
         else:
@@ -117,7 +117,7 @@ async def get_app(app: str | dict[str, str]) -> App:
         raise gate_errors[0]
     else:
         bound = _launch_and_gate(app)
-    status = permissions.status()
+    status = permissions._status()
     if status.get("accessibility") != "ok":
         raise ComputerUseError(
             "PERMISSIONS_NOT_GRANTED",
@@ -137,7 +137,7 @@ async def permissions_status() -> dict[str, Any]:
     """Report the macOS accessibility and screen-recording grants with help text."""
     from . import permissions
 
-    return permissions.status()
+    return permissions._status()
 
 
 def _launch_and_gate(spec: str | dict[str, str]) -> apps.RunningApp:
@@ -158,10 +158,10 @@ def _launch_and_gate(spec: str | dict[str, str]) -> apps.RunningApp:
             f"{policy.SETTINGS_PATH} and call get_app with {{'bundle_id': ...}}",
             {"spec": str(spec)[:64]},
         )
-    result = policy.gate_app(bundle_id)
+    result = policy._gate_app(bundle_id)
     if not result.allowed:
         raise ComputerUseError("APP_NOT_ALLOWED", result.reason, {"bundle_id": bundle_id})
-    launched = apps.launch(spec)
+    launched = apps._launch(spec)
     if launched.bundle_id != bundle_id:
         raise ComputerUseError(
             "APP_NOT_ALLOWED",
@@ -183,21 +183,21 @@ def _prelaunch_bundle_id(spec: str | dict[str, str]) -> str | None:
             return None
         if "." in spec:
             return spec
-        return apps.bundle_for_name(spec)
+        return apps._bundle_for_name(spec)
     kind = next((key for key in ("bundle_id", "name", "path") if key in spec), None)
     if kind == "bundle_id" and isinstance(spec["bundle_id"], str) and spec["bundle_id"].strip():
         return spec["bundle_id"]
     if kind == "path" and isinstance(spec["path"], str) and spec["path"].strip():
         return _bundle_id_for_path(spec["path"])
     if kind == "name" and isinstance(spec["name"], str) and spec["name"].strip():
-        return apps.bundle_for_name(spec["name"])
+        return apps._bundle_for_name(spec["name"])
     return None
 
 
 def _bundle_id_for_path(path: str) -> str | None:
     """Read an app bundle's identifier from its bundle, best-effort."""
     try:
-        cocoa = require_mac().cocoa
+        cocoa = _require_mac().cocoa
         bundle = cocoa.NSBundle.bundleWithPath_(str(Path(path).expanduser()))
         if bundle is None:
             return None
@@ -232,7 +232,7 @@ async def _emit_action(action: str, outcome: str, started: float, error_code: st
     }
     if error_code is not None:
         properties["error_code"] = error_code
-    await telemetry.emit(telemetry.ACTION, **properties)
+    await telemetry._emit(telemetry.ACTION, **properties)
 
 
 def _save_clipboard() -> dict[str, Any] | None:
@@ -242,7 +242,7 @@ def _save_clipboard() -> dict[str, Any] | None:
     images, file lists, and other formats survive the paste round-trip.
     """
     try:
-        cocoa = require_mac().cocoa
+        cocoa = _require_mac().cocoa
         pasteboard = cocoa.NSPasteboard.generalPasteboard()
         saved: dict[str, Any] = {}
         for type_name in pasteboard.types() or ():
@@ -256,7 +256,7 @@ def _save_clipboard() -> dict[str, Any] | None:
 
 def _write_clipboard(text: str, format: str) -> None:
     """Write one paste payload onto the system clipboard."""
-    cocoa = require_mac().cocoa
+    cocoa = _require_mac().cocoa
     pasteboard = cocoa.NSPasteboard.generalPasteboard()
     pasteboard.clearContents()
     if format == "html":
@@ -269,7 +269,7 @@ def _write_clipboard(text: str, format: str) -> None:
 def _restore_clipboard(saved: dict[str, Any] | None) -> None:
     """Restore every saved pasteboard type, best-effort."""
     try:
-        cocoa = require_mac().cocoa
+        cocoa = _require_mac().cocoa
         pasteboard = cocoa.NSPasteboard.generalPasteboard()
         pasteboard.clearContents()
         for type_name, data in (saved or {}).items():
@@ -346,7 +346,7 @@ class App:
         self._guard()
         from . import capture, permissions
 
-        status = permissions.status()
+        status = permissions._status()
         if status.get("screen_recording") != "ok":
             raise ComputerUseError(
                 "PERMISSIONS_NOT_GRANTED",
@@ -359,13 +359,13 @@ class App:
                 "TRANSPORT_ERROR",
                 "no focused window observed; call get_ax_state() first",
             )
-        result = capture.screenshot_window(
+        result = capture._screenshot_window(
             (int(round(rect[0])), int(round(rect[1]))),
             (int(round(rect[2])), int(round(rect[3]))),
             window_id=self._observation.window_id,
         )
         if attach:
-            await capture.attach_image_if_available(str(result["path"]))
+            await capture._attach_image_if_available(str(result["path"]))
         return result
 
     async def get_state_and_screenshot(self, diff: bool = True, attach: bool = True) -> dict[str, Any]:
@@ -405,11 +405,11 @@ class App:
                 element, ref = self._element(target)
                 actions = element.get("actions") or []
                 if button == "left" and count == 1 and "AXPress" in actions:
-                    ax.perform_action(ref, "AXPress")
+                    ax._perform_action(ref, "AXPress")
                     return
-                inject.click(self._pid, self._element_center(target), button=button, count=count)
+                inject._click(self._pid, self._element_center(target), button=button, count=count)
             elif isinstance(target, tuple):
-                inject.click(self._pid, self._window_point(target), button=button, count=count)
+                inject._click(self._pid, self._window_point(target), button=button, count=count)
             else:
                 raise ComputerUseError(
                     "INVALID_ARGUMENT",
@@ -424,7 +424,7 @@ class App:
         from . import inject
 
         def dispatch() -> None:
-            inject.drag(self._pid, self._window_point(from_), self._window_point(to))
+            inject._drag(self._pid, self._window_point(from_), self._window_point(to))
 
         await self._action("drag", dispatch)
 
@@ -459,7 +459,7 @@ class App:
                     f"target must be an element index or an (x, y) tuple, got {type(target).__name__}",
                     {"target": type(target).__name__},
                 )
-            inject.scroll(self._pid, direction, pages=pages, point=point)
+            inject._scroll(self._pid, direction, pages=pages, point=point)
 
         await self._action("scroll", dispatch)
 
@@ -473,7 +473,7 @@ class App:
         from . import inject
 
         def dispatch() -> None:
-            inject.press_key(self._pid, key)
+            inject._press_key(self._pid, key)
 
         await self._action("press_key", dispatch)
 
@@ -487,7 +487,7 @@ class App:
         from . import inject
 
         def dispatch() -> None:
-            inject.type_text(self._pid, text)
+            inject._type_text(self._pid, text)
 
         await self._action("type_text", dispatch)
 
@@ -498,13 +498,13 @@ class App:
         is still refused. When the live focus cannot be read, the last
         snapshot's focused index decides.
         """
-        focused_secure = ax.focused_is_secure(self._pid)
+        focused_secure = ax._focused_is_secure(self._pid)
         if focused_secure is None:
             observation = self._observation
             if observation is None or observation.focused_index is None:
                 return
-            element = ax.flatten(observation.tree)[observation.focused_index]
-            focused_secure = ax.is_secure_field(element)
+            element = ax._flatten(observation.tree)[observation.focused_index]
+            focused_secure = ax._is_secure_field(element)
         if focused_secure:
             raise ComputerUseError(
                 "ACTION_UNSUPPORTED",
@@ -528,19 +528,19 @@ class App:
 
         def dispatch() -> None:
             element, ref = self._element(element_index)
-            if ax.is_secure_field(element):
+            if ax._is_secure_field(element):
                 raise ComputerUseError(
                     "ACTION_UNSUPPORTED",
                     f"element {element_index}: {_SECURE_HANDOFF}",
                     {"element_index": element_index, "secure": True},
                 )
-            if not ax.is_settable(ref, "AXValue"):
+            if not ax._is_settable(ref, "AXValue"):
                 raise ComputerUseError(
                     "ACTION_UNSUPPORTED",
                     f"element {element_index} does not accept value writes; it is not editable text",
                     {"element_index": element_index},
                 )
-            ax.set_value(ref, value)
+            ax._set_value(ref, value)
 
         await self._action("set_value", dispatch)
 
@@ -569,13 +569,13 @@ class App:
 
         def dispatch() -> None:
             element, ref = self._element(element_index)
-            if ax.is_secure_field(element):
+            if ax._is_secure_field(element):
                 raise ComputerUseError(
                     "ACTION_UNSUPPORTED",
                     f"element {element_index}: {_SECURE_HANDOFF}",
                     {"element_index": element_index, "secure": True},
                 )
-            value = ax.current_value(ref)
+            value = ax._current_value(ref)
             if not isinstance(value, str):
                 raise ComputerUseError(
                     "ACTION_UNSUPPORTED",
@@ -603,7 +603,7 @@ class App:
                     f"{text!r} occurs {len(starts)} times; disambiguate it with prefix and suffix",
                     {"element_index": element_index, "occurrences": len(starts)},
                 )
-            ax.select_text_range(ref, starts[0], len(text))
+            ax._select_text_range(ref, starts[0], len(text))
 
         await self._action("select_text", dispatch)
 
@@ -623,7 +623,7 @@ class App:
                     f"element {element_index} exposes {exposed}, not {action}",
                     {"element_index": element_index, "action": str(action)[:32]},
                 )
-            ax.perform_action(ref, action)
+            ax._perform_action(ref, action)
 
         await self._action("secondary", dispatch)
 
@@ -653,7 +653,7 @@ class App:
             saved = _save_clipboard()
             try:
                 _write_clipboard(text, format)
-                inject.press_key(self._pid, "cmd+v")
+                inject._press_key(self._pid, "cmd+v")
                 time.sleep(_PASTE_SETTLE_SECONDS)
             finally:
                 _restore_clipboard(saved)
@@ -662,11 +662,11 @@ class App:
 
     async def _refresh(self, diff_on: bool = True) -> str:
         """Observe the app and store the new snapshot, returning its text."""
-        observation = ax.observe(self._pid)
-        lines = diff.serialize(observation.tree)
+        observation = ax._observe(self._pid)
+        lines = diff._serialize(observation.tree)
         full = self._render_full(observation, lines)
         if diff_on and self._lines is not None:
-            text = diff.diff(self._lines, lines) or "(no changes since the previous observation)"
+            text = diff._diff(self._lines, lines) or "(no changes since the previous observation)"
         else:
             text = full
         self._observation = observation
@@ -688,7 +688,7 @@ class App:
         instructions = ""
         if count and self._bundle_id not in _instruction_shown:
             _instruction_shown.add(self._bundle_id)
-            loaded = ax.load_instructions(self._bundle_id)
+            loaded = ax._load_instructions(self._bundle_id)
             if loaded:
                 instructions = "\n" + loaded
         return "\n".join(part for part in (header, body) if part) + instructions
@@ -713,7 +713,7 @@ class App:
         """
         from . import policy
 
-        running_bundle = apps.running_bundle_id(self._pid)
+        running_bundle = apps._running_bundle_id(self._pid)
         if running_bundle is None:
             raise ComputerUseError(
                 "APP_NOT_RUNNING",
@@ -727,10 +727,10 @@ class App:
                 "call get_app again to re-bind the app you want",
                 {"pid": self._pid, "running_bundle_id": running_bundle},
             )
-        result = policy.gate_app(self._bundle_id)
+        result = policy._gate_app(self._bundle_id)
         if not result.allowed:
             raise ComputerUseError("APP_NOT_ALLOWED", result.reason, {"bundle_id": self._bundle_id})
-        if policy.screen_locked():
+        if policy._screen_locked():
             raise ComputerUseError(
                 "SCREEN_LOCKED",
                 "the screen is locked; ask the user to unlock it before driving apps",
@@ -751,8 +751,8 @@ class App:
                 f"element index {element_index} is stale; re-observe with get_ax_state() and use fresh indices",
                 {"element_index": element_index},
             )
-        element = ax.flatten(self._observation.tree)[element_index]
-        live_role, live_title = ax.live_fingerprint(refs[element_index])
+        element = ax._flatten(self._observation.tree)[element_index]
+        live_role, live_title = ax._live_fingerprint(refs[element_index])
         if live_role != element.get("role") or live_title != element.get("title"):
             raise ComputerUseError(
                 "ELEMENT_STALE",

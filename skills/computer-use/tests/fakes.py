@@ -254,7 +254,7 @@ def raw_settings(
 
 
 class TelemetryRecorder:
-    """Async host_request fake capturing telemetry.emit payloads."""
+    """Async host_request fake capturing telemetry._emit payloads."""
 
     def __init__(self) -> None:
         self.events: list[dict[str, Any]] = []
@@ -266,7 +266,7 @@ class TelemetryRecorder:
             raise self.error
         normalized = dict(payload or {})
         self.requests.append((request_type, normalized))
-        if request_type == "telemetry.emit":
+        if request_type == "telemetry._emit":
             self.events.append(
                 {"name": normalized.get("name"), "properties": dict(normalized.get("properties") or {})}
             )
@@ -322,19 +322,19 @@ class RecordingBackend:
         """Return the recorded kwargs of every call with the given name."""
         return [kwargs for recorded, kwargs in self.calls if recorded == name]
 
-    def paste(self, pid: int, text: str, format: str = "text") -> None:
+    def _paste(self, pid: int, text: str, format: str = "text") -> None:
         """Record a paste without touching the clipboard."""
         self.calls.append(("paste", {"pid": pid, "text": text, "format": format}))
 
-    def click(self, pid: int, point: tuple[int, int], button: str = "left", count: int = 1) -> None:
+    def _click(self, pid: int, point: tuple[int, int], button: str = "left", count: int = 1) -> None:
         """Record a click without posting events."""
         self.calls.append(("click", {"pid": pid, "point": tuple(point), "button": button, "count": count}))
 
-    def drag(self, pid: int, start: tuple[int, int], end: tuple[int, int]) -> None:
+    def _drag(self, pid: int, start: tuple[int, int], end: tuple[int, int]) -> None:
         """Record a drag without posting events."""
         self.calls.append(("drag", {"pid": pid, "start": tuple(start), "end": tuple(end)}))
 
-    def scroll(self, pid: int, direction: str, pages: int = 1, point: tuple[int, int] | None = None) -> None:
+    def _scroll(self, pid: int, direction: str, pages: int = 1, point: tuple[int, int] | None = None) -> None:
         """Record a scroll without posting events."""
         self.calls.append(
             (
@@ -343,15 +343,15 @@ class RecordingBackend:
             )
         )
 
-    def press_key(self, pid: int, key: str) -> None:
+    def _press_key(self, pid: int, key: str) -> None:
         """Record a key press without posting events."""
         self.calls.append(("press_key", {"pid": pid, "key": key}))
 
-    def type_text(self, pid: int, text: str) -> None:
+    def _type_text(self, pid: int, text: str) -> None:
         """Record typing without posting events."""
         self.calls.append(("type_text", {"pid": pid, "text": text}))
 
-    def screenshot_window(
+    def _screenshot_window(
         self, origin: tuple[int, int], size: tuple[int, int], window_id: int | None = None
     ) -> dict[str, str | int]:
         """Record the capture region and return the canned screenshot dict."""
@@ -363,38 +363,40 @@ class RecordingBackend:
             raise self.screenshot_error
         return dict(self.screenshot)
 
-    async def attach_image_if_available(self, path: str) -> None:
+    async def _attach_image_if_available(self, path: str) -> None:
         """Record the attach path, or raise the injected attach error."""
         self.attach_calls.append(path)
         if self.attach_error is not None:
             raise self.attach_error
 
-    attach = attach_image_if_available
+    _attach = _attach_image_if_available
 
 
-INJECT_SEAMS = ("click", "drag", "scroll", "press_key", "type_text", "paste")
-CAPTURE_SEAMS = ("screenshot_window", "attach_image_if_available", "attach")
+INJECT_SEAMS = ("_click", "_drag", "_scroll", "_press_key", "_type_text")
+CAPTURE_SEAMS = ("_screenshot_window", "_attach_image_if_available", "_attach")
 
 
 @contextlib.contextmanager
-def recording_backend(backend: RecordingBackend | None = None) -> Iterator[RecordingBackend]:
+def recording_backend(_backend: RecordingBackend | None = None) -> Iterator[RecordingBackend]:
     """Patch the inject and capture module seams with one RecordingBackend."""
     from computer_use import capture, inject
 
-    backend = backend or RecordingBackend()
+    _backend = _backend or RecordingBackend()
     modules = {"inject": inject, "capture": capture}
     seams: list[tuple[str, str]] = [("inject", name) for name in INJECT_SEAMS]
     seams.extend(("capture", name) for name in CAPTURE_SEAMS)
     saved: dict[tuple[str, str], Any] = {}
     patched: list[tuple[str, str]] = []
     for module_name, attr in seams:
-        if not hasattr(modules[module_name], attr) or not hasattr(backend, attr):
-            continue
+        if not hasattr(modules[module_name], attr):
+            raise AssertionError(f"test seam {module_name}.{attr} is missing from the package")
+        if not hasattr(_backend, attr):
+            raise AssertionError(f"RecordingBackend is missing the {attr} seam")
         saved[(module_name, attr)] = getattr(modules[module_name], attr)
-        setattr(modules[module_name], attr, getattr(backend, attr))
+        setattr(modules[module_name], attr, getattr(_backend, attr))
         patched.append((module_name, attr))
     try:
-        yield backend
+        yield _backend
     finally:
         for module_name, attr in patched:
             setattr(modules[module_name], attr, saved[(module_name, attr)])
@@ -406,7 +408,7 @@ def observation(
     focused_index: int | None = None,
     window_id: int | None = None,
 ) -> Any:
-    """Build a canned ax.observe result; refs follow the same walk order as ax.flatten."""
+    """Build a canned ax._observe result; refs follow the same walk order as ax._flatten."""
     from computer_use import ax
 
     elements = tree if isinstance(tree, list) else tree["children"]
@@ -422,7 +424,7 @@ def observation(
 
 def _never_require_mac() -> Any:
     """Fail loudly when a faked test path reaches a real macOS framework."""
-    raise AssertionError("require_mac must not run under the faked environment")
+    raise AssertionError("_require_mac must not run under the faked environment")
 
 
 class FakeAttach:
@@ -441,7 +443,7 @@ class FakeAttach:
 class AppEnvironment:
     """One fully faked computer-use environment for App-level tests.
 
-    Patches every backend seam: platform dispatch, app listing and launch, AX
+    Patches every _backend seam: platform dispatch, app listing and launch, AX
     observation and element actions, the allowlist gate and lock probe, TCC
     status, inject/capture, telemetry, the clipboard helpers, and the
     kernel-resident module state. No display, TCC grant, real app, or live
@@ -540,31 +542,34 @@ class AppEnvironment:
             if self.permissions is None
             else self.permissions
         )
-        patch(computer_use, "backend", lambda: "mac")
-        patch(computer_use, "require_mac", _never_require_mac)
-        patch(apps, "running_apps", self._running_apps)
-        patch(apps, "launch", self._launch)
+        patch(computer_use, "_backend", lambda: "mac")
+        patch(computer_use, "_require_mac", _never_require_mac)
+        patch(apps, "_running_apps", self._running_apps)
+        patch(apps, "_launch", self._launch)
         patch(policy, "SETTINGS_PATH", self.settings_file)
-        patch(policy, "screen_locked", lambda: self.locked)
-        patch(permissions, "status", lambda: dict(status))
-        patch(ax, "observe", lambda pid: observation(self.current, self.window_title, self.window_rect, self.focused_index, self.window_id))
-        patch(ax, "live_fingerprint", self._live_fingerprint)
-        patch(ax, "focused_is_secure", lambda pid: self.secure_focus)
-        patch(ax, "perform_action", lambda ref, action: self.ax_calls.append(("perform_action", ref, action)))
-        patch(ax, "is_settable", lambda ref, attribute: self.settable)
-        patch(ax, "current_value", lambda ref: (ref.get("value") if isinstance(ref, dict) else None))
-        patch(ax, "set_value", lambda ref, value: self.ax_calls.append(("set_value", ref, value)))
-        patch(ax, "select_text_range", lambda ref, location, length: self.ax_calls.append(("select_text_range", ref, location, length)))
+        patch(policy, "_screen_locked", lambda: self.locked)
+        patch(permissions, "_status", lambda: dict(status))
+        patch(ax, "_observe", lambda pid: observation(self.current, self.window_title, self.window_rect, self.focused_index, self.window_id))
+        patch(ax, "_live_fingerprint", self._live_fingerprint)
+        patch(ax, "_focused_is_secure", lambda pid: self.secure_focus)
+        patch(ax, "_perform_action", lambda ref, action: self.ax_calls.append(("perform_action", ref, action)))
+        patch(ax, "_is_settable", lambda ref, attribute: self.settable)
+        patch(ax, "_current_value", lambda ref: (ref.get("value") if isinstance(ref, dict) else None))
+        patch(ax, "_set_value", lambda ref, value: self.ax_calls.append(("set_value", ref, value)))
+        patch(ax, "_select_text_range", lambda ref, location, length: self.ax_calls.append(("select_text_range", ref, location, length)))
         patch(telemetry, "host_request", self.telemetry_recorder)
         patch(computer_use, "_save_clipboard", self._save_clipboard)
         patch(computer_use, "_write_clipboard", self._write_clipboard)
         patch(computer_use, "_restore_clipboard", self._restore_clipboard)
         modules = {"inject": inject, "capture": capture}
-        seams = [("inject", seam) for seam in INJECT_SEAMS] + [("capture", "screenshot_window")]
+        seams = [("inject", seam) for seam in INJECT_SEAMS] + [("capture", "_screenshot_window")]
         for module_name, attr in seams:
             module = modules[module_name]
-            if hasattr(module, attr) and hasattr(self.recorder, attr):
-                patch(module, attr, getattr(self.recorder, attr))
+            if not hasattr(module, attr):
+                raise AssertionError(f"test seam {module_name}.{attr} is missing from the package")
+            if not hasattr(self.recorder, attr):
+                raise AssertionError(f"RecordingBackend is missing the {attr} seam")
+            patch(module, attr, getattr(self.recorder, attr))
         self.saved_attach_module = sys.modules.get("attach_image")
         attach_module = types.ModuleType("attach_image")
         attach_module.run = self.attach.run

@@ -1,6 +1,6 @@
 """Window screenshots through the macOS screencapture tool, plus the attach hook.
 
-screenshot_window is synchronous and shells out to screencapture; the App layer
+_screenshot_window is synchronous and shells out to screencapture; the App layer
 calls it from its async wrapper. origin and size are CG screen-space integer
 pairs derived from AX window bounds by the App layer; window_id scopes the
 capture to one window so occluding content is never included.
@@ -101,7 +101,7 @@ def _png_dimensions(path: Path) -> tuple[int, int]:
     return width, height
 
 
-def screenshot_window(
+def _screenshot_window(
     origin: tuple[int, int], size: tuple[int, int], window_id: int | None = None
 ) -> dict[str, str | int]:
     """Capture the target window, or the screen region as a documented fallback, into a PNG file.
@@ -191,7 +191,7 @@ def screenshot_window(
     return {"path": str(path), "width": width, "height": height}
 
 
-async def attach_image_if_available(path: str) -> None:
+async def _attach_image_if_available(path: str) -> None:
     """Load the screenshot at path into the model's context as an image attachment.
 
     Best-effort: every failure is swallowed silently, including a non-vision
@@ -205,4 +205,4 @@ async def attach_image_if_available(path: str) -> None:
         return
 
 
-attach = attach_image_if_available
+_attach = _attach_image_if_available

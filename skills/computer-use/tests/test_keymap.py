@@ -71,25 +71,25 @@ class KeycodesTableTests(unittest.TestCase):
 
 class ParseChordTests(unittest.TestCase):
     def test_single_key(self) -> None:
-        self.assertEqual(keymap.parse_chord("a"), keymap.ParsedChord(frozenset(), "a"))
-        self.assertEqual(keymap.parse_chord("Return"), keymap.ParsedChord(frozenset(), "Return"))
+        self.assertEqual(keymap._parse_chord("a"), keymap.ParsedChord(frozenset(), "a"))
+        self.assertEqual(keymap._parse_chord("Return"), keymap.ParsedChord(frozenset(), "Return"))
 
     def test_enter_aliases_return(self) -> None:
-        self.assertEqual(keymap.parse_chord("Enter"), keymap.ParsedChord(frozenset(), "Return"))
-        self.assertEqual(keymap.parse_chord("Enter"), keymap.parse_chord("Return"))
+        self.assertEqual(keymap._parse_chord("Enter"), keymap.ParsedChord(frozenset(), "Return"))
+        self.assertEqual(keymap._parse_chord("Enter"), keymap._parse_chord("Return"))
 
     def test_backspace_aliases_delete_at_parse_level(self) -> None:
-        self.assertEqual(keymap.parse_chord("Backspace"), keymap.ParsedChord(frozenset(), "Delete"))
-        self.assertEqual(keymap.parse_chord("Backspace"), keymap.parse_chord("Delete"))
+        self.assertEqual(keymap._parse_chord("Backspace"), keymap.ParsedChord(frozenset(), "Delete"))
+        self.assertEqual(keymap._parse_chord("Backspace"), keymap._parse_chord("Delete"))
 
     def test_literal_space_is_space(self) -> None:
-        self.assertEqual(keymap.parse_chord(" "), keymap.ParsedChord(frozenset(), " "))
+        self.assertEqual(keymap._parse_chord(" "), keymap.ParsedChord(frozenset(), " "))
         self.assertEqual(keymap.KEYCODES[" "], keymap.KEYCODES["Space"])
         self.assertEqual(keymap.KEYCODES[" "], 49)
 
     def test_single_char_punctuation(self) -> None:
-        self.assertEqual(keymap.parse_chord("-"), keymap.ParsedChord(frozenset(), "-"))
-        self.assertEqual(keymap.parse_chord("cmd+-"), keymap.ParsedChord(frozenset({"cmd"}), "-"))
+        self.assertEqual(keymap._parse_chord("-"), keymap.ParsedChord(frozenset(), "-"))
+        self.assertEqual(keymap._parse_chord("cmd+-"), keymap.ParsedChord(frozenset({"cmd"}), "-"))
 
     def test_modifier_canonicalization(self) -> None:
         pairs = (
@@ -106,24 +106,24 @@ class ParseChordTests(unittest.TestCase):
         )
         for chord, expected in pairs:
             with self.subTest(chord=chord):
-                self.assertEqual(keymap.parse_chord(chord), expected)
+                self.assertEqual(keymap._parse_chord(chord), expected)
 
     def test_multiple_modifiers(self) -> None:
         self.assertEqual(
-            keymap.parse_chord("cmd+shift+f"),
+            keymap._parse_chord("cmd+shift+f"),
             keymap.ParsedChord(frozenset({"cmd", "shift"}), "f"),
         )
 
     def test_key_names_case_insensitive(self) -> None:
-        self.assertEqual(keymap.parse_chord("RETURN"), keymap.ParsedChord(frozenset(), "Return"))
-        self.assertEqual(keymap.parse_chord("A"), keymap.ParsedChord(frozenset(), "a"))
-        self.assertEqual(keymap.parse_chord("f1"), keymap.ParsedChord(frozenset(), "F1"))
+        self.assertEqual(keymap._parse_chord("RETURN"), keymap.ParsedChord(frozenset(), "Return"))
+        self.assertEqual(keymap._parse_chord("A"), keymap.ParsedChord(frozenset(), "a"))
+        self.assertEqual(keymap._parse_chord("f1"), keymap.ParsedChord(frozenset(), "F1"))
 
 
 class ParseChordInvalidTests(unittest.TestCase):
     def assert_invalid(self, chord: object) -> None:
         with self.assertRaises(errors.ComputerUseError) as caught:
-            keymap.parse_chord(chord)
+            keymap._parse_chord(chord)
         self.assertEqual(caught.exception.code, "INVALID_ARGUMENT")
 
     def test_empty_chord(self) -> None:

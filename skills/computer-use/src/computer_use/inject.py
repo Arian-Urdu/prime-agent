@@ -8,9 +8,9 @@ converts window-relative coordinates to screen coordinates before calling.
 
 from __future__ import annotations
 
-from ._compat import require_mac
+from ._compat import _require_mac
 from .errors import ComputerUseError
-from .keymap import KEYCODES, parse_chord
+from .keymap import KEYCODES, _parse_chord
 
 _ERROR_LIMIT = 200
 _PIXELS_PER_PAGE = 800
@@ -40,11 +40,11 @@ def _transport_failed(action: str, pid: int, error: BaseException) -> ComputerUs
     return ComputerUseError("TRANSPORT_ERROR", f"{action} failed: {str(error)[:_ERROR_LIMIT]}", {"pid": pid})
 
 
-def click(pid: int, point: tuple[float, float], button: str = "left", count: int = 1) -> None:
-    """Post one or more click cycles to the app process with the given pid.
+def _click(pid: int, point: tuple[float, float], button: str = "left", count: int = 1) -> None:
+    """Post one or more _click cycles to the app process with the given pid.
 
     button is left, right, or middle; count is the number of press/release cycles,
-    so a double click is count=2. point is a CG screen-space (x, y) tuple of
+    so a double _click is count=2. point is a CG screen-space (x, y) tuple of
     numbers (int or float). Raises
     ComputerUseError INVALID_ARGUMENT for a bad button, count, or point, and
     INJECTION_FAILED with the underlying CG error text when a CG call fails.
@@ -57,7 +57,7 @@ def click(pid: int, point: tuple[float, float], button: str = "left", count: int
         raise ComputerUseError("INVALID_ARGUMENT", "count must be an integer of at least 1", {"count": count})
     x, y = _point(point, "point")
     try:
-        quartz = require_mac().quartz
+        quartz = _require_mac().quartz
         down_type, up_type, code = {
             "left": (quartz.kCGEventLeftMouseDown, quartz.kCGEventLeftMouseUp, 0),
             "right": (quartz.kCGEventRightMouseDown, quartz.kCGEventRightMouseUp, 1),
@@ -71,12 +71,12 @@ def click(pid: int, point: tuple[float, float], button: str = "left", count: int
     except ComputerUseError:
         raise
     except OSError as error:
-        raise _transport_failed("click", pid, error) from error
+        raise _transport_failed("_click", pid, error) from error
     except Exception as error:
         raise _injection_failed("click", pid, error) from error
 
 
-def drag(pid: int, start: tuple[float, float], end: tuple[float, float]) -> None:
+def _drag(pid: int, start: tuple[float, float], end: tuple[float, float]) -> None:
     """Drag with the left button: press at start, move to end, release.
 
     start and end are CG screen-space (x, y) tuples of numbers (int or float).
@@ -87,7 +87,7 @@ def drag(pid: int, start: tuple[float, float], end: tuple[float, float]) -> None
     start_x, start_y = _point(start, "start")
     end_x, end_y = _point(end, "end")
     try:
-        quartz = require_mac().quartz
+        quartz = _require_mac().quartz
         down = quartz.CGEventCreateMouseEvent(None, quartz.kCGEventLeftMouseDown, (start_x, start_y), 0)
         quartz.CGEventPostToPid(pid, down)
         moved = quartz.CGEventCreateMouseEvent(None, quartz.kCGEventLeftMouseDragged, (end_x, end_y), 0)
@@ -97,13 +97,13 @@ def drag(pid: int, start: tuple[float, float], end: tuple[float, float]) -> None
     except ComputerUseError:
         raise
     except OSError as error:
-        raise _transport_failed("drag", pid, error) from error
+        raise _transport_failed("_drag", pid, error) from error
     except Exception as error:
         raise _injection_failed("drag", pid, error) from error
 
 
-def scroll(pid: int, direction: str, pages: int = 1, point: tuple[float, float] | None = None) -> None:
-    """Post a scroll event to the app process with the given pid.
+def _scroll(pid: int, direction: str, pages: int = 1, point: tuple[float, float] | None = None) -> None:
+    """Post a _scroll event to the app process with the given pid.
 
     direction is up, down, left, or right: up/down map to a negative/positive
     vertical delta and left/right to a negative/positive horizontal delta; one
@@ -129,7 +129,7 @@ def scroll(pid: int, direction: str, pages: int = 1, point: tuple[float, float] 
         "right": (0, magnitude),
     }[direction]
     try:
-        quartz = require_mac().quartz
+        quartz = _require_mac().quartz
         event = quartz.CGEventCreateScrollWheelEvent(None, quartz.kCGScrollEventUnitPixel, 2, dy, dx)
         if location is not None:
             quartz.CGEventSetLocation(event, location)
@@ -137,23 +137,23 @@ def scroll(pid: int, direction: str, pages: int = 1, point: tuple[float, float] 
     except ComputerUseError:
         raise
     except OSError as error:
-        raise _transport_failed("scroll", pid, error) from error
+        raise _transport_failed("_scroll", pid, error) from error
     except Exception as error:
         raise _injection_failed("scroll", pid, error) from error
 
 
-def press_key(pid: int, key: str) -> None:
+def _press_key(pid: int, key: str) -> None:
     """Post a key chord such as "cmd+shift+f" to the app process with the given pid.
 
-    The chord is parsed with computer_use.keymap.parse_chord; the modifier flags
+    The chord is parsed with computer_use.keymap._parse_chord; the modifier flags
     are set on both the key-down and key-up events. Raises ComputerUseError
     INVALID_ARGUMENT for an unsupported chord, and INJECTION_FAILED with the
     underlying CG error text when a CG call fails.
     """
-    chord = parse_chord(key)
+    chord = _parse_chord(key)
     keycode = KEYCODES[chord.key]
     try:
-        quartz = require_mac().quartz
+        quartz = _require_mac().quartz
         masks = {
             "cmd": quartz.kCGEventFlagMaskCommand,
             "ctrl": quartz.kCGEventFlagMaskControl,
@@ -172,12 +172,12 @@ def press_key(pid: int, key: str) -> None:
     except ComputerUseError:
         raise
     except OSError as error:
-        raise _transport_failed("press_key", pid, error) from error
+        raise _transport_failed("_press_key", pid, error) from error
     except Exception as error:
         raise _injection_failed("press_key", pid, error) from error
 
 
-def type_text(pid: int, text: str) -> None:
+def _type_text(pid: int, text: str) -> None:
     """Type text into the app process with the given pid.
 
     Each keyboard event carries at most two UTF-16 code units (the macOS limit),
@@ -205,7 +205,7 @@ def type_text(pid: int, text: str) -> None:
     if pending:
         chunks.append((pending_units, "".join(pending)))
     try:
-        quartz = require_mac().quartz
+        quartz = _require_mac().quartz
         for units, chunk in chunks:
             down = quartz.CGEventCreateKeyboardEvent(None, 0, True)
             quartz.CGEventKeyboardSetUnicodeString(down, units, chunk)
@@ -216,6 +216,6 @@ def type_text(pid: int, text: str) -> None:
     except ComputerUseError:
         raise
     except OSError as error:
-        raise _transport_failed("type_text", pid, error) from error
+        raise _transport_failed("_type_text", pid, error) from error
     except Exception as error:
         raise _injection_failed("type_text", pid, error) from error

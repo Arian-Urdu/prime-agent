@@ -1,13 +1,13 @@
 """State serialization and element-indexed diffs for computer use.
 
-serialize renders a nested element tree into stable one-line-per-element
-lines; diff pairs two renders and marks changed lines with "~", added lines
+_serialize renders a nested element tree into stable one-line-per-element
+lines; _diff pairs two renders and marks changed lines with "~", added lines
 with "+", and removed lines with "-", omitting unchanged lines. Lines pair by
 their content with the element index stripped, so an element that shifts
 positions without changing still reads as unchanged, while a value change on
 the same element reads as one "~" line. Output lines always carry the indices
 of the full current snapshot (removed lines keep their previous index); the
-diff is display-only.
+_diff is display-only.
 """
 
 from __future__ import annotations
@@ -16,12 +16,12 @@ import re
 from difflib import SequenceMatcher
 from typing import Any
 
-from .ax import is_secure_field
+from .ax import _is_secure_field
 
 _INDEXED = re.compile(r"^(\s*)\[\d+\] ")
 
 
-def serialize(tree: list[dict[str, Any]]) -> list[str]:
+def _serialize(tree: list[dict[str, Any]]) -> list[str]:
     """Render one element tree depth-first into stable indexed lines.
 
     Line shape: "{indent}[{index}] role (subrole) 'title' = 'value'
@@ -41,7 +41,7 @@ def serialize(tree: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
-def diff(previous_lines: list[str], current_lines: list[str]) -> str:
+def _diff(previous_lines: list[str], current_lines: list[str]) -> str:
     """Mark the changes between two renders, omitting unchanged lines.
 
     Lines pair by index-stripped content: a 1:1 replaced line renders as "~"
@@ -82,7 +82,7 @@ def _line(index: int, depth: int, element: dict[str, Any]) -> str:
     title = element.get("title")
     if title:
         parts.append(repr(str(title)))
-    if is_secure_field(element):
+    if _is_secure_field(element):
         parts.append("[secure]")
     else:
         value = element.get("value")

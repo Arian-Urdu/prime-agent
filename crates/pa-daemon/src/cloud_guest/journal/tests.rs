@@ -239,3 +239,65 @@ fn restored_admissions_claim_in_order_and_settle() {
         assert!(seen.contains(id), "every admission claimed in order");
     }
 }
+
+#[test]
+fn torn_multibyte_tail_never_empties_the_journal() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("command-journal.ndjson");
+    {
+        let mut journal = GuestCommandJournal::open(&path).unwrap();
+        journal
+            .admit("cmd_done", &prompt_request_value("ünïcode turn"))
+            .unwrap();
+        let claimed = journal.claim_next_pending().unwrap().unwrap();
+        assert_eq!(claimed.receipt.command_id, "cmd_done");
+        journal.complete("cmd_done", None).unwrap();
+    }
+    // Simulate a power loss mid-append: a torn final line whose UTF-8
+    // sequence is split (invalid bytes the string reader would reject
+    // wholesale).
+    let mut contents = std::fs::read(&path).unwrap();
+    contents.extend_from_slice(b"{\"version\":1,\"type\":\"admit\",\"commandId\":\"cmd_\xF0\x9F");
+    std::fs::write(&path, &contents).unwrap();
+    // The recovered journal still knows the completed command: a
+    // retry of the same id is a duplicate, never a fresh admission.
+    let mut restored = GuestCommandJournal::open(&path).unwrap();
+    assert_eq!(
+        restored.receipt("cmd_done").unwrap().state,
+        CloudCommandState::Completed
+    );
+    let (admission, receipt) = restored
+        .admit("cmd_done", &prompt_request_value("ünïcode turn"))
+        .unwrap();
+    assert_eq!(admission, GuestAdmission::Duplicate);
+    assert_eq!(receipt.state, CloudCommandState::Completed);
+}
+
+#[test]
+fn unreadable_journal_fails_closed_instead_of_loading_empty() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // A directory where the journal file belongs: every read fails; an
+    // empty recovery would re-admit completed commands as new.
+    let path = dir.path().join("command-journal.ndjson");
+    std::fs::create_dir(&path).unwrap();
+    assert!(GuestCommandJournal::open(&path).is_err());
+}
+
+#[test]
+fn corrupted_midfile_record_fails_closed() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("command-journal.ndjson");
+    {
+        let mut journal = GuestCommandJournal::open(&path).unwrap();
+        journal.admit("cmd_a", &prompt_request_value("a")).unwrap();
+        journal.admit("cmd_b", &prompt_request_value("b")).unwrap();
+    }
+    // Corrupt a COMPLETE record (not the torn tail): silently folding
+    // it away could lose settled state, so the open refuses.
+    let contents = std::fs::read_to_string(&path).unwrap();
+    let mut lines: Vec<&str> = contents.split('\n').collect();
+    lines.insert(1, "{ not json at all");
+    let forged = lines.join("\n");
+    std::fs::write(&path, forged).unwrap();
+    assert!(GuestCommandJournal::open(&path).is_err());
+}

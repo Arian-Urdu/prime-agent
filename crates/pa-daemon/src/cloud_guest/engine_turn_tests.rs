@@ -148,3 +148,78 @@ fn one_real_session_engine_turn_runs_once_and_replay_never_reruns() {
         booted.serve.await.unwrap();
     });
 }
+
+#[test]
+fn a_restored_pending_prompt_runs_once_with_the_real_executor() {
+    // The crash shape the review flagged: the open was claimed (its
+    // running transition is fsynced) and a prompt was admitted but
+    // never claimed. The restored guest must execute the pending
+    // prompt exactly once with the real engine — the open's
+    // uncertainty must not strand the prompt behind a per-process
+    // "no session" flag.
+    let _faux_lock = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::TempDir::new().unwrap();
+    let cwd = dir.path().to_path_buf();
+    let session_id = "sess_engine_restore";
+    let generation = 7u64;
+    let state_dir = dir.path().join("guest-state");
+    let status_file = dir.path().join("daemon-status.json");
+    let workspace = cwd.display().to_string();
+    // Craft the crashed journal: open claimed (restores uncertain),
+    // prompt admitted (restores pending).
+    {
+        let mut journal = crate::cloud_guest::journal::GuestCommandJournal::open(
+            &state_dir.join("command-journal.ndjson"),
+        )
+        .unwrap();
+        journal
+            .admit(
+                "cmd_open",
+                &serde_json::to_value(open_request(&workspace)).unwrap(),
+            )
+            .unwrap();
+        journal
+            .admit(
+                "cmd_prompt",
+                &serde_json::to_value(prompt_request("the restored turn")).unwrap(),
+            )
+            .unwrap();
+        let claimed = journal.claim_next_pending().unwrap().unwrap();
+        assert_eq!(claimed.receipt.command_id, "cmd_open");
+    }
+    let executor = faux_executor(&cwd);
+    serve_rt().block_on(async {
+        let booted = boot_guest(
+            &state_dir,
+            &status_file,
+            &workspace,
+            session_id,
+            generation,
+            Arc::clone(&executor) as Arc<dyn GuestExecutor>,
+        );
+        // The restored open is uncertain and never re-runs; the
+        // restored prompt is claimable and the engine executes it once.
+        assert_eq!(booted.server.list_uncertain().len(), 1);
+        assert_eq!(booted.server.list_uncertain()[0].command_id, "cmd_open");
+        let (mut client, _) =
+            LoopbackClient::hello(&booted.hub, TEST_TOKEN, session_id, generation).await;
+        let settled = client
+            .await_receipt(
+                session_id,
+                generation,
+                "cmd_prompt",
+                CloudCommandState::Completed,
+            )
+            .await;
+        assert_eq!(settled, CloudCommandState::Completed);
+        assert_eq!(
+            executor.turn_count(),
+            1,
+            "the restored pending prompt runs exactly once with the real engine"
+        );
+        booted.server.begin_shutdown();
+        booted.serve.await.unwrap();
+    });
+}

@@ -205,6 +205,12 @@ pub async fn run_guest_daemon() -> Result<()> {
     let listener = pa_types::platform::transport::bind_transport(&env.socket_path)
         .await
         .with_context(|| format!("bind {}", env.socket_path.display()))?;
+    // Owner-only after the bind (TS `chmodSync(socketPath, 0o700)`):
+    // the platform private file mode (0600) is the same owner-only
+    // boundary — connecting to a unix socket needs the write bit — so
+    // the umask never decides who can reach the guest's bridge socket.
+    pa_core::platform::perms::restrict_file(&env.socket_path)
+        .with_context(|| format!("restrict {}", env.socket_path.display()))?;
     server.serve(listener, std::sync::Arc::new(executor)).await
 }
 

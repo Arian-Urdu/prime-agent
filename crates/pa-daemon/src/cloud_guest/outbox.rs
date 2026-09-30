@@ -4,9 +4,14 @@
 //! pushed, acknowledgements advance a persisted cursor, and replay
 //! comes from the acknowledged-cursor position, never from a memory
 //! window. Retention trimming (the TS generation bump that renumbers a
-//! trimmed log) stays with the full protocol server port: this slice
-//! keeps one fixed generation and stalls honestly at the record bound,
-//! exactly like the family request log.
+//! trimmed log) stays with the full protocol server port, so this slice
+//! keeps one fixed generation — and that omission is an INTEGRATION
+//! BLOCKER, not a mere gap: the record cap is on the whole log, an ack
+//! advances the cursor but frees no capacity, and once the 50,000th
+//! event is admitted the log is permanently full even under a healthy,
+//! acknowledging bridge (every later event drops with `retentionStalled`
+//! in the status probe). Trimming is the first blocking item of the
+//! resident-store port.
 //!
 //! Crash contract: the append is one fsynced line, so a crash may leave
 //! only the final line truncated; the reload drops it and repairs the
@@ -333,20 +338,41 @@ impl GuestEventOutbox {
         Ok(())
     }
 
+    /// Load the durable events: a missing file is a fresh log; a torn
+    /// FINAL line (a crash mid-append; the appends always end in a
+    /// newline) is dropped and the file repaired to the last complete
+    /// record; every complete record must verify its envelope digest
+    /// and sequence. Any other read failure or any non-final corruption
+    /// refuses the open — truncating or folding away fsynced events
+    /// would destroy the durable log an acknowledging bridge relies on.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the events file cannot be read (anything
+    /// but a missing file), the repair write fails, or a complete
+    /// record fails its envelope, digest, or sequence check.
     fn load_events(&mut self) -> Result<()> {
         let path = self.events_path();
-        let Ok(content) = fs::read_to_string(&path) else {
-            File::create(&path).with_context(|| format!("create {}", path.display()))?;
-            return Ok(());
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                File::create(&path).with_context(|| format!("create {}", path.display()))?;
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(anyhow!("read {}: {error}", path.display()));
+            }
         };
+        let content = String::from_utf8_lossy(&bytes);
         let mut lines: Vec<&str> = content.split('\n').collect();
-        let ended = content.ends_with('\n');
         if lines.last() == Some(&"") {
             lines.pop();
         }
-        if !ended && !lines.is_empty() {
-            // A crash truncated the final append: drop it and repair the
-            // file to the last complete record.
+        if !bytes.ends_with(b"\n") && !lines.is_empty() {
+            // A crash truncated the final append: drop that one line and
+            // repair the file to the last complete record. The repaired
+            // bytes are exactly the complete prefix — no fsynced event
+            // is lost.
             lines.pop();
             let repaired: Vec<String> = lines.iter().map(|line| (*line).to_string()).collect();
             self.rewrite_events(repaired)?;

@@ -11,12 +11,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pa_types::daemon::cloud::{
-    CloudCommandId, CloudCommandRequest, CloudCommandState, CloudCursor, CloudMessage, CloudSubmit,
-    CloudSubscribe,
+    CloudCommandId, CloudCommandRequest, CloudCommandState, CloudCursor, CloudGetCommand,
+    CloudMessage, CloudSubmit, CloudSubscribe,
 };
 
 use crate::cloud_guest::dispatch::{GuestDispatchOutcome, GuestExecutor, GuestSessionSnapshot};
-use crate::cloud_guest::outbox::GuestEventOutbox;
+use crate::cloud_guest::outbox::{GuestEventInput, GuestEventOutbox};
 use crate::cloud_guest::server::GuestProtocolServer;
 use crate::cloud_guest::tests_support::{
     boot_guest, event_sequence, open_request, prompt_request, rt, BootedGuest, LoopbackClient,
@@ -859,4 +859,176 @@ fn guest_env_requires_every_provisioned_coordinate() {
     };
     let error = parse_cloud_guest_env(&bad_generation, None).unwrap_err();
     assert_eq!(error.0, "invalid PRIME_AGENT_CLOUD_GENERATION");
+}
+
+#[test]
+fn torn_multibyte_outbox_tail_preserves_the_fsynced_events() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let session_id = "sess_outbox";
+    let state = dir.path().join("guest-state");
+    // A live event tail: command-accepted then command-state, fsynced.
+    {
+        let mut outbox = GuestEventOutbox::open(&state.join("event-outbox"), session_id).unwrap();
+        let receipt = crate::cloud_guest::journal::GuestCommandJournal::open(
+            &state.join("command-journal.ndjson"),
+        )
+        .unwrap()
+        .admit("cmd_x", &serde_json::json!({"kind": "abort"}))
+        .unwrap()
+        .1;
+        outbox
+            .append(GuestEventInput::CommandAccepted {
+                recorded_at: crate::cloud_guest::now_iso(),
+                receipt: receipt.clone(),
+            })
+            .unwrap();
+        outbox
+            .append(GuestEventInput::CommandState {
+                recorded_at: crate::cloud_guest::now_iso(),
+                receipt,
+            })
+            .unwrap();
+        outbox
+            .ack(&CloudCursor {
+                generation: 1,
+                sequence: 1,
+            })
+            .unwrap();
+    }
+    // A torn final append whose UTF-8 sequence is split: the string
+    // reader would reject the whole file; a truncating recovery would
+    // destroy both fsynced events.
+    let mut contents =
+        std::fs::read(&state.join("event-outbox").join("outbox-events.ndjson")).unwrap();
+    contents.extend_from_slice(b"{\"eventId\":\"evt_\xF0\x9F");
+    std::fs::write(
+        &state.join("event-outbox").join("outbox-events.ndjson"),
+        &contents,
+    )
+    .unwrap();
+    // The reopen keeps every complete record and the acknowledged
+    // cursor, and repairs the torn tail.
+    let outbox = GuestEventOutbox::open(&state.join("event-outbox"), session_id).unwrap();
+    assert_eq!(
+        outbox.tail_cursor().sequence,
+        2,
+        "both fsynced events survive"
+    );
+    assert_eq!(outbox.acknowledged_cursor().sequence, 1);
+    let events = outbox
+        .events_after(
+            &CloudCursor {
+                generation: 1,
+                sequence: 0,
+            },
+            10,
+        )
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    let reloaded = std::fs::read(&state.join("event-outbox").join("outbox-events.ndjson")).unwrap();
+    assert!(reloaded.ends_with(b"\n"), "the torn tail was repaired away");
+}
+
+#[test]
+fn unreadable_outbox_refuses_to_open_instead_of_truncating() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let state = dir.path().join("guest-state").join("event-outbox");
+    // A directory where the events file belongs: every read fails; a
+    // truncating recovery would destroy the durable log.
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir(state.join("outbox-events.ndjson")).unwrap();
+    std::fs::write(
+        state.join("outbox-meta.json"),
+        b"{\"version\":1,\"sessionId\":\"sess_outbox\",\"generation\":1,\"ackedSequence\":0}\n",
+    )
+    .unwrap();
+    assert!(GuestEventOutbox::open(&state, "sess_outbox").is_err());
+    // The directory was never truncated away (the fail-closed path
+    // leaves the path untouched).
+    assert!(state.join("outbox-events.ndjson").is_dir());
+}
+
+#[test]
+fn submit_with_a_stale_generation_is_dropped_and_never_admitted() {
+    let (executor, _open, _prompt, _park) = {
+        let dir = tempfile::TempDir::new().unwrap();
+        ScriptedExecutor::new(&dir.path().display().to_string())
+    };
+    let cwd_dir = tempfile::TempDir::new().unwrap();
+    rt().block_on(async {
+        let harness = GuestHarness::spawn(cwd_dir, executor);
+        let session_id = "sess_loopback";
+        let generation = 7u64;
+        let (mut client, _) =
+            LoopbackClient::hello(&harness.hub(), TEST_TOKEN, session_id, generation).await;
+        // Authenticated, but the submit names the wrong sandbox
+        // generation: the connection drops and the command is never
+        // journaled (TS handleSubmit's fence).
+        let request = prompt_request("stale turn");
+        let digest =
+            pa_types::daemon::cloud::cloud_request_digest(&serde_json::to_value(&request).unwrap())
+                .unwrap();
+        client
+            .send(&CloudMessage::Submit(CloudSubmit {
+                session_id: session_id.to_string(),
+                generation: generation + 1,
+                command_id: "cmd_stale".to_string(),
+                request,
+                digest,
+            }))
+            .await;
+        assert_eq!(
+            client.recv().await,
+            None,
+            "a stale submit generation drops the connection"
+        );
+        // A fresh connection proves nothing was admitted.
+        let (mut client, _) =
+            LoopbackClient::hello(&harness.hub(), TEST_TOKEN, session_id, generation).await;
+        client
+            .send(&CloudMessage::GetCommand(CloudGetCommand {
+                session_id: session_id.to_string(),
+                generation,
+                command_id: Some("cmd_stale".to_string()),
+                claim: None,
+            }))
+            .await;
+        assert_eq!(
+            client.recv().await,
+            None,
+            "the stale command was never admitted"
+        );
+        harness.server().begin_shutdown();
+        harness.booted.serve.await.unwrap();
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn the_guest_socket_is_owner_only_after_bind() {
+    // The guest's run path binds through the shared transport and then
+    // restricts the socket inode to 0700 (TS chmodSync parity) — the
+    // umask must not decide who can reach the bridge socket. Assert the
+    // restriction over a REAL unix listener.
+    rt().block_on(async {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("cloud.sock");
+        let listener = pa_types::platform::transport::bind_transport(&socket)
+            .await
+            .expect("guest bind");
+        drop(listener);
+        // Simulate the umask leaving the socket world-readable, then
+        // apply the guest's restriction step exactly where
+        // `run_guest_daemon` applies it.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o755)).unwrap();
+        pa_core::platform::perms::restrict_file(&socket).expect("restrict");
+        let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "the guest socket is owner-only after bind (got {mode:o})"
+        );
+        assert_eq!(mode & 0o700, 0o600, "the owner keeps connect access");
+    });
 }

@@ -89,7 +89,7 @@ impl GuestCommandJournal {
             record_count: 0,
             compact_after_records: COMPACT_AFTER_RECORDS,
         };
-        journal.load();
+        journal.load()?;
         Ok(journal)
     }
 
@@ -343,18 +343,41 @@ impl GuestCommandJournal {
     }
 
     /// Load and fold the durable records (TS `load`/`foldRecord`).
-    fn load(&mut self) {
-        let Ok(content) = std::fs::read_to_string(&self.path) else {
-            return;
+    /// Reads bytes, never lossy strings: only a torn FINAL line (a
+    /// crash mid-append; the appends always end in a newline) may be
+    /// skipped — any other unreadable file or any non-final record
+    /// that fails to parse is corruption the guest must refuse to serve
+    /// under, because silently folding it away could re-admit a
+    /// completed command as new and run it twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the journal cannot be read (anything but
+    /// a missing file) or a complete record is corrupt.
+    fn load(&mut self) -> Result<()> {
+        let bytes = match std::fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(anyhow!("read {}: {error}", self.path.display()));
+            }
         };
-        for line in content.split('\n') {
+        let content = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = content.split('\n').collect();
+        let torn_tail = !bytes.ends_with(b"\n");
+        let complete = if torn_tail {
+            // A crash may leave only the final append truncated: drop
+            // that one line; every earlier record stays authoritative.
+            lines[..lines.len() - 1].to_vec()
+        } else {
+            lines
+        };
+        for line in complete {
             if line.is_empty() {
                 continue;
             }
-            let Ok(record) = serde_json::from_str::<Value>(line) else {
-                // A crash may leave only the final append truncated.
-                continue;
-            };
+            let record = serde_json::from_str::<Value>(line)
+                .map_err(|_| anyhow!("command journal record is corrupt"))?;
             self.fold_record(&record);
         }
         // A claim fsyncs the running transition before the request
@@ -367,6 +390,7 @@ impl GuestCommandJournal {
                 entry.uncertain = true;
             }
         }
+        Ok(())
     }
 
     fn fold_record(&mut self, record: &Value) {

@@ -12,7 +12,7 @@
 //! wallet-bound-key) is a platform prerequisite that does not exist
 //! yet; until it does, live inference stays disabled here.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
@@ -31,7 +31,6 @@ pub const INFERENCE_DISABLED_MESSAGE: &str =
 /// The session-engine executor for the resident guest.
 pub struct EngineGuestExecutor {
     engine: Option<Arc<AgentSessionEngine>>,
-    opened: Arc<AtomicBool>,
     turn_count: Arc<AtomicU64>,
     cwd: String,
     model: Option<String>,
@@ -55,7 +54,6 @@ impl EngineGuestExecutor {
         };
         Ok(Self {
             engine,
-            opened: Arc::new(AtomicBool::new(false)),
             turn_count: Arc::new(AtomicU64::new(0)),
             cwd,
             model: model_label,
@@ -103,13 +101,15 @@ impl GuestExecutor for EngineGuestExecutor {
         _command_id: String,
         request: CloudCommandRequest,
     ) -> BoxFuture<'static, GuestDispatchOutcome> {
+        // The session is open by construction (TS boots the root session
+        // before dispatch; the engine facade materializes it on the
+        // first prompt), so a restored pending prompt always finds an
+        // open session — per-process flags would misreport a restart.
         let engine = self.engine.clone();
-        let opened = Arc::clone(&self.opened);
         let turn_count = Arc::clone(&self.turn_count);
         Box::pin(async move {
             match request {
                 CloudCommandRequest::OpenSession { prompt, .. } => {
-                    opened.store(true, Ordering::SeqCst);
                     // A duplicate open is a no-op reattach (the engine
                     // exists at boot); a carried prompt runs once, under
                     // this command's own idempotent admission.
@@ -121,11 +121,6 @@ impl GuestExecutor for EngineGuestExecutor {
                     }
                 }
                 CloudCommandRequest::Prompt { text, .. } => {
-                    if !opened.load(Ordering::SeqCst) {
-                        return GuestDispatchOutcome::Failed {
-                            error: Some("no open session".to_string()),
-                        };
-                    }
                     run_one_turn(engine.as_ref(), &text, turn_count).await
                 }
                 CloudCommandRequest::Abort => {

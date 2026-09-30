@@ -446,9 +446,13 @@ fn handle_frame(server: &Arc<GuestProtocolServer>, client: &ClientHandle, frame:
     match message {
         CloudMessage::Hello(hello) => handle_hello(server, client, &hello),
         CloudMessage::Subscribe(subscribe) => handle_subscribe(server, client, &subscribe),
-        CloudMessage::Submit(submit) => {
-            handle_submit(server, client, submit.command_id, &submit.request)
-        }
+        CloudMessage::Submit(submit) => handle_submit(
+            server,
+            client,
+            submit.generation,
+            submit.command_id,
+            &submit.request,
+        ),
         CloudMessage::GetCommand(get) => handle_get_command(server, client, &get),
         CloudMessage::Ack(ack) => handle_ack(server, client, &ack),
         // The guest of this slice has no broker wiring: authenticated
@@ -529,10 +533,16 @@ fn handle_subscribe(
 fn handle_submit(
     server: &Arc<GuestProtocolServer>,
     client: &ClientHandle,
+    generation: u64,
     command_id: String,
     request: &CloudCommandRequest,
 ) -> bool {
     if !client.authenticated() {
+        return false;
+    }
+    // Submits fence on the sandbox generation like hello; the event-log
+    // generation never gates control traffic (TS handleSubmit).
+    if generation != server.generation() {
         return false;
     }
     let Ok(request_value) = serde_json::to_value(request) else {

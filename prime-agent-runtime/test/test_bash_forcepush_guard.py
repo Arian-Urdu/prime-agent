@@ -402,13 +402,20 @@ class ForcePushScanCostTest(unittest.TestCase):
             "argument = sys.stdin.read()\n" "outcome = 'n/a'\n" "started = time.monotonic()\n"
             f"{body}\n" "print('%.6f\\t%s' % (time.monotonic() - started, outcome))\n"
         )
+        # A probe interpreter must not inherit a runner-launched bypass: a
+        # kernel started with PI_BASH_ALLOW_FORCE_PUSH freezes its snapshot
+        # armed and every verdict below would read "allowed". Pin the probe
+        # launch env to "unset", like `_launch` does for the frozen-bypass
+        # kernels.
+        env = dict(os.environ)
+        env.pop(BASH_FORCE_PUSH_BYPASS_ENV, None)
         try:
             completed = subprocess.run(
                 [sys.executable, "-c", probe],
                 input=argument,
                 capture_output=True,
                 text=True,
-                env=dict(os.environ),
+                env=env,
                 timeout=SCAN_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired:
@@ -649,6 +656,15 @@ class ForcePushGuardSuite(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self._restore_env)
         self.addCleanup(os.chdir, self._prev_cwd)
         self.test_dir = Path(temp.name)
+        # Hermetic git config, like the sibling git-guard suite's per-repo
+        # isolation: every real git this suite runs -- the `_git` repo setup,
+        # the commands bash() spawns, and the guard's own probe -- inherits
+        # this process environment, so an empty HOME hides the runner's user
+        # config and GIT_CONFIG_NOSYSTEM the system one. Global aliases,
+        # hooks, url.*.insteadOf rewrites, or push.default from the runner
+        # must not reach the test repositories.
+        os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+        os.environ["HOME"] = str(self.test_dir)
         os.chdir(self.test_dir)
 
     def _enter(self, name: str, branch: str = "feature") -> Path:
@@ -1888,6 +1904,13 @@ class ForcePushFrozenBypassTest(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
+        # Hermetic git config, like the sibling git-guard suite's per-repo
+        # isolation: the git calls below and the fresh kernels `_launch`
+        # starts both see an empty HOME (no runner user config) and
+        # GIT_CONFIG_NOSYSTEM (no system config), so global aliases, hooks,
+        # url.*.insteadOf rewrites, or push.default from the runner cannot
+        # change what these launches do.
+        self._git_env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "HOME": temp.name}
         self.workspace = Path(temp.name) / "repo"
         self.workspace.mkdir()
         bare = Path(temp.name) / "remote.git"
@@ -1929,6 +1952,7 @@ class ForcePushFrozenBypassTest(unittest.TestCase):
         completed = subprocess.run(
             ["git", *args],
             cwd=str(cwd),
+            env=self._git_env,
             capture_output=True,
             text=True,
             timeout=GIT_TIMEOUT,
@@ -1946,7 +1970,7 @@ class ForcePushFrozenBypassTest(unittest.TestCase):
             "async def main():\n" "    result = await bash(sys.argv[1])\n"
             "    return result.exit_code\n" "raise SystemExit(asyncio.run(main()))\n"
         )
-        env = dict(os.environ)
+        env = dict(self._git_env)
         env.pop(BASH_FORCE_PUSH_BYPASS_ENV, None)
         env.update(extra_env)
         return subprocess.run(
@@ -1992,7 +2016,7 @@ keeps the nested kernel's frozen launch snapshot clean, so its own guard refuses
             + repr(child)
             + ")), 60)\n    print(r.output, end='')\n    raise SystemExit(r.exit_code)\nasyncio.run(main())\n"
         )
-        env = {k: v for k, v in os.environ.items() if k != BASH_FORCE_PUSH_BYPASS_ENV}
+        env = {k: v for k, v in self._git_env.items() if k != BASH_FORCE_PUSH_BYPASS_ENV}
         completed = subprocess.run(
             [sys.executable, "-c", parent], cwd=str(self.workspace), env=env,
             capture_output=True, text=True, timeout=KERNEL_LAUNCH_TIMEOUT,

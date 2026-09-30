@@ -1842,7 +1842,14 @@ class FrozenBypassEnvLaunchTest(unittest.TestCase):
         # child launch env drops a bypass value absent at kernel start.
         os.environ[BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV] = "1"
         self.addCleanup(os.environ.pop, BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV, None)
-        self.assertNotIn(BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV, bash_module._child_env())
+        # The launch-time snapshot is a module attribute frozen at import;
+        # pin it to "unset" so the late-write rule decides, not the parent
+        # process's launch environment (a runner launched with the bypass
+        # set would otherwise legitimately keep the value).
+        with mock.patch.object(
+            bash_module, "_DESTRUCTIVE_CHMOD_BYPASS_AT_KERNEL_START", False
+        ):
+            self.assertNotIn(BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV, bash_module._child_env())
         # A value the kernel actually started with is the intentional state.
         with mock.patch.object(bash_module, "_DESTRUCTIVE_CHMOD_BYPASS_AT_KERNEL_START", True):
             self.assertIn(BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV, bash_module._child_env())

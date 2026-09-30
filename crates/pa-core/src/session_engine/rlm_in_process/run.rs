@@ -36,66 +36,129 @@ pub(super) async fn run_child_task(
     record: Arc<InProcessChildRecord>,
     prompt: String,
 ) {
-    if record.state().await.closed_by_parent {
+    if !subscribe_child_events(&record).await {
+        // Closed before the subscription landed (a delete or close won
+        // the race): the run arm owns nothing and exits.
         return;
     }
-    subscribe_child_events(&record).await;
     record.state().await.prompt_admitted = true;
     // The daemon prompt shape: the raw task text as the child's first
     // user row (the in-process host matches the established Rust child
     // surface; the TS custom-row spawn label is a documented divergence).
-    let admission = record
-        .engine
-        .session
-        .prompt(&prompt, crate::session_engine::PromptOptions::default())
-        .await;
-    if let Err(error) = admission {
-        let error = error.to_string();
-        record.settle_as("error", Some(error.clone())).await;
-        finish_run(&host, &record, Some(error)).await;
-        return;
+    // The prompt is raced against parent teardown: a stalled run never
+    // returns on its own, and the parent's engine dropping must tear this
+    // run down promptly, not only after the run happens to end.
+    let admission = tokio::select! {
+        result = record.engine.session.prompt(
+            &prompt,
+            crate::session_engine::PromptOptions::default(),
+        ) => Some(result),
+        () = parent_gone(&host) => None,
+    };
+    match admission {
+        None => teardown_close(&host, &record).await,
+        Some(Err(error)) => {
+            // The terminal sequence keeps its order: accounting, notice
+            // admission, THEN the settled state and its wake signal — the
+            // run state never exposes `settled` before the parent's
+            // notice is admitted.
+            finish_run(&host, &record, &TaskVerdict::Error(error.to_string())).await;
+        }
+        Some(Ok(_)) => match wait_for_task_settle(&host, &record).await {
+            TaskSettle::Done => {
+                finish_run(&host, &record, &TaskVerdict::Done).await;
+            }
+            TaskSettle::ParentGone => teardown_close(&host, &record).await,
+        },
     }
-    wait_for_task_settle(&record).await;
-    record.settle_as("done", None).await;
-    finish_run(&host, &record, None).await;
+}
+
+/// Resolve once the parent engine is gone (the binding weak died). Bounded
+/// polling: teardown latency is one settle slice.
+async fn parent_gone(host: &InProcessRlmHost) {
+    loop {
+        if host.parent_engine().is_none() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(SETTLE_POLL_SLICE_MS)).await;
+    }
+}
+
+/// Parent teardown: nothing observes this run's result anymore. Abort it,
+/// close the whole descendant subtree (grandchildren cascade the same
+/// way through their own run tasks), settle the record, and run the
+/// terminal sequence so the engine tears down with this task's exit
+/// instead of outliving its parent.
+async fn teardown_close(host: &InProcessRlmHost, record: &Arc<InProcessChildRecord>) {
+    record.engine.session.agent().abort();
+    record.child_host.close_children().await;
+    record
+        .settle_as("cancelled", Some("Parent session ended".to_string()))
+        .await;
+    finish_run(host, record, &TaskVerdict::Cancelled).await;
+}
+
+/// The run's would-be terminal verdict, decided before the settled state
+/// lands (the state itself stays `running` until the notice is admitted).
+enum TaskVerdict {
+    Done,
+    Error(String),
+    Cancelled,
 }
 
 /// The run's terminal sequence, in the order TS resolves settlement
 /// (`_startRlmChildRun`'s `finally`): flush the child's usage accounting,
-/// deliver the parent's terminal notice, THEN publish the settle signal
-/// (a `collect` result never precedes the notice), and release the event
-/// listener so the record — engine and kernel included — drops with the
-/// registry entry instead of leaking through the agent's listener list.
+/// deliver the parent's terminal notice, THEN record the settled state and
+/// publish the wake signal — the run state never exposes `settled` before
+/// the parent's notice is admitted, and a `collect` result never precedes
+/// the notice — and finally release the event listener so the record —
+/// engine and kernel included — drops with the registry entry instead of
+/// leaking through the agent's listener list.
 async fn finish_run(
     host: &InProcessRlmHost,
     record: &Arc<InProcessChildRecord>,
-    error: Option<String>,
+    verdict: &TaskVerdict,
 ) {
     flush_pending_usage(host, record).await;
-    // A cancel or close claimed the verdict and its notice already; a
-    // failed run reports its failure, a completed one without an explicit
-    // reply reports the no-reply notice.
-    let (status, replied) = {
-        let state = record.state().await;
-        (state.settled_status, state.replied_since_task)
-    };
-    match (status, error) {
-        (Some("error"), Some(error)) => {
-            super::notices::deliver_failure_notice(host, record, &error).await;
+    // A cancel or close claimed the notice already (nothing to deliver);
+    // a failed run reports its failure, a completed one without an
+    // explicit reply reports the no-reply notice.
+    match verdict {
+        TaskVerdict::Error(error) => {
+            super::notices::deliver_failure_notice(host, record, error).await;
         }
-        (Some("done"), None) if !replied => {
-            super::notices::deliver_no_reply_notice(host, record).await;
+        TaskVerdict::Done => {
+            let replied = record.state().await.replied_since_task;
+            if !replied {
+                super::notices::deliver_no_reply_notice(host, record).await;
+            }
         }
-        _ => {}
+        TaskVerdict::Cancelled => {}
+    }
+    match verdict {
+        TaskVerdict::Done => record.settle_as("done", None).await,
+        TaskVerdict::Error(error) => record.settle_as("error", Some(error.clone())).await,
+        TaskVerdict::Cancelled => record.settle_as("cancelled", None).await,
     }
     record.publish_settled();
     record.unsubscribe_listener().await;
 }
 
 /// Subscribe the child agent's events into the record: activity, tool
-/// counts, answer previews, last-activity clock, and the per-origin
-/// usage batches that flush at run ends.
-async fn subscribe_child_events(record: &Arc<InProcessChildRecord>) {
+/// counts, answer previews, last-activity clock, and the per-origin usage
+/// batches that flush at run ends.
+///
+/// Closed-aware: a
+/// delete/close racing this subscription cannot strand a second listener
+/// on the agent — the store and the `closed_by_parent` re-check share one
+/// critical section on the record state, and a close that loses the race
+/// (it took the listener slot before this store) is still observed here,
+/// the fresh subscription is unsubscribed, and the run arm exits. Both
+/// interleavings end with no live listener on a closed record.
+async fn subscribe_child_events(record: &Arc<InProcessChildRecord>) -> bool {
+    if record.state().await.closed_by_parent {
+        return false;
+    }
     let agent = record.engine.session.agent().clone();
     let run_record = Arc::clone(record);
     let subscription = agent
@@ -107,11 +170,14 @@ async fn subscribe_child_events(record: &Arc<InProcessChildRecord>) {
             })
         })
         .await;
-    // Retained: the agent keeps the listener until it is explicitly
-    // removed, and the record owns the only handle — released at the run
-    // task's end and on delete/close so the engine and its kernel tear
-    // down with the registry entry.
-    record.state().await.listener = Some(subscription);
+    let mut state = record.state().await;
+    if state.closed_by_parent {
+        drop(state);
+        subscription.unsubscribe().await;
+        return false;
+    }
+    state.listener = Some(subscription);
+    true
 }
 
 /// One child event's record updates (TS `_startRlmChildRun`'s child
@@ -308,26 +374,57 @@ async fn child_usage_origin(
     ChildUsageOrigin::DirectUser
 }
 
+/// How the task run ended: drained on its own, or its parent tore down.
+enum TaskSettle {
+    Done,
+    ParentGone,
+}
+
 /// Wait until the child's task run settles: the agent is idle, its queues
 /// are empty, and its own children (grandchildren of the spawning parent)
 /// settled too (TS `waitForRlmQuiescence`). Follow-up turns a delivered
-/// agent message starts keep the task unsettled until they drain.
-async fn wait_for_task_settle(record: &Arc<InProcessChildRecord>) {
+/// agent message starts keep the task unsettled until they drain. The
+/// wait is ticked (`wait_for_idle` raced against the poll slice) so a
+/// parent teardown is noticed within one slice even while the child's
+/// own run streams: when the parent engine is gone the caller closes the
+/// whole descendant subtree.
+async fn wait_for_task_settle(
+    host: &InProcessRlmHost,
+    record: &Arc<InProcessChildRecord>,
+) -> TaskSettle {
     loop {
+        if host.parent_engine().is_none() {
+            return TaskSettle::ParentGone;
+        }
         let agent = record.engine.session.agent();
-        agent.wait_for_idle().await;
+        // Every iteration waits a bounded slice — an idle agent's
+        // `wait_for_idle` resolves immediately (no run slot), so racing
+        // it bare would spin; a busy run gets the slice as its tick so a
+        // parent teardown is still noticed mid-stream.
+        if agent.state().await.is_streaming {
+            tokio::select! {
+                () = agent.wait_for_idle() => {}
+                () = tokio::time::sleep(Duration::from_millis(SETTLE_POLL_SLICE_MS)) => {}
+            }
+        } else {
+            tokio::time::sleep(Duration::from_millis(SETTLE_POLL_SLICE_MS)).await;
+        }
+        if host.parent_engine().is_none() {
+            return TaskSettle::ParentGone;
+        }
         let child_host = record.child_host.clone();
         let stable = !agent.has_queued_messages() && !child_host.any_running().await;
         if stable {
             tokio::time::sleep(Duration::from_millis(SETTLE_GRACE_MS)).await;
+            if host.parent_engine().is_none() {
+                return TaskSettle::ParentGone;
+            }
             let still_idle = !agent.state().await.is_streaming;
             let still_empty = !agent.has_queued_messages() && !child_host.any_running().await;
             if still_idle && still_empty {
-                break;
+                return TaskSettle::Done;
             }
-            continue;
         }
-        tokio::time::sleep(Duration::from_millis(SETTLE_POLL_SLICE_MS)).await;
     }
 }
 

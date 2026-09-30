@@ -24,15 +24,17 @@
 //! adopting it as a guest root without the seam blocks adoption.
 //!
 //! Composition contract: the embedding owns the parent engine's lifetime.
-//! Drop the parent engine and the subtree follows (every strong edge
-//! points down the tree: parent engine → host → child records → child
-//! engines → child hosts; every edge back up is weak, and the child event
-//! listeners release at settle, so nothing leaks through the agents'
-//! listener lists). A session END — a close or replacement while children
-//! run — must call [`InProcessRlmHost::close_children`] so running
-//! children abort and their kernels tear down; a settled subtree needs
-//! nothing (registry-deleted and listener-released children drop with the
-//! parent engine).
+//! Drop the parent engine and the whole subtree follows on its own — each
+//! child's detached run task races its task prompt and settle wait
+//! against the parent binding (a weak edge), notices the teardown within
+//! one settle slice even mid-stream, aborts its own run, closes its
+//! descendant subtree, settles, and releases its event listener, so the
+//! engines and kernels tear down with the tasks' exits (every strong
+//! edge points down the tree: parent engine → host → child records →
+//! child engines → child hosts; every edge back up is weak). A session
+//! CLOSE or replacement — where the parent engine stays alive — must
+//! call [`InProcessRlmHost::close_children`] explicitly, the same
+//! teardown the run tasks perform on an engine drop.
 
 mod family;
 mod model;

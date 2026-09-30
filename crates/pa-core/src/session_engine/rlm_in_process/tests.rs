@@ -513,12 +513,27 @@ async fn deleting_a_running_child_delivers_the_cancelled_notice() {
     rig.catalog
         .provider("glm-5.3")
         .push_text_turn("notice turn");
+    // The engine probe captures its weak before the delete clears the
+    // registry: the deleted RUNNING child must also release (the abort
+    // ends its run, the run task releases the listener, the engine tears
+    // down).
+    let engine_weak = {
+        let child = rig.first_child().await;
+        let weak = Arc::downgrade(&child.engine);
+        assert!(weak.upgrade().is_some());
+        weak
+    };
     let deleted = rig
         .host
         .delete_subagent(handle.rlm_child_id.clone())
         .await
         .unwrap();
     assert_eq!(deleted.outcome, Some("deleted"));
+    eventually("the deleted running child's engine to drop", || {
+        let probe = engine_weak.clone();
+        async move { probe.upgrade().is_none() }
+    })
+    .await;
     let parent = Arc::clone(&rig.engine);
     let target_id = handle.rlm_child_id.clone();
     eventually("the cancelled notice row", move || {
@@ -583,6 +598,129 @@ async fn a_deleted_settled_child_releases_its_engine() {
     eventually("the deleted child's engine to drop", || {
         let probe = engine_weak.clone();
         async move { probe.upgrade().is_none() }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn dropping_the_parent_engine_closes_the_running_subtree() {
+    let rig = TestRig::new().await;
+    rig.catalog
+        .provider("glm-5.3-turbo")
+        .push_stalled_turn("child partial");
+    let handle = rig
+        .host
+        .spawn(spawn_request(
+            Some("subtree"),
+            Some("test-provider/glm-5.3-turbo"),
+        ))
+        .await
+        .unwrap();
+    let child = rig.first_child().await;
+    // A grandchild runs under the child (the cascade must reach it too).
+    rig.catalog
+        .provider("glm-5.3-turbo")
+        .push_stalled_turn("grand partial");
+    let _grand = child
+        .child_host
+        .spawn(spawn_request(
+            Some("grand"),
+            Some("test-provider/glm-5.3-turbo"),
+        ))
+        .await
+        .unwrap();
+    let child_weak = Arc::downgrade(&child.engine);
+    // Scope the strong probe Arcs: the weaks must be the only way the
+    // test observes the engines after the teardown.
+    let grand_weak = {
+        let grand_engine = child
+            .child_host
+            .children()
+            .await
+            .first()
+            .map(|record| Arc::clone(&record.engine))
+            .expect("the grandchild");
+        Arc::downgrade(&grand_engine)
+    };
+    drop(child);
+    // Parent teardown: nothing calls close_children — the binding weak
+    // dies with the engine, and the detached run tasks close their own
+    // runs and their descendant subtrees within a settle slice.
+    drop(rig);
+    eventually("the child engine to drop", || {
+        let probe = child_weak.clone();
+        async move { probe.upgrade().is_none() }
+    })
+    .await;
+    eventually("the grandchild engine to drop", || {
+        let probe = grand_weak.clone();
+        async move { probe.upgrade().is_none() }
+    })
+    .await;
+    let _ = handle;
+}
+
+#[tokio::test]
+async fn an_error_run_settles_only_after_its_failure_notice() {
+    let rig = TestRig::new().await;
+    // The child's only scripted turn fails at the stream call: the prompt
+    // admission itself errors and the run task takes the error verdict.
+    rig.catalog
+        .provider("glm-5.3-turbo")
+        .push_fail_start_turn("provider exploded");
+    let handle = rig
+        .host
+        .spawn(spawn_request(
+            Some("broken"),
+            Some("test-provider/glm-5.3-turbo"),
+        ))
+        .await
+        .unwrap();
+    rig.catalog
+        .provider("glm-5.3")
+        .push_text_turn("notice turn");
+    let collected = rig
+        .host
+        .collect(vec![handle.rlm_child_id.clone()], 10_000)
+        .await
+        .unwrap();
+    let result = one(&collected);
+    assert_eq!(result.status, "error");
+    assert!(result.settled);
+    // The settled state exposed by the collect already implies the
+    // failure notice was admitted (streaming) or its row persisted.
+    let streaming = rig.engine.session.agent().state().await.is_streaming;
+    let failure_admitted = rig.parent_rows().await.iter().any(|entry| {
+        matches!(
+            entry,
+            pa_types::session::FileEntry::CustomMessage { payload, .. }
+                if payload.custom_type
+                    == crate::session_engine::rlm_notices::RLM_CHILD_FAILURE_CUSTOM_TYPE
+        )
+    });
+    assert!(
+        streaming || failure_admitted,
+        "the failure notice admission precedes the error settle"
+    );
+    let parent = Arc::clone(&rig.engine);
+    eventually("the failure notice row", move || {
+        let parent = Arc::clone(&parent);
+        async move {
+            let rows = parent
+                .session
+                .shared_persistence()
+                .lock()
+                .await
+                .get_entries();
+            rows.iter().any(|entry| {
+                matches!(
+                    entry,
+                    pa_types::session::FileEntry::CustomMessage { payload, .. }
+                        if payload.custom_type
+                            == crate::session_engine::rlm_notices::RLM_CHILD_FAILURE_CUSTOM_TYPE
+                )
+            })
+        }
     })
     .await;
 }
@@ -1008,6 +1146,29 @@ async fn a_composed_remote_family_routes_sends_beyond_the_local_graph() {
         members: Vec<crate::session_engine::agent_messaging::AgentFamilyMember>,
         sent: Mutex<Vec<String>>,
     }
+    impl RemoteSurface {
+        /// One remote observe row for the roster join (the seam's optional
+        /// observe surface).
+        fn remote_row() -> crate::session_engine::agent_messaging::AgentObserveSummary {
+            crate::session_engine::agent_messaging::AgentObserveSummary {
+                active_session_id: Some("cloud-parent".to_string()),
+                session_id: "cloud-parent".to_string(),
+                session_name: Some("cloud-parent".to_string()),
+                relationship: Some(
+                    crate::session_engine::agent_messaging::AgentFamilyRelationship::Parent,
+                ),
+                runtime_kind: Some("top-level".to_string()),
+                status: crate::session_engine::agent_messaging::AgentFamilyStatus::Idle,
+                activity: None,
+                is_current: false,
+                is_streaming: false,
+                is_compacting: false,
+                attached_clients: 0,
+                queued_count: 0,
+                is_session_active: true,
+            }
+        }
+    }
     impl super::RlmRemoteFamily for RemoteSurface {
         fn members(
             &self,
@@ -1016,6 +1177,13 @@ async fn a_composed_remote_family_routes_sends_beyond_the_local_graph() {
         > {
             let members = self.members.clone();
             Box::pin(async move { Ok(members) })
+        }
+        fn observe_summaries(
+            &self,
+        ) -> crate::session_engine::rlm_host::RlmHostFuture<
+            Vec<crate::session_engine::agent_messaging::AgentObserveSummary>,
+        > {
+            Box::pin(async move { Ok(vec![Self::remote_row()]) })
         }
         fn send(
             &self,
@@ -1098,6 +1266,16 @@ async fn a_composed_remote_family_routes_sends_beyond_the_local_graph() {
         remote.sent.lock().unwrap().as_slice(),
         ["up?".to_string()].as_slice()
     );
+    // The seam's observe rows ride the roster, and a remote row resolves
+    // through get_agent.
+    let agents = controller.list_agents().await.unwrap();
+    let remote_row = agents
+        .iter()
+        .find(|agent| agent.session_id == "cloud-parent")
+        .expect("the remote observe row");
+    assert!(!remote_row.is_current);
+    let fetched = controller.get_agent("cloud-parent").await.unwrap();
+    assert!(fetched.is_some_and(|agent| agent.session_id == "cloud-parent"));
     // The composed root kind surfaces on the root's own observe row.
     let agents = controller.list_agents().await.unwrap();
     let self_row = agents

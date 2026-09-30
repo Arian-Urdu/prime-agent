@@ -47,6 +47,16 @@ pub trait RlmRemoteFamily: Send + Sync {
         &self,
         input: AgentMessageSendInput,
     ) -> super::super::rlm_host::RlmHostFuture<AgentMessageReceipt>;
+    /// Remote rows for `agent_observe.list_agents`/`get_agent` (the
+    /// guest's supervisor family roster). The default is empty — a seam
+    /// that only routes messaging reports no remote observe rows — so
+    /// extending the seam to observe is safe for every composer: supply
+    /// it only when the embedding has remote status. `recent_messages`
+    /// stays local-only either way (remote transcripts are the
+    /// embedding's own surface, not this seam's).
+    fn observe_summaries(&self) -> super::super::rlm_host::RlmHostFuture<Vec<AgentObserveSummary>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
 /// Whether a selector addresses one member by id, name, or alias.
@@ -521,6 +531,11 @@ impl AgentObserveController for InProcessFamilyController {
                 )
                 .await,
             );
+        }
+        // The composed remote family's observe rows ride the roster after
+        // the local ones (empty when the seam reports none).
+        if let Some(remote) = self.host.remote_family() {
+            summaries.extend(remote.observe_summaries().await?);
         }
         Ok(summaries)
     }

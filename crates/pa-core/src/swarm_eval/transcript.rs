@@ -29,10 +29,9 @@ use serde_json::Value;
 
 use pa_types::usage::{calculate_context_tokens, estimate_tokens, valid_assistant_usage};
 
-use super::{ArrivalCounts, ContextShape, MessagingStatsSnapshot, SendCounts, StepCounts};
+use crate::session_engine::agent_messaging::AGENT_MESSAGE_CUSTOM_TYPE;
 
-/// TS `AGENT_MESSAGE_CUSTOM_TYPE`: the agent-message row marker.
-pub const AGENT_MESSAGE_CUSTOM_TYPE: &str = "agent_message";
+use super::{ArrivalCounts, ContextShape, MessagingStatsSnapshot, SendCounts, StepCounts};
 
 /// Build a messaging snapshot from the session transcript and the working
 /// context token estimate.

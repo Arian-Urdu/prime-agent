@@ -25,6 +25,8 @@
 //! present, [`transcript::snapshot_from_transcript`] derives the same shape
 //! from the session transcript the daemon already serves.
 
+use std::time::{Duration, Instant};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -313,7 +315,15 @@ pub fn parse_eval_args(argv: &[String]) -> Result<SwarmEvalConfig, EvalArgsError
             }
             "--timeout-minutes" => {
                 let raw = arg_value(argv, &mut index, arg)?;
-                config.timeout_minutes = raw.parse::<f64>().unwrap_or(1.0).max(1.0);
+                // `inf`/`infinity` (any case, any sign) explicitly remove the
+                // per-trial timeout: `f64::parse` accepts them, and passing a
+                // non-finite value through to a `Duration` conversion panics
+                // mid-run. Every other unparsable or sub-minute value keeps
+                // the clamped default.
+                config.timeout_minutes = match raw.trim().to_ascii_lowercase().as_str() {
+                    "inf" | "+inf" | "infinity" | "+infinity" => f64::INFINITY,
+                    _ => raw.parse::<f64>().unwrap_or(1.0).max(1.0),
+                };
             }
             "--out" => config.out_dir = arg_value(argv, &mut index, arg)?.to_string(),
             "--seed" => {
@@ -356,23 +366,48 @@ fn arg_value<'a>(
     }
 }
 
+/// The per-trial poll deadline; `None` means unbounded.
+///
+/// The explicit `--timeout-minutes inf` (and `NaN`, which the argument
+/// parser clamps away but a hand-built config could still carry) maps to an
+/// unbounded wait, and any finite value too large to represent in a
+/// [`Duration`] or to add to [`Instant::now`] degrades to unbounded as
+/// well. Either way the deadline computation never panics, so the driver's
+/// poll loop cannot leave a live session behind by crashing.
+#[must_use]
+pub fn trial_deadline(timeout_minutes: f64) -> Option<Instant> {
+    if !timeout_minutes.is_finite() {
+        return None;
+    }
+    Duration::try_from_secs_f64(timeout_minutes * 60.0)
+        .ok()
+        .and_then(|timeout| Instant::now().checked_add(timeout))
+}
+
 fn default_out_dir() -> String {
     let stamp = crate::session::manager::format_iso_now().replace([':', '.'], "-");
     format!("swarm-eval-reports/{stamp}")
 }
 
 /// Deterministic 3-digit secrets from a SHA-256 hash chain, so evals are
-/// reproducible across runs.
+/// reproducible across runs. The digest advances on every child, and a
+/// value already handed out is redrawn, so the secrets of one trial are
+/// pairwise unique: children sharing a number would let a swapped or
+/// merged aggregation still match the expected ANSWER.
 #[must_use]
 pub fn seeded_secrets(seed: i64, count: usize) -> Vec<u32> {
     let mut digest = Sha256::digest(format!("{seed}:{count}:0").as_bytes());
     let mut secrets = Vec::with_capacity(count);
-    for index in 0..count {
-        if index % 2 == 0 {
-            digest = Sha256::digest(digest);
+    while secrets.len() < count {
+        digest = Sha256::digest(digest);
+        let value = 100 + (u32::from(digest[0]) * 256 + u32::from(digest[1])) % 900;
+        // Redraw a handed-out value (order-checking the ANSWER requires
+        // pairwise-unique secrets). Past 900 children the 3-digit space is
+        // exhausted and the chain values pass through unchanged.
+        if secrets.len() < 900 && secrets.contains(&value) {
+            continue;
         }
-        let value = u32::from(digest[0]) * 256 + u32::from(digest[1]);
-        secrets.push(100 + value % 900);
+        secrets.push(value);
     }
     secrets
 }
@@ -454,7 +489,9 @@ pub fn parse_answer_line(text: Option<&str>) -> Option<Vec<u64>> {
             None => break,
         }
     }
-    Some(numbers)
+    // Anything but whitespace after the last number means the ANSWER line is
+    // malformed; parsing a prefix out of it would credit a wrong answer.
+    rest.is_empty().then_some(numbers)
 }
 
 fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
@@ -585,25 +622,49 @@ pub fn render_markdown_report(
             if row.task_success { "ok" } else { "failed" },
         ));
     }
-    let failures = results
-        .iter()
-        .filter(|row| row.verdict == DefenseVerdict::Fail)
-        .map(|row| format!("size {}/trial {}", row.size, row.trial))
-        .collect::<Vec<_>>();
+    let trial_ids = |verdict: DefenseVerdict| {
+        results
+            .iter()
+            .filter(|row| row.verdict == verdict)
+            .map(|row| format!("size {}/trial {}", row.size, row.trial))
+            .collect::<Vec<_>>()
+    };
+    let failures = trial_ids(DefenseVerdict::Fail);
+    let inconclusives = trial_ids(DefenseVerdict::Inconclusive);
     lines.push(String::new());
     lines.push("## Verdict".to_string());
     lines.push(String::new());
     if failures.is_empty() {
-        lines.push(format!(
-            "All {} trials passed every defense line.",
-            results.len()
-        ));
-    } else {
+        if inconclusives.is_empty() {
+            lines.push(format!(
+                "All {} trials passed every defense line.",
+                results.len()
+            ));
+        } else {
+            // Inconclusive is its own class, never a silent pass: the
+            // harness forbids presenting unmeasured trials as successes.
+            lines.push(format!(
+                "No trial failed a defense line, but {}/{} trials were inconclusive (a defense line was unmeasured): {}.",
+                inconclusives.len(),
+                results.len(),
+                inconclusives.join(", ")
+            ));
+        }
+    } else if inconclusives.is_empty() {
         lines.push(format!(
             "{}/{} trials failed: {}.",
             failures.len(),
             results.len(),
             failures.join(", ")
+        ));
+    } else {
+        lines.push(format!(
+            "{}/{} trials failed: {}. {} trials were inconclusive: {}.",
+            failures.len(),
+            results.len(),
+            failures.join(", "),
+            inconclusives.len(),
+            inconclusives.join(", ")
         ));
     }
     lines.push(String::new());

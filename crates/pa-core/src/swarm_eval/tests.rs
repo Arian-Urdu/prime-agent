@@ -196,6 +196,44 @@ fn parses_arguments_with_defaults_and_validates_the_model() {
 }
 
 #[test]
+fn timeout_minutes_inf_parses_to_an_unbounded_wait() {
+    // `--timeout-minutes inf` must become an explicit unbounded wait instead
+    // of reaching a `Duration` conversion that panics mid-run.
+    for raw in ["inf", "Infinity", "+INF", " infinity "] {
+        let config =
+            parse_eval_args(&args(&["--model", "m", "--timeout-minutes", raw])).expect("parses");
+        assert!(
+            config.timeout_minutes.is_infinite(),
+            "{raw} must parse to infinity"
+        );
+    }
+    let config =
+        parse_eval_args(&args(&["--model", "m", "--timeout-minutes", "30"])).expect("parses");
+    assert_eq!(config.timeout_minutes, 30.0);
+    // Other non-finite or unparsable values keep the clamped default.
+    let nan =
+        parse_eval_args(&args(&["--model", "m", "--timeout-minutes", "nan"])).expect("parses");
+    assert_eq!(nan.timeout_minutes, 1.0);
+}
+
+#[test]
+fn the_trial_deadline_degrades_extreme_timeouts_instead_of_panicking() {
+    use std::time::{Duration, Instant};
+    // The explicit unbounded wait.
+    assert_eq!(trial_deadline(f64::INFINITY), None);
+    // A non-finite hand-built value degrades the same way (never a
+    // `Duration::from_secs_f64` panic).
+    assert_eq!(trial_deadline(f64::NAN), None);
+    // A finite value too large to represent degrades to unbounded too.
+    assert_eq!(trial_deadline(1e300), None);
+    // A sane timeout produces the deadline it asked for.
+    let before = Instant::now();
+    let deadline = trial_deadline(15.0).expect("a finite timeout is bounded");
+    assert!(deadline >= before + Duration::from_mins(14));
+    assert!(deadline <= Instant::now() + Duration::from_mins(16));
+}
+
+#[test]
 fn drops_non_positive_sizes_and_requires_at_least_one() {
     let config =
         parse_eval_args(&args(&["--model", "m", "--sizes", "2, 0, x, 5"])).expect("parses");
@@ -270,6 +308,28 @@ fn seeds_secrets_deterministically() {
     assert!(first.iter().all(|secret| (100..1000).contains(secret)));
 }
 
+#[test]
+fn seeds_a_unique_secret_for_every_child() {
+    // Every secret of a trial must be pairwise unique: adjacent children
+    // sharing one number (the old even-index hash chain) would let a
+    // swapped or merged aggregation still match the expected ANSWER.
+    for seed in [1, 2, 7, 100] {
+        let secrets = seeded_secrets(seed, 12);
+        let mut unique = secrets.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), secrets.len(), "seed {seed}: {secrets:?}");
+    }
+    // The default sweep's largest crew stays unique as well.
+    let size = 40;
+    let sweep_seed = 1 + i64::try_from(size).expect("in range") * 31 + 1;
+    let secrets = seeded_secrets(sweep_seed, size);
+    let mut unique = secrets.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), secrets.len());
+}
+
 // ---------------------------------------------------------------------------
 // Verification and reporting
 // ---------------------------------------------------------------------------
@@ -286,6 +346,10 @@ fn parses_the_answer_line() {
     assert_eq!(parse_answer_line(Some("no answer")), None);
     assert_eq!(parse_answer_line(Some("ANSWER:")), None);
     assert_eq!(parse_answer_line(Some("ANSWER: 1,")), None);
+    // Trailing non-whitespace text makes the line malformed: parsing a
+    // prefix out of it would credit a wrong answer.
+    assert_eq!(parse_answer_line(Some("ANSWER: 12, 34 extra text")), None);
+    assert_eq!(parse_answer_line(Some("ANSWER: 12 34")), None);
     assert_eq!(parse_answer_line(None), None);
 }
 
@@ -359,6 +423,73 @@ fn reports_all_passed_when_no_trial_fails() {
     )];
     let report = render_markdown_report(&rows, &config);
     assert!(report.contains("All 1 trials passed every defense line."));
+}
+
+#[test]
+fn reports_an_all_inconclusive_sweep_as_inconclusive_never_as_passed() {
+    let config = eval_config();
+    // An empty snapshot leaves every defense line unknown, so both rows
+    // fold to Inconclusive; the summary must not claim them as passes.
+    let rows = vec![
+        trial_result_from_snapshot(
+            &config,
+            2,
+            1,
+            &MessagingStatsSnapshot::default(),
+            true,
+            None,
+            10.0,
+        ),
+        trial_result_from_snapshot(
+            &config,
+            5,
+            1,
+            &MessagingStatsSnapshot::default(),
+            true,
+            None,
+            11.0,
+        ),
+    ];
+    let report = render_markdown_report(&rows, &config);
+    assert!(
+        report.contains("2/2 trials were inconclusive (a defense line was unmeasured)"),
+        "{report}"
+    );
+    assert!(!report.contains("passed every defense line"), "{report}");
+    assert!(report.contains("size 2/trial 1"), "{report}");
+    assert!(report.contains("size 5/trial 1"), "{report}");
+    // The per-row verdict column shows the inconclusive token itself.
+    assert!(report.contains("| inconclusive |"), "{report}");
+}
+
+#[test]
+fn names_the_inconclusive_trials_in_a_mixed_report() {
+    let config = eval_config();
+    let rows = vec![
+        trial_result_from_snapshot(&config, 2, 1, &snapshot(), true, None, 10.0),
+        trial_result_from_snapshot(
+            &config,
+            5,
+            1,
+            &MessagingStatsSnapshot::default(),
+            true,
+            None,
+            11.0,
+        ),
+    ];
+    let report = render_markdown_report(&rows, &config);
+    assert!(report.contains("1/2 trials were inconclusive"), "{report}");
+    assert!(!report.contains("All 2 trials passed"), "{report}");
+    // A failing trial keeps its summary and the inconclusive rows are
+    // still named beside it.
+    let mixed = vec![
+        rows[0].clone(),
+        rows[1].clone(),
+        trial_result_from_snapshot(&config, 10, 1, &snapshot(), false, None, 11.0),
+    ];
+    let report = render_markdown_report(&mixed, &config);
+    assert!(report.contains("1/3 trials failed"), "{report}");
+    assert!(report.contains("1 trials were inconclusive"), "{report}");
 }
 
 // ---------------------------------------------------------------------------

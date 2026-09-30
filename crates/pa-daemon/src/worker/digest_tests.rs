@@ -244,7 +244,7 @@ async fn read_inbox_with_ids_reads_only_those_entries() {
         .as_str()
         .unwrap()
         .to_string();
-    let read = worker.agent_digest.read_inbox(Some(vec![first_id.clone()]));
+    let read = worker.agent_digest.read_inbox(Some(vec![first_id]));
     assert_eq!(read["entries"].as_array().unwrap().len(), 1);
     assert_eq!(read["unread"], json!(1));
     let unknown = worker

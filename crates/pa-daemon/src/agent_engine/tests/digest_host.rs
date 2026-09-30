@@ -13,10 +13,12 @@ use pa_core::kernel::shared::{HostRequestHandlers, HostRequestPayload};
 /// self-arc registered (the handler closures hold the engine weakly).
 struct Harness {
     _dir: tempfile::TempDir,
+    /// Held only to keep the engine alive (the handler closures hold it
+    /// weakly); the `call` guard reads it.
     engine: std::sync::Arc<AgentSessionEngine>,
     handlers: HostRequestHandlers,
     sink_calls: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
-    read_state: std::sync::Arc<std::sync::Mutex<Option<Option<Vec<String>>>>>,
+    read_state: std::sync::Arc<std::sync::Mutex<Vec<Option<Vec<String>>>>>,
     configure_state: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
@@ -25,8 +27,8 @@ impl Harness {
         let dir = tempfile::TempDir::new().unwrap();
         let engine = std::sync::Arc::new(bare_engine(dir.path()));
         engine.register_arc();
-        let read: std::sync::Arc<std::sync::Mutex<Option<Option<Vec<String>>>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let read: std::sync::Arc<std::sync::Mutex<Vec<Option<Vec<String>>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let configured = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
         let list_for_seam = std::sync::Arc::new(std::sync::Mutex::new(None::<Value>));
         let read_for_seam = std::sync::Arc::clone(&read);
@@ -40,7 +42,7 @@ impl Harness {
                     .unwrap_or_else(|| json!({ "entries": [], "unread": 0, "total": 0 }))
             }),
             read: std::sync::Arc::new(move |ids| {
-                *read_for_seam.lock().unwrap() = Some(ids.clone());
+                read_for_seam.lock().unwrap().push(ids);
                 Ok(json!({ "entries": [], "unread": 0 }))
             }),
             configure: std::sync::Arc::new(move |mode| {
@@ -70,6 +72,9 @@ impl Harness {
     }
 
     async fn call(&self, request_type: &str, data: Value) -> anyhow::Result<Value> {
+        // The closures hold the engine weakly (the TS self-arc pattern):
+        // the harness keeps it alive through the calls.
+        assert!(!self.engine.session_is_closed());
         let handler = self
             .handlers
             .get(request_type)
@@ -91,15 +96,16 @@ async fn inbox_handlers_route_through_the_worker_seams() {
     assert_eq!(listing["total"], json!(0));
 
     harness.call("rlm.inbox.read", json!({})).await.unwrap();
-    assert!(harness.read_ids().as_ref().is_some_and(|ids| ids.is_none()));
+    // The read-all form passes no ids through the seam.
+    assert_eq!(harness.read_ids().last(), Some(&None));
 
     harness
         .call("rlm.inbox.read", json!({ "ids": ["entry-1", "entry-2"] }))
         .await
         .unwrap();
     assert_eq!(
-        harness.read_ids().clone().flatten(),
-        Some(vec!["entry-1".to_string(), "entry-2".to_string()])
+        harness.read_ids().last(),
+        Some(&Some(vec!["entry-1".to_string(), "entry-2".to_string()]))
     );
 
     let error = harness
@@ -121,7 +127,7 @@ async fn inbox_handlers_route_through_the_worker_seams() {
 }
 
 impl Harness {
-    fn read_ids(&self) -> std::sync::MutexGuard<'_, Option<Option<Vec<String>>>> {
+    fn read_ids(&self) -> std::sync::MutexGuard<'_, Vec<Option<Vec<String>>>> {
         self.read_state.lock().unwrap()
     }
     fn configured_mode(&self) -> String {

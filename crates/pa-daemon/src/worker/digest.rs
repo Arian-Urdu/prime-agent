@@ -53,17 +53,12 @@ const CONTEXT_TOKENS_PER_CHAR: f64 = 4.0;
 /// auto-armed default would flip long-running orchestrators onto the digest
 /// lane and break the established parent-child reply protocol), and
 /// `rlm.inbox.configure("auto")` arms the controller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum DigestLanePin {
     Auto,
+    #[default]
     Push,
     Digest,
-}
-
-impl Default for DigestLanePin {
-    fn default() -> Self {
-        DigestLanePin::Push
-    }
 }
 
 impl DigestLanePin {

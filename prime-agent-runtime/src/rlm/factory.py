@@ -860,12 +860,15 @@ def _child_name(run_id: str, state_id: str, instance_index: int, attempt: int) -
     A long state id is truncated but always disambiguated with a digest of
     the full id: two states sharing a 20-character prefix would otherwise
     produce the same sibling name, and the second admission would fail the
-    supervisor's unique-name requirement.
+    supervisor's unique-name requirement. The digest is 64-bit (16 hex
+    characters), so even a pathological 1024-state run sharing one prefix
+    has a negligible collision chance; the longest name stays under the
+    host's 64-character cap.
     """
     if len(state_id) <= 20:
         token = state_id
     else:
-        digest = hashlib.sha256(state_id.encode("utf-8")).hexdigest()[:6]
+        digest = hashlib.sha256(state_id.encode("utf-8")).hexdigest()[:16]
         token = f"{state_id[:20]}-{digest}"
     parts = ["sw", token, run_id[:6]]
     if instance_index >= 0:
@@ -930,7 +933,10 @@ def _json_equal(actual: Any, expected: Any) -> bool:
     if actual is None or expected is None:
         return actual is None and expected is None
     if _is_number(actual) and _is_number(expected):
-        return float(actual) == float(expected)
+        # Exact: Python compares int/int, int/float, and float/float
+        # mathematically (no lossy float conversion), so distinct large
+        # JSON integers never compare equal (9007199254740993 != 9007199254740992).
+        return actual == expected
     if isinstance(actual, str) and isinstance(expected, str):
         return actual == expected
     return False
@@ -1537,6 +1543,7 @@ class FactoryExecutor:
                 if transition_index < resume_from:
                     continue  # already fired before the pause; do not re-fire
                 raw_from = transition["from"]
+                join_signature: "frozenset[tuple[str, int]] | None" = None
                 if isinstance(raw_from, list):
                     # A join fires from this settle only when every source
                     # state has a settle, and only once per source-settle
@@ -1560,7 +1567,12 @@ class FactoryExecutor:
                     key = (id(transition), transition["to"])
                     if run.join_fired.get(key) == signature:
                         continue  # this completion already fired (or was blocked)
-                    run.join_fired[key] = signature
+                    # The signature is CLAIMED only below, when the
+                    # transition actually fires or is blocked: a
+                    # max_transitions pause that re-queues this transition
+                    # must not leave a stale mark, or the resume would skip
+                    # the join forever.
+                    join_signature = (key, signature)
                 else:
                     sources = [raw_from]
                     when = transition.get("when")
@@ -1569,6 +1581,10 @@ class FactoryExecutor:
                 target = run.states[transition["to"]]
                 from_field = transition["from"]
                 if target.entries_used >= target.max_entries:
+                    if join_signature is not None:
+                        # Blocked: this source-settle combination is consumed
+                        # even though the target had no entries left.
+                        run.join_fired[join_signature[0]] = join_signature[1]
                     self._event(
                         run,
                         "transition_blocked",
@@ -1592,6 +1608,8 @@ class FactoryExecutor:
                         f"resume with await rlm.factory.resume('{run.run_id}')",
                     )
                     return
+                if join_signature is not None:
+                    run.join_fired[join_signature[0]] = join_signature[1]
                 run.transitions_fired += 1
                 self._event(
                     run,
@@ -2151,6 +2169,14 @@ class FactoryExecutor:
                     if instance.status != "running" or instance.child_id is None:
                         continue
                     child_id = instance.child_id
+                    # Claim the instance BEFORE the await: a concurrent
+                    # cancellation pass (stop() racing fail_fast's cascade, or a
+                    # repeated stop) must never issue a duplicate delete for a
+                    # child this pass already owns. A failed delete still
+                    # releases the slot, so the terminal status is the same
+                    # either way, and a settle landing inside the delete window
+                    # is dropped instead of applying to a child being torn down.
+                    instance.status = "cancelled"
                     try:
                         await delete_subagent(child_id)
                     except Exception as exc:
@@ -2158,13 +2184,12 @@ class FactoryExecutor:
                         # The slot is released either way, so the ledger also
                         # records the cancellation next to the failure (the
                         # eval replay checker keys off cancelled events, and
-                        # the instance below reads cancelled).
+                        # the instance above already reads cancelled).
                         self._event(run, "cancelled", node=state_id, entry=entry.index, instance=instance.index, child=child_id, detail="slot released despite the failed delete")
                     else:
                         self._event(run, "cancelled", node=state_id, entry=entry.index, instance=instance.index, child=child_id)
                     # The child is supervisor-owned; a failed delete leaves it
                     # running there, but the executor treats its slot as released.
-                    instance.status = "cancelled"
 
     # -- completion ----------------------------------------------------------
 

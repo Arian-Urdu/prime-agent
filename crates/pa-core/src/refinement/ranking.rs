@@ -271,7 +271,7 @@ pub fn format_harness_state_for_prompt(
             lines.push(format!("{kind_name}: {} (invoke a spec by turning it into a concise task prompt and spawning with `await rlm.spawn('<task>', name='<worker>')`; admission returns a child handle, never the answer)", entries.len()));
         } else if kind_name == "factory" && !entries.is_empty() && include_ipython {
             lines.push(format!(
-                "{kind_name}: {} (state-machine workflow specs; run one with `await rlm.factory.run('<id>')`; watch with `await rlm.factory.status(run_id)`, stop with `await rlm.factory.stop(run_id)`)",
+                "{kind_name}: {} (state-machine workflow specs; run one with `await rlm.factory.run('<id>')`; watch with `await rlm.factory.status(run_id)`, stop with `await rlm.factory.stop(run_id)`, resume a paused run with `await rlm.factory.resume(run_id)`)",
                 entries.len()
             ));
         } else {
@@ -688,7 +688,7 @@ mod tests {
             },
         );
         assert!(rendered.contains(
-            "factory: 1 (state-machine workflow specs; run one with `await rlm.factory.run('<id>')`; watch with `await rlm.factory.status(run_id)`, stop with `await rlm.factory.stop(run_id)`)"
+            "factory: 1 (state-machine workflow specs; run one with `await rlm.factory.run('<id>')`; watch with `await rlm.factory.status(run_id)`, stop with `await rlm.factory.stop(run_id)`, resume a paused run with `await rlm.factory.resume(run_id)`)"
         ));
         assert!(rendered.contains("- [global:sweep] PR review sweep (review, v1): Sweep review."));
         // Without IPython examples the hint line stays a plain count.

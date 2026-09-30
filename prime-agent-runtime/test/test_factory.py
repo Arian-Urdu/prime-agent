@@ -2796,6 +2796,59 @@ class FactoryExecutorTest(unittest.TestCase):
         self.assertEqual(len(cancelled), 3)
         self.assertTrue(all(e.get("detail") == "entry failed before admission" for e in cancelled))
 
+    @async_test
+    async def test_foreach_sibling_failure_after_terminal_entry_settles_without_retry(self) -> None:
+        # Review finding (Cursor Bugbot): a foreach sibling failing with
+        # retries left AFTER its entry is already terminal was reset to
+        # pending -- _next_pending_instance serves running entries only, so
+        # the instance was never re-admitted, while _run_complete and the
+        # stall detector both counted it as in-flight: the control loop
+        # never finished the run. A terminal entry cannot re-admit a
+        # retry, so the sibling settles error instead.
+        self.host.outcomes["src"] = {"status": "done", "answer": '{"items": ["a", "b"]}'}
+        self.store_factory(
+            {
+                "run": {"failure_policy": "continue", "max_parallel": 8},
+                "nodes": [
+                    {"id": "src", "subagent": "worker", "outputs": [{"name": "items", "type": "json"}]},
+                    {
+                        "id": "fan",
+                        "subagent": "worker",
+                        "depends_on": ["src"],
+                        "inputs": [{"name": "items", "type": "json", "from": "src.items"}],
+                        "foreach": {"over": "items", "max": 2},
+                        "retries": 1,
+                    },
+                ],
+            }
+        )
+        result = await self.start()
+        run = self.executor._runs[result["run_id"]]
+        # src is child-1; fan instances are child-2 (i0) and child-3 (i1).
+        # i0 fails (attempt 1 <= retries 1 -> retry), is re-admitted as
+        # child-4, and fails again (attempt 2 > retries 1 -> the entry is
+        # terminal error while i1 is still running).
+        self.host.child_outcomes["child-2"] = {"status": "error", "error": "boom-1"}
+        self.host.child_outcomes["child-4"] = {"status": "error", "error": "boom-2"}
+        self.host.child_outcomes["child-3"] = {"status": "running"}
+        await self.wait_until(
+            lambda: any(entry.status == "error" for entry in run.states["fan"].entries)
+        )
+        self.assertEqual(len(self.host.spawn_calls("fan")), 3)
+        # i1 fails now with retries remaining, but the entry is terminal:
+        # no retry is queued, the run finishes instead of hanging.
+        self.host.child_outcomes["child-3"] = {"status": "error", "error": "boom-3"}
+        status = await self.settle(result)
+        self.assertEqual(status["state"], "failed")
+        fan = self.node_status(status, "fan")
+        self.assertEqual(fan["status"], "error")
+        self.assertEqual([i["status"] for i in fan["instances"]], ["error", "error"])
+        self.assertEqual([i["attempt"] for i in fan["instances"]], [2, 1])
+        # only i0's failure was ever retried; i1 settled without a re-spawn
+        self.assertEqual(len(self.host.spawn_calls("fan")), 3)
+        retries = [e for e in self.all_events_of(result, "retry") if e.get("node") == "fan"]
+        self.assertEqual([e["instance"] for e in retries], [0])
+
     # -- failure policies ---------------------------------------------------------
 
     @async_test

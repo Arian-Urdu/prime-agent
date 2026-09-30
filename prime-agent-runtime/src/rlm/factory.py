@@ -2014,7 +2014,16 @@ class FactoryExecutor:
             duration_ms=instance.duration_ms,
         )
         retries = state.spec.get("retries", NODE_RETRIES_DEFAULT)
-        if retry and instance.attempt <= retries:
+        # A retry is only queued when the entry can re-admit it: a foreach
+        # sibling failing with retries left after its entry already went
+        # terminal (a sibling failed it permanently first) would otherwise
+        # sit pending forever -- _next_pending_instance serves running
+        # entries only, while _run_complete and the stall detector both
+        # count the pending instance as in-flight, so the control loop
+        # would never finish the run. The failed instance settles as an
+        # error instead; the policy call below is a no-op on a terminal
+        # entry.
+        if retry and instance.attempt <= retries and entry.status == "running":
             instance.status = "pending"
             instance.error = None
             self._event(

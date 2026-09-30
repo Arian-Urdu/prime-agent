@@ -427,10 +427,12 @@ impl GuestCommandJournal {
         Ok(())
     }
 
-    /// Fold one version-1 record. Unknown versions stay skippable (TS
-    /// forward-compatibility); a version-1 record that fails its
-    /// semantic validation is corruption and fails the open closed —
-    /// folding it away could downgrade settled state.
+    /// Fold one version-1 record. Unknown versions stay skippable (an
+    /// explicit forward-compatibility tradeoff, exactly like TS: a
+    /// future-version record cannot be interpreted by this code, so it
+    /// must not wedge a newer journal); a version-1 record that fails
+    /// its semantic validation is corruption and fails the open closed
+    /// — folding it away could downgrade settled state.
     ///
     /// # Errors
     ///
@@ -511,17 +513,20 @@ impl GuestCommandJournal {
         Ok(())
     }
 
-    /// Fold one transition record. A transition for a KNOWN admitted
-    /// command must be semantically valid — folding it away could
-    /// downgrade a completed command back to accepted and re-execute
-    /// it — so any invalid field fails the open closed. An orphan
-    /// transition (its admit is absent) names no state to downgrade
-    /// and stays droppable (TS parity).
+    /// Fold one transition record. Every version-1 transition must be
+    /// semantically valid AND belong to a known admitted command —
+    /// folding either away could downgrade a completed command back to
+    /// accepted and re-execute it. An orphan transition is corruption,
+    /// not a drop candidate: no legitimate append ever writes a
+    /// transition without its admit (admits precede their transitions
+    /// in every append and in the compaction rewrite), so a transition
+    /// naming an unknown command is a single-byte corruption of a real
+    /// command's id and fails the open closed.
     ///
     /// # Errors
     ///
-    /// Returns an error when a known command's transition record is
-    /// semantically invalid.
+    /// Returns an error when a transition record is semantically
+    /// invalid or names a command that was never admitted.
     fn fold_transition(&mut self, record: &Value) -> Result<()> {
         let Some(command_id) = record.get("commandId").and_then(Value::as_str) else {
             return Err(anyhow!("command journal transition record is corrupt"));
@@ -548,9 +553,10 @@ impl GuestCommandJournal {
                 return Err(anyhow!("command journal transition record is corrupt"));
             }
         }
-        // A transition without an admit line cannot be trusted; drop it.
         let Some(entry) = self.entries.get_mut(command_id) else {
-            return Ok(());
+            return Err(anyhow!(
+                "command journal transition record names an unknown command"
+            ));
         };
         entry.state = state;
         entry.updated_at = recorded_at.to_string();

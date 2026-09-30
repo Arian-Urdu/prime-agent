@@ -422,3 +422,110 @@ fn an_unknown_record_version_stays_skippable() {
     assert!(restored.receipt("cmd_a").is_some());
     assert!(restored.receipt("cmd_future").is_none());
 }
+
+#[test]
+fn compacted_terminal_id_corruption_fails_closed_before_a_rerun() {
+    // The auto-rerun vector is the COMPACTED shape: compaction rewrites
+    // the journal to admit + terminal transition only, so a corrupted
+    // terminal commandId would otherwise leave the command at its admit
+    // state - ACCEPTED - and the restart's claim loop would re-execute
+    // it. No legitimate append ever creates an orphan transition, so
+    // the open refuses instead.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("command-journal.ndjson");
+    {
+        let mut journal = GuestCommandJournal::open(&path).unwrap();
+        journal.compact_after_records_for_tests(2);
+        journal
+            .admit("cmd_done", &prompt_request_value("the settled turn"))
+            .unwrap();
+        let claimed = journal.claim_next_pending().unwrap().unwrap();
+        assert_eq!(claimed.receipt.command_id, "cmd_done");
+        journal.complete("cmd_done", None).unwrap();
+    }
+    // The compaction rewrote the journal to admit + terminal only.
+    let contents = std::fs::read_to_string(&path).unwrap();
+    let records: Vec<&str> = contents
+        .split_inclusive('\n')
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    assert_eq!(
+        records.len(),
+        2,
+        "the compacted journal holds admit + terminal"
+    );
+    assert!(records[0].contains("\"type\":\"admit\""));
+    assert!(records[1].contains("\"type\":\"transition\""));
+    assert!(records[1].contains("\"state\":\"completed\""));
+    // One valid-ASCII byte flipped in the terminal transition's
+    // commandId: an orphan transition, refused closed.
+    let forged = records[1].replacen("cmd_done", "cmd_d0ne", 1);
+    let corrupted = format!("{}{}", records[0], forged);
+    std::fs::write(&path, &corrupted).unwrap();
+    assert!(
+        GuestCommandJournal::open(&path).is_err(),
+        "an orphan terminal transition must fail closed instead of restoring the command accepted for a rerun"
+    );
+    // The un-corrupted compacted journal still restores completed and
+    // a duplicate submit stays a duplicate (the positive control).
+    std::fs::write(&path, &contents).unwrap();
+    let mut restored = GuestCommandJournal::open(&path).unwrap();
+    assert_eq!(
+        restored.receipt("cmd_done").unwrap().state,
+        CloudCommandState::Completed
+    );
+    let (admission, receipt) = restored
+        .admit("cmd_done", &prompt_request_value("the settled turn"))
+        .unwrap();
+    assert_eq!(admission, GuestAdmission::Duplicate);
+    assert_eq!(receipt.state, CloudCommandState::Completed);
+}
+
+#[test]
+fn uncompacted_transition_id_corruption_also_fails_closed() {
+    // In the UN-compacted shape the running transition still exists,
+    // so a corrupted terminal id would restore the command RUNNING and
+    // uncertain - not an automatic rerun (the honest nuance; the
+    // compacted shape is the auto-rerun vector). The fail-closed rule
+    // refuses the open for BOTH shapes: an orphan version-1 transition
+    // is corruption either way.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("command-journal.ndjson");
+    {
+        let mut journal = GuestCommandJournal::open(&path).unwrap();
+        journal
+            .admit("cmd_done", &prompt_request_value("the settled turn"))
+            .unwrap();
+        let claimed = journal.claim_next_pending().unwrap().unwrap();
+        assert_eq!(claimed.receipt.command_id, "cmd_done");
+        journal.complete("cmd_done", None).unwrap();
+    }
+    let contents = std::fs::read_to_string(&path).unwrap();
+    let mut forged = String::new();
+    let mut corrupted = false;
+    for line in contents.split_inclusive('\n') {
+        if !corrupted
+            && line.contains("\"type\":\"transition\"")
+            && line.contains("\"commandId\":\"cmd_done\"")
+        {
+            forged.push_str(&line.replacen("cmd_done", "cmd_d0ne", 1));
+            corrupted = true;
+        } else {
+            forged.push_str(line);
+        }
+    }
+    assert!(corrupted, "a transition line was found");
+    std::fs::write(&path, &forged).unwrap();
+    assert!(
+        GuestCommandJournal::open(&path).is_err(),
+        "an orphan version-1 transition fails closed in every shape"
+    );
+    // The un-corrupted journal restores completed with uncertainty
+    // nowhere in sight (running + completed transitions both fold).
+    std::fs::write(&path, &contents).unwrap();
+    let restored = GuestCommandJournal::open(&path).unwrap();
+    assert_eq!(
+        restored.receipt("cmd_done").unwrap().state,
+        CloudCommandState::Completed
+    );
+}

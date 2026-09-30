@@ -106,6 +106,38 @@ class McpRegistryTest(unittest.TestCase):
         run(generation.discover())
         return generation
 
+    def test_status_reports_tools_and_errors_per_server(self):
+        async def ok_listing(server):
+            return [{"name": f"{server}.tool", "description": "fixture description", "inputSchema": {}}]
+
+        with mock.patch.object(mcp, "list_tools", ok_listing):
+            result = run(mcp.status(["alpha", "beta"], 60_000.0))
+        self.assertEqual(
+            result,
+            [
+                {"server": "alpha", "tools": [{"name": "alpha.tool", "description": "fixture description"}], "error": None},
+                {"server": "beta", "tools": [{"name": "beta.tool", "description": "fixture description"}], "error": None},
+            ],
+        )
+
+    def test_status_isolates_failures_and_timeouts(self):
+        async def failing_listing(server):
+            raise RuntimeError(f"no config for {server}")
+
+        async def slow_listing(server):
+            await asyncio.sleep(1.0)
+            return []
+
+        with mock.patch.object(mcp, "list_tools", failing_listing):
+            result = run(mcp.status(["broken"], 60_000.0))
+        self.assertIsNone(result[0]["tools"])
+        self.assertEqual(result[0]["error"], "RuntimeError: no config for broken")
+
+        with mock.patch.object(mcp, "list_tools", slow_listing):
+            result = run(mcp.status(["slow"], 50.0))
+        self.assertIsNone(result[0]["tools"])
+        self.assertIn("TimeoutError", result[0]["error"])
+
     def test_schema_alias_and_exact_names(self):
         schema = {"type": "object", "properties": {"x": {"const": 1}}}
         tool = SimpleNamespace(name="raw.tool/name", description="raw", input_schema=schema)
@@ -369,6 +401,35 @@ class McpRegistryTest(unittest.TestCase):
         with mock.patch.object(mcp, "_read_auth", return_value=None):
             with self.assertRaises(RuntimeError):
                 asyncio.run(mcp._headers("github", config))
+
+    def test_static_token_failure_is_the_kernel_unavailable_error(self):
+        config = {"type": "http", "url": "https://api.example/mcp", "credentialSource": "static-token"}
+        with mock.patch.object(mcp, "_read_auth", return_value=None):
+            with self.assertRaises(mcp.McpCredentialsUnavailable) as caught:
+                asyncio.run(mcp._headers("github", config))
+        self.assertEqual(
+            str(caught.exception),
+            "MCP credentials for 'github' are not available. Ask the user to connect it "
+            "(/plugins or /mcp login github); do not ask them to set environment variables.",
+        )
+        with mock.patch.object(mcp, "_read_auth", return_value=None):
+            with self.assertRaises(mcp.McpCredentialsUnavailable):
+                asyncio.run(mcp._auth_identity("github", config))
+
+    def test_static_token_bearer_is_never_env_or_command_resolved(self):
+        config = {"type": "http", "url": "https://api.example/mcp", "credentialSource": "static-token"}
+        # A bearer that LOOKS like an env-var name or a `!command` is attached
+        # as the literal pasted value, never resolved like a stored api_key.
+        for pasted in ("GITHUB_PAT_TOKEN", "!sh -c secret", "  spaced-token  "):
+            cred = {"type": "mcp_static_token", "endpoint": "https://api.example/mcp", "bearer": pasted}
+            with mock.patch.dict(os.environ, {"GITHUB_PAT_TOKEN": "env-resolved-token"}, clear=False):
+                with mock.patch.object(mcp, "_read_auth", return_value=cred):
+                    headers = asyncio.run(mcp._headers("github", config))
+                    identity = asyncio.run(mcp._auth_identity("github", config))
+            expected = pasted.strip()
+            self.assertEqual(headers["Authorization"], f"Bearer {expected}")
+            self.assertEqual(identity, hashlib.sha256(expected.encode()).hexdigest())
+            self.assertNotIn("env-resolved-token", headers["Authorization"])
 
     def test_static_token_auth_identity_hashes_the_bound_bearer(self):
         config = {"type": "http", "url": "https://api.example/mcp", "credentialSource": "static-token"}
@@ -752,6 +813,7 @@ class McpRegistryTest(unittest.TestCase):
                 self.assertEqual(mcp._registry._generations, {})
 
         run(scenario())
+
 
 
 class PagedSession:
@@ -1214,7 +1276,6 @@ class McpDiscoveryInventoryTest(unittest.TestCase):
             streams = run(generation._open_http())
         self.assertIsNotNone(captured["http_client"])
         self.assertEqual(streams, ("read", "write"))
-
 
 
 if __name__ == "__main__":

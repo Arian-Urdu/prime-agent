@@ -8,6 +8,7 @@ next to this file. Cells execute with top-level await in one persistent
 from __future__ import annotations
 
 import ast
+import asyncio
 import codecs
 import contextvars
 import ctypes
@@ -19,6 +20,7 @@ import os
 import platform
 import signal
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -53,6 +55,12 @@ _PAYLOAD_CAP = 16 * 1024 * 1024
 _ALWAYS_SKIP = {"rlm", "mcp", "bash", "asyncio", "In", "Out", "get_ipython", "exit", "quit", "open"}
 # IPython-injected names that may appear in a snapshot payload; never restored.
 _RESTORE_SKIP = {"In", "Out", "get_ipython"}
+# The target of the last successful snapshot, remembered so an EOF shutdown
+# (the host process died without a graceful dispose) can flush the final
+# namespace before exit. `None` until this process has committed a snapshot:
+# an EOF before that must not overwrite the on-disk payload with a namespace
+# the host never considered durable.
+_last_snapshot_target: dict[str, Any] | None = None
 
 _protocol_fd: int = -1
 _write_lock = threading.Lock()
@@ -62,8 +70,6 @@ _serve_task: asyncio.Task[Any] | None = None
 
 class _CellExecution:
     def __init__(self) -> None:
-        import asyncio
-
         self.finished = asyncio.Event()
         self.owner: asyncio.Task[Any] | None = None
 
@@ -142,8 +148,6 @@ def current_cell_completion_context() -> tuple[asyncio.Event, asyncio.Task[Any] 
 def active_cell_task() -> asyncio.Task[Any] | None:
     """The cell body task executing right now, or None between cells (global
     state, not the cell contextvar — detached tasks keep stale context copies)."""
-    import asyncio
-
     with _interrupt_lock:
         task = _active["task"]
     return task if isinstance(task, asyncio.Task) and not task.done() else None
@@ -368,10 +372,6 @@ def _consume_task_exception(task: asyncio.Task[Any]) -> None:
 
 
 def _sigint_handler(signum: int, frame: types.FrameType | None) -> None:
-    # asyncio loads by the time any task can be active (main() imports it), so
-    # this is a cached sys.modules hit even inside the signal handler.
-    import asyncio
-
     global _handoff_interrupted
     task = _active["task"]
     # No lock (the main thread may hold it): the rid equality revalidates the
@@ -520,6 +520,34 @@ def _cap_text(text: str) -> str:
     return text
 
 
+def _cap_traceback_lines(lines: list[str]) -> list[str]:
+    """Bound the aggregate, not just each entry: an exception chain can carry
+    thousands of entries, and per-entry caps alone would still let one error
+    event exceed the host's protocol line limit. Keep the newest entries — the
+    outermost exception carries the actionable failure — and lead with a
+    truncation marker."""
+    total = sum(len(line) for line in lines)
+    if total <= _RESULT_TEXT_CAP:
+        return lines
+    kept: list[str] = []
+    remaining = _RESULT_TEXT_CAP
+    for line in reversed(lines):
+        if len(line) > remaining:
+            if not kept:
+                # Never drop the newest entry: it names the raised exception.
+                kept.append(line)
+            break
+        kept.append(line)
+        remaining -= len(line)
+    kept.reverse()
+    kept.insert(
+        0,
+        f"[... traceback truncated: kept the newest {len(kept)} of {len(lines)} entries "
+        f"to fit {_RESULT_TEXT_CAP} characters ...]\n",
+    )
+    return kept
+
+
 def _error_event(cell_id: str, exc: BaseException) -> dict[str, Any]:
     # No cell frame (e.g. SyntaxError): exception-only keeps filename, source, and caret.
     te = traceback.TracebackException.from_exception(exc)
@@ -534,7 +562,7 @@ def _error_event(cell_id: str, exc: BaseException) -> dict[str, Any]:
         "id": cell_id,
         "ename": type(exc).__name__,
         "evalue": _cap_text(_safe_str(exc)),
-        "traceback": [_cap_text(line) for line in lines],
+        "traceback": _cap_traceback_lines([_cap_text(line) for line in lines]),
     }
 
 
@@ -576,8 +604,6 @@ async def _run_codes(codes: list[types.CodeType], ns: dict[str, Any]) -> Any:
 
 async def _run_guarded(task: asyncio.Task[Any], rid: str) -> tuple[str, Any, dict[str, Any] | None]:
     """Await a request task; returns (status, value, error event or None)."""
-    import asyncio
-
     with _interrupt_lock:
         _active["interrupted"] = False
         _active["rid"] = rid
@@ -685,13 +711,16 @@ class _CappedWriter:
         return size
 
 
-def _read_snapshot_records(fh: Any) -> dict[str, bytes]:
+def _read_snapshot_records(fh: Any, max_bytes: int, max_variable_bytes: int) -> dict[str, bytes]:
     """Framing damage is a corrupt snapshot: a restore error, never a partial namespace.
-    Length fields are bounds-checked before their reads, so a corrupt header cannot force a huge allocation."""
+    Length fields are bounds-checked before their reads, so a corrupt header cannot force a huge
+    allocation; the writer's own per-record and aggregate caps bound every blob read, so a
+    sparse multi-gigabyte file cannot OOM the process either."""
     fh.seek(0, os.SEEK_END)
     size = fh.tell()
     fh.seek(len(_SNAPSHOT_MAGIC))
     records: dict[str, bytes] = {}
+    total = 0
     while fh.tell() < size:
         header = fh.read(4)
         if len(header) < 4:
@@ -699,11 +728,22 @@ def _read_snapshot_records(fh: Any) -> dict[str, bytes]:
         name_len = int.from_bytes(header, "little")
         if fh.tell() + name_len + 8 > size:
             raise ValueError("truncated snapshot record")
+        # The name is bounded by the same aggregate cap as the blobs: a
+        # corrupt or sparse snapshot declaring a multi-gigabyte name must
+        # fail the cap BEFORE the read allocates it (the same OOM class
+        # the blob caps close).
+        if name_len > max_bytes:
+            raise ValueError("snapshot record name exceeds the aggregate byte cap")
         name = fh.read(name_len)
         raw_len = fh.read(8)
         blob_len = int.from_bytes(raw_len, "little")
         if len(raw_len) < 8 or fh.tell() + blob_len > size:
             raise ValueError("truncated snapshot record")
+        if blob_len > max_variable_bytes:
+            raise ValueError("snapshot record exceeds the per-variable byte cap")
+        total += blob_len
+        if total > max_bytes:
+            raise ValueError("snapshot payload exceeds the aggregate byte cap")
         blob = fh.read(blob_len)
         if len(blob) < blob_len:
             raise ValueError("truncated snapshot record")
@@ -721,7 +761,6 @@ def _snapshot_state(
     committed: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     import datetime
-    import tempfile
 
     try:
         import dill
@@ -733,6 +772,7 @@ def _snapshot_state(
     skipped: list[dict[str, str]] = []
     oversized: list[str] = []
     missing = object()
+
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     temps: list[str] = []
 
@@ -781,7 +821,14 @@ def _snapshot_state(
                         # A background thread deleted the name after the key listing.
                         skipped.append({"name": name, "reason": "deleted during snapshot"})
                         continue
-                    encoded = name.encode("utf-8")
+                    try:
+                        encoded = name.encode("utf-8")
+                    except UnicodeEncodeError as err:
+                        # A lone-surrogate name (e.g. "\ud800") cannot ride the
+                        # v2 record header; skip it like any other unserializable
+                        # name instead of failing the whole snapshot.
+                        skipped.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
+                        continue
                     # Record header: 4-byte name length + 8-byte blob length, plus the name itself.
                     budget = max_bytes - total - 12 - len(encoded)
                     # Prune mode measures at the full per-variable cap: only that cap decides
@@ -904,26 +951,64 @@ def _revive_with_live_globals(
             changed = changed or revived is not arg
             keywords[key] = revived
         if not changed:
-            return memo.setdefault(id(value), value)
+            # An unchanged partial still carries its original attributes:
+            # __main__ callables there would keep frozen snapshot globals, so
+            # revive them in place. Memoize first — an attribute can cycle
+            # back to this partial.
+            memo[id(value)] = value
+            value.__dict__.update({key: revive(attr) for key, attr in value.__dict__.items()})
+            return value
         rebuilt_partial = functools.partial(rebuilt, *args, **keywords)
-        rebuilt_partial.__dict__.update(value.__dict__)
-        return memo.setdefault(id(value), rebuilt_partial)
+        # Memoize before the attribute walk: attributes can hold the partial
+        # itself (a self-cycle or mutual partials), and unlike the function
+        # branch below there is no outer memo entry yet. Once set, the
+        # not-changed fast path also returns the rebuilt one.
+        memo[id(value)] = rebuilt_partial
+        rebuilt_partial.__dict__.update({key: revive(attr) for key, attr in value.__dict__.items()})
+        return rebuilt_partial
     atoms = (int, float, str, bytes, bool, type(None))
     # dill loads __main__.__dict__ by reference, so a saved globals() IS the live ns: never walk it.
     if value is ns:
         return value
-    if isinstance(value, (list, dict)):
+    if isinstance(value, (list, dict, set)):
         # Memoized before recursing and revived in place: cycles and identity come for free.
         # Skipping atoms keeps the walk over million-element containers near dill.loads cost.
         memo[id(value)] = value
-        for key, item in enumerate(value) if isinstance(value, list) else value.items():
-            revived = item if type(item) in atoms else revive(item)
-            if revived is not item:
-                value[key] = revived
+        if isinstance(value, set):
+            # Iterate a snapshot: discard+add during iteration would skip members.
+            for item in list(value):
+                revived = item if type(item) in atoms else revive(item)
+                if revived is not item:
+                    value.discard(item)
+                    value.add(revived)
+        elif isinstance(value, list):
+            for key, item in enumerate(value):
+                revived = item if type(item) in atoms else revive(item)
+                if revived is not item:
+                    value[key] = revived
+        else:
+            # Keys can be __main__ callables too: revive them, or lookups
+            # through the dict keep observing frozen globals. The snapshot
+            # tolerates the delete+reinsert a rebuilt key needs.
+            for key, item in list(value.items()):
+                revived = item if type(item) in atoms else revive(item)
+                revived_key = key if type(key) in atoms else revive(key)
+                if revived_key is not key:
+                    del value[key]
+                    value[revived_key] = revived
+                elif revived is not item:
+                    value[key] = revived
         return value
     if type(value) is tuple:
         items = tuple(item if type(item) in atoms else revive(item) for item in value)
         if all(new is old for new, old in zip(items, value)):
+            items = value
+        return memo.setdefault(id(value), items)
+    if type(value) is frozenset:
+        # Immutable: rebuild when any member revived (identity equality makes
+        # the comparison exact — a rebuilt function never equals the original).
+        items = frozenset(item if type(item) in atoms else revive(item) for item in value)
+        if items == value:
             items = value
         return memo.setdefault(id(value), items)
     if not isinstance(value, types.FunctionType) or value.__module__ != "__main__":
@@ -966,7 +1051,11 @@ def _revive_with_live_globals(
 
 
 def _restore_state(
-    ns: dict[str, Any], path: str, committed: list[dict[str, Any]] | None = None
+    ns: dict[str, Any],
+    path: str,
+    committed: list[dict[str, Any]] | None = None,
+    max_bytes: int | None = None,
+    max_variable_bytes: int | None = None,
 ) -> dict[str, Any]:
     if not os.path.exists(path):
         return {"restored": [], "failed": [], "reason": "snapshot not found"}
@@ -977,7 +1066,15 @@ def _restore_state(
     try:
         with open(path, "rb") as fh:
             if fh.read(len(_SNAPSHOT_MAGIC)) == _SNAPSHOT_MAGIC:
-                payload = _read_snapshot_records(fh)
+                payload = _read_snapshot_records(
+                    fh,
+                    max_bytes if max_bytes is not None else DEFAULT_SNAPSHOT_MAX_BYTES,
+                    (
+                        max_variable_bytes
+                        if max_variable_bytes is not None
+                        else DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES
+                    ),
+                )
             else:
                 # Legacy: one dill-pickled dict; old snapshot files must keep restoring.
                 fh.seek(0)
@@ -1002,10 +1099,16 @@ def _restore_state(
     backfill: list[tuple[str, Any]] = []
     revive_failed: list[dict[str, str]] = []
     for name, value in staged.items():
+        # The backfill entries a name's revival produced merge only if THAT
+        # name revives: a failed revival adds nothing (its saved globals
+        # would partially restore state the failure report says failed).
+        name_backfill: list[tuple[str, Any]] = []
         try:
-            prepared[name] = _revive_with_live_globals(value, ns, backfill)
+            prepared[name] = _revive_with_live_globals(value, ns, name_backfill)
         except Exception as err:  # noqa: BLE001 - one broken revival must not abort the restore
             revive_failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
+            continue
+        backfill.extend(name_backfill)
     result = {"restored": sorted(prepared), "failed": failed + revive_failed}
     # Park SIGINT across the whole apply so it is all-or-nothing; the parked interrupt is consumed by the commit (as in snapshot).
     previous = signal.signal(signal.SIGINT, lambda signum, frame: None)
@@ -1026,8 +1129,6 @@ def _restore_state(
 
 async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
     """Run snapshot/restore as an interruptible task and reply in the done event."""
-    import asyncio
-
     rid = req["id"]
     committed: list[dict[str, Any]] = []
 
@@ -1055,7 +1156,13 @@ async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
                 prune,
                 committed,
             )
-        return _restore_state(ns, req["path"], committed)
+        return _restore_state(
+            ns,
+            req["path"],
+            committed,
+            req.get("max_bytes", DEFAULT_SNAPSHOT_MAX_BYTES),
+            req.get("max_variable_bytes", DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES),
+        )
 
     assert _loop is not None
     task = _loop.create_task(run())
@@ -1099,7 +1206,42 @@ async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
     if "error" in result:
         _send({"event": "done", "id": rid, "status": "error", "reason": result["error"]})
         return
+    if req["type"] == "snapshot":
+        global _last_snapshot_target
+        _last_snapshot_target = {
+            "path": req["path"],
+            "manifest_path": req["manifest_path"],
+            "max_bytes": req.get("max_bytes", DEFAULT_SNAPSHOT_MAX_BYTES),
+            "max_variable_bytes": req.get("max_variable_bytes", DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES),
+        }
     _send({"event": "done", "id": rid, "status": "ok", **result})
+
+
+def _flush_final_snapshot(ns: dict[str, Any]) -> None:
+    """EOF-only best-effort final snapshot before exit.
+
+    The host died without a graceful dispose (crash, SIGKILL, worker exit
+    path that skipped `shutdown`), so its debounced snapshots stop at the
+    last one. Flush the current namespace to the last-known target so a
+    resume revives state up to the EOF instead of up to the debounce.
+    Atomic staging (temp + rename) means an interrupted flush leaves the
+    previous payload intact, never a torn one.
+    """
+    target = _last_snapshot_target
+    if target is None:
+        return
+    try:
+        _snapshot_state(
+            ns,
+            target["path"],
+            target["manifest_path"],
+            target["max_bytes"],
+            target["max_variable_bytes"],
+            False,
+            None,
+        )
+    except BaseException:  # noqa: BLE001 - never block or crash the shutdown path
+        pass
 
 
 def _list_names(ns: dict[str, Any]) -> list[str]:
@@ -1112,6 +1254,19 @@ def _list_names(ns: dict[str, Any]) -> list[str]:
 
 async def _handle_list_names(req: dict[str, Any], ns: dict[str, Any]) -> None:
     _send({"event": "done", "id": req["id"], "status": "ok", "names": _list_names(ns)})
+
+
+async def _handle_mcp_status(req: dict[str, Any], ns: dict[str, Any]) -> None:
+    from . import mcp as mcp_mod
+
+    servers = req.get("servers")
+    if not isinstance(servers, list) or not all(isinstance(name, str) for name in servers):
+        raise ValueError("mcp_status requires a list of server names")
+    timeout_ms = req.get("timeout_ms", 10_000)
+    if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, (int, float)) or timeout_ms <= 0:
+        raise ValueError("mcp_status timeout_ms must be a positive number")
+    connections = await mcp_mod.status(servers, float(timeout_ms))
+    _send({"event": "done", "id": req["id"], "status": "ok", "connections": connections})
 
 
 async def _handle_request(
@@ -1145,6 +1300,10 @@ async def _serve(queue: asyncio.Queue[dict[str, Any]], ns: dict[str, Any]) -> No
         rtype = req.get("type")
         if rtype == "shutdown":
             rid = req.get("id")
+            if req.get("eof"):
+                # Host stdin closed without a shutdown request: the host
+                # process is gone, so this is the last chance to persist.
+                _flush_final_snapshot(ns)
             # MCP children must close before the loop dies; close() is internally bounded under the host's 5s deadline.
             mcp_mod = sys.modules.get("rlm.mcp")
             if mcp_mod is not None:
@@ -1163,6 +1322,54 @@ async def _serve(queue: asyncio.Queue[dict[str, Any]], ns: dict[str, Any]) -> No
             await _handle_request(_handle_state, req, ns)
         elif rtype == "list_names":
             await _handle_request(_handle_list_names, req, ns)
+        elif rtype == "mcp_status":
+            await _handle_request(_handle_mcp_status, req, ns)
+
+
+def _handle_bash_activity(req: dict[str, Any]) -> None:
+    """Out-of-band: a running cell must not block inspection or cancellation."""
+    from .bash import activity_request
+
+    rid = req["id"]
+    try:
+        response = activity_request(req["action"], req.get("activityId"), req.get("lines", 50))
+        frame = {"event": "done", "id": rid, "status": "ok", **response}
+        _cap_bash_activity_frame(frame)
+        _send(frame)
+    except (KeyError, ValueError) as exc:
+        _send({"event": "done", "id": rid, "status": "error", "reason": str(exc)})
+
+
+def _cap_bash_activity_frame(frame: dict[str, Any]) -> None:
+    """Keep the serialized response under the 16 KiB wire cap.
+
+    json escaping can expand one character to six bytes (uXXXX-style), so
+    the byte slices in `activity_request` cannot bound the frame alone. Trim
+    from the oldest end: a tail keeps its newest lines, a list keeps its
+    newest rows.
+    """
+    tail = frame.get("tail")
+    if isinstance(tail, str):
+        while len(json.dumps(frame)) > 16_384:
+            excess = len(json.dumps(frame)) - 16_384
+            keep = max(0, len(tail) - excess // 6 - 1)
+            if keep >= len(tail):
+                # The frame cannot fit no matter how the payload shrinks
+                # (oversized request metadata): emit the smallest frame
+                # instead of looping forever on the reader thread.
+                frame["tail"] = ""
+                break
+            tail = tail[-keep:] if keep else ""
+            frame["tail"] = tail
+        return
+    rows = frame.get("activities")
+    while len(json.dumps(frame)) > 16_384 and isinstance(rows, list) and len(rows) > 1:
+        victim = next(
+            (index for index, row in enumerate(rows) if row.get("status") != "running"),
+            0,
+        )
+        rows.pop(victim)
+
 
 
 _REQUIRED_FIELDS = {
@@ -1170,6 +1377,10 @@ _REQUIRED_FIELDS = {
     "snapshot": ("id", "path", "manifest_path"),
     "restore": ("id", "path"),
     "list_names": ("id",),
+    # mcp_status's server list is a JSON array, so only its id is a
+    # string-required field; the handler validates the list itself.
+    "mcp_status": ("id",),
+    "bash_activity": ("id", "action"),
     "shutdown": (),
 }
 
@@ -1207,6 +1418,22 @@ def _handle_request_line(raw: bytes, queue: asyncio.Queue[dict[str, Any]]) -> No
     if missing:
         _protocol_error(f"{rtype} request needs string fields: {', '.join(missing)}")
         return
+    if rtype == "bash_activity":
+        if req["action"] not in ("list", "tail", "kill"):
+            _protocol_error("unknown bash activity action")
+            return
+        if req["action"] != "list" and not isinstance(req.get("activityId"), str):
+            _protocol_error("bash activity tail/kill requires string activityId")
+            return
+        if len(req["id"]) > 256 or len(req.get("activityId") or "") > 256:
+            # Frame metadata rides every response: an unbounded id would
+            # leave no room for the capped payload.
+            _protocol_error("bash activity ids must stay under 256 characters")
+            return
+        # Like host_reply, this bypasses the cell FIFO. Handles remain owned
+        # by the runtime, not by an arbitrary PID supplied by the client.
+        _handle_bash_activity(req)
+        return
     if rtype in ("execute", "snapshot", "restore"):
         with _interrupt_lock:
             # A reused in-flight id would corrupt interrupt/finish bookkeeping.
@@ -1238,9 +1465,11 @@ def _read_requests(stdin_fd: int, queue: asyncio.Queue[dict[str, Any]]) -> None:
                 _handle_request_line(raw, queue)
             except BaseException as err:  # noqa: BLE001
                 _protocol_error(f"{type(err).__name__}: {_safe_str(err)}")
-    # Host closed stdin: shut the runtime down.
+    # Host closed stdin: shut the runtime down. The marker distinguishes
+    # this from the host's explicit shutdown request (which runs after the
+    # host flushed its own final snapshot, so no runtime-side flush runs).
     _loop.call_soon_threadsafe(_fail_pending_host_requests)
-    _loop.call_soon_threadsafe(queue.put_nowait, {"type": "shutdown"})
+    _loop.call_soon_threadsafe(queue.put_nowait, {"type": "shutdown", "eof": True})
 
 
 def _resolve_owner_pid() -> int:
@@ -1350,25 +1579,15 @@ def main() -> None:
     user_module.__dict__["__builtins__"] = __builtins__
     sys.modules["__main__"] = user_module
 
-    _send({"event": "ready", "protocol": PROTOCOL_VERSION, "python": platform.python_version()})
-
-    # The event-loop stack (asyncio plus its ssl, concurrent.futures, and
-    # logging imports) is the heaviest part of this module's boot chain; load
-    # it after the ready event so kernel startup stays lean. The loop, reader
-    # thread, and serve task all come up here before the host's first request
-    # can be served, and every function that references asyncio runs only
-    # after this point.
-    import asyncio
     _loop = asyncio.new_event_loop()
     asyncio.set_event_loop(_loop)
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    signal.signal(signal.SIGINT, _sigint_handler)
     threading.Thread(target=_read_requests, args=(stdin_fd, queue), daemon=True).start()
 
+    _send({"event": "ready", "protocol": PROTOCOL_VERSION, "python": platform.python_version()})
+
     _serve_task = _loop.create_task(_serve(queue, user_module.__dict__))
-    # _sigint_handler has no task to target before serving starts, so installing
-    # it earlier would silently swallow a Ctrl-C during this boot window; the
-    # default handler must stay in charge until the loop and serve task exist.
-    signal.signal(signal.SIGINT, _sigint_handler)
     # A KeyboardInterrupt escaping a cell or background task stops
     # run_until_complete; the interrupt is already recorded, so resume serving.
     while not _serve_task.done():

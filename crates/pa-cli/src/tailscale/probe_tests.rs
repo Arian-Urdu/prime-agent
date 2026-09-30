@@ -252,6 +252,30 @@ fn a_failed_assertion_restores_the_process_cwd() {
     );
 }
 
+/// A failed assertion unwinds through the `PATH` guard: the poisoned
+/// `PATH` is restored even though the panic escaped with it live, so the
+/// unwind cannot leave the binary's other tests resolving commands
+/// against the poisoned entries.
+#[test]
+fn a_failed_assertion_restores_the_process_path() {
+    let _env = crate::config::env_lock();
+    let before = std::env::var_os("PATH");
+    let unwind = std::panic::catch_unwind(|| {
+        // Creation order mirrors the shadowing test: the guard first,
+        // then the poisoned value, so the unwind restores the `PATH` the
+        // panic left live.
+        let _path = PathGuard::capture();
+        std::env::set_var("PATH", ".:/definitely/poisoned");
+        panic!("simulate a failed assertion while the poisoned PATH is live");
+    });
+    assert!(unwind.is_err(), "the simulated assertion must unwind");
+    assert_eq!(
+        std::env::var_os("PATH"),
+        before,
+        "the guard must restore the process PATH after the unwind"
+    );
+}
+
 /// A non-executable `tailscale` in an entry does not resolve.
 #[test]
 fn resolution_skips_a_non_executable_candidate() {
@@ -306,10 +330,11 @@ fn the_public_commands_never_execute_a_tailscale_shadowing_the_cwd() {
         ),
     );
     let real = Shim::write(ONLINE, "{}");
-    // The cwd guard covers the unwind paths (a panic inside a bridge call
-    // would otherwise leak the chdir'd directory).
+    // Both guards cover the unwind paths: a panic inside a bridge call
+    // would otherwise leak the chdir'd directory and the poisoned `PATH`
+    // to the binary's other tests.
     let _cwd = CwdGuard::capture();
-    let previous_path = std::env::var_os("PATH");
+    let _path = PathGuard::capture();
     std::env::set_current_dir(workspace.path()).expect("chdir workspace");
     // The poisoned entries come first; the original `PATH` rides last so
     // the shims' own shell tools (and any concurrently running test's
@@ -321,15 +346,12 @@ fn the_public_commands_never_execute_a_tailscale_shadowing_the_cwd() {
             ".:{}:{}:{}",
             workspace.path().display(),
             real.dir().display(),
-            previous_path
-                .as_deref()
-                .map(std::ffi::OsStr::to_string_lossy)
-                .unwrap_or_default(),
+            _path.saved_lossy(),
         ),
     );
-    // Run every public bridge under the poisoned env, then restore the
-    // poisoned `PATH` before asserting so an assertion failure cannot
-    // leak it; the cwd guard restores the directory on every exit path.
+    // Run every public bridge under the poisoned env; the guards restore
+    // the `PATH` and the cwd on every exit path, so a failed assert or a
+    // panic inside a bridge call cannot leak either.
     let facts = tailscale_doctor_facts();
     let status_code = run_tailscale_status(false);
     let serve_code = run_tailscale_serve(3000.0, false);
@@ -337,10 +359,6 @@ fn the_public_commands_never_execute_a_tailscale_shadowing_the_cwd() {
         .argvs()
         .iter()
         .any(|argv| argv == &["serve", "--bg", "localhost:3000"]);
-    match previous_path {
-        Some(path) => std::env::set_var("PATH", path),
-        None => std::env::remove_var("PATH"),
-    }
     assert!(
         !marker.exists(),
         "the shadowing ./tailscale executed; facts: {facts:?}"
@@ -375,5 +393,36 @@ impl CwdGuard {
 impl Drop for CwdGuard {
     fn drop(&mut self) {
         let _ = std::env::set_current_dir(&self.0);
+    }
+}
+
+/// The process `PATH` on scope exit (including panics): the same drop-guard
+/// pattern as [`CwdGuard`], so a panic inside a public bridge call cannot
+/// leak the poisoned `PATH` to the binary's other tests - the env lock
+/// unwinds with the panic, so a write-back placed after the bridge calls
+/// never runs.
+struct PathGuard(Option<std::ffi::OsString>);
+
+impl PathGuard {
+    fn capture() -> Self {
+        Self(std::env::var_os("PATH"))
+    }
+
+    /// The saved `PATH`, lossy, for appending the original behind the
+    /// poisoned entries.
+    fn saved_lossy(&self) -> std::borrow::Cow<'_, str> {
+        self.0
+            .as_deref()
+            .map(std::ffi::OsStr::to_string_lossy)
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for PathGuard {
+    fn drop(&mut self) {
+        match self.0.as_ref() {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
     }
 }

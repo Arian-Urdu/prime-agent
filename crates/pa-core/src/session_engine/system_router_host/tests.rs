@@ -30,10 +30,13 @@ fn write_catalog(dir: &Path) {
 }
 
 fn session_model() -> Model {
+    // The agent-side descriptor's own wire names (`base_url`, not the ai
+    // side's `baseUrl`): a session model the catalog does not carry must
+    // survive the crossing back with these fields intact.
     serde_json::from_value(json!({
         "id": "session-model", "name": "Session Model", "api": "openai-completions",
-        "provider": "testprov", "baseUrl": "http://localhost:9", "reasoning": false,
-        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+        "provider": "testprov", "base_url": "http://localhost:9", "reasoning": false,
+        "cost": { "input": 1.5, "output": 2.5, "cacheRead": 0, "cacheWrite": 0 },
         "contextWindow": 128_000, "maxTokens": 4096
     }))
     .unwrap()
@@ -110,8 +113,92 @@ fn the_allowlist_pin_refuses_a_resolved_action_model() {
     assert_eq!(model.id, "action-model");
 }
 
-/// A provider with no credential is not searchable: the resolution reports
-/// the model as unavailable, unauthenticated, or expired.
+/// The fallback order's last resort: a session model the catalog does not
+/// carry (a scripted or in-memory model, one the searchable set cannot
+/// return) still resolves. The agent-side descriptor crosses back to the ai
+/// side field by field; the two `Model`s do not share a wire shape (the
+/// agent side serializes `base_url` and never carries `input`), so the
+/// earlier wire-shape round trip never produced a model and the session
+/// model errored as unavailable even when it was the intended action model.
+#[test]
+fn a_non_catalog_session_model_still_resolves_as_the_action_model() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path()).unwrap();
+    // A catalog that carries other testprov models but not the session
+    // one: the searchable set must miss it, so the resolution rides the
+    // session-model fallback, not the catalog.
+    std::fs::write(
+        dir.path().join("models.json"),
+        r#"{
+          "providers": {
+            "testprov": {
+              "baseUrl": "http://localhost:9",
+              "apiKey": "router-key",
+              "api": "openai-completions",
+              "models": [
+                { "id": "action-model", "name": "Action Model", "contextWindow": 128000 }
+              ]
+            }
+          }
+        }"#,
+    )
+    .unwrap();
+    let config = host_config(dir.path(), None, None);
+    let (model, api_key, _headers) = resolve_action_model(&config, None).unwrap();
+    assert_eq!(model.provider, "testprov");
+    assert_eq!(model.id, "session-model");
+    assert_eq!(model.api, "openai-completions");
+    assert_eq!(model.base_url, "http://localhost:9");
+    assert_eq!(model.context_window, 128_000);
+    assert_eq!(model.max_tokens, 4096);
+    assert_eq!(model.cost.input.as_f64(), 1.5);
+    // The fallback model runs the same auth preflight as a catalog model:
+    // the provider's credential resolves from the registry.
+    assert_eq!(api_key.as_deref(), Some("router-key"));
+    // The explicit session selector resolves through the same fallback.
+    let (model, _, _) = resolve_action_model(&config, Some("testprov/session-model")).unwrap();
+    assert_eq!(model.id, "session-model");
+}
+
+/// A stale or expired session-model provider must fail the resolution
+/// loudly (the TS parent-model branch: "a stale or expired provider has
+/// to fail the spawn here instead of starting a child that fails its
+/// first model request") instead of resolving the fallback model with a
+/// dead credential. The catalog itself cannot carry the session model
+/// here (the stale filter keeps the provider out of the searchable set),
+/// so this pins the fallback's own gate.
+#[test]
+fn a_stale_session_model_provider_fails_instead_of_resolving() {
+    let auth_data = crate::auth::types::AuthStorageData(
+        json!({ "testprov": { "type": "api_key", "key": "stale-key" } })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+    );
+    let mut auth = crate::auth::manager::AuthStorage::in_memory_without_env(
+        &auth_data,
+        std::sync::Arc::new(crate::auth::manager::NoOAuth),
+    );
+    assert!(auth.mark_auth_stale("testprov"));
+    let registry = ModelRegistry::in_memory(auth);
+    let dir = tempfile::tempdir().unwrap();
+    let config = host_config(dir.path(), None, None);
+    let selector = session_selector(&config);
+    let error = resolve_reference(&registry, &config, &selector, &selector).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("is unavailable, unauthenticated, or expired"),
+        "unexpected error: {error}"
+    );
+}
+
+/// A provider with no credential is not searchable: a reference to another
+/// model on it reports the model as unavailable, unauthenticated, or
+/// expired. The session model itself still resolves through the fallback
+/// (TS: the parent model is in active use, and a provider with no
+/// credential at all is neither stale nor expired; the auth preflight is
+/// what passes or fails it).
 #[test]
 fn a_provider_without_a_credential_is_not_searchable() {
     let dir = tempfile::tempdir().unwrap();
@@ -123,18 +210,56 @@ fn a_provider_without_a_credential_is_not_searchable() {
             "testprov": {
               "baseUrl": "http://localhost:9",
               "api": "openai-completions",
-              "models": [ { "id": "session-model", "name": "Session Model", "contextWindow": 128000 } ]
+              "models": [
+                { "id": "session-model", "name": "Session Model", "contextWindow": 128000 },
+                { "id": "other-model", "name": "Other Model", "contextWindow": 128000 }
+              ]
             }
           }
         }"#,
     )
     .unwrap();
     let config = host_config(dir.path(), None, None);
-    let error = resolve_action_model(&config, None).unwrap_err();
+    let error = resolve_action_model(&config, Some("testprov/other-model")).unwrap_err();
     assert!(
         error
             .to_string()
             .contains("is unavailable, unauthenticated, or expired"),
+        "unexpected error: {error}"
+    );
+    let (model, api_key, _) = resolve_action_model(&config, None).unwrap();
+    assert_eq!(model.id, "session-model");
+    assert_eq!(api_key.as_deref(), None);
+}
+
+/// The scripted-session scenario at the handler level: a session model the
+/// catalog does not carry (no models.json carries it) must still resolve
+/// and reach the segment — the failure below is the adapter's, not the
+/// model's (the pre-fix behavior errored "unavailable" before the segment).
+#[tokio::test]
+async fn the_registered_handler_runs_a_non_catalog_session_model() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let mut handlers = HostRequestHandlers::default();
+    register_system_router_handlers(&mut handlers, host_config(dir.path(), None, None));
+    let handler = handlers
+        .get("system_router.run")
+        .expect("the system_router.run handler is registered")
+        .clone();
+    let payload = HostRequestPayload {
+        data: json!({
+            "type": "system_router.run",
+            "goal": "reach the overworld",
+            "timeoutMs": 150,
+            "actions": { "look": { "description": "Look at the screen." } },
+            "environment": { "stdio": { "command": ["sh", "-c", "exit 0"] } }
+        }),
+        cell_source_code: None,
+    };
+    let error = handler(payload).await.unwrap_err().to_string();
+    assert!(
+        error.contains("environment adapter init failed")
+            || error.contains("environment adapter failed to start"),
         "unexpected error: {error}"
     );
 }

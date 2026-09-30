@@ -43,8 +43,10 @@ pub struct SystemRouterHostConfig {
     pub agent_dir: PathBuf,
     pub cwd: PathBuf,
     /// The session model: the last fallback for the action-model selector.
-    /// It crosses the crate boundary by wire shape, like every other
-    /// pa-agent/pa-ai model handoff.
+    /// It crosses back to the ai side field by field
+    /// ([`crate::session_engine::provider_adapter::agent_model_to_ai_model`]);
+    /// the two `Model`s do not share a wire shape, unlike the message
+    /// handoffs.
     pub session_model: Model,
     pub session_id: String,
     /// The configured subagent default model (the action model's first
@@ -112,8 +114,8 @@ type ResolvedActionModel = (AiModel, Option<String>, Option<BTreeMap<String, Str
 /// selector, else the configured subagent default, else the session model.
 /// The session model resolves through the catalog like any other selector
 /// (the pa-agent model on this side is lossy: it carries no input
-/// modalities), with a wire-shape round trip as the fallback for a session
-/// model the catalog does not carry.
+/// modalities), with the agent-model field mapping as the fallback for a
+/// session model the catalog does not carry.
 fn resolve_action_model(
     config: &SystemRouterHostConfig,
     reference: Option<&str>,
@@ -160,8 +162,8 @@ fn session_selector(config: &SystemRouterHostConfig) -> String {
 }
 
 /// Resolve one model reference against the credential-backed catalog. The
-/// session model itself falls back to the pa-agent/pa-ai wire-shape round
-/// trip when the catalog does not carry it (a scripted or in-memory model).
+/// session model itself falls back to the agent-model field mapping when
+/// the catalog does not carry it (a scripted or in-memory model).
 fn resolve_reference(
     registry: &ModelRegistry,
     config: &SystemRouterHostConfig,
@@ -179,14 +181,22 @@ fn resolve_reference(
         return Ok(model.clone());
     }
     if reference.eq_ignore_ascii_case(session_selector) {
-        // The catalog miss for the session's own model means the same thing as
-        // for any other reference: unauthenticated, absent, or expired. The
-        // wire-shape round trip covers a session model the catalog does not
-        // carry (a scripted or in-memory model).
-        if let Some(model) =
-            crate::session_engine::provider_adapter::json_round_trip(&config.session_model)
+        // The catalog miss for the session's own model means the same thing
+        // as for any other reference: unauthenticated, absent, or expired.
+        // A stale or expired provider must fail here instead of starting a
+        // segment whose first decision call fails its model request (the
+        // TS parent-model branch); every other miss crosses back to the ai
+        // side field by field, which covers a session model the catalog
+        // does not carry (a scripted or in-memory model).
+        let status = registry.get_provider_auth_status(&config.session_model.provider);
+        if status.source != Some(crate::auth::types::AuthSource::Stale)
+            && status.label.as_deref() != Some("expired")
         {
-            return Ok(model);
+            return Ok(
+                crate::session_engine::provider_adapter::agent_model_to_ai_model(
+                    &config.session_model,
+                ),
+            );
         }
     }
     Err(anyhow::anyhow!(

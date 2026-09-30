@@ -98,7 +98,7 @@ struct Harness {
     agent_dir: PathBuf,
     #[allow(dead_code)]
     socket: PathBuf,
-    _daemon: Daemon,
+    daemon: Daemon,
     client: Client,
 }
 
@@ -110,8 +110,8 @@ impl Drop for Harness {
         // journal fragment into the removed tree inside its orphan-exit
         // window (the fleet-wide 15s behavior); the fragment is inert and
         // dies with the worker.
-        let _ = self._daemon.child.kill();
-        let _ = self._daemon.child.wait();
+        let _ = self.daemon.child.kill();
+        let _ = self.daemon.child.wait();
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
@@ -240,22 +240,20 @@ fn kernel_python() -> Option<pa_core::factory_eval::FactoryKernelPython> {
 fn resolve_kernel_python(
     explicit: Option<PathBuf>,
 ) -> Option<pa_core::factory_eval::FactoryKernelPython> {
-    let explicit = explicit;
     let (kernel, shared_venv_exists) = resolve_factory_kernel_python(explicit);
-    match (&kernel, shared_venv_exists) {
-        (Some(_), _) => {}
-        (None, true) => {
-            eprintln!(
-                "No factory-capable kernel python: point PA_E2E_KERNEL_PYTHON at one, or create \
-                 the checkout-local venv ({}), or refresh the shared kernel venv. Skipping: \
-                 pinning is what keeps this suite from rebuilding the shared kernel venv that \
-                 live sessions run on.",
-                pa_core::factory_eval::FACTORY_KERNEL_VENV_RECIPE
-            );
-        }
-        // No shared venv exists at all: the standard bootstrap builds it
-        // from this checkout's runtime (safe; nothing live depends on it).
-        (None, false) => {}
+    if kernel.is_none() && shared_venv_exists {
+        // A shared venv exists but no candidate probes factory-capable:
+        // skip with the recipe instead of letting the standard bootstrap
+        // rebuild the shared kernel venv that live sessions run on. (With
+        // no shared venv at all, the standard bootstrap builds it from
+        // this checkout's runtime — safe; nothing live depends on it.)
+        eprintln!(
+            "No factory-capable kernel python: point PA_E2E_KERNEL_PYTHON at one, or create \
+             the checkout-local venv ({}), or refresh the shared kernel venv. Skipping: \
+             pinning is what keeps this suite from rebuilding the shared kernel venv that \
+             live sessions run on.",
+            pa_core::factory_eval::FACTORY_KERNEL_VENV_RECIPE
+        );
     }
     kernel
 }
@@ -324,7 +322,7 @@ fn seeded_factory_entries() -> serde_json::Map<String, Value> {
 /// The review/fix loop machine (the #2485 scenario-1 shape): reviewing
 /// re-enters with an optional `fix_report` input that binds the null
 /// sentinel on the first review and the fixer's json report on every
-/// re-entry. The scripted children all answer the same multi-key json
+/// re-entry. The scripted children all answer the same multi-key `json`
 /// block (verdict + fix_report), so the loop closes on bounded re-entry:
 /// reviewing runs to `max_entries` 4 while fixing exhausts `max_entries` 3
 /// and the last reviewing->fixing transition is recorded as blocked.
@@ -561,6 +559,9 @@ fn write_script(dir: &Path, name: &str, script: &Value) -> PathBuf {
 
 // -- the harness ------------------------------------------------------------
 
+// The timeout panic path cannot wait on the child; the test process exits
+// immediately afterwards, reaping it.
+#[allow(clippy::zombie_processes)]
 fn spawn_supervisor(
     socket: &Path,
     agent_dir: &Path,
@@ -656,7 +657,7 @@ fn harness(label: &str, kernel: Option<&pa_core::factory_eval::FactoryKernelPyth
         root,
         agent_dir,
         socket,
-        _daemon: spawned,
+        daemon: spawned,
         client,
     }
 }
@@ -698,13 +699,10 @@ impl Harness {
             .or_else(|| data.get("id").and_then(Value::as_str))
             .expect("active session id in create response")
             .to_string();
-        let session_uuid = data
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                panic!("session id in create response: {created}");
-            });
+        let Some(session_uuid) = data.get("sessionId").and_then(Value::as_str) else {
+            panic!("session id in create response: {created}");
+        };
+        let session_uuid = session_uuid.to_string();
         (active_session_id, session_uuid)
     }
 

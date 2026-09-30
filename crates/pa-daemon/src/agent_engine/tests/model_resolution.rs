@@ -465,6 +465,55 @@ async fn request_auth_follows_the_session_directory_context() {
     );
 }
 
+/// A broken prime CLI directory context (here a pin naming a saved
+/// context that does not exist) fails a Prime Inference turn at the
+/// preflight, before any request, instead of billing the stored team.
+#[test]
+fn a_broken_directory_context_fails_the_prime_inference_turn() {
+    let dir = tempfile::TempDir::new().unwrap();
+    write_prime_auth(&dir.path().join("agent"));
+    std::fs::create_dir_all(dir.path().join(".prime")).unwrap();
+    std::fs::write(
+        dir.path().join(".prime/context.json"),
+        r#"{"context": "missing-context"}"#,
+    )
+    .unwrap();
+    let engine = std::sync::Arc::new(restore_test_engine(
+        dir.path(),
+        Some("prime-inference"),
+        None,
+    ));
+    engine.register_arc();
+    let mut events: Vec<EngineEvent> = Vec::new();
+    engine.run_prompt(
+        0,
+        PromptRequest {
+            batch: Vec::new(),
+            images: Vec::new(),
+            message: "hello".to_string(),
+            source: "user".to_string(),
+            agent_message_id: None,
+            custom_message: None,
+        },
+        &|| false,
+        &mut |event| {
+            events.push(event);
+            true
+        },
+    );
+    let Some(EngineEvent::Done(Err(error))) = events.last() else {
+        panic!("the turn fails: {events:?}");
+    };
+    assert!(
+        error.starts_with("Invalid Prime team selection: Prime context 'missing-context' from "),
+        "{error}"
+    );
+    assert!(
+        error.ends_with("run `prime config unpin` in this directory."),
+        "{error}"
+    );
+}
+
 /// The revival race this lane fixes (the 2026-09-23 05:57 fleet kill):
 /// a revived session (scheduled wake / update restore / worker
 /// relaunch — a create without model flags) resolves against the cold

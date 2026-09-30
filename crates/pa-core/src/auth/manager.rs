@@ -288,8 +288,6 @@ pub struct AuthStorage {
     /// The session directory whose prime CLI directory context selects the
     /// Prime Inference team (see `with_project_dir`); `None` never reads one.
     project_dir: Option<std::path::PathBuf>,
-    /// The prime CLI's config directory; `None` is `~/.prime`.
-    prime_dir: Option<std::path::PathBuf>,
 }
 
 impl AuthStorage {
@@ -309,7 +307,6 @@ impl AuthStorage {
             errors: Vec::new(),
             candidate_memos: std::sync::Mutex::new(HashMap::new()),
             project_dir: None,
-            prime_dir: None,
         };
         auth.reload();
         auth
@@ -389,7 +386,6 @@ impl AuthStorage {
             errors: Vec::new(),
             candidate_memos: std::sync::Mutex::new(HashMap::new()),
             project_dir: None,
-            prime_dir: None,
         };
         auth.reload();
         auth

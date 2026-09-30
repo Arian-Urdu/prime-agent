@@ -51,6 +51,22 @@ impl AgentSessionEngine {
         let preflight_model = self
             .armed_image_route()
             .map_or_else(|| model.clone(), |route| route.target.model);
+        // A broken prime CLI directory context (a malformed
+        // `.prime/context.json`, or one naming a missing saved context)
+        // fails a Prime Inference run instead of billing the stored team,
+        // as the prime CLI refuses to run under it (no TS equivalent).
+        if self.config.faux_script.is_none()
+            && preflight_model.provider == pa_core::auth::PRIME_INFERENCE_PROVIDER_ID
+        {
+            if let Err(error) = self.session_auth().prime_directory_team() {
+                return TurnResult::Error {
+                    error: format!(
+                        "Invalid Prime team selection: {error}\n\nFix it, or run `prime config unpin` in this directory."
+                    ),
+                    assistant: None,
+                };
+            }
+        }
         if self.config.faux_script.is_none() && self.current_selection().api_key.is_none() {
             let mut registry = self.session_model_registry();
             registry.load_private_authorization_from_cache();

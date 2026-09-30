@@ -8,13 +8,19 @@ use super::{
 };
 
 impl AgentSessionEngine {
-    /// A model registry over this session's auth: the stored credentials,
-    /// with the Prime Inference team the session directory's prime CLI
-    /// directory context (`.prime/context.json`) selects.
+    /// This session's auth: the stored credentials, with the Prime
+    /// Inference team the session directory's prime CLI directory context
+    /// (`.prime/context.json`) selects.
+    pub(crate) fn session_auth(&self) -> pa_core::auth::AuthStorage {
+        pa_core::auth::AuthStorage::create(&self.config.agent_dir).with_project_dir(self.cwd())
+    }
+
+    /// A model registry over [`Self::session_auth`].
     pub(crate) fn session_model_registry(&self) -> pa_core::models::ModelRegistry {
-        let auth =
-            pa_core::auth::AuthStorage::create(&self.config.agent_dir).with_project_dir(self.cwd());
-        pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"))
+        pa_core::models::ModelRegistry::create(
+            self.session_auth(),
+            self.config.agent_dir.join("models.json"),
+        )
     }
 
     /// The TS `createAgentSession` startup chain (the no-flagged-model

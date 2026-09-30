@@ -331,7 +331,7 @@ fn provider_headers_follow_the_directory_context() {
     ];
     for (name, pin, env, with_dir, expected) in cases {
         let root = tempfile::tempdir().unwrap();
-        let repo = root.path().join("home/repo");
+        let repo = root.path().join("repo");
         std::fs::create_dir_all(repo.join(".prime")).unwrap();
         std::fs::write(repo.join(".prime/context.json"), pin).unwrap();
         let env = env
@@ -350,7 +350,6 @@ fn provider_headers_follow_the_directory_context() {
         if with_dir {
             auth = auth.with_project_dir(&repo);
         }
-        auth.prime_dir = Some(root.path().join("home/.prime"));
         let header = auth
             .get_provider_headers(PRIME_INFERENCE_PROVIDER_ID)
             .and_then(|headers| headers.get("X-Prime-Team-ID").cloned());

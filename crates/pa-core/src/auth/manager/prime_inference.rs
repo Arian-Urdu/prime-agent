@@ -135,35 +135,34 @@ impl AuthStorage {
     }
 
     /// Resolve the Prime Inference team from the prime CLI directory context
-    /// (`.prime/context.json`, or `PRIME_CONTEXT`) of the session directory
-    /// `cwd`, ahead of the stored team. The stored credential is untouched.
+    /// (`PRIME_CONTEXT`, else the nearest `.prime/context.json`) of the
+    /// session directory `cwd`, ahead of the stored team. The stored
+    /// credential is untouched.
     #[must_use]
     pub fn with_project_dir(mut self, cwd: impl Into<std::path::PathBuf>) -> Self {
         self.project_dir = Some(cwd.into());
         self
     }
 
-    /// The team the project directory's prime CLI directory context selects,
-    /// if any. A malformed pin or missing context is logged and ignored.
-    pub fn prime_directory_team(&self) -> Option<crate::auth::PrimeDirectoryTeam> {
-        let cwd = self.project_dir.as_deref()?;
-        let prime_dir = self.prime_dir.clone().or_else(|| {
-            crate::auth::default_prime_cli_config_path()
-                .parent()
-                .map(std::path::Path::to_path_buf)
-        })?;
-        let prime_context = self.env_credentials.prime_context();
-        match crate::auth::prime_directory::resolve_directory_team(
+    /// The team the project directory's prime CLI directory context selects:
+    /// `None` without a project directory or when no context applies.
+    ///
+    /// # Errors
+    ///
+    /// A malformed pin, or a pin or `PRIME_CONTEXT` naming a missing or
+    /// malformed saved context. The request headers fall back to the stored
+    /// team; the turn preflight refuses Prime Inference runs until it is
+    /// fixed.
+    pub fn prime_directory_team(&self) -> Result<Option<crate::auth::PrimeDirectoryTeam>, String> {
+        let (Some(cwd), Some(home)) = (self.project_dir.as_deref(), pa_types::platform::home_dir())
+        else {
+            return Ok(None);
+        };
+        crate::auth::prime_directory::resolve_directory_team(
             cwd,
-            &prime_dir,
-            prime_context.as_deref(),
-        ) {
-            Ok(team) => team,
-            Err(error) => {
-                tracing::warn!(%error, "ignoring Prime directory context");
-                None
-            }
-        }
+            &home,
+            self.env_credentials.prime_context().as_deref(),
+        )
     }
 
     /// Provider-scoped request headers (prime-inference team header only):
@@ -185,7 +184,10 @@ impl AuthStorage {
             .filter(|value| !value.is_empty());
         let team_id = match env_team {
             Some(team_id) => Some(team_id),
-            None => match self.prime_directory_team() {
+            None => match self.prime_directory_team().unwrap_or_else(|error| {
+                tracing::warn!(%error, "invalid Prime directory context; using the stored team");
+                None
+            }) {
                 Some(directory) => directory.team_id,
                 None => match self.data.credential(provider_id) {
                     Some(AuthCredential::ApiKey { prime_team, .. }) => {

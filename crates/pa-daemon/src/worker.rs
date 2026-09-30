@@ -984,7 +984,7 @@ mod worker_resume_settings_tests;
 
 #[cfg(test)]
 mod agent_message_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod cloud_inbox_tests;
 
 #[cfg(test)]

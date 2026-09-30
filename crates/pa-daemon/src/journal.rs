@@ -78,109 +78,82 @@ pub(crate) fn validate_private_journal_parent(path: &Path) -> Result<()> {
 }
 
 /// Create or tighten the journal's parent to the private mode a keyed
-/// (cloud) commit requires: a missing parent chain is created private, and
-/// a pre-existing parent owned by the effective user is tightened to 0700
-/// (a normal `create_dir_all` parent is 0755 under the usual umask — the
-/// commit must work against it, not quarantine over it). The mode change
-/// applies to a VERIFIED OPEN DIRECTORY HANDLE, never the re-resolved
-/// path, and every rejection — a symlink parent, a replaced parent, a
-/// parent owned by anyone else — happens before the first chmod, so a
-/// same-user symlink can never tighten its target before the validator
-/// refuses it and a swapped parent cannot redirect the change. A parent
-/// owned by anyone else is left untouched and fails the validation that
-/// follows: privacy is never assumed from a directory this process does
-/// not control.
+/// (cloud) commit requires, returning the PINNED VERIFIED DIRECTORY
+/// HANDLE: a missing parent chain is created private, and a pre-existing
+/// parent owned by the effective user is tightened to 0700 (a normal
+/// `create_dir_all` parent is 0755 under the usual umask — the commit
+/// must work against it, not quarantine over it). The directory is
+/// opened with `O_NOFOLLOW` (a symlinked parent is refused at the open
+/// itself), the path is re-statted and must still be that same inode,
+/// and every rejection — a symlink parent, a replaced parent, a parent
+/// owned by anyone else — happens before the first chmod, which applies
+/// to the opened handle. A parent owned by anyone else is left untouched
+/// and fails the validation that follows: privacy is never assumed from
+/// a directory this process does not control. The caller holds the
+/// returned handle and does every leaf operation relative to it, so no
+/// ancestor swap can redirect anything after this point.
+///
+/// # Errors
+///
+/// Returns an error when the parent cannot be created, opened, verified,
+/// or tightened.
+#[cfg(unix)]
+pub(crate) fn establish_private_journal_parent(path: &Path) -> Result<File> {
+    let parent = path.parent().context("journal has no parent directory")?;
+    pa_core::platform::perms::create_dir_all_private(parent)
+        .with_context(|| format!("create private {}", parent.display()))?;
+    let handle = pa_core::platform::private_fs::open_dir_no_follow(parent)
+        .with_context(|| format!("open {}", parent.display()))?;
+    let path_metadata = fs::symlink_metadata(parent)?;
+    anyhow::ensure!(
+        path_metadata.is_dir() && !path_metadata.file_type().is_symlink(),
+        "worker journal parent {} must be a real private directory",
+        parent.display()
+    );
+    let opened = handle.metadata()?;
+    anyhow::ensure!(
+        (opened.dev(), opened.ino()) == (path_metadata.dev(), path_metadata.ino()),
+        "worker journal parent {} was replaced while opening it",
+        parent.display()
+    );
+    let owner = pa_core::platform::perms::effective_uid()
+        .context("the effective-uid probe is required for a private journal parent")?;
+    anyhow::ensure!(
+        opened.uid() == owner,
+        "worker journal parent {} must be owned by the current user",
+        parent.display()
+    );
+    if opened.mode() & 0o777 != pa_core::platform::perms::PRIVATE_DIR_MODE {
+        handle
+            .set_permissions(std::fs::Permissions::from_mode(
+                pa_core::platform::perms::PRIVATE_DIR_MODE,
+            ))
+            .with_context(|| format!("tighten {}", parent.display()))?;
+    }
+    Ok(handle)
+}
+
+/// The path-based form of [`establish_private_journal_parent`] for callers
+/// that do not pin the handle (the keyed worker journal and the seam
+/// inbox keep their own append discipline): identical behavior, the
+/// verified handle dropped.
 ///
 /// # Errors
 ///
 /// Returns an error when the parent cannot be created, opened, verified,
 /// or tightened.
 pub(crate) fn ensure_private_journal_parent(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("worker journal has no parent directory")?;
-    pa_core::platform::perms::create_dir_all_private(parent)
-        .with_context(|| format!("create private {}", parent.display()))?;
     #[cfg(unix)]
     {
-        let handle = File::open(parent).with_context(|| format!("open {}", parent.display()))?;
-        let path_metadata = fs::symlink_metadata(parent)?;
-        anyhow::ensure!(
-            path_metadata.is_dir() && !path_metadata.file_type().is_symlink(),
-            "worker journal parent {} must be a real private directory",
-            parent.display()
-        );
-        let opened = handle.metadata()?;
-        anyhow::ensure!(
-            opened.is_dir(),
-            "worker journal parent {} is not a directory",
-            parent.display()
-        );
-        anyhow::ensure!(
-            (opened.dev(), opened.ino()) == (path_metadata.dev(), path_metadata.ino()),
-            "worker journal parent {} was replaced while opening it",
-            parent.display()
-        );
-        let owner = pa_core::platform::perms::effective_uid()
-            .context("the effective-uid probe is required for a private journal parent")?;
-        anyhow::ensure!(
-            opened.uid() == owner,
-            "worker journal parent {} must be owned by the current user",
-            parent.display()
-        );
-        if opened.mode() & 0o777 != pa_core::platform::perms::PRIVATE_DIR_MODE {
-            handle
-                .set_permissions(std::fs::Permissions::from_mode(
-                    pa_core::platform::perms::PRIVATE_DIR_MODE,
-                ))
-                .with_context(|| format!("tighten {}", parent.display()))?;
-        }
+        drop(establish_private_journal_parent(path)?);
     }
-    Ok(())
-}
-
-/// The validated parent directory's unix identity (device, inode),
-/// captured at open for the append-time revalidation. Call only after
-/// the parent passed [`validate_private_journal_parent`].
-///
-/// # Errors
-///
-/// Returns an error when the parent cannot be inspected or is not a
-/// real private directory.
-#[cfg(unix)]
-pub(crate) fn private_parent_identity(path: &Path) -> Result<(u64, u64)> {
-    let parent = path.parent().context("journal has no parent directory")?;
-    let metadata = fs::symlink_metadata(parent)?;
-    anyhow::ensure!(
-        metadata.is_dir() && !metadata.file_type().is_symlink(),
-        "journal parent {} must be a real private directory",
-        parent.display()
-    );
-    Ok((metadata.dev(), metadata.ino()))
-}
-
-/// Revalidate the private-parent contract at APPEND time against the
-/// identity captured at open: the parent must still be a real
-/// owner-private directory AND the same inode — a parent swapped through
-/// a writable ancestor between the open and this append is refused
-/// instead of receiving the write. (The check-to-open window remains;
-/// closing it fully needs an openat dir handle, which is platform
-/// machinery outside this scope.)
-///
-/// # Errors
-///
-/// Returns the validator's error, an inspect failure, or the identity
-/// mismatch.
-#[cfg(unix)]
-pub(crate) fn revalidate_private_journal_parent(path: &Path, identity: (u64, u64)) -> Result<()> {
-    validate_private_journal_parent(path)?;
-    let parent = path.parent().context("journal has no parent directory")?;
-    let metadata = fs::symlink_metadata(parent)?;
-    anyhow::ensure!(
-        (metadata.dev(), metadata.ino()) == identity,
-        "journal parent {} was replaced after open",
-        parent.display()
-    );
+    #[cfg(not(unix))]
+    {
+        let parent = path
+            .parent()
+            .context("worker journal has no parent directory")?;
+        pa_core::platform::perms::create_dir_all_private(parent)?;
+    }
     Ok(())
 }
 
@@ -218,6 +191,86 @@ pub(crate) fn ensure_private_journal_file(path: &Path) -> Result<()> {
             File::open(parent)?.sync_all()?;
         }
     }
+    Ok(())
+}
+
+/// [`append_record`] relative to the pinned parent handle: the leaf is
+/// opened with `O_NOFOLLOW` through `openat`, so neither a swapped
+/// ancestor nor a replaced leaf can redirect the append.
+///
+/// # Errors
+///
+/// Returns an error when the private open, the serialization, the write,
+/// or the sync fails.
+#[cfg(unix)]
+pub(crate) fn append_record_at(parent: &File, leaf: &str, record: &Value) -> Result<()> {
+    let mut file = pa_core::platform::private_fs::open_append_at(parent, leaf)
+        .with_context(|| format!("open journal {leaf}"))?;
+    let mut line = serde_json::to_string(record)?;
+    line.push('\n');
+    file.write_all(line.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// [`rewrite_records`] relative to the pinned parent handle: the temp is
+/// created through `openat` (`O_NOFOLLOW`, owner-only) and renamed with
+/// `renameat` — no path resolution anywhere in the swap.
+///
+/// # Errors
+///
+/// Returns an error when the temp write, the sync, or the rename fails.
+#[cfg(unix)]
+pub(crate) fn rewrite_records_at(parent: &File, leaf: &str, records: &[Value]) -> Result<()> {
+    let temp = format!("{leaf}.tmp-{}", std::process::id());
+    {
+        let file = pa_core::platform::private_fs::create_replace_at(parent, &temp)
+            .with_context(|| format!("create {temp}"))?;
+        let mut writer = BufWriter::new(file);
+        for record in records {
+            let mut line = serde_json::to_string(record)?;
+            line.push('\n');
+            writer.write_all(line.as_bytes())?;
+        }
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+    }
+    pa_core::platform::private_fs::rename_at(parent, &temp, leaf)
+        .with_context(|| format!("persist {leaf}"))?;
+    // Sync the directory entry so the replacement name survives a crash
+    // before the old journal can be forgotten.
+    parent.sync_all()?;
+    Ok(())
+}
+
+/// [`ensure_private_journal_file`] relative to the pinned parent handle:
+/// a legacy loose leaf moves to a fresh owner-only inode with the read,
+/// the temp write, and the rename all resolved through the handle.
+///
+/// # Errors
+///
+/// Returns an error when the leaf cannot be inspected, read, copied,
+/// synced, or renamed.
+#[cfg(unix)]
+pub(crate) fn migrate_private_journal_file_at(parent: &File, leaf: &str) -> Result<()> {
+    let mut file = match pa_core::platform::private_fs::open_read_at(parent, leaf) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("open {leaf}")),
+    };
+    if file.metadata()?.mode() & 0o777 == pa_core::platform::perms::PRIVATE_FILE_MODE {
+        return Ok(());
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes)?;
+    let temp = format!("{leaf}.private-{}", std::process::id());
+    let mut copy = pa_core::platform::private_fs::create_replace_at(parent, &temp)
+        .with_context(|| format!("create {temp}"))?;
+    copy.write_all(&bytes)?;
+    copy.sync_all()?;
+    pa_core::platform::private_fs::rename_at(parent, &temp, leaf)
+        .with_context(|| format!("persist {leaf}"))?;
+    parent.sync_all()?;
     Ok(())
 }
 
@@ -2066,6 +2119,9 @@ mod tests {
     /// drops the WHOLE transaction — the queue row never replays without
     /// its request-id admission — and the repair truncates the fragment
     /// so the next append cannot glue onto it.
+    /// Unix-only: the keyed (cloud) admission path fails closed off
+    /// unix, so its success verifiers run where the path exists.
+    #[cfg(unix)]
     #[test]
     fn torn_transaction_tail_drops_all_of_it_and_repairs_the_file() {
         let path = temp_path("torn-transaction.jsonl");
@@ -2126,6 +2182,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// Unix-only: the keyed (cloud) admission path fails closed off
+    /// unix, so its success verifiers run where the path exists.
+    #[cfg(unix)]
     #[test]
     fn failed_replay_sync_refuses_readable_admission_then_compaction_keeps_it() {
         let path = temp_path("replay-sync.jsonl");
@@ -2171,6 +2230,9 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// Unix-only: the keyed (cloud) admission path fails closed off
+    /// unix, so its success verifiers run where the path exists.
+    #[cfg(unix)]
     #[test]
     fn undelimited_transaction_repairs_before_append_and_unknown_version_fails_closed() {
         let path = temp_path("delimiter-version.jsonl");
@@ -2405,7 +2467,7 @@ mod tests {
         let link = root.join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let mut journal = WorkerRecoveryJournal::open(&link.join("recovery.jsonl")).unwrap();
-        let error = journal
+        journal
             .record_queue_checkpoint(
                 "sess-s",
                 "sess-s-file",
@@ -2416,13 +2478,7 @@ mod tests {
                 &[],
                 Some(("msgreq_link", &serde_json::json!({"id":"receipt"}))),
             )
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("must be a real private directory"),
-            "the symlink parent is rejected: {error:#}"
-        );
+            .expect_err("the O_NOFOLLOW open refuses the symlinked parent");
         assert!(journal.is_quarantined());
         assert_eq!(
             pa_core::platform::perms::file_mode(&target),

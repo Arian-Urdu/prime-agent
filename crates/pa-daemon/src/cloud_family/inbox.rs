@@ -73,7 +73,21 @@ pub(crate) fn load_journal_lines(path: &Path) -> Result<(Vec<String>, JournalTai
         }
         Err(error) => return Err(anyhow::anyhow!("read journal {}: {error}", path.display())),
     };
-    let (complete, fragment) = crate::journal::split_ndjson_boundaries(&contents);
+    parse_journal_lines(&contents, path)
+}
+
+/// Parse the journal bytes into their valid lines and the tail verdict
+/// (the parse half of [`load_journal_lines`], shared with callers that
+/// read through a pinned directory handle).
+///
+/// # Errors
+///
+/// Returns an error when a complete delimited record has invalid UTF-8.
+pub(crate) fn parse_journal_lines(
+    contents: &[u8],
+    context: &Path,
+) -> Result<(Vec<String>, JournalTail)> {
+    let (complete, fragment) = crate::journal::split_ndjson_boundaries(contents);
     let mut valid = Vec::new();
     let mut tail = JournalTail::Clean;
     let mut malformed_seen = false;
@@ -86,7 +100,7 @@ pub(crate) fn load_journal_lines(path: &Path) -> Result<(Vec<String>, JournalTai
         let text = std::str::from_utf8(line).map_err(|error| {
             anyhow!(
                 "journal {} has invalid delimited UTF-8: {error}",
-                path.display()
+                context.display()
             )
         })?;
         if serde_json::from_str::<Value>(text).is_ok() {
@@ -420,7 +434,7 @@ impl CloudInboxLog {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     #[cfg(unix)]

@@ -340,7 +340,7 @@ fn drive_trial(
     sessions_dir: &Path,
     ledger_path: &Path,
 ) -> Result<TrialCaptured, String> {
-    fs::create_dir_all(&sessions_dir).map_err(|error| format!("create the trial dir: {error}"))?;
+    fs::create_dir_all(sessions_dir).map_err(|error| format!("create the trial dir: {error}"))?;
     let Some((provider, model_id)) = config.model.split_once('/') else {
         return Err(format!("model must be provider/id, got {}", config.model));
     };
@@ -567,6 +567,75 @@ fn main() {
     }
 }
 
+/// Run every configured trial pair plus the two probes, logging and
+/// counting every trial (a thrown trial stays in the sweep as its own
+/// failed row — the report can never cover a subset of the planned
+/// trials).
+fn run_sweep(
+    client: &mut Client,
+    config: &FactoryEvalConfig,
+    reference_factories: &[pa_core::factory_eval::ReferenceFactory],
+    runs_root: &Path,
+) -> Vec<FactoryEvalTrialResult> {
+    let mut results: Vec<FactoryEvalTrialResult> = Vec::new();
+
+    for selection in &config.factories {
+        let factory = find_reference_factory(reference_factories, *selection);
+        for trial in 1..=config.trials {
+            println!(
+                "running {} factory trial {trial}/{} on {}",
+                factory.kind.as_str(),
+                config.trials,
+                config.model
+            );
+            results.push(run_trial(
+                client,
+                config,
+                factory,
+                EvalArm::Factory,
+                trial,
+                runs_root,
+            ));
+            println!(
+                "running {} baseline trial {trial}/{} on {}",
+                factory.kind.as_str(),
+                config.trials,
+                config.model
+            );
+            results.push(run_trial(
+                client,
+                config,
+                factory,
+                EvalArm::Baseline,
+                trial,
+                runs_root,
+            ));
+        }
+    }
+    let escalation =
+        find_reference_factory(reference_factories, ReferenceFactoryKind::ReviewSweepFail);
+    println!("running review-sweep escalation probe (one trial)");
+    results.push(run_trial(
+        client,
+        config,
+        escalation,
+        EvalArm::Factory,
+        1,
+        runs_root,
+    ));
+    let broken = find_reference_factory(reference_factories, ReferenceFactoryKind::DryRunReject);
+    println!("running dry-run rejection probe (one trial)");
+    results.push(run_trial(
+        client,
+        config,
+        broken,
+        EvalArm::Factory,
+        1,
+        runs_root,
+    ));
+    results
+}
+
 fn run(config: &FactoryEvalConfig) -> Result<(), String> {
     let runs_root = runs_root_path();
     fs::create_dir_all(&runs_root).map_err(|error| format!("create the runs root: {error}"))?;
@@ -603,61 +672,7 @@ fn run(config: &FactoryEvalConfig) -> Result<(), String> {
     // The model must resolve before any token is spent.
     probe_model(&mut client, config, &runs_root)?;
 
-    let mut results: Vec<FactoryEvalTrialResult> = Vec::new();
-    for selection in &config.factories {
-        let factory = find_reference_factory(&reference_factories, *selection);
-        for trial in 1..=config.trials {
-            println!(
-                "running {} factory trial {trial}/{} on {}",
-                factory.kind.as_str(),
-                config.trials,
-                config.model
-            );
-            results.push(run_trial(
-                &mut client,
-                config,
-                factory,
-                EvalArm::Factory,
-                trial,
-                &runs_root,
-            ));
-            println!(
-                "running {} baseline trial {trial}/{} on {}",
-                factory.kind.as_str(),
-                config.trials,
-                config.model
-            );
-            results.push(run_trial(
-                &mut client,
-                config,
-                factory,
-                EvalArm::Baseline,
-                trial,
-                &runs_root,
-            ));
-        }
-    }
-    let escalation =
-        find_reference_factory(&reference_factories, ReferenceFactoryKind::ReviewSweepFail);
-    println!("running review-sweep escalation probe (one trial)");
-    results.push(run_trial(
-        &mut client,
-        config,
-        escalation,
-        EvalArm::Factory,
-        1,
-        &runs_root,
-    ));
-    let broken = find_reference_factory(&reference_factories, ReferenceFactoryKind::DryRunReject);
-    println!("running dry-run rejection probe (one trial)");
-    results.push(run_trial(
-        &mut client,
-        config,
-        broken,
-        EvalArm::Factory,
-        1,
-        &runs_root,
-    ));
+    let results = run_sweep(&mut client, config, &reference_factories, &runs_root);
     drop(client);
     drop(supervisor);
     if results.is_empty() {

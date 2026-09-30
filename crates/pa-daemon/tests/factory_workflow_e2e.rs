@@ -323,7 +323,7 @@ fn seeded_factory_entries() -> serde_json::Map<String, Value> {
 /// re-enters with an optional `fix_report` input that binds the null
 /// sentinel on the first review and the fixer's json report on every
 /// re-entry. The scripted children all answer the same multi-key `json`
-/// block (verdict + fix_report), so the loop closes on bounded re-entry:
+/// block (verdict and `fix_report`), so the loop closes on bounded re-entry:
 /// reviewing runs to `max_entries` 4 while fixing exhausts `max_entries` 3
 /// and the last reviewing->fixing transition is recorded as blocked.
 fn loop_machine() -> Value {

@@ -131,10 +131,10 @@ request is one line; each reply is one line:
   working directory otherwise (a relative `command` or path resolves against the
   session, not the host process).
 - Requests time out after `environment.stdio.requestTimeoutMs` (default 30s). At
-  segment end the adapter is asked to close and then signaled (SIGTERM, then
-  SIGKILL) within the segment's remaining budget, so a wedged adapter cannot extend
-  a timed-out segment; on POSIX the whole process group is signaled so a launcher's
-  descendants go down with it.
+  segment end the adapter is asked to close, then sent SIGTERM, then killed with the
+  platform tree kill (SIGKILL to the process group on POSIX, `taskkill /T` on
+  Windows), all within the segment's remaining budget, so a wedged adapter cannot
+  extend a timed-out segment and a launcher's descendants go down with it.
 
 Adapters can be written in any language. Because the adapter is a subprocess, it
 also crosses machine boundaries: the same `command` can wrap a container.

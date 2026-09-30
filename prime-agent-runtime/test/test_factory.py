@@ -1418,6 +1418,27 @@ class ValidateFactoryMachineTest(unittest.TestCase):
             validate_factory_machine(resident_source),
             ["transitions[0] cannot leave resident state 'watcher'"],
         )
+        # Regression (bot review): UNHASHABLE malformed entries (a dict, a
+        # list) used to raise a raw TypeError from the set() dedupe before
+        # the type check; validation must report an error instead.
+        for bad_from in ([{}], [[1]], ["a", {}]):
+            malformed = {
+                "states": [state("a", entry=True), state("d")],
+                "transitions": [{"from": bad_from, "to": "d"}],
+            }
+            self.assertEqual(
+                validate_factory_machine(malformed),
+                ["transitions[0] from entries must be non-empty state id strings"],
+            )
+            self.assertEqual(
+                validate_factory_spec(
+                    {
+                        "states": [state("a", entry=True), state("d")],
+                        "transitions": [{"from": bad_from, "to": "d"}],
+                    }
+                ),
+                ["transitions[0] from entries must be non-empty state id strings"],
+            )
 
     def test_self_loop_is_legal_re_entry(self) -> None:
         machine = {
@@ -1767,6 +1788,42 @@ class ValidateFactorySpecFormTest(unittest.TestCase):
             validate_factory_spec({"nodes": "nope"}),
             ["factory dag requires a nodes list"],
         )
+
+    def test_validation_reports_errors_and_never_raises(self) -> None:
+        # The write-time dry run touches arbitrary caller JSON: malformed
+        # shapes (unhashable entries, wrong types everywhere) must surface
+        # as error lists, never as raw exceptions (regression: the join
+        # set() dedupe used to raise TypeError on unhashable from entries).
+        hostile = [
+            "str",
+            12,
+            None,
+            {"nodes": "nope"},
+            {"nodes": [None, 5, "str"]},
+            {"nodes": [{"id": {}, "subagent": "w"}]},
+            {"nodes": [{"id": ["x"], "subagent": "w"}]},
+            {"nodes": [{"id": "a", "subagent": {"prompt": 1}}]},
+            {"nodes": [{"id": "a", "subagent": "w", "depends_on": "a"}]},
+            {"nodes": [{"id": "a", "subagent": "w", "depends_on": [{}]}]},
+            {"nodes": [{"id": "a", "subagent": "w", "inputs": "nope"}]},
+            {"nodes": [{"id": "a", "subagent": "w", "inputs": [{"from": 5}]}]},
+            {"nodes": [{"id": "a", "subagent": "w", "outputs": [{"name": {}, "type": "text"}]}]},
+            {"nodes": [{"id": "a", "subagent": "w", "foreach": {"over": 5, "max": "x"}}]},
+            {"states": [{"id": "a", "entry": True, "subagent": "w"}], "transitions": [{"from": {}, "to": "a"}]},
+            {"states": [{"id": "a", "entry": True, "subagent": "w"}], "transitions": [{"from": [{}], "to": "a"}]},
+            {"states": [{"id": "a", "entry": True, "subagent": "w"}], "transitions": [{"from": ["a", {}], "to": "a"}]},
+            {"states": [{"id": "a", "entry": True, "subagent": "w"}], "transitions": [{"from": ["a"], "to": {}}]},
+            {"states": [{"id": "a", "entry": True, "subagent": "w"}], "transitions": [{"from": "a", "to": "a", "when": {"op": "eq", "value": [1]}}]},
+            {"states": [{"id": "a", "entry": True, "subagent": "w", "max_entries": {}}]},
+            {"states": [{"id": "a", "entry": True, "subagent": "w"}], "transitions": {"from": "a"}},
+            {"nodes": [{"id": "a", "subagent": "w"}], "states": [{"id": "b", "entry": True, "subagent": "w"}]},
+        ]
+        for index, spec in enumerate(hostile):
+            result = validate_factory_spec(spec)
+            self.assertIsInstance(result, list, f"spec #{index}")
+            self.assertTrue(all(isinstance(error, str) and error for error in result), f"spec #{index}")
+            self.assertTrue(result, f"hostile spec #{index} must report errors")
+
 
     def test_non_object_specs_reject_with_dag_wording(self) -> None:
         for bad in (None, [], "nodes", 42):

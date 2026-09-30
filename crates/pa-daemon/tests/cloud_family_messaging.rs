@@ -209,7 +209,16 @@ impl FamilyResultSubmitter for TestSubmitter {
 }
 
 fn open_request_log(dir: &std::path::Path, max_records: usize) -> FamilyRequestLog {
-    FamilyRequestLog::open(dir, "sess_cloud_1", max_records).unwrap()
+    // The macOS temp root resolves through /var (a symlink); the strict
+    // no-symlink placement policy requires the ORIGINAL path to be
+    // symlink-free, so the caller canonicalizes legitimate temp paths
+    // (the product keeps no exception).
+    FamilyRequestLog::open(
+        &std::fs::canonicalize(dir).unwrap(),
+        "sess_cloud_1",
+        max_records,
+    )
+    .unwrap()
 }
 
 fn requester(log: FamilyRequestLog) -> Arc<CloudFamilyRequester> {
@@ -257,7 +266,9 @@ async fn send_resolves_answered_only_after_receiver_admission() {
     assert!(!task.is_finished(), "no answer may claim the send early");
 
     let event = wait_for_event(&requester).await;
-    let results = dir.path().join("results.ndjson");
+    let results = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .join("results.ndjson");
     let responder = CloudFamilyResponder::new(FamilyResultLog::open(&results).unwrap());
     let delivery = TestDelivery::new();
     let submitter = TestSubmitter::new();
@@ -374,7 +385,9 @@ async fn duplicate_replay_never_redelivers() {
     });
     let event = wait_for_event(&requester).await;
 
-    let results = dir.path().join("results.ndjson");
+    let results = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .join("results.ndjson");
     let responder = CloudFamilyResponder::new(FamilyResultLog::open(&results).unwrap());
     let delivery = TestDelivery::new();
     let submitter = TestSubmitter::new();
@@ -420,7 +433,9 @@ async fn responder_restart_replays_without_redelivery() {
     });
     let event = wait_for_event(&requester).await;
 
-    let results = dir.path().join("results.ndjson");
+    let results = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .join("results.ndjson");
     let delivery = TestDelivery::new();
     let submitter = TestSubmitter::new();
     let responder = CloudFamilyResponder::new(FamilyResultLog::open(&results).unwrap());
@@ -464,7 +479,9 @@ async fn submit_failure_is_honest_and_a_replay_resubmits_the_durable_answer() {
     });
     let event = wait_for_event(&requester).await;
 
-    let results = dir.path().join("results.ndjson");
+    let results = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .join("results.ndjson");
     let responder = CloudFamilyResponder::new(FamilyResultLog::open(&results).unwrap());
     let delivery = TestDelivery::new();
     let submitter = TestSubmitter::new();
@@ -512,7 +529,9 @@ async fn roster_request_answers_rows_and_degrades_to_empty_on_error() {
     let event = wait_for_event(&requester).await;
     assert!(event.request_id().starts_with("famreq_"));
 
-    let results = dir.path().join("results.ndjson");
+    let results = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .join("results.ndjson");
     let responder = CloudFamilyResponder::new(FamilyResultLog::open(&results).unwrap());
     let delivery = TestDelivery::new();
     *delivery.roster_error.lock().unwrap() = Some("roster build failed".to_string());
@@ -544,7 +563,9 @@ async fn a_roster_answer_carries_the_local_rows() {
     });
     let event = wait_for_event(&requester).await;
 
-    let results = dir.path().join("results.ndjson");
+    let results = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .join("results.ndjson");
     let responder = CloudFamilyResponder::new(FamilyResultLog::open(&results).unwrap());
     let delivery = TestDelivery::new();
     let submitter = TestSubmitter::new();
@@ -604,7 +625,12 @@ async fn first_attempt_unresolved_stays_unanswered_until_receiver_reconciles() {
     let event = wait_for_event(&requester).await;
     let request_id = event.request_id().to_string();
     let responder = CloudFamilyResponder::new(
-        FamilyResultLog::open(&dir.path().join("results.ndjson")).unwrap(),
+        FamilyResultLog::open(
+            &std::fs::canonicalize(dir.path())
+                .unwrap()
+                .join("results.ndjson"),
+        )
+        .unwrap(),
     );
     let delivery = TestDelivery::new();
     delivery.unresolved_for.lock().unwrap().insert(
@@ -675,7 +701,9 @@ async fn delivery_errors_slice_to_2000_utf16_units() {
     });
     let event = wait_for_event(&requester).await;
 
-    let results = dir.path().join("results.ndjson");
+    let results = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .join("results.ndjson");
     let responder = CloudFamilyResponder::new(FamilyResultLog::open(&results).unwrap());
     let delivery = TestDelivery::new();
     delivery.errors_for.lock().unwrap().insert(
@@ -829,7 +857,9 @@ async fn crash_after_receiver_admission_reconciles_through_the_seam() {
     });
     let event = wait_for_event(&requester).await;
 
-    let results = dir.path().join("results.ndjson");
+    let results = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .join("results.ndjson");
     let delivery = Arc::new(TestDelivery::new());
     let submitter = Arc::new(TestSubmitter::new());
     let responder = Arc::new(CloudFamilyResponder::new(
@@ -909,7 +939,9 @@ async fn unknown_lookup_keeps_the_request_uncertain_without_redelivery() {
     });
     let event = wait_for_event(&requester).await;
 
-    let results = dir.path().join("results.ndjson");
+    let results = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .join("results.ndjson");
     let delivery = Arc::new(TestDelivery::new());
     let submitter = Arc::new(TestSubmitter::new());
     let responder = Arc::new(CloudFamilyResponder::new(
@@ -970,7 +1002,9 @@ async fn roster_crash_replay_reruns_the_read_and_reconciles() {
     });
     let event = wait_for_event(&requester).await;
 
-    let results = dir.path().join("results.ndjson");
+    let results = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .join("results.ndjson");
     let delivery = Arc::new(TestDelivery::new());
     let submitter = Arc::new(TestSubmitter::new());
     let responder = Arc::new(CloudFamilyResponder::new(
@@ -1029,7 +1063,9 @@ async fn reconciliation_records_the_answer_and_replay_resubmits() {
     });
     let event = wait_for_event(&requester).await;
 
-    let results = dir.path().join("results.ndjson");
+    let results = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .join("results.ndjson");
     let delivery = Arc::new(TestDelivery::new());
     let submitter = Arc::new(TestSubmitter::new());
     let responder = Arc::new(CloudFamilyResponder::new(
@@ -1096,7 +1132,9 @@ async fn in_flight_duplicate_surfaces_uncertain_without_delivery() {
     });
     let event = wait_for_event(&requester).await;
 
-    let results = dir.path().join("results.ndjson");
+    let results = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .join("results.ndjson");
     let delivery = Arc::new(TestDelivery::new());
     let (release, gate) = oneshot::channel::<()>();
     *delivery.delivery_gate.lock().unwrap() = Some(gate);
@@ -1157,7 +1195,9 @@ async fn answer_record_failure_surfaces_uncertain_and_can_be_completed() {
     });
     let event = wait_for_event(&requester).await;
 
-    let results = dir.path().join("results.ndjson");
+    let results = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .join("results.ndjson");
     let delivery = Arc::new(TestDelivery::new());
     *delivery.sabotage_results_path.lock().unwrap() = Some(results.clone());
     let submitter = TestSubmitter::new();

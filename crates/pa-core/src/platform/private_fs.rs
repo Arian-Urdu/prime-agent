@@ -112,10 +112,41 @@ fn open_at(parent: &File, leaf: &str, oflag: nix::fcntl::OFlag) -> io::Result<Fi
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+/// Open `name` inside the pinned directory as a directory for further
+/// pinned-relative operations, refusing a symlink (`O_NOFOLLOW` +
+/// `O_DIRECTORY`): the trusted-namespace walk resolves one ORIGINAL
+/// component at a time, never re-traversing a path.
+///
+/// # Errors
+///
+/// Returns the open error (a symlink component answers `ELOOP`/
+/// `ENOTDIR`).
+#[cfg(unix)]
+pub fn open_dir_no_follow_at(parent: &File, name: &std::ffi::OsStr) -> io::Result<File> {
+    let oflag = nix::fcntl::OFlag::O_RDONLY
+        | nix::fcntl::OFlag::O_DIRECTORY
+        | nix::fcntl::OFlag::O_NOFOLLOW
+        | nix::fcntl::OFlag::O_CLOEXEC;
+    let fd = nix::fcntl::openat(
+        Some(parent.as_raw_fd()),
+        name,
+        oflag,
+        nix::sys::stat::Mode::empty(),
+    )?;
+    // SAFETY: nix returned a newly-owned raw descriptor.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
 /// Windows arm of [`open_dir_no_follow`]: no mode bits or uid-style
 /// probes for this discipline — callers fail closed upstream.
 #[cfg(not(unix))]
 pub fn open_dir_no_follow(_path: &Path) -> io::Result<File> {
+    Err(unsupported())
+}
+
+/// Windows arm of [`open_dir_no_follow_at`]: see the module note.
+#[cfg(not(unix))]
+pub fn open_dir_no_follow_at(_parent: &File, _name: &std::ffi::OsStr) -> io::Result<File> {
     Err(unsupported())
 }
 

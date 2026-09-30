@@ -78,7 +78,7 @@ impl FamilyRequestLog {
             let events_path = directory.join(EVENTS_FILE);
             let parent = crate::journal::establish_private_journal_parent(&events_path)?;
             crate::journal::validate_private_journal_parent(&events_path)?;
-            crate::journal::require_trusted_namespace(directory)?;
+            crate::journal::require_trusted_namespace(&parent, directory)?;
             let mut log = Self {
                 session_id: session_id.to_string(),
                 events: Vec::new(),
@@ -387,10 +387,10 @@ impl FamilyResultLog {
         {
             let parent = crate::journal::establish_private_journal_parent(path)?;
             crate::journal::validate_private_journal_parent(path)?;
-            crate::journal::require_trusted_namespace(
-                path.parent()
-                    .context("the family result journal needs a parent directory")?,
-            )?;
+            let parent_path = path
+                .parent()
+                .context("the family result journal needs a parent directory")?;
+            crate::journal::require_trusted_namespace(&parent, parent_path)?;
             let Some(leaf) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
                 anyhow::bail!("the family result journal needs a file name");
             };
@@ -617,6 +617,14 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// The macOS temp root resolves through /var (a symlink); the strict
+    /// no-symlink placement policy requires the ORIGINAL path to be
+    /// symlink-free, so the tests canonicalize their legitimate temp
+    /// paths at the call site (the product keeps no exception).
+    fn temp_root(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        std::fs::canonicalize(dir.path()).unwrap()
+    }
+
     /// The request outbox carries the message body in PLAINTEXT (the TS
     /// envelope), so its inode must be private from the first write — the
     /// umask-default 0644 file was readable through any traversable path
@@ -625,7 +633,7 @@ mod tests {
     #[test]
     fn request_outbox_is_private_from_its_first_write() {
         let dir = tempfile::tempdir().unwrap();
-        let outbox = dir.path().join("nested-outbox");
+        let outbox = temp_root(&dir).join("nested-outbox");
         let mut log = FamilyRequestLog::open(&outbox, "sess_priv", 50).unwrap();
         log.append(CloudFamilyEventPayload::AgentMessageRequest {
             request_id: "msgreq_priv".to_string(),
@@ -661,7 +669,7 @@ mod tests {
     fn legacy_loose_outbox_migrates_to_a_fresh_private_inode() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let dir = tempfile::tempdir().unwrap();
-        let mut log = FamilyRequestLog::open(dir.path(), "sess_priv", 50).unwrap();
+        let mut log = FamilyRequestLog::open(&temp_root(&dir), "sess_priv", 50).unwrap();
         log.append(CloudFamilyEventPayload::AgentMessageRequest {
             request_id: "msgreq_priv".to_string(),
             from_remote_session_id: "remote_child".to_string(),
@@ -669,13 +677,13 @@ mod tests {
             message: "the plaintext body".to_string(),
         })
         .unwrap();
-        let events = dir.path().join("outbox-events.ndjson");
+        let events = temp_root(&dir).join("outbox-events.ndjson");
         // The old shape: the same file at the umask-default 0644.
         fs::set_permissions(&events, fs::Permissions::from_mode(0o644)).unwrap();
         let before = fs::symlink_metadata(&events).unwrap();
         let bytes = fs::read(&events).unwrap();
 
-        let reopened = FamilyRequestLog::open(dir.path(), "sess_priv", 50).unwrap();
+        let reopened = FamilyRequestLog::open(&temp_root(&dir), "sess_priv", 50).unwrap();
 
         let after = fs::symlink_metadata(&events).unwrap();
         assert_ne!(
@@ -698,7 +706,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            FamilyRequestLog::open(dir.path(), "sess_priv", 50)
+            FamilyRequestLog::open(&temp_root(&dir), "sess_priv", 50)
                 .unwrap()
                 .tail_sequence(),
             2,
@@ -714,7 +722,7 @@ mod tests {
     fn result_journal_is_private_and_migrates_a_legacy_loose_file() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("family-results.jsonl");
+        let path = temp_root(&dir).join("family-results.jsonl");
         let mut log = FamilyResultLog::open(&path).unwrap();
         log.admit("msgreq_r1").unwrap();
         assert_eq!(
@@ -751,10 +759,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         // The symlinked parent: rejected for both logs, and the target's
         // mode is never touched.
-        let target = root.path().join("target");
+        let target = temp_root(&root).join("target");
         fs::create_dir_all(&target).unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
-        let link = root.path().join("link");
+        let link = temp_root(&root).join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         FamilyRequestLog::open(&link, "sess_priv", 50)
             .expect_err("the O_NOFOLLOW open refuses the symlinked parent");
@@ -766,7 +774,7 @@ mod tests {
             "the symlink target is never tightened"
         );
         // A pre-existing loose own parent is tightened at open.
-        let loose = root.path().join("loose");
+        let loose = temp_root(&root).join("loose");
         fs::create_dir_all(&loose).unwrap();
         fs::set_permissions(&loose, fs::Permissions::from_mode(0o755)).unwrap();
         FamilyRequestLog::open(&loose, "sess_priv", 50).unwrap();
@@ -784,9 +792,9 @@ mod tests {
     #[test]
     fn outbox_append_refuses_a_replaced_path() {
         let dir = tempfile::tempdir().unwrap();
-        let mut log = FamilyRequestLog::open(dir.path(), "sess_priv", 50).unwrap();
-        let events = dir.path().join("outbox-events.ndjson");
-        let sink = dir.path().join("attacker-sink");
+        let mut log = FamilyRequestLog::open(&temp_root(&dir), "sess_priv", 50).unwrap();
+        let events = temp_root(&dir).join("outbox-events.ndjson");
+        let sink = temp_root(&dir).join("attacker-sink");
         fs::write(&sink, "").unwrap();
         fs::remove_file(&events).unwrap();
         std::os::unix::fs::symlink(&sink, &events).unwrap();
@@ -814,9 +822,9 @@ mod tests {
     fn outbox_append_lands_in_the_pinned_parent_despite_a_swapped_path() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
-        let outbox = root.path().join("outbox");
+        let outbox = temp_root(&root).join("outbox");
         let mut log = FamilyRequestLog::open(&outbox, "sess_priv", 50).unwrap();
-        fs::rename(&outbox, root.path().join("moved")).unwrap();
+        fs::rename(&outbox, temp_root(&root).join("moved")).unwrap();
         fs::create_dir_all(&outbox).unwrap();
         fs::set_permissions(&outbox, fs::Permissions::from_mode(0o700)).unwrap();
         log.append(CloudFamilyEventPayload::AgentMessageRequest {
@@ -826,8 +834,8 @@ mod tests {
             message: "the plaintext body".to_string(),
         })
         .expect("the pinned parent keeps serving the append");
-        let moved =
-            fs::read_to_string(root.path().join("moved").join("outbox-events.ndjson")).unwrap();
+        let moved = fs::read_to_string(temp_root(&root).join("moved").join("outbox-events.ndjson"))
+            .unwrap();
         assert!(
             moved.contains("the plaintext body"),
             "the record lives in the pinned (moved) inode: {moved}"
@@ -852,7 +860,7 @@ mod tests {
             // The mutable ancestor is INTERMEDIATE: the open tightens the
             // log's own parent, and the placement policy then refuses the
             // chain that could move it between runs.
-            let movable = root.path().join(format!("loose-{loose_mode:o}"));
+            let movable = temp_root(&root).join(format!("loose-{loose_mode:o}"));
             fs::create_dir_all(movable.join("outbox")).unwrap();
             fs::set_permissions(&movable, fs::Permissions::from_mode(loose_mode)).unwrap();
             let error = FamilyRequestLog::open(&movable.join("outbox"), "sess_priv", 50)
@@ -871,7 +879,7 @@ mod tests {
         // A sticky intermediate (the POSIX /tmp contract: only the entry's
         // owner may rename it) cannot move another user's entries, so the
         // placement stays durable.
-        let sticky = root.path().join("sticky");
+        let sticky = temp_root(&root).join("sticky");
         fs::create_dir_all(sticky.join("outbox")).unwrap();
         fs::set_permissions(&sticky, fs::Permissions::from_mode(0o1777)).unwrap();
         let mut log = FamilyRequestLog::open(&sticky.join("outbox"), "sess_priv", 50)
@@ -888,6 +896,27 @@ mod tests {
         assert!(content.contains("the plaintext body"));
     }
 
+    /// The reviewer's retargeting hole: an INTERMEDIATE symlink component
+    /// in the ORIGINAL path (the parent's path RESOLVES through an
+    /// attacker-retargetable link — even inside a sticky directory,
+    /// where the link is the attacker's own entry) is refused by the
+    /// strict original-component walk, even though the pinned handle
+    /// holds the resolved real directory.
+    #[test]
+    fn family_logs_reject_a_symlink_component_in_the_original_path() {
+        let root = tempfile::tempdir().unwrap();
+        let real = temp_root(&root).join("real-outbox");
+        fs::create_dir_all(&real).unwrap();
+        let link = temp_root(&root).join("retargetable");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // The pinned handle resolves through the symlink into the real
+        // directory — the walk then refuses the symlink component itself.
+        FamilyRequestLog::open(&link.join("outbox"), "sess_priv", 50)
+            .expect_err("a symlink component in the original path fails closed");
+        FamilyResultLog::open(&link.join("outbox").join("family-results.jsonl"))
+            .expect_err("a symlink component in the original path fails closed");
+    }
+
     /// The result journal's appends ride the same pinned handle: the
     /// admission lands in the original (moved) inode and the decoy
     /// stays empty.
@@ -895,17 +924,17 @@ mod tests {
     fn result_journal_append_lands_in_the_pinned_parent_despite_a_swapped_path() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
-        let parent = root.path().join("results-dir");
+        let parent = temp_root(&root).join("results-dir");
         fs::create_dir_all(&parent).unwrap();
         let path = parent.join("family-results.jsonl");
         let mut log = FamilyResultLog::open(&path).unwrap();
-        fs::rename(&parent, root.path().join("moved")).unwrap();
+        fs::rename(&parent, temp_root(&root).join("moved")).unwrap();
         fs::create_dir_all(&parent).unwrap();
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
         log.admit("msgreq_swap")
             .expect("the pinned parent keeps serving the admission");
-        let moved =
-            fs::read_to_string(root.path().join("moved").join("family-results.jsonl")).unwrap();
+        let moved = fs::read_to_string(temp_root(&root).join("moved").join("family-results.jsonl"))
+            .unwrap();
         assert!(
             moved.contains("msgreq_swap"),
             "the admission lives in the pinned (moved) inode: {moved}"
@@ -922,7 +951,7 @@ mod tests {
     #[test]
     fn torn_tail_is_repaired_and_never_glued() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("family-results.jsonl");
+        let path = temp_root(&dir).join("family-results.jsonl");
         let mut log = FamilyResultLog::open(&path).unwrap();
         log.admit("msgreq_t1").unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
@@ -959,7 +988,7 @@ mod tests {
     #[test]
     fn mid_file_corruption_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("family-results.jsonl");
+        let path = temp_root(&dir).join("family-results.jsonl");
         let mut log = FamilyResultLog::open(&path).unwrap();
         log.admit("msgreq_m1").unwrap();
         drop(log);

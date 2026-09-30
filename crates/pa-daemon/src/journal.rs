@@ -194,54 +194,89 @@ pub(crate) fn ensure_private_journal_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The trusted-namespace placement policy for a durable journal parent
-/// (the follow-up review's integrity finding): the pinned handle keeps
-/// the RUNNING process honest, but a placement is only durable ACROSS
-/// RESTARTS when no ancestor can MOVE the directory — an attacker with
-/// rename rights anywhere up the chain could relocate the verified
-/// directory between runs, and a fresh open at the original path would
-/// silently lose every durable record. The policy walks the RESOLVED
-/// chain (symlinks resolved via `canonicalize`) from the filesystem
-/// root and requires every ancestor to be a real directory owned by the
-/// effective user or root (the two identities outside the local-user
-/// threat model — an ancestor owned by another user can be re-chmodded
-/// writable by its owner) and not attacker-mutable: no group/other
-/// write bit, unless the sticky bit pins entry ownership (the POSIX
-/// `/tmp` contract — only the entry's owner may rename it). This is an
-/// open-time PLACEMENT certification, not an append-time recheck: once
-/// accepted, an ancestor can only become mutable through its owner (us
-/// or root, outside the threat model).
+/// The trusted-namespace placement certification for a durable journal
+/// parent (the follow-up review's integrity finding): the pinned handle
+/// keeps the RUNNING process honest, but a placement is only durable
+/// ACROSS RESTARTS when no component of the ORIGINAL path can move or
+/// retarget between runs — an attacker with rename rights anywhere up
+/// the chain could relocate the verified directory, and an
+/// attacker-owned symlink component could retarget the lookup itself.
+/// The certification walks the ORIGINAL components from the filesystem
+/// root through HANDLE-CHAINED no-follow opens (`openat` +
+/// `O_NOFOLLOW` + `O_DIRECTORY`): symlink components are rejected
+/// outright (strict-simplest — a symlink's owner can retarget it at
+/// will; no sticky or release exception applies), and every component
+/// must be owned by the effective user or root (the identities outside
+/// the local-attacker threat model) and not attacker-mutable: no
+/// group/other write bit, unless the sticky bit pins entry ownership
+/// (the POSIX `/tmp` contract — only the entry's owner may rename it).
+/// Each component's checks run on the OPENED HANDLE's metadata — the
+/// walk re-resolves no path — and the walk's final directory is BOUND
+/// to the pinned parent handle by device and inode: the certification
+/// can never describe a different directory than the one serving the
+/// appends. This is an open-time PLACEMENT certification, not an
+/// append-time recheck.
+///
+/// Callers hand over the ORIGINAL ABSOLUTE parent path; legitimate
+/// symlinked placements (a temp root resolving through `/var`, for
+/// example) must be canonicalized at the CALLER before opening — the
+/// product keeps no symlink exception.
 ///
 /// # Errors
 ///
-/// Returns an error when the chain cannot be resolved or an ancestor is
-/// foreign-owned or attacker-mutable.
+/// Returns an error when the path is not absolute and normalized, a
+/// component is a symlink, foreign-owned, or attacker-mutable, or the
+/// walked directory is not the pinned parent's inode.
 #[cfg(unix)]
-pub(crate) fn require_trusted_namespace(parent: &Path) -> Result<()> {
-    let resolved =
-        std::fs::canonicalize(parent).with_context(|| format!("resolve {}", parent.display()))?;
+pub(crate) fn require_trusted_namespace(parent: &File, original: &Path) -> Result<()> {
+    use std::path::Component;
+    anyhow::ensure!(
+        original.is_absolute(),
+        "journal placement {} must be an absolute path",
+        original.display()
+    );
     let owner = pa_core::platform::perms::effective_uid()
         .context("the effective-uid probe is required for a trusted namespace")?;
-    for ancestor in resolved.ancestors() {
-        let metadata = fs::symlink_metadata(ancestor)
-            .with_context(|| format!("inspect {}", ancestor.display()))?;
-        anyhow::ensure!(
-            metadata.is_dir() && !metadata.file_type().is_symlink(),
-            "journal ancestor {} must be a real directory",
-            ancestor.display()
-        );
-        anyhow::ensure!(
-            metadata.uid() == owner || metadata.uid() == 0,
-            "journal ancestor {} must be owned by the current user or root",
-            ancestor.display()
-        );
-        let mode = metadata.mode();
-        anyhow::ensure!(
-            mode & 0o022 == 0 || mode & 0o1000 != 0,
-            "journal ancestor {} is writable by others; the placement is not durable",
-            ancestor.display()
-        );
+    let mut current = pa_core::platform::private_fs::open_dir_no_follow(Path::new("/"))
+        .context("open the filesystem root")?;
+    for component in original.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                let next = pa_core::platform::private_fs::open_dir_no_follow_at(&current, name)
+                    .with_context(|| format!("open ancestor {}", name.display()))?;
+                let metadata = next.metadata()?;
+                anyhow::ensure!(
+                    metadata.uid() == owner || metadata.uid() == 0,
+                    "journal ancestor {} must be owned by the current user or root",
+                    name.display()
+                );
+                let mode = metadata.mode();
+                anyhow::ensure!(
+                    mode & 0o022 == 0 || mode & 0o1000 != 0,
+                    "journal ancestor {} is writable by others; the placement is not durable",
+                    name.display()
+                );
+                current = next;
+            }
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                anyhow::bail!(
+                    "journal placement {} must be a normalized absolute path",
+                    original.display()
+                );
+            }
+        }
     }
+    // THE BIND: the walked chain's final directory must be the pinned
+    // parent's inode — the certification cannot describe any other
+    // directory than the one serving the appends.
+    let walked = current.metadata()?;
+    let pinned = parent.metadata()?;
+    anyhow::ensure!(
+        (walked.dev(), walked.ino()) == (pinned.dev(), pinned.ino()),
+        "journal parent {} moved while its placement was certified",
+        original.display()
+    );
     Ok(())
 }
 

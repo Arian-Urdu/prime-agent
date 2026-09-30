@@ -4236,6 +4236,45 @@ class FactoryExecutorTest(unittest.TestCase):
         self.assertEqual(self.host.deleted_targets(), ["child-1"])
 
     @async_test
+    async def test_resident_in_flight_stall_fails_the_run_instead_of_wedging(self) -> None:
+        # Bugbot review finding (PR #3199): the dead-end stall check only ran
+        # with NOTHING in flight, but an admitted resident never settles, so a
+        # pending entry waiting on an input source that never settled kept the
+        # loop polling collect forever (in_flight true, _run_complete false,
+        # _resident_cap_starved false: it sees queued instances, not
+        # unprepared entries). Residents can never unblock a pending entry
+        # (no outputs, no outgoing transitions), so the stall detection must
+        # fire with only resident instances in flight too.
+        self.host.outcomes["watcher"] = {"status": "running"}  # residents never settle
+        self.store_machine(
+            {
+                "run": {"failure_policy": "continue"},
+                "states": [
+                    {"id": "watcher", "entry": True, "subagent": "worker", "lifecycle": "resident"},
+                    {"id": "a", "entry": True, "subagent": "worker", "outputs": [{"name": "o", "type": "text"}]},
+                    {"id": "b", "subagent": "worker", "inputs": [{"name": "i", "type": "text", "from": "c.o"}]},
+                    {"id": "c", "subagent": "worker", "outputs": [{"name": "o", "type": "text"}]},
+                ],
+                "transitions": [{"from": "a", "to": "b"}],
+            }
+        )
+        result = await self.start()
+        self.assertEqual(result["started"], ["watcher", "a"])
+        status = await self.settle(result)  # never leaves "running" without the fix
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(self.state_report(status, "b")["status"], "pending")
+        stall_events = self.events_of(status, "executor_error")
+        self.assertEqual(len(stall_events), 1)
+        self.assertIn("pending entry of state 'b'", stall_events[0]["error"])
+        self.assertIn("never settled", stall_events[0]["error"])
+        self.assertIn("failed", self.host.notice_kinds())
+        # stop() still tears the resident child down and cancels the stuck
+        # entries; the never-entered source state c reads cancelled too.
+        stopped = await rlm_module.rlm.factory.stop(result["run_id"])
+        self.assertEqual(stopped["cancelled"], ["watcher", "b", "c"])
+        self.assertEqual(self.host.deleted_targets(), ["child-1"])
+
+    @async_test
     async def test_resume_bumps_the_loop_generation_no_double_admission(self) -> None:
         # Review finding (resume race): the pause-path control loop can still
         # be winding down (an in-flight milestone await) when resume() lands.

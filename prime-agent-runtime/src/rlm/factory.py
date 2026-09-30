@@ -2380,15 +2380,22 @@ class FactoryExecutor:
                 except Exception:
                     pass
                 return
+            resident_only_in_flight = all(
+                state.lifecycle == "resident" for state, _, _ in in_flight
+            )
             if (
-                not in_flight
+                (not in_flight or resident_only_in_flight)
                 and not started
                 and not self._has_pending_instance(run)
                 and not run.pending_evaluations
             ):
                 # Defensive: nothing in flight, nothing admitted, nothing
-                # pending. The one reachable shape is a pending entry whose
-                # input source never settled; end the run instead of spinning.
+                # pending -- or only resident instances in flight, which
+                # never settle and can never unblock anything (residents
+                # declare no outputs and no outgoing transitions, so a
+                # pending entry's input source can only stay unsettled).
+                # The one reachable shape is a pending entry whose input
+                # source never settled; end the run instead of spinning.
                 stuck = [
                     state_id
                     for state_id in run.order

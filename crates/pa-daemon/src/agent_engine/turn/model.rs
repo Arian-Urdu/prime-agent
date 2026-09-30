@@ -107,6 +107,34 @@ impl AgentSessionEngine {
                 }
             }
         };
+        // The serving target's Prime Inference key and team header were
+        // resolved when the session was built (or its model last switched).
+        // Re-resolve them for every turn so a `.prime/context.json` change
+        // mid-session (`prime switch --local`) bills the team the preflight
+        // above just validated, not the one the session started with. The
+        // target keeps its model: only the request auth moves.
+        let serving = self
+            .provider_target
+            .read()
+            .expect("provider target lock")
+            .as_ref()
+            .map(|target| target.model.clone())
+            .filter(|serving| serving.provider == pa_core::auth::PRIME_INFERENCE_PROVIDER_ID);
+        if let Some(serving) = serving {
+            let (api_key, headers) = self.resolve_request_key_and_headers(&serving);
+            if let Some(target) = self
+                .provider_target
+                .write()
+                .expect("provider target lock")
+                .as_mut()
+                .filter(|target| {
+                    target.model.provider == serving.provider && target.model.id == serving.id
+                })
+            {
+                target.api_key = api_key;
+                target.headers = headers;
+            }
+        }
         // The delivery's cancel flag is consulted at the admission, before
         // the agent run registers: an abort that landed after this
         // delivery's pickup but before the registration (the lazy session

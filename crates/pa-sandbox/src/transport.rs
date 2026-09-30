@@ -55,12 +55,21 @@ impl std::fmt::Debug for TransportRequest {
 }
 
 /// One inbound HTTP response, for every status.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TransportResponse {
     /// The response status.
     pub status: u16,
     /// The response body, read under the transport's byte cap.
     pub body: Vec<u8>,
+}
+
+impl std::fmt::Debug for TransportResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransportResponse")
+            .field("status", &self.status)
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
 }
 
 /// The sandbox HTTP transport. Implementations execute one request and
@@ -203,6 +212,19 @@ fn reqwest_method(method: Method) -> reqwest::Method {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_debug_never_prints_server_body() {
+        let key = "sk-synthetic-private-key";
+        let response = TransportResponse {
+            status: 403,
+            body: format!("server echoed {key}").into_bytes(),
+        };
+        let rendered = format!("{response:?}");
+        assert!(!rendered.contains(key));
+        assert!(rendered.contains("status: 403"));
+        assert!(rendered.contains(&format!("body_bytes: {}", response.body.len())));
+    }
 
     #[test]
     fn request_debug_keeps_header_names_but_not_values_or_body() {

@@ -80,9 +80,8 @@ fn require_non_empty(value: &str, field: &str) -> Result<(), SandboxError> {
 /// `invalid_response` error, never a silent default (TS
 /// `parsePrimeSandbox`).
 pub(crate) fn parse_sandbox(value: serde_json::Value) -> Result<Sandbox, SandboxError> {
-    let raw: RawSandbox = serde_json::from_value(value).map_err(|error| {
-        SandboxError::invalid_response(format!("Sandbox response record is malformed: {error}"))
-    })?;
+    let raw: RawSandbox = serde_json::from_value(value)
+        .map_err(|_| SandboxError::invalid_response("Sandbox response record is malformed"))?;
     let status = SandboxStatus::from_wire(&raw.status)
         .ok_or_else(|| SandboxError::invalid_response("Sandbox response has unknown status"))?;
     for (field, value) in [
@@ -208,6 +207,18 @@ mod tests {
         let mut wire = sandbox_wire();
         wire["vm"] = serde_json::json!("yes");
         assert!(parse_sandbox(wire).is_err());
+    }
+
+    #[test]
+    fn malformed_record_error_never_echoes_untrusted_values() {
+        let secret = "sk-synthetic-private-key";
+        let mut wire = sandbox_wire();
+        wire["cpuCores"] = serde_json::json!(format!("Bearer {secret}\r\n"));
+        let rendered = parse_sandbox(wire).unwrap_err().to_string();
+        assert_eq!(rendered, "Sandbox response record is malformed");
+        assert!(!rendered.contains(secret));
+        assert!(!rendered.contains('\r'));
+        assert!(!rendered.contains('\n'));
     }
 
     #[test]

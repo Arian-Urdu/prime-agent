@@ -34,6 +34,7 @@ fn options(
         policy: crate::session_engine::provider_retry::DEFAULT_PROVIDER_RETRY_POLICY,
         env: Some(env),
         decide: Some(decide),
+        default_cwd: None,
         signal: None,
     }
 }
@@ -159,6 +160,7 @@ async fn adapter_init_is_bounded_by_the_segment_budget() {
         policy: crate::session_engine::provider_retry::DEFAULT_PROVIDER_RETRY_POLICY,
         env: None,
         decide: Some(support::scripted_decide(vec![])),
+        default_cwd: None,
         signal: None,
     };
     let started = std::time::Instant::now();
@@ -170,6 +172,40 @@ async fn adapter_init_is_bounded_by_the_segment_budget() {
         "unexpected error: {error}"
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+/// The spec's adapter cwd wins; an omitted one falls back to the caller's
+/// session working directory instead of the host process cwd.
+#[tokio::test]
+async fn the_adapter_runs_in_the_session_working_directory_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("adapter-cwd.txt");
+    let command = format!("pwd > {} ; exit 0", marker.display());
+    let payload = json!({
+        "goal": "reach the overworld",
+        "timeoutMs": 2_000,
+        "actions": { "look": { "description": "Look." } },
+        "environment": { "stdio": { "command": ["sh", "-c", command] } }
+    });
+    let spec = parse_system_router_run_spec(&payload).unwrap();
+    let options = RouterSegmentOptions {
+        model: action_model(),
+        api_key: Some("test-key".to_string()),
+        headers: None,
+        session_id: None,
+        policy: crate::session_engine::provider_retry::DEFAULT_PROVIDER_RETRY_POLICY,
+        env: None,
+        decide: Some(support::scripted_decide(vec![])),
+        default_cwd: Some(dir.path().to_string_lossy().into_owned()),
+        signal: None,
+    };
+    // The adapter cannot speak the protocol, so the segment fails after the
+    // shell wrote its cwd.
+    let _ = run_router_segment(&spec, options).await;
+    let written = std::fs::read_to_string(&marker).expect("the adapter ran in the default cwd");
+    let expected = std::fs::canonicalize(dir.path()).unwrap();
+    let actual = std::fs::canonicalize(written.trim()).unwrap();
+    assert_eq!(actual, expected);
 }
 
 /// The env trait object is what the loop closes; keep the compiler honest

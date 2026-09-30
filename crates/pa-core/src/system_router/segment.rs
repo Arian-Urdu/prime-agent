@@ -38,6 +38,11 @@ pub struct RouterSegmentOptions {
     /// compaction `SummarizerFn`): the model-backed function is built when
     /// this is `None`.
     pub decide: Option<RouterDecisionFn>,
+    /// The adapter working directory when the spec declares none. The
+    /// session passes its own working directory, so a relative adapter
+    /// command or path resolves against the session, not the host process
+    /// (the two differ in a daemon worker switched onto another session).
+    pub default_cwd: Option<String>,
     /// External abort (host shutdown): ends the run `failed("aborted")`.
     pub signal: Option<AbortSignal>,
 }
@@ -58,7 +63,11 @@ pub async fn run_router_segment(
     let env: Arc<dyn RouterSegmentEnvironment> = options.env.clone().unwrap_or_else(|| {
         Arc::new(StdioRouterEnvironment::new(
             spec.environment.stdio.command.clone(),
-            spec.environment.stdio.cwd.clone(),
+            spec.environment
+                .stdio
+                .cwd
+                .clone()
+                .or_else(|| options.default_cwd.clone()),
             spec.environment.stdio.request_timeout_ms,
             spec.environment.stdio.init.clone(),
         ))

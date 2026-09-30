@@ -94,6 +94,7 @@ pub async fn handle_system_router_run(
             policy: config.policy.clone(),
             env: None,
             decide: None,
+            default_cwd: Some(config.cwd.to_string_lossy().into_owned()),
             // No per-request abort signal exists on the kernel host bridge;
             // the segment's wall-clock budget bounds the run.
             signal: None,

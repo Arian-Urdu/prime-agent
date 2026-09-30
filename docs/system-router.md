@@ -127,6 +127,9 @@ request is one line; each reply is one line:
   base64 PNG `image`, and `terminal`.
 - `execute`: reply with `text` and optional `terminal`. A soft failure is an
   honest `text` result; an `ok: false` error fails the run.
+- The adapter runs in `environment.stdio.cwd` when given, and in the session's
+  working directory otherwise (a relative `command` or path resolves against the
+  session, not the host process).
 - Requests time out after `environment.stdio.requestTimeoutMs` (default 30s). At
   segment end the adapter is asked to close and then signaled (SIGTERM, then
   SIGKILL) within the segment's remaining budget, so a wedged adapter cannot extend

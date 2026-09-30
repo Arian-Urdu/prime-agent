@@ -110,14 +110,18 @@ where
     tokio::pin!(work);
     let timeout = tokio::time::sleep_until(deadline);
     tokio::pin!(timeout);
+    // Biased: finished work is never discarded for a deadline that became
+    // ready in the same poll, and an abort outranks a simultaneous deadline.
     if let Some(signal) = signal {
         tokio::select! {
+            biased;
             value = &mut work => Race::Done(value),
-            () = &mut timeout => Race::Deadline,
             () = signal.aborted() => Race::Aborted,
+            () = &mut timeout => Race::Deadline,
         }
     } else {
         tokio::select! {
+            biased;
             value = &mut work => Race::Done(value),
             () = &mut timeout => Race::Deadline,
         }

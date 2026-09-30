@@ -187,11 +187,13 @@ fn resolution_takes_the_first_trusted_absolute_entry() {
 #[test]
 fn resolution_skips_relative_entries_and_the_current_directory() {
     let _env = crate::config::env_lock();
+    // The process cwd is global: capture it in a drop guard, so a failed
+    // assert unwinds through the restore instead of skipping it.
+    let _cwd = CwdGuard::capture();
     let workspace = tempfile::tempdir().expect("temp dir");
     write_executable(&workspace.path().join("tailscale"), "#!/bin/sh\nexit 0\n");
     let real = tempfile::tempdir().expect("temp dir");
     write_executable(&real.path().join("tailscale"), "#!/bin/sh\nexit 0\n");
-    let previous_cwd = std::env::current_dir().expect("cwd");
     std::env::set_current_dir(workspace.path()).expect("chdir workspace");
     let path =
         std::env::join_paths([Path::new("."), workspace.path(), real.path()]).expect("join paths");
@@ -204,7 +206,6 @@ fn resolution_skips_relative_entries_and_the_current_directory() {
         resolve_tailscale_binary(OsStr::new(""), workspace.path(), "tailscale"),
         None
     );
-    std::env::set_current_dir(previous_cwd).expect("restore cwd");
 }
 
 /// When only untrusted entries hold the CLI, the CLI is absent. Runs from
@@ -213,9 +214,10 @@ fn resolution_skips_relative_entries_and_the_current_directory() {
 #[test]
 fn resolution_reports_no_cli_when_only_untrusted_entries_hold_it() {
     let _env = crate::config::env_lock();
+    // Same guard: the cwd restores on every exit path, failed assert or not.
+    let _cwd = CwdGuard::capture();
     let workspace = tempfile::tempdir().expect("temp dir");
     write_executable(&workspace.path().join("tailscale"), "#!/bin/sh\nexit 0\n");
-    let previous_cwd = std::env::current_dir().expect("cwd");
     std::env::set_current_dir(workspace.path()).expect("chdir workspace");
     let path = std::env::join_paths([Path::new("."), Path::new(""), workspace.path()])
         .expect("join paths");
@@ -223,7 +225,31 @@ fn resolution_reports_no_cli_when_only_untrusted_entries_hold_it() {
         resolve_tailscale_binary(path.as_os_str(), workspace.path(), "tailscale"),
         None
     );
-    std::env::set_current_dir(previous_cwd).expect("restore cwd");
+}
+
+/// A failed assertion unwinds through the cwd guard: the process cwd is
+/// restored even though the chdir'd temp directory has already been
+/// removed, so the panic cannot leave other tests running from a deleted
+/// directory.
+#[test]
+fn a_failed_assertion_restores_the_process_cwd() {
+    let _env = crate::config::env_lock();
+    let before = std::env::current_dir().expect("cwd");
+    let unwind = std::panic::catch_unwind(|| {
+        // Creation order mirrors the resolution tests: the guard first,
+        // then the chdir'd directory, so the unwind drops the directory
+        // before the guard restores the cwd.
+        let _cwd = CwdGuard::capture();
+        let workspace = tempfile::tempdir().expect("temp dir");
+        std::env::set_current_dir(workspace.path()).expect("chdir workspace");
+        panic!("simulate a failed assertion while chdir'd into the temp dir");
+    });
+    assert!(unwind.is_err(), "the simulated assertion must unwind");
+    assert_eq!(
+        std::env::current_dir().expect("cwd"),
+        before,
+        "the guard must restore the process cwd after the unwind"
+    );
 }
 
 /// A non-executable `tailscale` in an entry does not resolve.
@@ -280,7 +306,9 @@ fn the_public_commands_never_execute_a_tailscale_shadowing_the_cwd() {
         ),
     );
     let real = Shim::write(ONLINE, "{}");
-    let previous_cwd = std::env::current_dir().expect("cwd");
+    // The cwd guard covers the unwind paths (a panic inside a bridge call
+    // would otherwise leak the chdir'd directory).
+    let _cwd = CwdGuard::capture();
     let previous_path = std::env::var_os("PATH");
     std::env::set_current_dir(workspace.path()).expect("chdir workspace");
     // The poisoned entries come first; the original `PATH` rides last so
@@ -299,8 +327,9 @@ fn the_public_commands_never_execute_a_tailscale_shadowing_the_cwd() {
                 .unwrap_or_default(),
         ),
     );
-    // Run every public bridge under the poisoned env, then restore before
-    // asserting so an assertion failure cannot leak the poisoned state.
+    // Run every public bridge under the poisoned env, then restore the
+    // poisoned `PATH` before asserting so an assertion failure cannot
+    // leak it; the cwd guard restores the directory on every exit path.
     let facts = tailscale_doctor_facts();
     let status_code = run_tailscale_status(false);
     let serve_code = run_tailscale_serve(3000.0, false);
@@ -308,7 +337,6 @@ fn the_public_commands_never_execute_a_tailscale_shadowing_the_cwd() {
         .argvs()
         .iter()
         .any(|argv| argv == &["serve", "--bg", "localhost:3000"]);
-    std::env::set_current_dir(previous_cwd).expect("restore cwd");
     match previous_path {
         Some(path) => std::env::set_var("PATH", path),
         None => std::env::remove_var("PATH"),
@@ -330,4 +358,22 @@ fn the_public_commands_never_execute_a_tailscale_shadowing_the_cwd() {
         "the trusted CLI must receive the serve spawn: {:?}",
         real.argvs()
     );
+}
+
+/// The process working directory on scope exit (including panics): a drop
+/// guard, so a failed assert cannot leak the chdir'd temp directory to the
+/// binary's other tests - the `CwdGuard` convention from
+/// `pa-types/src/platform/transport.rs`.
+struct CwdGuard(std::path::PathBuf);
+
+impl CwdGuard {
+    fn capture() -> Self {
+        Self(std::env::current_dir().expect("current dir"))
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.0);
+    }
 }

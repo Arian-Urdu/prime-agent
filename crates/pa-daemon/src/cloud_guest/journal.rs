@@ -20,6 +20,7 @@ use pa_types::daemon::cloud::{
     CLOUD_MAX_ERROR_CHARS, CLOUD_MAX_RECEIPT_RESULT_CHARS,
 };
 use serde_json::{json, Value};
+use std::io::Write as _;
 
 use crate::cloud_guest::now_iso;
 use crate::journal::{append_record, rewrite_records, Finalize};
@@ -343,17 +344,22 @@ impl GuestCommandJournal {
     }
 
     /// Load and fold the durable records (TS `load`/`foldRecord`).
-    /// Reads bytes, never lossy strings: only a torn FINAL line (a
-    /// crash mid-append; the appends always end in a newline) may be
-    /// skipped — any other unreadable file or any non-final record
-    /// that fails to parse is corruption the guest must refuse to serve
-    /// under, because silently folding it away could re-admit a
-    /// completed command as new and run it twice.
+    ///
+    /// Byte-level strict: only a torn FINAL line (a crash mid-append;
+    /// the appends always end in a newline) may be skipped, and it is
+    /// REPAIRED AWAY ON DISK before this returns — otherwise the next
+    /// append would glue onto the malformed tail and wedge the next
+    /// reboot. Every complete line must be strict UTF-8 and valid
+    /// JSON, and every version-1 record must be semantically valid:
+    /// folding away a complete record could downgrade a completed
+    /// command back to accepted and re-execute it, so corruption
+    /// anywhere but the torn tail fails the open closed.
     ///
     /// # Errors
     ///
     /// Returns an error when the journal cannot be read (anything but
-    /// a missing file) or a complete record is corrupt.
+    /// a missing file), a complete record is corrupt, or the torn-tail
+    /// repair write fails.
     fn load(&mut self) -> Result<()> {
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
@@ -362,23 +368,28 @@ impl GuestCommandJournal {
                 return Err(anyhow!("read {}: {error}", self.path.display()));
             }
         };
-        let content = String::from_utf8_lossy(&bytes);
-        let lines: Vec<&str> = content.split('\n').collect();
         let torn_tail = !bytes.ends_with(b"\n");
-        let complete = if torn_tail {
-            // A crash may leave only the final append truncated: drop
-            // that one line; every earlier record stays authoritative.
-            lines[..lines.len() - 1].to_vec()
+        let complete_prefix_end = if torn_tail {
+            bytes
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |last_newline| last_newline + 1)
         } else {
-            lines
+            bytes.len()
         };
-        for line in complete {
+        let complete = &bytes[..complete_prefix_end];
+        if torn_tail {
+            self.repair_torn_tail(complete)?;
+        }
+        let content = std::str::from_utf8(complete)
+            .map_err(|_| anyhow!("command journal record is not valid UTF-8"))?;
+        for line in content.split('\n') {
             if line.is_empty() {
                 continue;
             }
             let record = serde_json::from_str::<Value>(line)
                 .map_err(|_| anyhow!("command journal record is corrupt"))?;
-            self.fold_record(&record);
+            self.fold_record(&record)?;
         }
         // A claim fsyncs the running transition before the request
         // leaves the journal, so an accepted command on disk was never
@@ -393,56 +404,97 @@ impl GuestCommandJournal {
         Ok(())
     }
 
-    fn fold_record(&mut self, record: &Value) {
+    /// Rewrite the journal to exactly the complete prefix (temp file,
+    /// fsync, rename): the torn tail is gone BEFORE any new append can
+    /// glue onto it. The rewritten bytes are the good prefix verbatim.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the temp write, its sync, or the swap
+    /// fails.
+    fn repair_torn_tail(&self, complete_prefix: &[u8]) -> Result<()> {
+        let temp = self
+            .path
+            .with_extension(format!("ndjson.tmp-{}", std::process::id()));
+        {
+            let mut file = std::fs::File::create(&temp)
+                .with_context(|| format!("create {}", temp.display()))?;
+            file.write_all(complete_prefix)?;
+            file.sync_all()?;
+        }
+        pa_core::platform::rename_onto(&temp, &self.path)
+            .with_context(|| format!("persist {}", self.path.display()))?;
+        Ok(())
+    }
+
+    /// Fold one version-1 record. Unknown versions stay skippable (TS
+    /// forward-compatibility); a version-1 record that fails its
+    /// semantic validation is corruption and fails the open closed —
+    /// folding it away could downgrade settled state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a version-1 record is semantically
+    /// invalid.
+    fn fold_record(&mut self, record: &Value) -> Result<()> {
         if record.get("version").and_then(Value::as_u64) != Some(1) {
-            return;
+            return Ok(());
         }
         self.record_count += 1;
         let kind = record.get("type").and_then(Value::as_str);
         if kind == Some("admit") {
-            self.fold_admit(record);
+            self.fold_admit(record)?;
         } else if kind == Some("transition") {
-            self.fold_transition(record);
+            self.fold_transition(record)?;
+        } else {
+            return Err(anyhow!("command journal record has an unknown type"));
         }
+        Ok(())
     }
 
-    fn fold_admit(&mut self, record: &Value) {
+    /// Fold one admit record. Every version-1 admit must be
+    /// semantically valid; a bad one fails the open closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the admit record is semantically invalid.
+    fn fold_admit(&mut self, record: &Value) -> Result<()> {
         let Some(command_id) = record.get("commandId").and_then(Value::as_str) else {
-            return;
+            return Err(anyhow!("command journal admit record is corrupt"));
         };
         if cloud_id_problem(Some(&json!(command_id)), "commandId").is_some() {
-            return;
+            return Err(anyhow!("command journal admit record is corrupt"));
         }
         let Some(digest) = record.get("digest").and_then(Value::as_str) else {
-            return;
+            return Err(anyhow!("command journal admit record is corrupt"));
         };
         if !is_cloud_digest(digest) {
-            return;
+            return Err(anyhow!("command journal admit record is corrupt"));
         }
         let Some(request) = record.get("request").and_then(Value::as_str) else {
-            return;
+            return Err(anyhow!("command journal admit record is corrupt"));
         };
         let Some(recorded_at) = record.get("recordedAt").and_then(Value::as_str) else {
-            return;
+            return Err(anyhow!("command journal admit record is corrupt"));
         };
         let Ok(parsed) = serde_json::from_str::<Value>(request) else {
-            return;
+            return Err(anyhow!("command journal admit record is corrupt"));
         };
         if cloud_request_problem(&parsed).is_some() {
-            return;
+            return Err(anyhow!("command journal admit record is corrupt"));
         }
         // The stored digest must match the stored request; a mismatched
         // pair is corruption.
         let Ok(canonical) = canonical_json(&parsed) else {
-            return;
+            return Err(anyhow!("command journal admit record is corrupt"));
         };
         if cloud_digest(&canonical) != digest {
-            return;
+            return Err(anyhow!("command journal admit record is corrupt"));
         }
         // Admits are create-only; a repeated admit line (hand-edited
         // journal) keeps the first.
         if self.entries.contains_key(command_id) {
-            return;
+            return Ok(());
         }
         let entry = JournalEntry {
             digest: digest.to_string(),
@@ -456,43 +508,56 @@ impl GuestCommandJournal {
         };
         self.entries.insert(command_id.to_string(), entry);
         self.order.push(command_id.to_string());
+        Ok(())
     }
 
-    fn fold_transition(&mut self, record: &Value) {
+    /// Fold one transition record. A transition for a KNOWN admitted
+    /// command must be semantically valid — folding it away could
+    /// downgrade a completed command back to accepted and re-execute
+    /// it — so any invalid field fails the open closed. An orphan
+    /// transition (its admit is absent) names no state to downgrade
+    /// and stays droppable (TS parity).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a known command's transition record is
+    /// semantically invalid.
+    fn fold_transition(&mut self, record: &Value) -> Result<()> {
         let Some(command_id) = record.get("commandId").and_then(Value::as_str) else {
-            return;
+            return Err(anyhow!("command journal transition record is corrupt"));
         };
         let Some(state) = record
             .get("state")
             .and_then(Value::as_str)
             .and_then(parse_state)
         else {
-            return;
+            return Err(anyhow!("command journal transition record is corrupt"));
         };
         let Some(recorded_at) = record.get("recordedAt").and_then(Value::as_str) else {
-            return;
+            return Err(anyhow!("command journal transition record is corrupt"));
         };
         let error = record.get("error").and_then(Value::as_str);
         if let Some(error) = error {
             if error.is_empty() || error.chars().count() > CLOUD_MAX_ERROR_CHARS {
-                return;
+                return Err(anyhow!("command journal transition record is corrupt"));
+            }
+        }
+        let result = record.get("result").and_then(Value::as_str);
+        if let Some(result) = result {
+            if result.is_empty() || result.chars().count() > CLOUD_MAX_RECEIPT_RESULT_CHARS {
+                return Err(anyhow!("command journal transition record is corrupt"));
             }
         }
         // A transition without an admit line cannot be trusted; drop it.
         let Some(entry) = self.entries.get_mut(command_id) else {
-            return;
+            return Ok(());
         };
-        let result = record.get("result").and_then(Value::as_str);
-        if let Some(result) = result {
-            if result.is_empty() || result.chars().count() > CLOUD_MAX_RECEIPT_RESULT_CHARS {
-                return;
-            }
-        }
         entry.state = state;
         entry.updated_at = recorded_at.to_string();
         entry.uncertain = record.get("uncertain").and_then(Value::as_bool) == Some(true);
         entry.error = error.map(str::to_string);
         entry.result = result.map(str::to_string);
+        Ok(())
     }
 
     /// Compaction must observe the caller's completed state mutation, so

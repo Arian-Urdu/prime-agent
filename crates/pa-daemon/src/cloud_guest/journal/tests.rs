@@ -133,7 +133,7 @@ fn crash_truncated_tail_folds_to_the_last_complete_record() {
 }
 
 #[test]
-fn corrupt_records_fold_out() {
+fn a_version_one_admit_with_a_mismatched_digest_fails_closed() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("command-journal.ndjson");
     {
@@ -141,24 +141,18 @@ fn corrupt_records_fold_out() {
         journal
             .admit("cmd_kept", &prompt_request_value("kept"))
             .unwrap();
-        journal
-            .admit("cmd_dropped", &prompt_request_value("dropped"))
-            .unwrap();
     }
-    // Hand-corrupt the journal: a bad-version record and an admit whose
-    // digest does not match its request both fold out.
+    // Hand-forged version-1 admit whose digest does not match its
+    // request: it is corruption of a known-schema record, not a
+    // skippable future version — the open refuses instead of folding
+    // state away.
     let contents = std::fs::read_to_string(&path).unwrap();
     let forged = format!(
-        "{contents}{}\n{}\n",
-        r#"{"version":2,"type":"admit","commandId":"cmd_new","digest":"sha256:0","request":"{}","recordedAt":"now"}"#,
+        "{contents}{}\n",
         r#"{"version":1,"type":"admit","commandId":"cmd_bad_digest","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","request":"{\"kind\":\"abort\"}","recordedAt":"now"}"#
     );
     std::fs::write(&path, forged).unwrap();
-    let restored = GuestCommandJournal::open(&path).unwrap();
-    assert!(restored.receipt("cmd_kept").is_some());
-    assert!(restored.receipt("cmd_dropped").is_some());
-    assert!(restored.receipt("cmd_new").is_none());
-    assert!(restored.receipt("cmd_bad_digest").is_none());
+    assert!(GuestCommandJournal::open(&path).is_err());
 }
 
 #[test]
@@ -300,4 +294,131 @@ fn corrupted_midfile_record_fails_closed() {
     let forged = lines.join("\n");
     std::fs::write(&path, forged).unwrap();
     assert!(GuestCommandJournal::open(&path).is_err());
+}
+
+#[test]
+fn torn_tail_is_repaired_on_disk_so_the_next_append_never_glues() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("command-journal.ndjson");
+    {
+        let mut journal = GuestCommandJournal::open(&path).unwrap();
+        journal
+            .admit("cmd_a", &prompt_request_value("turn"))
+            .unwrap();
+        let claimed = journal.claim_next_pending().unwrap().unwrap();
+        assert_eq!(claimed.receipt.command_id, "cmd_a");
+        journal.complete("cmd_a", None).unwrap();
+    }
+    // Reopen #1 with a torn tail: the recovery must REPAIR the disk, not
+    // just skip in memory — otherwise the next append glues onto the
+    // malformed line and the next reboot wedges on a corrupt complete
+    // record.
+    let mut contents = std::fs::read(&path).unwrap();
+    contents.extend_from_slice(b"{\"version\":1,\"type\":\"admit\",\"commandId\":\"cmd_to");
+    std::fs::write(&path, &contents).unwrap();
+    {
+        let mut journal = GuestCommandJournal::open(&path).unwrap();
+        assert_eq!(
+            journal.receipt("cmd_a").unwrap().state,
+            CloudCommandState::Completed
+        );
+        // The repaired file admits fresh work normally.
+        journal
+            .admit("cmd_b", &prompt_request_value("after the repair"))
+            .unwrap();
+    }
+    // Reopen #2: both the completed command and the post-repair
+    // admission survive; nothing glued.
+    let mut restored = GuestCommandJournal::open(&path).unwrap();
+    assert_eq!(
+        restored.receipt("cmd_a").unwrap().state,
+        CloudCommandState::Completed
+    );
+    let (admission, receipt) = restored
+        .admit("cmd_b", &prompt_request_value("after the repair"))
+        .unwrap();
+    assert_eq!(admission, GuestAdmission::Duplicate);
+    assert_eq!(receipt.state, CloudCommandState::Accepted);
+    let claimed = restored.claim_next_pending().unwrap().unwrap();
+    assert_eq!(claimed.receipt.command_id, "cmd_b");
+}
+
+#[test]
+fn a_complete_line_with_invalid_utf8_fails_closed() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("command-journal.ndjson");
+    {
+        let mut journal = GuestCommandJournal::open(&path).unwrap();
+        journal
+            .admit("cmd_a", &prompt_request_value("turn"))
+            .unwrap();
+    }
+    // A COMPLETE line (newline-terminated) carrying a lone invalid byte:
+    // lossy decoding could fold a mutated record; strict decoding
+    // refuses the open.
+    let mut contents = std::fs::read(&path).unwrap();
+    contents.extend_from_slice(b"{\"commandId\":\"cmd_\xFF\xFE\"}\n");
+    std::fs::write(&path, &contents).unwrap();
+    assert!(GuestCommandJournal::open(&path).is_err());
+}
+
+#[test]
+fn a_malformed_complete_transition_fails_closed_instead_of_downgrading() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("command-journal.ndjson");
+    {
+        let mut journal = GuestCommandJournal::open(&path).unwrap();
+        journal
+            .admit("cmd_done", &prompt_request_value("turn"))
+            .unwrap();
+        let claimed = journal.claim_next_pending().unwrap().unwrap();
+        assert_eq!(claimed.receipt.command_id, "cmd_done");
+        journal.complete("cmd_done", None).unwrap();
+    }
+    // Corrupt the command's completed transition INTO a complete line
+    // with an invalid state: folding it away would restore the settled
+    // command as accepted and re-execute it, so the open must refuse.
+    let contents = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = contents.split('\n').collect();
+    let mut forged: Vec<String> = Vec::new();
+    let mut replaced = false;
+    for line in lines {
+        if line.contains("\"type\":\"transition\"") && line.contains("cmd_done") && !replaced {
+            let mut record: serde_json::Value = serde_json::from_str(line).unwrap();
+            record["state"] = serde_json::json!("settled_somehow");
+            forged.push(record.to_string());
+            replaced = true;
+        } else {
+            forged.push(line.to_string());
+        }
+    }
+    assert!(replaced, "the completed transition line was found");
+    let forged = forged.join("\n");
+    std::fs::write(&path, forged).unwrap();
+    assert!(
+        GuestCommandJournal::open(&path).is_err(),
+        "a malformed transition of a known command must fail closed, never downgrade it to accepted"
+    );
+}
+
+#[test]
+fn an_unknown_record_version_stays_skippable() {
+    // Forward compatibility (TS parity): a future-version record folds
+    // out without corrupting the open.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("command-journal.ndjson");
+    {
+        let mut journal = GuestCommandJournal::open(&path).unwrap();
+        journal
+            .admit("cmd_a", &prompt_request_value("turn"))
+            .unwrap();
+    }
+    let contents = std::fs::read_to_string(&path).unwrap();
+    let forged = format!(
+        "{contents}{{\"version\":2,\"type\":\"admit\",\"commandId\":\"cmd_future\",\"digest\":\"sha256:0\",\"request\":\"{{}}\",\"recordedAt\":\"now\"}}\n"
+    );
+    std::fs::write(&path, forged).unwrap();
+    let restored = GuestCommandJournal::open(&path).unwrap();
+    assert!(restored.receipt("cmd_a").is_some());
+    assert!(restored.receipt("cmd_future").is_none());
 }

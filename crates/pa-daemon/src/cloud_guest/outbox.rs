@@ -363,19 +363,28 @@ impl GuestEventOutbox {
                 return Err(anyhow!("read {}: {error}", path.display()));
             }
         };
-        let content = String::from_utf8_lossy(&bytes);
+        let torn_tail = !bytes.ends_with(b"\n");
+        let complete_prefix_end = if torn_tail {
+            bytes
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |last_newline| last_newline + 1)
+        } else {
+            bytes.len()
+        };
+        let complete = &bytes[..complete_prefix_end];
+        if torn_tail {
+            // A crash truncated the final append: rewrite the file to
+            // exactly the complete prefix (verbatim bytes) so no later
+            // append can glue onto the malformed tail. No fsynced
+            // event is lost.
+            self.repair_torn_tail(complete)?;
+        }
+        let content = std::str::from_utf8(complete)
+            .map_err(|_| anyhow!("Cloud event outbox record is not valid UTF-8"))?;
         let mut lines: Vec<&str> = content.split('\n').collect();
         if lines.last() == Some(&"") {
             lines.pop();
-        }
-        if !bytes.ends_with(b"\n") && !lines.is_empty() {
-            // A crash truncated the final append: drop that one line and
-            // repair the file to the last complete record. The repaired
-            // bytes are exactly the complete prefix — no fsynced event
-            // is lost.
-            lines.pop();
-            let repaired: Vec<String> = lines.iter().map(|line| (*line).to_string()).collect();
-            self.rewrite_events(repaired)?;
         }
         for (index, line) in lines.iter().enumerate() {
             let record: Value = serde_json::from_str(line)
@@ -402,6 +411,30 @@ impl GuestEventOutbox {
         Ok(())
     }
 
+    /// Rewrite the event log to exactly the complete prefix (temp
+    /// file, fsync, rename): the torn tail is gone BEFORE any new
+    /// append can glue onto it. The rewritten bytes are the good
+    /// prefix verbatim.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the temp write, its sync, or the swap
+    /// fails.
+    fn repair_torn_tail(&self, complete_prefix: &[u8]) -> Result<()> {
+        let temp = self
+            .events_path()
+            .with_extension(format!("ndjson.tmp-{}", std::process::id()));
+        {
+            let mut file =
+                File::create(&temp).with_context(|| format!("create {}", temp.display()))?;
+            file.write_all(complete_prefix)?;
+            file.sync_all()?;
+        }
+        pa_core::platform::rename_onto(&temp, &self.events_path())
+            .with_context(|| format!("persist {}", self.events_path().display()))?;
+        Ok(())
+    }
+
     fn validate_sequence(&self) -> Result<()> {
         if self.meta.acked_sequence > tail_sequence(&self.events) {
             return Err(anyhow!(
@@ -425,26 +458,6 @@ impl GuestEventOutbox {
         }
         fs::rename(&temp, self.meta_path())
             .with_context(|| format!("persist {}", self.meta_path().display()))?;
-        Ok(())
-    }
-
-    /// Rewrite the event log with the given canonical envelope lines,
-    /// durably (temp file, fsync, rename), repairing a truncated tail in
-    /// place.
-    fn rewrite_events(&mut self, lines: Vec<String>) -> Result<()> {
-        let path = self.events_path();
-        let temp = path.with_extension("ndjson.tmp");
-        {
-            let file = File::create(&temp).with_context(|| format!("create {}", temp.display()))?;
-            let mut writer = BufWriter::new(file);
-            for line in &lines {
-                writer.write_all(line.as_bytes())?;
-                writer.write_all(b"\n")?;
-            }
-            writer.flush()?;
-            writer.get_ref().sync_all()?;
-        }
-        fs::rename(&temp, &path).with_context(|| format!("persist {}", path.display()))?;
         Ok(())
     }
 }

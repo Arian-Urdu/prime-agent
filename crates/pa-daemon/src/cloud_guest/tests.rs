@@ -899,10 +899,10 @@ fn torn_multibyte_outbox_tail_preserves_the_fsynced_events() {
     // reader would reject the whole file; a truncating recovery would
     // destroy both fsynced events.
     let mut contents =
-        std::fs::read(&state.join("event-outbox").join("outbox-events.ndjson")).unwrap();
+        std::fs::read(state.join("event-outbox").join("outbox-events.ndjson")).unwrap();
     contents.extend_from_slice(b"{\"eventId\":\"evt_\xF0\x9F");
     std::fs::write(
-        &state.join("event-outbox").join("outbox-events.ndjson"),
+        state.join("event-outbox").join("outbox-events.ndjson"),
         &contents,
     )
     .unwrap();
@@ -925,7 +925,7 @@ fn torn_multibyte_outbox_tail_preserves_the_fsynced_events() {
         )
         .unwrap();
     assert_eq!(events.len(), 2);
-    let reloaded = std::fs::read(&state.join("event-outbox").join("outbox-events.ndjson")).unwrap();
+    let reloaded = std::fs::read(state.join("event-outbox").join("outbox-events.ndjson")).unwrap();
     assert!(reloaded.ends_with(b"\n"), "the torn tail was repaired away");
 }
 
@@ -1010,6 +1010,7 @@ fn the_guest_socket_is_owner_only_after_bind() {
     // restricts the socket inode to 0700 (TS chmodSync parity) — the
     // umask must not decide who can reach the bridge socket. Assert the
     // restriction over a REAL unix listener.
+    use std::os::unix::fs::PermissionsExt;
     rt().block_on(async {
         let dir = tempfile::TempDir::new().unwrap();
         let socket = dir.path().join("cloud.sock");
@@ -1020,7 +1021,6 @@ fn the_guest_socket_is_owner_only_after_bind() {
         // Simulate the umask leaving the socket world-readable, then
         // apply the guest's restriction step exactly where
         // `run_guest_daemon` applies it.
-        use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o755)).unwrap();
         pa_core::platform::perms::restrict_file(&socket).expect("restrict");
         let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;

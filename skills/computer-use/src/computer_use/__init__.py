@@ -42,6 +42,10 @@ _LINUX_PASTE_HINT = "type the text with type_text instead"
 _LINUX_SET_VALUE_HINT = "set it with click and type_text instead"
 _LINUX_SELECT_HINT = "select by dragging instead"
 _LINUX_SECONDARY_HINT = "click the element instead"
+_LINUX_FOCUS_GAP = (
+    "focus control is not available on the linux X11 backend yet; keyboard flows that "
+    "need app focus are unsupported there"
+)
 
 
 def _linux_backend() -> ModuleType | None:
@@ -90,6 +94,18 @@ def _refuse_linux_action(action: str, hint: str) -> None:
         f"element-value API for it; {hint}",
         {"action": action, "platform": "linux"},
     )
+
+
+def _refuse_linux_focus() -> None:
+    """Raise ACTION_UNSUPPORTED for a focus-control action on linux (no-op on mac).
+
+    activate and is_frontmost read or move the mac key window; the linux X11
+    backend has no focus seam yet, so both name the gap instead of failing
+    through the mac path.
+    """
+    if _linux_backend() is None:
+        return
+    raise ComputerUseError("ACTION_UNSUPPORTED", _LINUX_FOCUS_GAP, {"platform": "linux"})
 
 
 async def get_state(emit: bool = True) -> dict[str, Any]:
@@ -494,11 +510,21 @@ class App:
         The non-vision screen-reading path: regions carry text, confidence,
         and window-screenshot-relative pixel coordinates, so click targets
         can be derived directly. attach=True also attaches the screenshot
-        for vision-capable models. Same guards as get_screenshot.
+        for vision-capable models. Same guards as get_screenshot. On Linux
+        this raises ACTION_UNSUPPORTED naming the gap: the OCR
+        screen-reading path is macOS-only so far.
         """
         self._guard()
         from . import capture, ocr, permissions
 
+        linux = _linux_backend()
+        if linux is not None:
+            raise ComputerUseError(
+                "ACTION_UNSUPPORTED",
+                "get_text_regions is not available on the Linux X11 backend yet: the OCR "
+                "screen-reading path is macOS-only; use get_ax_state or get_screenshot instead",
+                {"action": "get_text_regions", "platform": "linux"},
+            )
         status = permissions._status()
         if status.get("screen_recording") != "ok":
             raise ComputerUseError(
@@ -880,12 +906,24 @@ class App:
         App-scoped keyboard shortcuts (menus, quick switchers) only fire
         while the app is key, so call this before shortcut-driven flows;
         it replaces the `open -a`/osascript detours the model would
-        otherwise improvise from bash.
+        otherwise improvise from bash. On Linux this raises
+        ACTION_UNSUPPORTED: focus control is not available on the linux
+        X11 backend yet.
         """
-        await self._action("activate", lambda: apps._activate(self._pid))
+
+        def dispatch() -> None:
+            _refuse_linux_focus()
+            apps._activate(self._pid)
+
+        await self._action("activate", dispatch)
 
     def is_frontmost(self) -> bool:
-        """Report whether the app is the frontmost (key) application."""
+        """Report whether the app is the frontmost (key) application.
+
+        On Linux this raises ACTION_UNSUPPORTED: focus control is not
+        available on the linux X11 backend yet.
+        """
+        _refuse_linux_focus()
         return apps._frontmost_pid() == self._pid
 
     async def _refresh(self, diff_on: bool = True) -> str:

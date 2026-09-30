@@ -820,6 +820,43 @@ class AppLinuxDispatchTests(unittest.TestCase):
                             {"action": action, "outcome": "error", "error_code": "ACTION_UNSUPPORTED"},
                         )
 
+    def test_activate_on_linux_raises_action_unsupported(self) -> None:
+        import asyncio
+
+        import computer_use
+
+        with fakes_linux.linux_app_environment() as script:
+            app = self.bind_notes(script)
+            with fakes.telemetry_recorder() as recorder:
+                with self.assertRaises(ComputerUseError) as caught:
+                    asyncio.run(app.activate())
+            self.assertEqual(caught.exception.code, "ACTION_UNSUPPORTED")
+            self.assertIn("focus control is not available on the linux X11 backend yet", caught.exception.message)
+            self.assertIn("keyboard flows that need app focus are unsupported there", caught.exception.message)
+            self.assert_action_event(
+                recorder.events[-1],
+                {"action": "activate", "outcome": "error", "error_code": "ACTION_UNSUPPORTED"},
+            )
+
+    def test_is_frontmost_on_linux_raises_action_unsupported(self) -> None:
+        with fakes_linux.linux_app_environment() as script:
+            app = self.bind_notes(script)
+            with self.assertRaises(ComputerUseError) as caught:
+                app.is_frontmost()
+            self.assertEqual(caught.exception.code, "ACTION_UNSUPPORTED")
+            self.assertIn("focus control is not available on the linux X11 backend yet", caught.exception.message)
+
+    def test_get_text_regions_on_linux_names_the_gap(self) -> None:
+        import asyncio
+
+        with fakes_linux.linux_app_environment() as script:
+            app = self.bind_notes(script)
+            with self.assertRaises(ComputerUseError) as caught:
+                asyncio.run(app.get_text_regions())
+        self.assertEqual(caught.exception.code, "ACTION_UNSUPPORTED")
+        self.assertIn("not available on the Linux X11 backend yet", caught.exception.message)
+        self.assertIn("get_ax_state", caught.exception.message)
+
     def test_action_telemetry_flows_on_the_linux_path(self) -> None:
         import asyncio
 

@@ -126,6 +126,13 @@ class RlmWatchJobTest(unittest.TestCase):
                 await rlm.rlm.watch.job(object())
             with self.assertRaises(ValueError):
                 await rlm.rlm.watch.job(FakeJobHandle(1, ["x"]), interval_seconds=0)
+            # A non-finite interval would sleep-raise inside the task and
+            # kill the watch silently; it is rejected at registration.
+            with self.assertRaises(ValueError):
+                await rlm.rlm.watch.job(FakeJobHandle(2, ["x"]), interval_seconds=float("nan"))
+            with self.assertRaises(ValueError):
+                await rlm.rlm.watch.job(FakeJobHandle(3, ["x"]), interval_seconds=float("inf"))
+            self.assertEqual(rlm.rlm.watch.job_list(), [])
 
         asyncio.run(scenario())
 

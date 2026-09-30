@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import sys
 import types
 from dataclasses import dataclass
@@ -585,8 +586,8 @@ async def watch_job(handle: Any, interval_seconds: float = 5.0) -> dict[str, Any
     pid = getattr(handle, "pid", None)
     if not isinstance(pid, int):
         raise TypeError("rlm.watch.job requires a bash handle returned by bash()")
-    if interval_seconds <= 0:
-        raise ValueError("interval_seconds must be positive")
+    if interval_seconds <= 0 or not math.isfinite(interval_seconds):
+        raise ValueError("interval_seconds must be a positive finite number")
     if pid in _JOB_WATCHES:
         return {"pid": pid, "watching": True, "already_watched": True}
     # The baseline is captured at registration (not inside the scheduled

@@ -459,6 +459,32 @@ fn parses_the_answer_line() {
 }
 
 #[test]
+fn parses_past_a_prose_answer_mention_before_the_real_answer_line() {
+    // The TS-era regex scanned forward past prose `answer:` mentions; the
+    // first substring occurrence must not hijack the real ANSWER line and
+    // make a correct response look missing.
+    assert_eq!(
+        parse_answer_line(Some("I don't have the answer: not yet.\nANSWER: 12, 34")),
+        Some(vec![12, 34])
+    );
+    // A prose mention followed by numbers must not be credited either: the
+    // ANSWER line is the occurrence whose numbers consume the whole text,
+    // so the terminal occurrence wins over the prose one (the TS regex
+    // would have returned the prose digits here).
+    assert_eq!(
+        parse_answer_line(Some("the answer: 999 and counting\nANSWER: 12, 34")),
+        Some(vec![12, 34])
+    );
+    // The strict terminal rule stands when no real ANSWER line follows the
+    // prose mention: trailing text is still malformed, never a prefix
+    // credit.
+    assert_eq!(
+        parse_answer_line(Some("the answer: 999 is all I have\nANSWER: 12, 34 extra")),
+        None
+    );
+}
+
+#[test]
 fn turns_task_failures_and_rate_limit_errors_into_instant_fails() {
     let config = eval_config();
     let ok = trial_result_from_snapshot(&config, 5, 1, &snapshot(), true, None, 12.0);

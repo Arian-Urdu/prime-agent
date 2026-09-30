@@ -519,11 +519,30 @@ pub fn build_orchestrator_prompt(config: &SwarmEvalConfig, size: usize, secrets:
 }
 
 /// Parse the final ANSWER line; `None` when absent or malformed.
+///
+/// Ordinary prose before the real ANSWER line can mention `answer:` (the
+/// TS-era regex scanned forward past such mentions instead of pinning to
+/// the first substring), so every case-insensitive occurrence is tried.
+/// An occurrence wins only when its number list consumes the entire
+/// remaining text: the ANSWER line must end the assistant's turn, so at
+/// most one occurrence can win and trailing text never does.
 #[must_use]
 pub fn parse_answer_line(text: Option<&str>) -> Option<Vec<u64>> {
     let text = text?;
-    let start = find_ascii_case_insensitive(text, "answer:")?;
-    let mut rest = text[start + "answer:".len()..].trim_start_matches(char::is_whitespace);
+    let mut offset = 0;
+    loop {
+        let start = find_ascii_case_insensitive(text, "answer:", offset)?;
+        if let Some(numbers) = parse_answer_suffix(&text[start + "answer:".len()..]) {
+            return Some(numbers);
+        }
+        offset = start + 1;
+    }
+}
+
+/// The strict ANSWER remainder: a comma-separated number list that consumes
+/// the whole input.
+fn parse_answer_suffix(rest: &str) -> Option<Vec<u64>> {
+    let mut rest = rest.trim_start_matches(char::is_whitespace);
     let mut numbers = Vec::new();
     loop {
         let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
@@ -542,13 +561,15 @@ pub fn parse_answer_line(text: Option<&str>) -> Option<Vec<u64>> {
     rest.is_empty().then_some(numbers)
 }
 
-fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+/// The first index at or after `from` where `needle` occurs, comparing
+/// ASCII bytes case-insensitively.
+fn find_ascii_case_insensitive(haystack: &str, needle: &str, from: usize) -> Option<usize> {
     let haystack = haystack.as_bytes();
     let needle = needle.as_bytes();
-    if needle.is_empty() || haystack.len() < needle.len() {
+    if needle.is_empty() || haystack.len() < needle.len() || from > haystack.len() - needle.len() {
         return None;
     }
-    (0..=haystack.len() - needle.len())
+    (from..=haystack.len() - needle.len())
         .find(|&index| haystack[index..index + needle.len()].eq_ignore_ascii_case(needle))
 }
 

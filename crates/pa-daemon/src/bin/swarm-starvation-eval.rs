@@ -90,11 +90,20 @@ impl Client {
                     return serde_json::from_str(line.trim())
                         .map_err(|error| format!("invalid daemon line: {error}"));
                 }
-                Err(error) => {
+                // Only the poll timeout (WouldBlock on Unix, TimedOut on
+                // Windows) means "no line yet". Any other read error — a
+                // reset or broken socket, invalid UTF-8 — is persistent,
+                // so retrying would busy-loop the rest of the command
+                // budget instead of failing the trial fast.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
                     if Instant::now() >= deadline {
                         return Err(format!("timed out reading from the daemon: {error}"));
                     }
                 }
+                Err(error) => return Err(format!("daemon socket error: {error}")),
             }
         }
     }
@@ -491,6 +500,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use pa_core::swarm_eval::{seeded_secrets, ArrivalPattern, MessageSize, SwarmEvalConfig};
+    use pa_types::platform::transport::BlockingTransportStream;
     use serde_json::{json, Value};
 
     use super::{run, run_trial, runs_root_path, socket_from_args, Client};
@@ -679,6 +689,153 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    /// A transport whose reads fail with the configured kind, for pinning
+    /// `read_line`'s error classification without a live daemon.
+    #[derive(Debug)]
+    struct FailingStream {
+        kind: std::io::ErrorKind,
+        reads: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl std::io::Read for FailingStream {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(std::io::Error::new(self.kind, "scripted transport failure"))
+        }
+    }
+
+    impl std::io::Write for FailingStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl BlockingTransportStream for FailingStream {
+        fn try_clone_box(&self) -> std::io::Result<Box<dyn BlockingTransportStream>> {
+            Ok(Box::new(Self {
+                kind: self.kind,
+                reads: self.reads.clone(),
+            }))
+        }
+
+        fn set_read_timeout(&self, _timeout: Duration) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_persistent_read_error_fails_fast_instead_of_spinning() {
+        // A reset or broken socket fails every read immediately; the client
+        // used to retry those errors like poll timeouts, busy-looping the
+        // rest of the command budget before surfacing the failure.
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut client = Client {
+            reader: BufReader::new(Box::new(FailingStream {
+                kind: std::io::ErrorKind::ConnectionReset,
+                reads: reads.clone(),
+            })),
+            writer: Box::new(FailingStream {
+                kind: std::io::ErrorKind::BrokenPipe,
+                reads: reads.clone(),
+            }),
+            request_id: 0,
+        };
+        let started = Instant::now();
+        let error = client
+            .read_line(Duration::from_secs(2))
+            .expect_err("a reset socket must fail the read");
+        assert!(
+            error.contains("daemon socket error") && error.contains("scripted transport failure"),
+            "{error}"
+        );
+        // The error surfaced on the first read, long before the budget.
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the read failed fast, waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A transport whose reads time out (`WouldBlock`) before a full JSONL
+    /// line arrives, pinning the retry side of the classification.
+    #[derive(Debug)]
+    struct StalledStream {
+        reads: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl std::io::Read for StalledStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if read < 2 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "scripted poll timeout",
+                ));
+            }
+            if read > 2 {
+                return Ok(0);
+            }
+            let line = br#"{"type":"daemon_hello"}
+"#;
+            buf[..line.len()].copy_from_slice(line);
+            Ok(line.len())
+        }
+    }
+
+    impl std::io::Write for StalledStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl BlockingTransportStream for StalledStream {
+        fn try_clone_box(&self) -> std::io::Result<Box<dyn BlockingTransportStream>> {
+            Ok(Box::new(Self {
+                reads: self.reads.clone(),
+            }))
+        }
+
+        fn set_read_timeout(&self, _timeout: Duration) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_poll_timeout_is_retried_until_the_line_arrives() {
+        // Only the poll timeout (WouldBlock on Unix, TimedOut on Windows)
+        // means "no line yet": the fragmented-frame retry the client's
+        // polling depends on must keep working after the persistent-error
+        // arm starts failing fast.
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut client = Client {
+            reader: BufReader::new(Box::new(StalledStream {
+                reads: reads.clone(),
+            })),
+            writer: Box::new(StalledStream {
+                reads: reads.clone(),
+            }),
+            request_id: 0,
+        };
+        let line = client
+            .read_line(Duration::from_secs(2))
+            .expect("the two poll timeouts must be retried");
+        assert_eq!(line["type"], "daemon_hello", "{line}");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     #[test]

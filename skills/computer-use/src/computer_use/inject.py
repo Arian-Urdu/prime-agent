@@ -41,10 +41,10 @@ def _transport_failed(action: str, pid: int, error: BaseException) -> ComputerUs
 
 
 def _click(pid: int, point: tuple[float, float], button: str = "left", count: int = 1) -> None:
-    """Post one or more _click cycles to the app process with the given pid.
+    """Post one or more click cycles to the app process with the given pid.
 
     button is left, right, or middle; count is the number of press/release cycles,
-    so a double _click is count=2. point is a CG screen-space (x, y) tuple of
+    so a double click is count=2. point is a CG screen-space (x, y) tuple of
     numbers (int or float). Raises
     ComputerUseError INVALID_ARGUMENT for a bad button, count, or point, and
     INJECTION_FAILED with the underlying CG error text when a CG call fails.
@@ -71,7 +71,7 @@ def _click(pid: int, point: tuple[float, float], button: str = "left", count: in
     except ComputerUseError:
         raise
     except OSError as error:
-        raise _transport_failed("_click", pid, error) from error
+        raise _transport_failed("click", pid, error) from error
     except Exception as error:
         raise _injection_failed("click", pid, error) from error
 
@@ -97,13 +97,13 @@ def _drag(pid: int, start: tuple[float, float], end: tuple[float, float]) -> Non
     except ComputerUseError:
         raise
     except OSError as error:
-        raise _transport_failed("_drag", pid, error) from error
+        raise _transport_failed("drag", pid, error) from error
     except Exception as error:
         raise _injection_failed("drag", pid, error) from error
 
 
 def _scroll(pid: int, direction: str, pages: int = 1, point: tuple[float, float] | None = None) -> None:
-    """Post a _scroll event to the app process with the given pid.
+    """Post a scroll event to the app process with the given pid.
 
     direction is up, down, left, or right: up/down map to a negative/positive
     vertical delta and left/right to a negative/positive horizontal delta; one
@@ -137,7 +137,7 @@ def _scroll(pid: int, direction: str, pages: int = 1, point: tuple[float, float]
     except ComputerUseError:
         raise
     except OSError as error:
-        raise _transport_failed("_scroll", pid, error) from error
+        raise _transport_failed("scroll", pid, error) from error
     except Exception as error:
         raise _injection_failed("scroll", pid, error) from error
 
@@ -172,7 +172,7 @@ def _press_key(pid: int, key: str) -> None:
     except ComputerUseError:
         raise
     except OSError as error:
-        raise _transport_failed("_press_key", pid, error) from error
+        raise _transport_failed("press_key", pid, error) from error
     except Exception as error:
         raise _injection_failed("press_key", pid, error) from error
 
@@ -216,6 +216,6 @@ def _type_text(pid: int, text: str) -> None:
     except ComputerUseError:
         raise
     except OSError as error:
-        raise _transport_failed("_type_text", pid, error) from error
+        raise _transport_failed("type_text", pid, error) from error
     except Exception as error:
         raise _injection_failed("type_text", pid, error) from error

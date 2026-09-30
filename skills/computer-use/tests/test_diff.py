@@ -25,6 +25,30 @@ def marked_lines(marked: str, marker: str) -> list[str]:
     return [line for line in marked.splitlines() if line.startswith(marker)]
 
 
+class DiffIndexShiftTests(unittest.TestCase):
+    def test_a_shifted_unchanged_element_renders_with_its_new_index(self) -> None:
+        previous = lines(
+            [
+                fakes.element(role="AXStaticText", title="A", value="alpha"),
+                fakes.element(role="AXStaticText", title="B", value="beta"),
+                fakes.element(role="AXStaticText", title="C", value="gamma"),
+            ]
+        )
+        shifted = lines(
+            [
+                fakes.element(role="AXStaticText", title="B", value="beta"),
+                fakes.element(role="AXStaticText", title="C", value="gamma"),
+                fakes.element(role="AXButton", title="New"),
+            ]
+        )
+        rendered = diff._diff(previous, shifted)
+        self.assertIn("+[2] AXButton", rendered)
+        # B and C kept their content but their indices shifted: both surface
+        # with their new indices so a reused old index is visible, not silent
+        self.assertIn("~[0] AXStaticText 'B'", rendered)
+        self.assertIn("~[1] AXStaticText 'C'", rendered)
+
+
 class SerializationTests(unittest.TestCase):
     def test_serialization_is_stable(self) -> None:
         self.assertEqual(lines(fakes.small_tree()), lines(fakes.deep_copy(fakes.small_tree())))

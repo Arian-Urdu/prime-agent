@@ -1,6 +1,6 @@
 """Best-effort adoption telemetry for Prime Agent computer use.
 
-Events ride the kernel host bridge (the ``telemetry._emit`` host request) into
+Events ride the kernel host bridge (the ``telemetry.emit`` host request) into
 the versioned event catalog; hosts without the bridge no-op silently, and
 telemetry never fails an action. Frozen events:
 
@@ -55,7 +55,7 @@ async def _emit(name: str, **properties: Any) -> None:
             capped[key] = value
     try:
         await asyncio.wait_for(
-            host_request("telemetry._emit", {"name": name, "properties": capped}),
+            host_request("telemetry.emit", {"name": name, "properties": capped}),
             timeout=BRIDGE_TIMEOUT_SECONDS,
         )
     except Exception:

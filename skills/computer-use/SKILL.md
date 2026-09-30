@@ -60,8 +60,11 @@ text = await app.get_ax_state()  # the settled UI, diffed again
   visible change, an old index may target the wrong element.
 - A stale index raises `ELEMENT_STALE`. Never retry the same index:
   re-observe with `get_ax_state()` and act on fresh indices.
-- Never sleep or poll for a UI change. The runtime settles after each
-  action; the next `get_ax_state()` already shows the settled state.
+- Never sleep yourself: every action that injects input or performs an AX
+  action already waits for the app to settle (a bounded poll of the focused
+  window) before it returns, so the next `get_ax_state()` shows the settled
+  state. If an action still looks like it did not land, re-observe and act
+  on fresh indices instead of sleeping.
 - The full action surface (`drag`, `scroll`, `select_text`,
   `perform_secondary_action`, `paste`) is in the API reference.
 
@@ -74,10 +77,13 @@ images, canvases, or controls whose state the tree does not expose.
 shot = await app.get_screenshot()  # attaches the image to your context
 ```
 
-- Returns `{"path", "width", "height"}`; pass `attach=False` to keep the
-  image file out of your context.
+- Returns `{"path", "width", "height"}` — the PNG's own pixel dimensions
+  (a Retina capture is 2x the window's logical bounds); pass `attach=False`
+  to keep the image file out of your context.
 - Pixel targets for `click`, `drag`, and `scroll` are `(x, y)` tuples in
-  window-screenshot coordinates. Capture first, then act on those pixels.
+  window-screenshot coordinates. Capture first, then act on those pixels;
+  the runtime scales the screenshot's pixels back to the window's logical
+  bounds automatically, so image coordinates work on Retina too.
 - Screenshots cost far more tokens than the AX diff. Observe by AX first.
 
 ## Typing hazards
@@ -88,8 +94,10 @@ shot = await app.get_screenshot()  # attaches the image to your context
 - For multiline input, set the whole value in one call:
   `await app.set_value(element_index, "first line\nsecond line")`.
 - `press_key` takes chord names: `"cmd+shift+f"`, `"Return"`, `"super+c"`.
-- `paste(text, format="md")` writes rich text through the clipboard and
-  restores the clipboard afterwards.
+- `paste(text, format="html")` writes rich text through the clipboard;
+  `format="text"` and `format="md"` paste plain text. The clipboard is
+  restored afterwards when it still holds the pasted payload, so a copy you
+  make during the paste is never discarded.
 - Secure fields (passwords, tokens, API keys) refuse typing and `set_value`
   with `ACTION_UNSUPPORTED`. Hand off: ask the user to type the credential.
 
@@ -128,5 +136,6 @@ stating the risk and the exact action about to happen.
   untrusted-evidence rule.
 - [Permissions](references/permissions.md) — the two macOS grants, why the
   skill needs them, and the exact settings paths.
-- App guides — [Slack](references/app-instructions/slack.md) and
-  [Notion](references/app-instructions/notion.md) UI notes.
+- App guides — [Slack](references/app-instructions/com.tinyspeck.slackmacgap.md)
+  and [Notion](references/app-instructions/notion.id.md) UI notes, keyed by
+  each app's bundle id.

@@ -1,13 +1,13 @@
 """State serialization and element-indexed diffs for computer use.
 
-_serialize renders a nested element tree into stable one-line-per-element
-lines; _diff pairs two renders and marks changed lines with "~", added lines
+serialize renders a nested element tree into stable one-line-per-element
+lines; diff pairs two renders and marks changed lines with "~", added lines
 with "+", and removed lines with "-", omitting unchanged lines. Lines pair by
 their content with the element index stripped, so an element that shifts
 positions without changing still reads as unchanged, while a value change on
 the same element reads as one "~" line. Output lines always carry the indices
 of the full current snapshot (removed lines keep their previous index); the
-_diff is display-only.
+diff is display-only.
 """
 
 from __future__ import annotations
@@ -46,7 +46,10 @@ def _diff(previous_lines: list[str], current_lines: list[str]) -> str:
 
     Lines pair by index-stripped content: a 1:1 replaced line renders as "~"
     plus the current line, any other replacement renders as "-" per previous
-    line and "+" per current line, and equal lines drop out entirely.
+    line and "+" per current line, and equal lines drop out — except when an
+    insertion or deletion shifted the element's index: those render as "~"
+    plus the current line so a caller reusing the old index sees the shift
+    instead of silently targeting a different element.
     """
     previous_content = [_strip_index(line) for line in previous_lines]
     current_content = [_strip_index(line) for line in current_lines]
@@ -54,6 +57,9 @@ def _diff(previous_lines: list[str], current_lines: list[str]) -> str:
     output: list[str] = []
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
+            for previous_line, current_line in zip(previous_lines[i1:i2], current_lines[j1:j2]):
+                if _index_of(previous_line) != _index_of(current_line):
+                    output.append("~" + current_line)
             continue
         if tag == "replace":
             if i2 - i1 == j2 - j1:
@@ -66,6 +72,12 @@ def _diff(previous_lines: list[str], current_lines: list[str]) -> str:
         elif tag == "insert":
             output.extend("+" + line for line in current_lines[j1:j2])
     return "\n".join(output)
+
+
+def _index_of(line: str) -> str | None:
+    """Return one rendered line's element index, or None when it has none."""
+    matched = re.match(r"^\s*\[(\d+)\] ", line)
+    return matched.group(1) if matched else None
 
 
 def _strip_index(line: str) -> str:

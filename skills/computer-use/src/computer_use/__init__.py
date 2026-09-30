@@ -9,6 +9,8 @@ gate and the locked screen.
 
 from __future__ import annotations
 
+import asyncio
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -22,6 +24,9 @@ __all__ = ["App", "ComputerUseError", "get_app", "get_state", "list_apps", "perm
 
 _PASTE_SETTLE_SECONDS = 0.1
 _PASTE_FORMATS = ("text", "md", "html")
+_PASTE_LOCK = threading.Lock()  # one save/write/paste/restore transaction at a time
+_SETTLE_POLL_SECONDS = 0.05
+_SETTLE_MAX_SECONDS = 0.5
 _MAX_CLICK_COUNT = 10
 _SECURE_HANDOFF = "this element is a secure field; Prime Agent never types into it — ask the user to enter the value"
 
@@ -75,7 +80,7 @@ async def get_app(app: str | dict[str, str]) -> App:
 
     Runs the allowlist gate, checks the locked screen and the macOS grants,
     launches the app when it is not running, and loads the first accessibility
-    state. Raises ComputerUseError TRANSPORT_ERROR without a _backend,
+    state. Raises ComputerUseError TRANSPORT_ERROR without a backend,
     SCREEN_LOCKED, APP_NOT_ALLOWED, AMBIGUOUS_APP, APP_LAUNCH_FAILED,
     APP_NOT_RUNNING, PERMISSIONS_NOT_GRANTED, or INVALID_ARGUMENT.
     """
@@ -84,7 +89,7 @@ async def get_app(app: str | dict[str, str]) -> App:
     if _backend() is None:
         raise ComputerUseError(
             "TRANSPORT_ERROR",
-            "computer use _backend unavailable: no macOS frameworks and no Linux X11 tools on this host",
+            "computer use backend unavailable: no macOS frameworks and no Linux X11 tools on this host",
         )
     if policy._screen_locked():
         raise ComputerUseError(
@@ -116,7 +121,9 @@ async def get_app(app: str | dict[str, str]) -> App:
     elif gate_errors:
         raise gate_errors[0]
     else:
-        bound = _launch_and_gate(app)
+        # launch blocks for up to the open timeout plus the appear poll, so
+        # it must not stall the kernel's event loop
+        bound = await asyncio.to_thread(_launch_and_gate, app)
     status = permissions._status()
     if status.get("accessibility") != "ok":
         raise ComputerUseError(
@@ -128,6 +135,7 @@ async def get_app(app: str | dict[str, str]) -> App:
     if existing is not None and existing.pid == bound.pid:
         return existing
     instance = App(bound.bundle_id, bound.name, bound.pid)
+    instance._guard()  # the bind window spans launch and settle: revalidate before the first read
     await instance._refresh(diff_on=False)
     _bound_apps[bound.bundle_id] = instance
     return instance
@@ -143,12 +151,24 @@ async def permissions_status() -> dict[str, Any]:
 def _launch_and_gate(spec: str | dict[str, str]) -> apps.RunningApp:
     """Launch the app the spec names, gating its bundle id before any launch.
 
-    An unresolvable spec fails closed: Prime Agent never opens an app whose
-    bundle id it could not determine beforehand, so a denied app cannot start
-    as a side effect of a rejected bind.
+    The Accessibility grant is checked before launching, so a missing grant
+    never starts an app as a side effect of a rejected bind. An unresolvable
+    spec fails closed: Prime Agent never opens an app whose bundle id it
+    could not determine beforehand, so a denied app cannot start as a side
+    effect of a rejected bind. The launch itself targets the resolved bundle
+    id (open -b), not the mutable name or path, so a spec that changes
+    between resolution and launch cannot start a different app; the
+    post-launch identity check remains as the backstop.
     """
-    from . import policy
+    from . import permissions, policy
 
+    status = permissions._status()
+    if status.get("accessibility") != "ok":
+        raise ComputerUseError(
+            "PERMISSIONS_NOT_GRANTED",
+            "the Accessibility grant is missing or unknown; allow Prime Agent in System Settings > Privacy & Security > Accessibility, then retry",
+            {"permission": "accessibility", "reported": str(status.get("accessibility"))[:16]},
+        )
     bundle_id = _prelaunch_bundle_id(spec)
     if bundle_id is None:
         raise ComputerUseError(
@@ -161,7 +181,7 @@ def _launch_and_gate(spec: str | dict[str, str]) -> apps.RunningApp:
     result = policy._gate_app(bundle_id)
     if not result.allowed:
         raise ComputerUseError("APP_NOT_ALLOWED", result.reason, {"bundle_id": bundle_id})
-    launched = apps._launch(spec)
+    launched = apps._launch({"bundle_id": bundle_id})
     if launched.bundle_id != bundle_id:
         raise ComputerUseError(
             "APP_NOT_ALLOWED",
@@ -182,6 +202,15 @@ def _prelaunch_bundle_id(spec: str | dict[str, str]) -> str | None:
         if not spec.strip():
             return None
         if "." in spec:
+            # A dotted string is a bundle id only when it names a running app
+            # or no installed app answers to it as a display name — a display
+            # name can carry a dot too ("Acme 1.0"), and launching that as
+            # `open -b` can never start it.
+            if any(app.bundle_id == spec for app in apps._running_apps()):
+                return spec
+            resolved = apps._bundle_for_name(spec)
+            if resolved is not None:
+                return resolved
             return spec
         return apps._bundle_for_name(spec)
     kind = next((key for key in ("bundle_id", "name", "path") if key in spec), None)
@@ -239,7 +268,9 @@ def _save_clipboard() -> dict[str, Any] | None:
     """Snapshot every pasteboard type's data for a later restore.
 
     Iterates the pasteboard's types and stores each type's data as bytes, so
-    images, file lists, and other formats survive the paste round-trip.
+    images, file lists, and other formats survive the paste round-trip. An
+    empty pasteboard snapshots as an empty dict; None is reserved for a
+    failed read, on which paste aborts instead of destroying the clipboard.
     """
     try:
         cocoa = _require_mac().cocoa
@@ -249,7 +280,7 @@ def _save_clipboard() -> dict[str, Any] | None:
             data = pasteboard.dataForType_(type_name)
             if data is not None:
                 saved[str(type_name)] = bytes(data)
-        return saved or None
+        return saved
     except Exception:
         return None
 
@@ -267,16 +298,75 @@ def _write_clipboard(text: str, format: str) -> None:
 
 
 def _restore_clipboard(saved: dict[str, Any] | None) -> None:
-    """Restore every saved pasteboard type, best-effort."""
+    """Restore every saved pasteboard type, best-effort.
+
+    None never touches the pasteboard: it is a failed snapshot, and clearing
+    on it would erase the user's clipboard. Each type is restored on its own
+    so one unreadable format never blocks the rest.
+    """
+    if saved is None:
+        return
     try:
         cocoa = _require_mac().cocoa
         pasteboard = cocoa.NSPasteboard.generalPasteboard()
         pasteboard.clearContents()
-        for type_name, data in (saved or {}).items():
-            payload = cocoa.NSData.dataWithBytes_length_(data, len(data))
-            pasteboard.setData_forType_(payload, type_name)
+        for type_name, data in saved.items():
+            try:
+                payload = cocoa.NSData.dataWithBytes_length_(data, len(data))
+                pasteboard.setData_forType_(payload, type_name)
+            except Exception:
+                continue
     except Exception:
         return
+
+
+def _clipboard_still_holds_payload(text: str) -> bool:
+    """Report whether the pasteboard still carries exactly the payload paste wrote.
+
+    Compared before cmd+v is pressed, so a copy made between the write and
+    the paste is not sent into the app and is left in place.
+    """
+    try:
+        cocoa = _require_mac().cocoa
+        pasteboard = cocoa.NSPasteboard.generalPasteboard()
+        current = pasteboard.dataForType_(cocoa.NSPasteboardTypeString)
+        return bytes(current) == text.encode("utf-8")
+    except Exception:
+        return False
+
+
+def _clipboard_change_count() -> int | None:
+    """Read the pasteboard's change count, or None when it cannot be read.
+
+    The count increments on every pasteboard change, so it detects a copy
+    whose plain text matches the payload but whose rich or file data does
+    not.
+    """
+    try:
+        cocoa = _require_mac().cocoa
+        return int(cocoa.NSPasteboard.generalPasteboard().changeCount())
+    except Exception:
+        return None
+
+
+def _clipboard_unchanged(count: int | None, text: str) -> bool:
+    """Report whether the pasteboard is unchanged since this paste's write.
+
+    The change count is the primary token (it covers every type); a count
+    that cannot be read or compared falls back to comparing the written
+    payload, and an unverifiable pasteboard is treated as changed — the
+    restore is skipped rather than discarding a concurrent copy.
+    """
+    try:
+        current = _clipboard_change_count()
+        if current is not None and count is not None:
+            return current == count
+        cocoa = _require_mac().cocoa
+        pasteboard = cocoa.NSPasteboard.generalPasteboard()
+        payload = pasteboard.dataForType_(cocoa.NSPasteboardTypeString)
+        return bytes(payload) == text.encode("utf-8")
+    except Exception:
+        return False
 
 
 class App:
@@ -295,6 +385,9 @@ class App:
         self._observation: ax.Observation | None = None
         self._lines: list[str] | None = None
         self._state: str | None = None
+        self._shot_size: tuple[float, float] | None = None
+        self._shot_rect: tuple[float, float, float, float] | None = None
+        self._shot_window_id: int | None = None
 
     def __repr__(self) -> str:
         return f"<App {self._name} ({self._bundle_id}) pid {self._pid}>"
@@ -353,17 +446,35 @@ class App:
                 "the Screen Recording grant is missing or unknown; allow Prime Agent in System Settings > Privacy & Security > Screen Recording, then retry",
                 {"permission": "screen_recording", "reported": str(status.get("screen_recording"))[:16]},
             )
-        rect = self._observation.window_rect if self._observation is not None else None
+        observation = self._observation
+        rect = observation.window_rect if observation is not None else None
         if rect is None:
             raise ComputerUseError(
                 "TRANSPORT_ERROR",
                 "no focused window observed; call get_ax_state() first",
             )
-        result = capture._screenshot_window(
+        if observation.window_id is None:
+            # a region capture would include whatever is on screen there —
+            # other apps' content — so a window without a scoping id is
+            # refused rather than captured
+            raise ComputerUseError(
+                "TRANSPORT_ERROR",
+                "the focused window does not expose its window id, so the capture cannot be "
+                "scoped to it; call get_ax_state() again and retry",
+                {},
+            )
+        # screencapture blocks for up to its timeout, so it must not stall the
+        # kernel's event loop; the observation is snapshotted once so a
+        # concurrent re-observe cannot re-tag the image with another window
+        result = await asyncio.to_thread(
+            capture._screenshot_window,
             (int(round(rect[0])), int(round(rect[1]))),
             (int(round(rect[2])), int(round(rect[3]))),
-            window_id=self._observation.window_id,
+            window_id=observation.window_id,
         )
+        self._shot_size = (float(result["width"]), float(result["height"]))
+        self._shot_rect = rect
+        self._shot_window_id = observation.window_id
         if attach:
             await capture._attach_image_if_available(str(result["path"]))
         return result
@@ -417,7 +528,7 @@ class App:
                     {"target": type(target).__name__},
                 )
 
-        await self._action("click", dispatch)
+        await self._action("click", dispatch, settle=True)
 
     async def drag(self, from_: tuple[float, float], to: tuple[float, float]) -> None:
         """Drag between two window-screenshot (x, y) points."""
@@ -426,7 +537,7 @@ class App:
         def dispatch() -> None:
             inject._drag(self._pid, self._window_point(from_), self._window_point(to))
 
-        await self._action("drag", dispatch)
+        await self._action("drag", dispatch, settle=True)
 
     async def scroll(self, target: int | tuple[float, float], direction: str, pages: int = 1) -> None:
         """Scroll at one element index or window-screenshot point in one direction.
@@ -461,21 +572,23 @@ class App:
                 )
             inject._scroll(self._pid, direction, pages=pages, point=point)
 
-        await self._action("scroll", dispatch)
+        await self._action("scroll", dispatch, settle=True)
 
     async def press_key(self, key: str) -> None:
         """Post one key chord such as "cmd+shift+f" or "Return" to the app.
 
         Refuses when the focused element is a secure field (secrets are the
-        user's to type).
+        user's to type). The refusal runs after the guards, so a locked
+        screen or a revoked allowlist reports its own error code instead of
+        the secure-field hand-off.
         """
-        self._refuse_secure_focus()
         from . import inject
 
         def dispatch() -> None:
+            self._refuse_secure_focus()
             inject._press_key(self._pid, key)
 
-        await self._action("press_key", dispatch)
+        await self._action("press_key", dispatch, settle=True)
 
     async def type_text(self, text: str) -> None:
         """Type literal text into the app.
@@ -483,28 +596,29 @@ class App:
         Refuses with ACTION_UNSUPPORTED when the focused element is a secure
         field: passwords are the user's to type, not the agent's.
         """
-        self._refuse_secure_focus()
         from . import inject
 
         def dispatch() -> None:
+            self._refuse_secure_focus()
             inject._type_text(self._pid, text)
 
-        await self._action("type_text", dispatch)
+        await self._action("type_text", dispatch, settle=True)
 
     def _refuse_secure_focus(self) -> None:
         """Refuse keyboard entry into a focused secure field (hand-off to the user).
 
         The live focus wins: a post-snapshot focus change onto a secure field
-        is still refused. When the live focus cannot be read, the last
-        snapshot's focused index decides.
+        is still refused, and an unreadable live focus fails closed — the
+        last snapshot never approves typing into a field it cannot verify.
         """
         focused_secure = ax._focused_is_secure(self._pid)
         if focused_secure is None:
-            observation = self._observation
-            if observation is None or observation.focused_index is None:
-                return
-            element = ax._flatten(observation.tree)[observation.focused_index]
-            focused_secure = ax._is_secure_field(element)
+            raise ComputerUseError(
+                "ACTION_UNSUPPORTED",
+                "could not verify that the focused element is not a secure text field; "
+                "ask the user to type passwords and other secrets themselves",
+                {"live": False},
+            )
         if focused_secure:
             raise ComputerUseError(
                 "ACTION_UNSUPPORTED",
@@ -528,11 +642,19 @@ class App:
 
         def dispatch() -> None:
             element, ref = self._element(element_index)
-            if ax._is_secure_field(element):
+            live_secure = ax._live_is_secure(ref)
+            if ax._is_secure_field(element) or live_secure:
                 raise ComputerUseError(
                     "ACTION_UNSUPPORTED",
                     f"element {element_index}: {_SECURE_HANDOFF}",
                     {"element_index": element_index, "secure": True},
+                )
+            if live_secure is None:
+                raise ComputerUseError(
+                    "ACTION_UNSUPPORTED",
+                    f"element {element_index}: could not verify that it is not a secure field; "
+                    "ask the user to enter the value themselves",
+                    {"element_index": element_index},
                 )
             if not ax._is_settable(ref, "AXValue"):
                 raise ComputerUseError(
@@ -569,11 +691,19 @@ class App:
 
         def dispatch() -> None:
             element, ref = self._element(element_index)
-            if ax._is_secure_field(element):
+            live_secure = ax._live_is_secure(ref)
+            if ax._is_secure_field(element) or live_secure:
                 raise ComputerUseError(
                     "ACTION_UNSUPPORTED",
                     f"element {element_index}: {_SECURE_HANDOFF}",
                     {"element_index": element_index, "secure": True},
+                )
+            if live_secure is None:
+                raise ComputerUseError(
+                    "ACTION_UNSUPPORTED",
+                    f"element {element_index}: could not verify that it is not a secure field; "
+                    "ask the user to enter the value themselves",
+                    {"element_index": element_index},
                 )
             value = ax._current_value(ref)
             if not isinstance(value, str):
@@ -590,6 +720,8 @@ class App:
                 after = value[end : end + len(suffix or "")] if suffix else ""
                 if (not prefix or before == prefix) and (not suffix or after == suffix):
                     starts.append(start)
+                    if len(starts) > 1:
+                        break  # ambiguity is all the caller needs to know
                 start = value.find(text, start + 1)
             if not starts:
                 raise ComputerUseError(
@@ -625,15 +757,18 @@ class App:
                 )
             ax._perform_action(ref, action)
 
-        await self._action("secondary", dispatch)
+        await self._action("secondary", dispatch, settle=True)
 
     async def paste(self, text: str, format: str = "text") -> None:
         """Paste text through the clipboard with cmd+v, restoring the clipboard after.
 
-        format is one of text, md, or html. Refuses when the focused
-        element is a secure field (secrets are the user's to paste).
+        format is one of text, md, or html; only html writes rich clipboard
+        data, text and md paste plain. Refuses when the focused element is a
+        secure field (secrets are the user's to paste). The clipboard is
+        restored afterwards, unless it no longer holds the pasted payload —
+        a copy made during the paste window is kept, and a failed snapshot
+        aborts before anything is written.
         """
-        self._refuse_secure_focus()
         if format not in _PASTE_FORMATS:
             raise ComputerUseError(
                 "INVALID_ARGUMENT",
@@ -650,19 +785,56 @@ class App:
         def dispatch() -> None:
             from . import inject
 
+            self._refuse_secure_focus()
             saved = _save_clipboard()
-            try:
-                _write_clipboard(text, format)
-                inject._press_key(self._pid, "cmd+v")
-                time.sleep(_PASTE_SETTLE_SECONDS)
-            finally:
-                _restore_clipboard(saved)
+            if saved is None:
+                raise ComputerUseError(
+                    "TRANSPORT_ERROR",
+                    "could not snapshot the clipboard; refusing to paste and risk the user's clipboard",
+                    {},
+                )
+            with _PASTE_LOCK:
+                wrote = False
+                change_count: int | None = None
+                try:
+                    try:
+                        _write_clipboard(text, format)
+                        wrote = True
+                        if not _clipboard_still_holds_payload(text):
+                            # a concurrent copy displaced the payload: never
+                            # paste it, never restore over it
+                            raise ComputerUseError(
+                                "TRANSPORT_ERROR",
+                                "the clipboard changed during the paste; the payload was not pasted",
+                                {},
+                            )
+                        change_count = _clipboard_change_count()
+                        inject._press_key(self._pid, "cmd+v")
+                        time.sleep(_PASTE_SETTLE_SECONDS)
+                    except ComputerUseError:
+                        raise
+                    except Exception as error:
+                        raise ComputerUseError(
+                            "TRANSPORT_ERROR",
+                            f"could not write the paste payload: {str(error)[:200]}",
+                            {},
+                        ) from error
+                finally:
+                    # A failed write leaves the cleared pasteboard behind:
+                    # restore it. A successful write restores only when the
+                    # change count has not moved, so a copy made during the
+                    # paste window wins over the restore.
+                    if wrote and not _clipboard_unchanged(change_count, text):
+                        pass
+                    else:
+                        _restore_clipboard(saved)
 
-        await self._action("paste", dispatch)
+        await self._action("paste", dispatch, settle=True)
 
     async def _refresh(self, diff_on: bool = True) -> str:
         """Observe the app and store the new snapshot, returning its text."""
-        observation = ax._observe(self._pid)
+        # the walk can take up to its deadline on an unresponsive app
+        observation = await asyncio.to_thread(ax._observe, self._pid)
         lines = diff._serialize(observation.tree)
         full = self._render_full(observation, lines)
         if diff_on and self._lines is not None:
@@ -684,6 +856,11 @@ class App:
             header += f" — {count} elements, indices [0]..[{count - 1}]"
         elif observation.window_title is None:
             header += " — no focused window"
+        if observation.truncated:
+            header += (
+                " — TRUNCATED: the observation stopped at its element/depth/time bounds, "
+                "some controls are hidden"
+            )
         body = "\n".join(lines)
         instructions = ""
         if count and self._bundle_id not in _instruction_shown:
@@ -693,25 +870,56 @@ class App:
                 instructions = "\n" + loaded
         return "\n".join(part for part in (header, body) if part) + instructions
 
-    async def _action(self, action: str, dispatch: Callable[[], None]) -> None:
-        """Run one guarded action and emit its outcome telemetry."""
+    async def _action(self, action: str, dispatch: Callable[[], None], settle: bool = False) -> None:
+        """Run one guarded action, wait for its UI effects, and emit telemetry.
+
+        settle=True waits for the app to process the injected input (a
+        bounded fingerprint poll) so the next get_ax_state observes the
+        settled state; synchronous AX writes pass settle=False because the
+        write has already completed when they return.
+        """
         started = time.perf_counter()
         try:
             self._guard()
-            dispatch()
+            # dispatch posts CG events and drives synchronous AX calls, each
+            # bounded by its messaging timeout — still too slow for the loop
+            await asyncio.to_thread(dispatch)
+            if settle:
+                await asyncio.to_thread(self._settle)
         except ComputerUseError as error:
             await _emit_action(action, "error", started, error_code=error.code)
             raise
         await _emit_action(action, "ok", started)
 
+    def _settle(self) -> None:
+        """Wait for the app to process injected input, bounded by the poll interval and cap.
+
+        Reads the focused window's live fingerprint until two consecutive
+        reads agree (or the read fails): a responsive app's tree has stopped
+        changing by then, and a churning app is given up on at the cap
+        instead of stalling the action.
+        """
+        deadline = time.monotonic() + _SETTLE_MAX_SECONDS
+        previous = ax._window_fingerprint(self._pid, timeout_seconds=_SETTLE_MAX_SECONDS)
+        if previous is None:
+            return
+        while time.monotonic() < deadline:
+            time.sleep(_SETTLE_POLL_SECONDS)
+            current = ax._window_fingerprint(self._pid, timeout_seconds=max(deadline - time.monotonic(), 0.05))
+            if current is None or current == previous:
+                return
+            previous = current
+
     def _guard(self) -> None:
-        """Re-validate the pid, the allowlist gate, and the locked screen before one action.
+        """Re-validate the pid, the allowlist gate, the locked screen, and the grants.
 
         A reused pid now owned by another process (or nothing at all) fails
         closed: APP_NOT_RUNNING when no app owns it, APP_NOT_ALLOWED when a
-        different bundle owns it.
+        different bundle owns it. A grant revoked mid-session fails with
+        PERMISSIONS_NOT_GRANTED so the model is told to stop and re-grant
+        instead of chasing INJECTION_FAILED.
         """
-        from . import policy
+        from . import permissions, policy
 
         running_bundle = apps._running_bundle_id(self._pid)
         if running_bundle is None:
@@ -734,6 +942,15 @@ class App:
             raise ComputerUseError(
                 "SCREEN_LOCKED",
                 "the screen is locked; ask the user to unlock it before driving apps",
+            )
+        status = permissions._status()
+        if status.get("accessibility") != "ok":
+            raise ComputerUseError(
+                "PERMISSIONS_NOT_GRANTED",
+                "the Accessibility grant is missing or was revoked; allow Prime Agent again in "
+                "System Settings > Privacy & Security > Accessibility and restart Prime Agent, "
+                "then re-bind with get_app",
+                {"permission": "accessibility", "reported": str(status.get("accessibility"))[:16]},
             )
 
     def _element(self, element_index: int) -> tuple[dict[str, Any], Any]:
@@ -779,7 +996,12 @@ class App:
         )
 
     def _window_point(self, point: tuple[float, float]) -> tuple[float, float]:
-        """Translate one window-screenshot (x, y) point into screen space."""
+        """Translate one window-screenshot (x, y) point into screen space.
+
+        Screenshot pixels are scaled back to the window's logical bounds when
+        the captured image is larger (Retina captures are 2x), so a point read
+        off the image lands on the on-screen element it shows.
+        """
         if (
             not isinstance(point, tuple)
             or len(point) != 2
@@ -795,6 +1017,47 @@ class App:
             raise ComputerUseError(
                 "TRANSPORT_ERROR",
                 "no focused window observed; call get_ax_state() first",
+            )
+        shot = self._shot_size
+        current_window_id = self._observation.window_id
+        if shot is not None and current_window_id is not None and self._shot_window_id is not None:
+            if current_window_id != self._shot_window_id:
+                raise ComputerUseError(
+                    "TRANSPORT_ERROR",
+                    "the focused window changed since the screenshot; take a fresh screenshot "
+                    "before clicking image coordinates",
+                    {},
+                )
+        if shot is not None and shot != (float(self._shot_rect[2]), float(self._shot_rect[3])):
+            # the capture's pixel-to-logical scale is a size property: it
+            # survives a moved window (the origin below is the live one), so
+            # image points still land on the on-screen element they show
+            if not 0 <= float(point[0]) < shot[0] or not 0 <= float(point[1]) < shot[1]:
+                raise ComputerUseError(
+                    "INVALID_ARGUMENT",
+                    f"point {point!r} is outside the captured image "
+                    f"({shot[0]:.0f}x{shot[1]:.0f}); use coordinates from its screenshot",
+                    {"point": repr(point)[:64]},
+                )
+            scaled = (
+                float(point[0]) * float(self._shot_rect[2]) / shot[0],
+                float(point[1]) * float(self._shot_rect[3]) / shot[1],
+            )
+            if not 0 <= scaled[0] < float(rect[2]) or not 0 <= scaled[1] < float(rect[3]):
+                raise ComputerUseError(
+                    "INVALID_ARGUMENT",
+                    f"point {point!r} lands outside the observed window "
+                    f"({float(rect[2]):.0f}x{float(rect[3]):.0f}); the window changed since the "
+                    "capture, so take a fresh screenshot",
+                    {"point": repr(point)[:64]},
+                )
+            return (rect[0] + scaled[0], rect[1] + scaled[1])
+        if shot is not None and (not 0 <= float(point[0]) < shot[0] or not 0 <= float(point[1]) < shot[1]):
+            raise ComputerUseError(
+                "INVALID_ARGUMENT",
+                f"point {point!r} is outside the captured image "
+                f"({shot[0]:.0f}x{shot[1]:.0f}); use coordinates from its screenshot",
+                {"point": repr(point)[:64]},
             )
         if not 0 <= float(point[0]) < float(rect[2]) or not 0 <= float(point[1]) < float(rect[3]):
             raise ComputerUseError(

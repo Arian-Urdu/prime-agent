@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import shutil
 import sys
 from functools import cache
 from importlib import import_module
@@ -21,12 +20,13 @@ class MacFrameworks(NamedTuple):
 
 
 def _backend() -> str | None:
-    """Report the available _backend: "mac" on darwin, "linux" when the xdotool
-    tool is on PATH, otherwise None."""
+    """Report the available backend: "mac" on darwin, otherwise None.
+
+    macOS is the v1 platform; no other backend is advertised until its module
+    ships, so get_state never reports a platform this skill cannot drive.
+    """
     if sys.platform == "darwin":
         return "mac"
-    if shutil.which("xdotool") is not None:
-        return "linux"
     return None
 
 
@@ -36,12 +36,12 @@ def _require_mac() -> MacFrameworks:
 
     The frameworks load only on darwin and the result is cached per process.
     Raises ComputerUseError TRANSPORT_ERROR off darwin or when a framework is
-    missing, naming the missing _backend.
+    missing, naming the missing backend.
     """
     if sys.platform != "darwin":
         raise ComputerUseError(
             "TRANSPORT_ERROR",
-            f"computer use _backend unavailable: the macOS frameworks need darwin, this host runs {sys.platform}",
+            f"computer use backend unavailable: the macOS frameworks need darwin, this host runs {sys.platform}",
         )
     try:
         cocoa = import_module("Cocoa")
@@ -50,27 +50,9 @@ def _require_mac() -> MacFrameworks:
     except ImportError as error:
         raise ComputerUseError(
             "TRANSPORT_ERROR",
-            f"computer use _backend unavailable: the macOS frameworks are not installed ({error})",
+            f"computer use backend unavailable: the macOS frameworks are not installed ({error})",
         ) from error
     return MacFrameworks(cocoa=cocoa, quartz=quartz, app_services=app_services)
 
 
-def _require_linux() -> ModuleType:
-    """Import the Linux X11 _backend module lazily for the Linux lane.
 
-    Raises ComputerUseError TRANSPORT_ERROR when the X11 tools are missing or
-    the _backend module has not shipped yet.
-    """
-    if _backend() != "linux":
-        raise ComputerUseError(
-            "TRANSPORT_ERROR",
-            "computer use _backend unavailable: the Linux _backend needs the xdotool tool on PATH",
-        )
-    try:
-        from . import _linux
-    except ImportError as error:
-        raise ComputerUseError(
-            "TRANSPORT_ERROR",
-            "computer use _backend unavailable: the Linux _backend module is not installed yet",
-        ) from error
-    return _linux

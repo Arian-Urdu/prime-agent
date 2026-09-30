@@ -254,7 +254,12 @@ def raw_settings(
 
 
 class TelemetryRecorder:
-    """Async host_request fake capturing telemetry._emit payloads."""
+    """Async host_request fake capturing telemetry.emit payloads.
+
+    The request type is the kernel bridge's wire contract: the host registers
+    exactly "telemetry.emit" (the stacked kernel telemetry bridge), so this
+    match documents what the production call must send.
+    """
 
     def __init__(self) -> None:
         self.events: list[dict[str, Any]] = []
@@ -266,7 +271,7 @@ class TelemetryRecorder:
             raise self.error
         normalized = dict(payload or {})
         self.requests.append((request_type, normalized))
-        if request_type == "telemetry._emit":
+        if request_type == "telemetry.emit":
             self.events.append(
                 {"name": normalized.get("name"), "properties": dict(normalized.get("properties") or {})}
             )
@@ -470,8 +475,13 @@ class AppEnvironment:
         self.locked = False
         self.settable = True
         self.focused_index: int | None = None
-        self.secure_focus: bool | None = None  # live focused_is_secure verdict; None = live read unavailable
-        self.window_id: int | None = None
+        self.secure_focus: bool | None = False  # live focused_is_secure verdict; None = the live read failed (fails closed)
+        self.live_secure_ref: bool = False  # live per-element secure verdict used by set_value/select_text
+        self.fingerprint_values: list[Any] | None = None  # queued window_fingerprint reads; None = unreadable
+        self.fingerprint_reads = 0
+        self.pasteboard_holds_payload = True  # _clipboard_unchanged verdict for paste
+        self.clipboard_change_count: int | None = 3  # _clipboard_change_count reading
+        self.window_id: int | None = 4321
         self.drift = False  # when True, live fingerprints mismatch the snapshot (stale refs)
         self.running: list[Any] = []
         self.running_error: BaseException | None = None
@@ -505,6 +515,13 @@ class AppEnvironment:
         return (ref.get("role") if isinstance(ref, dict) else None,
                 ref.get("title") if isinstance(ref, dict) else None)
 
+    def _window_fingerprint(self, pid: Any, timeout_seconds: float | None = None) -> Any:
+        """Serve the queued fingerprint reads, cycling while more than one is queued."""
+        self.fingerprint_reads += 1
+        if self.fingerprint_values is None:
+            return None
+        return self.fingerprint_values[(self.fingerprint_reads - 1) % len(self.fingerprint_values)]
+
     def _running_apps(self) -> list[Any]:
         if self.running_error is not None:
             raise self.running_error
@@ -512,6 +529,9 @@ class AppEnvironment:
 
     def _launch(self, spec: Any) -> Any:
         self.launch_calls.append(spec)
+        # the launched app appears in the running list, matching _await_running
+        if self.launch_result is not None and self.launch_result not in self.running:
+            self.running.append(self.launch_result)
         return self.launch_result
 
     def _save_clipboard(self) -> dict[str, Any]:
@@ -537,21 +557,20 @@ class AppEnvironment:
             self.running = [RunningApp(bundle_id=self.bundle, name=self.name, pid=self.pid, path=None)]
         if self.launch_result is None:
             self.launch_result = RunningApp(bundle_id=self.bundle, name=self.name, pid=self.pid, path=None)
-        status = (
-            {"accessibility": "ok", "screen_recording": "ok", "help": []}
-            if self.permissions is None
-            else self.permissions
-        )
+        if self.permissions is None:
+            self.permissions = {"accessibility": "ok", "screen_recording": "ok", "help": []}
         patch(computer_use, "_backend", lambda: "mac")
         patch(computer_use, "_require_mac", _never_require_mac)
         patch(apps, "_running_apps", self._running_apps)
         patch(apps, "_launch", self._launch)
         patch(policy, "SETTINGS_PATH", self.settings_file)
         patch(policy, "_screen_locked", lambda: self.locked)
-        patch(permissions, "_status", lambda: dict(status))
+        patch(permissions, "_status", lambda: dict(self.permissions))
         patch(ax, "_observe", lambda pid: observation(self.current, self.window_title, self.window_rect, self.focused_index, self.window_id))
         patch(ax, "_live_fingerprint", self._live_fingerprint)
         patch(ax, "_focused_is_secure", lambda pid: self.secure_focus)
+        patch(ax, "_live_is_secure", lambda ref: self.live_secure_ref)
+        patch(ax, "_window_fingerprint", self._window_fingerprint)
         patch(ax, "_perform_action", lambda ref, action: self.ax_calls.append(("perform_action", ref, action)))
         patch(ax, "_is_settable", lambda ref, attribute: self.settable)
         patch(ax, "_current_value", lambda ref: (ref.get("value") if isinstance(ref, dict) else None))
@@ -561,6 +580,9 @@ class AppEnvironment:
         patch(computer_use, "_save_clipboard", self._save_clipboard)
         patch(computer_use, "_write_clipboard", self._write_clipboard)
         patch(computer_use, "_restore_clipboard", self._restore_clipboard)
+        patch(computer_use, "_clipboard_change_count", lambda: self.clipboard_change_count)
+        patch(computer_use, "_clipboard_unchanged", lambda count, text: self.pasteboard_holds_payload)
+        patch(computer_use, "_clipboard_still_holds_payload", lambda text: self.pasteboard_holds_payload)
         modules = {"inject": inject, "capture": capture}
         seams = [("inject", seam) for seam in INJECT_SEAMS] + [("capture", "_screenshot_window")]
         for module_name, attr in seams:

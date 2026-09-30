@@ -1,9 +1,10 @@
-"""App discovery, binding, and _launch for macOS apps."""
+"""App discovery, binding, and launch for macOS apps."""
 
 from __future__ import annotations
 
 import plistlib
 import subprocess
+from xml.parsers import expat
 import time
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -41,7 +42,7 @@ def _running_apps() -> list[RunningApp]:
     if _backend() != "mac":
         raise ComputerUseError(
             "TRANSPORT_ERROR",
-            "computer use _backend unavailable: listing apps needs the macOS workspace",
+            "computer use backend unavailable: listing apps needs the macOS workspace",
         )
     cocoa = _require_mac().cocoa
     apps: list[RunningApp] = []
@@ -77,15 +78,17 @@ def _running_bundle_id(pid: int) -> str | None:
 def _bundle_for_name(name: str) -> str | None:
     """Resolve an installed app's bundle id by display name through Spotlight.
 
-    Queries mdfind without launching anything, caps the results, and reads the
-    bundle id from the first result's Info.plist. Returns None when the name
-    cannot be resolved to an installed bundle.
+    Queries mdfind without launching anything and reads the bundle id from
+    the results' Info.plist. Returns None when the name cannot be resolved;
+    raises ComputerUseError AMBIGUOUS_APP when several distinct installed
+    bundles share the display name (bind by bundle id instead).
     """
     if not isinstance(name, str) or not name.strip():
         return None
+    escaped = _escape_spotlight(name)
     query = (
         'kMDItemContentTypeTree == "com.apple.application" '
-        f'&& kMDItemDisplayName == "{name}"'
+        f'&& kMDItemDisplayName == "{escaped}"'
     )
     try:
         finished = subprocess.run(
@@ -95,11 +98,29 @@ def _bundle_for_name(name: str) -> str | None:
         return None
     if finished.returncode != 0:
         return None
+    bundle_ids: list[str] = []
     for path in finished.stdout.splitlines()[:_MDFIND_RESULT_CAP]:
         bundle_id = _bundle_id_for_bundle_dir(path.strip())
-        if bundle_id:
-            return bundle_id
-    return None
+        if bundle_id and bundle_id not in bundle_ids:
+            bundle_ids.append(bundle_id)
+            if len(bundle_ids) > 1:
+                raise ComputerUseError(
+                    "AMBIGUOUS_APP",
+                    f"the name {name!r} matches several installed apps ("
+                    + ", ".join(bundle_ids)
+                    + "); call get_app with the bundle_id of the one you want",
+                    {"bundle_ids": bundle_ids},
+                )
+    return bundle_ids[0] if bundle_ids else None
+
+
+def _escape_spotlight(value: str) -> str:
+    """Escape one Spotlight query metacharacter from a literal display name.
+
+    `*`, `?`, backslashes, and quotes are predicate syntax in the query
+    language; a literal name must not carry them through unescaped.
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("*", "\\*").replace("?", "\\?")
 
 
 def _resolve(spec: str | dict[str, str]) -> list[RunningApp]:
@@ -128,12 +149,12 @@ def _resolve(spec: str | dict[str, str]) -> list[RunningApp]:
 
 
 def _launch(spec: str | dict[str, str]) -> RunningApp:
-    """Open the app the spec names and wait for it to start running.
+    """Open the app the resolved spec names and wait for it to start running.
 
-    A string spec containing a dot launches by bundle id with open -b, any
-    other string launches by name with open -a, and a dict launches through
-    its one key. Raises ComputerUseError APP_LAUNCH_FAILED when the open
-    command fails and APP_NOT_RUNNING when the app does not appear in time.
+    The spec is the one-key dict the gate resolved — binding always launches
+    the already-gated bundle id, never a raw name or path. Raises
+    ComputerUseError APP_LAUNCH_FAILED when the open command fails and
+    APP_NOT_RUNNING when the app does not appear in time.
     """
     command = _open_command(spec)
     try:
@@ -159,12 +180,13 @@ def _launch(spec: str | dict[str, str]) -> RunningApp:
 
 
 def _open_command(spec: str | dict[str, str]) -> list[str]:
-    """Build the open command for one app spec."""
-    if isinstance(spec, str):
-        value = spec
-        kind = "bundle_id" if "." in spec else "name"
-    else:
-        kind, value = _spec_value(spec)
+    """Build the open command for one resolved app spec (a one-key dict).
+
+    Binding always launches the already-resolved bundle id, so no string
+    heuristic runs here: a display name with a period ("Acme 1.0") can never
+    be mistaken for a bundle id at launch time.
+    """
+    kind, value = _spec_value(spec)
     if kind == "bundle_id":
         return ["open", "-b", value]
     if kind == "name":
@@ -189,9 +211,7 @@ def _await_running(spec: str | dict[str, str]) -> RunningApp:
 
 
 def _launch_target(spec: str | dict[str, str]) -> tuple[str, str]:
-    """Normalize one spec into its _launch-match kind and value."""
-    if isinstance(spec, str):
-        return ("bundle_id", spec) if "." in spec else ("name", spec)
+    """Normalize one resolved spec into its launch-match kind and value."""
     return _spec_value(spec)
 
 
@@ -217,7 +237,7 @@ def _spec_value(spec: str | dict[str, str]) -> tuple[str, str]:
         raise ComputerUseError(
             "INVALID_ARGUMENT",
             "a dict app spec must carry exactly one of bundle_id, name, or path",
-            {"keys": sorted(spec)},
+            {"keys": sorted(spec, key=str)},
         )
     kind = kinds[0]
     value = spec[kind]
@@ -236,7 +256,7 @@ def _bundle_id_for_bundle_dir(path: str) -> str | None:
     try:
         with info.open("rb") as handle:
             plist = plistlib.load(handle)
-    except (OSError, plistlib.InvalidFileException):
+    except (OSError, plistlib.InvalidFileException, expat.ExpatError):
         return None
     bundle_id = plist.get("CFBundleIdentifier") if isinstance(plist, dict) else None
     return bundle_id if isinstance(bundle_id, str) and bundle_id else None

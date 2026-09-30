@@ -1,7 +1,7 @@
-"""Allowlist _gate, deny-lists, risk labels, and the locked-screen check.
+"""Allowlist gate, deny-lists, risk labels, and the locked-screen check.
 
 The user-edited settings file at ``~/.prime/agent/settings/computer-use.toml``
-is the hard _gate of the computer-use safety model: every app binding and every
+is the hard gate of the computer-use safety model: every app binding and every
 action re-checks it, and the skill never writes it. Decision cores take plain
 data and stay IO-free; the thin shells touch disk or Quartz.
 """
@@ -33,7 +33,7 @@ class Settings:
 
 @dataclass(frozen=True)
 class GateResult:
-    """One _gate decision; ``reason`` is the actionable denial text, empty when allowed."""
+    """One gate decision; ``reason`` is the actionable denial text, empty when allowed."""
 
     allowed: bool
     reason: str
@@ -77,7 +77,7 @@ def _load_settings(path: Path | str | None = None) -> Settings:
     try:
         with open(settings_path, "rb") as handle:
             raw = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError):
+    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError, RecursionError):
         return Settings()
     return _parse_settings(raw)
 
@@ -85,7 +85,7 @@ def _load_settings(path: Path | str | None = None) -> Settings:
 def _gate(bundle_id: str, settings: Settings) -> GateResult:
     """Decide one bundle id against settings; the deny-lists win over the allowlist."""
     risk = settings.risk.get(bundle_id, DEFAULT_RISK)
-    if bundle_id in settings.system_deny:
+    if bundle_id in SYSTEM_DENY or bundle_id in settings.system_deny:
         reason = (
             f"{bundle_id} is on the system deny-list; OS authentication surfaces are "
             f"always refused. To allow an app, add its bundle id to `apps.allowed` "
@@ -149,15 +149,20 @@ def _locked_from_session(session: object) -> bool:
 def _screen_locked() -> bool:
     """Report whether the session screen is locked, failing open when unavailable.
 
-    The check is advisory UX on top of the allowlist hard _gate, so a session
-    that cannot be read (non-mac host, missing Quartz, API error) reads as
-    unlocked and never blocks allowed work on its own.
+    The allowlist is the hard gate, but the lock check protects the same
+    thing the rest of the safety model protects: the user watching their
+    desktop while it is driven. A session that cannot be read is treated as
+    locked, so binding and input injection stop with SCREEN_LOCKED instead
+    of proceeding on an unverifiable desktop.
     """
     try:
         from computer_use import _compat
 
-        # pyobjc binds CGSessionCopyCurrentDictionary with no arguments.
+        # pyobjc binds CGSessionCopyCurrentDictionary with no arguments; a
+        # NULL session dictionary comes back as None without raising.
         session = _compat._require_mac().quartz.CGSessionCopyCurrentDictionary()
     except Exception:
-        return False
+        return True
+    if session is None:
+        return True
     return _locked_from_session(session)

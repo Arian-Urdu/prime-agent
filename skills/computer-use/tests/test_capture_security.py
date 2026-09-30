@@ -107,6 +107,37 @@ class WindowScopedCaptureTests(_CaptureTestCase):
             self.assertEqual(caught.exception.code, "INVALID_ARGUMENT")
 
 
+class FutureStampedSweepTests(_CaptureTestCase):
+    def test_the_post_capture_sweep_never_deletes_the_capture_it_just_wrote(self) -> None:
+        # 20 retained files with FUTURE mtimes: without the keep guard the
+        # fresh capture sorts last and would be swept away
+        future = time.time() + 3600
+        self.shots_dir.mkdir(parents=True, exist_ok=True)
+        for index in range(20):
+            path = self.shots_dir / f"future-{index}.png"
+            path.write_bytes(b"png")
+            os.utime(path, (future, future))
+        self.capture_run()
+        result = capture._screenshot_window((0, 0), (5, 5))
+        self.assertTrue(Path(result["path"]).exists())  # the capture survives
+        self.assertEqual(len(list(self.shots_dir.iterdir())), 20)  # the cap still holds
+
+
+class PlantedFifoTests(_CaptureTestCase):
+    def test_a_planted_fifo_at_the_target_never_blocks_the_read(self) -> None:
+        fixed = uuid.uuid4()
+        self.shots_dir.mkdir(parents=True, exist_ok=True)
+        planted = self.shots_dir / f"{fixed}.png"
+        os.mkfifo(planted)
+        with mock.patch.object(capture, "uuid4", return_value=fixed):
+            self.capture_run()  # screencapture fails onto the fifo, or writes are refused first
+            started = time.monotonic()
+            with self.assertRaises(ComputerUseError) as caught:
+                capture._screenshot_window((0, 0), (5, 5))
+            self.assertLess(time.monotonic() - started, 2.0)  # never blocks
+        self.assertEqual(caught.exception.code, "TRANSPORT_ERROR")
+
+
 class PngHygieneTests(_CaptureTestCase):
     def test_sweep_deletes_files_older_than_a_day(self) -> None:
         stale = self.write_shot("stale.png", _STALE_AGE_SECONDS)
@@ -119,9 +150,12 @@ class PngHygieneTests(_CaptureTestCase):
     def test_sweep_keeps_at_most_the_twenty_most_recent(self) -> None:
         paths = [self.write_shot(f"shot-{index}.png", 3600 + (25 - index)) for index in range(25)]
         self.capture_run()
-        capture._screenshot_window((0, 0), (5, 5))
+        result = capture._screenshot_window((0, 0), (5, 5))
+        # the post-capture sweep enforces the cap with the new file included
         survivors = [path for path in paths if path.exists()]
-        self.assertEqual(survivors, paths[5:])
+        self.assertEqual(survivors, paths[6:])
+        self.assertTrue(Path(result["path"]).exists())
+        self.assertEqual(len(list(self.shots_dir.iterdir())), 20)
 
     def test_sweep_failure_never_breaks_the_capture(self) -> None:
         undeletable = self.shots_dir / "stale-dir"
@@ -194,7 +228,7 @@ class ErrorContractTests(_CaptureTestCase):
                 with self.subTest(call=call.__name__), self.assertRaises(ComputerUseError) as caught:
                     call(*args)
                 self.assertEqual(caught.exception.code, "TRANSPORT_ERROR")
-                self.assertIn(call.__name__, caught.exception.message)
+                self.assertIn(call.__name__.lstrip("_"), caught.exception.message)
                 self.assertEqual(caught.exception.details, {"pid": 123})
 
     def test_inject_non_os_exceptions_stay_injection_failed(self) -> None:
@@ -228,6 +262,51 @@ class FileModesTests(_CaptureTestCase):
 
 
 class SymlinkGuardTests(_CaptureTestCase):
+    def test_a_symlink_planted_after_the_guard_is_refused_by_the_open_chain(self) -> None:
+        # the guard passes (it is called first), the swap happens, and the
+        # no-follow open still refuses: validation and use cannot be separated
+        fake_home = Path(self.tmp.name) / "fake-home"
+        real = fake_home / "real-parent"
+        real.mkdir(parents=True)
+        linked = fake_home / ".prime"
+        linked.parent.mkdir(parents=True, exist_ok=True)
+        linked.symlink_to(real)
+        shots = linked / "agent" / "tmp" / "shots"
+        with mock.patch.object(capture, "_SCREENSHOTS_DIR", shots):
+            with mock.patch.object(capture.Path, "home", return_value=fake_home):
+                with mock.patch.object(capture, "_refuse_symlinked", lambda path: None):
+                    with self.assertRaises(ComputerUseError) as caught:
+                        capture._screenshot_window((0, 0), (5, 5))
+        self.assertEqual(caught.exception.code, "TRANSPORT_ERROR")
+        self.assertIn("symlink", caught.exception.message)
+        self.assertFalse(shots.exists())
+
+    def test_the_sweep_unlinks_a_planted_symlink_not_its_target(self) -> None:
+        stale = self.write_shot("stale.png", _STALE_AGE_SECONDS)
+        target = Path(self.tmp.name) / "attacker-target.png"
+        target.write_bytes(b"target data")
+        link = self.shots_dir / "planted.png"
+        self.shots_dir.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(target)
+        old_stamp = time.time() - _STALE_AGE_SECONDS
+        os.utime(link, (old_stamp, old_stamp), follow_symlinks=False)
+        self.capture_run()
+        capture._screenshot_window((0, 0), (5, 5))
+        self.assertFalse(link.exists())  # the planted link is gone
+        self.assertFalse(stale.exists())  # the sweep ran through the fd
+        self.assertTrue(target.exists())  # the link's target was never touched
+
+    def test_missing_components_are_created_private(self) -> None:
+        fake_home = Path(self.tmp.name) / "plain-home"
+        fake_home.mkdir(parents=True)
+        shots = fake_home / ".prime" / "agent" / "tmp" / "shots"
+        with mock.patch.object(capture, "_SCREENSHOTS_DIR", shots):
+            with mock.patch.object(capture.Path, "home", return_value=fake_home):
+                self.capture_run()
+                result = capture._screenshot_window((0, 0), (5, 5))
+        self.assertTrue(result["path"].endswith(".png"))
+        self.assertEqual(os.stat(shots).st_mode & 0o777, 0o700)
+
     def test_symlinked_dir_is_refused(self) -> None:
         real = Path(self.tmp.name) / "elsewhere"
         real.mkdir()
@@ -320,12 +399,12 @@ class PngDimensionTests(_CaptureTestCase):
     def test_region_capture_at_two_x_retina_scale_is_allowed(self) -> None:
         self.capture_run(png=fake_png_bytes(800, 600))
         result = capture._screenshot_window((0, 0), (400, 300))
-        self.assertEqual((result["width"], result["height"]), (400, 300))
+        self.assertEqual((result["width"], result["height"]), (800, 600))
 
     def test_window_capture_is_not_rect_checked(self) -> None:
         self.capture_run(png=fake_png_bytes(4000, 3000))
         result = capture._screenshot_window((0, 0), (400, 300), window_id=77)
-        self.assertEqual((result["width"], result["height"]), (400, 300))
+        self.assertEqual((result["width"], result["height"]), (4000, 3000))
 
 
 if __name__ == "__main__":

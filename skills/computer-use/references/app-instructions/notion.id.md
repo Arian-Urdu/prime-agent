@@ -18,8 +18,10 @@
 
 ## Multiline and structured input
 
-- For long or structured content prefer `paste(text, format="md")`: markdown
-  structure becomes blocks in one action and the clipboard is restored.
+- For long or structured content prefer `set_value`: it writes the whole
+  block in one action. `paste(text, format="md")` pastes the markdown
+  source as plain text — only `format="html"` writes rich data — and the
+  clipboard is restored afterwards when it still holds the payload.
 - `set_value` on a text block writes its content directly; prefer it over
   typing when the text is long or contains newlines.
 

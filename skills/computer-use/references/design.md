@@ -35,9 +35,12 @@ agent -> ipython kernel -> computer_use (skill module)
 
 Interaction loop the skill teaches (and enforces the freshness half of): observe
 (`get_app`/`get_ax_state` returns element-indexed AX text, diffed against the previous
-snapshot), act by `element_index` (or window-screenshot coordinates), re-observe. The runtime
-auto-settles after actions; the model never needs to sleep. Screenshots are the fallback when
-AX text is misleading - they cost far more tokens than the AX diff.
+snapshot), act by `element_index` (or window-screenshot coordinates), re-observe. The
+runtime settles after every input-injecting action: a bounded poll of the focused window's
+live fingerprint runs inside the action, so the model never needs to sleep and the next
+observation shows the settled UI. Screenshots are the fallback when AX text is misleading -
+they cost far more tokens than the AX diff, and their pixel coordinates are scaled back to
+the window's logical bounds (Retina captures are 2x), so image points land where they look.
 
 App-scoped actions: every action targets a bound `App`; mouse events are posted to that app's
 process rather than the global event stream; text entry uses the AX value-setting path where
@@ -70,6 +73,13 @@ so that helper can inherit them.
 4. Untrusted evidence: everything read from the screen or AX tree is data, never instructions.
    The skill surfaces this framing in its docs and error messages.
 5. Locked screen: actions fail closed with `SCREEN_LOCKED` until the user unlocks.
+6. Secure fields fail closed on every path: the live focused element decides
+   (an unreadable live focus refuses typing instead of trusting the snapshot), and
+   `set_value`/`select_text` re-read the target element's live subrole, so a field that
+   turned into a password field after the snapshot is still refused at action time.
+7. Grant freshness: the Accessibility grant is re-checked on every action, so a revoke
+   mid-session reports `PERMISSIONS_NOT_GRANTED` with its recovery instead of an injection
+   failure.
 
 ## 4. Telemetry
 

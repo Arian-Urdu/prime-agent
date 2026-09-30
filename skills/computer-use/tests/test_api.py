@@ -1,4 +1,4 @@
-"""Tests for the computer-use API surface and its _backend seams.
+"""Tests for the computer-use API surface and its backend seams.
 
 Covers telemetry caps, the permissions snapshot with injected probes, the
 capture surface with a stubbed screencapture, and the inject surface's
@@ -22,7 +22,7 @@ from typing import Any
 from unittest import mock
 
 import fakes
-from computer_use import capture, inject, permissions, telemetry
+from computer_use import apps, capture, inject, permissions, telemetry
 from computer_use import errors
 
 
@@ -277,8 +277,7 @@ class InjectionFailureTests(unittest.TestCase):
         with mock.patch.object(inject, "_require_mac", side_effect=RuntimeError("e" * 500)):
             with self.assertRaises(errors.ComputerUseError) as caught:
                 inject._click(123, (10, 20))
-        underlying = caught.exception.message.split("failed: ", 1)[-1]
-        self.assertLessEqual(len(underlying), 200)
+        self.assertLessEqual(len(caught.exception.message), len("click failed: ") + 200)
 
     def test_drag_and_scroll_wrap_cg_errors(self) -> None:
         for name in ("drag", "scroll"):
@@ -440,7 +439,7 @@ class GetAppTests(AppTestCase):
         env.running = []
         env.launch_result = RunningApp(bundle_id=env.bundle, name=env.name, pid=5555, path=None)
         app = await env.get_app()
-        self.assertEqual(env.launch_calls, [env.bundle])
+        self.assertEqual(env.launch_calls, [{"bundle_id": env.bundle}])
         self.assertEqual(app.pid, 5555)
 
     async def test_get_app_launch_denied_for_unallowed_bundle(self) -> None:
@@ -472,7 +471,7 @@ class GetAppTests(AppTestCase):
         with self.assertRaises(errors.ComputerUseError) as caught:
             await computer_use.get_app("Example")
         self.assertEqual(caught.exception.code, "TRANSPORT_ERROR")
-        self.assertIn("computer use _backend unavailable", caught.exception.message)
+        self.assertIn("computer use backend unavailable", caught.exception.message)
 
 
 class AppDispatchTests(AppTestCase):
@@ -588,6 +587,7 @@ class AppDispatchTests(AppTestCase):
 
         env = self.make_env()
         env.focused_index = 4  # the Password secure field
+        env.secure_focus = True  # the live focus agrees
         app = await env.get_app()
         with self.assertRaises(errors.ComputerUseError) as caught:
             await app.type_text("hunter2")
@@ -629,6 +629,7 @@ class AppDispatchTests(AppTestCase):
 
         env = self.make_env()
         env.focused_index = 4  # the Password secure field
+        env.secure_focus = True  # the live focus agrees
         app = await env.get_app()
         with self.assertRaises(errors.ComputerUseError) as caught:
             await app.press_key("a")
@@ -640,6 +641,7 @@ class AppDispatchTests(AppTestCase):
 
         env = self.make_env()
         env.focused_index = 4
+        env.secure_focus = True  # the live focus agrees
         app = await env.get_app()
         with self.assertRaises(errors.ComputerUseError) as caught:
             await app.paste("secret")
@@ -833,6 +835,169 @@ class AppElementActionTests(AppTestCase):
         self.assertEqual(env.clipboard_calls, [])
 
 
+class SettleTests(AppTestCase):
+    async def test_injected_click_waits_for_the_ui_to_settle(self) -> None:
+        env = self.make_env()
+        app = await env.get_app()
+        env.fingerprint_values = [("Main", 5), ("Main", 6), ("Main", 6)]
+        await app.click(0)
+        self.assertGreaterEqual(env.fingerprint_reads, 3)  # polled until two reads agreed
+
+    async def test_churning_app_settles_at_the_cap(self) -> None:
+        env = self.make_env()
+        app = await env.get_app()
+        import computer_use
+
+        env.fingerprint_values = [("loading", 1), ("loading", 2)]
+        with mock.patch.object(computer_use, "_SETTLE_MAX_SECONDS", 0.2), mock.patch.object(
+            computer_use, "_SETTLE_POLL_SECONDS", 0.01
+        ):
+            started = time.monotonic()
+            await app.click(0)
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1.0)
+        self.assertGreaterEqual(env.fingerprint_reads, 3)
+
+    async def test_unreadable_fingerprint_settles_immediately(self) -> None:
+        env = self.make_env()
+        app = await env.get_app()
+        started = time.monotonic()
+        await app.type_text("hello")  # fingerprint None -> no poll
+        self.assertLess(time.monotonic() - started, 0.3)
+        self.assertEqual(env.fingerprint_reads, 1)
+
+
+class MovedWindowScaleTests(AppTestCase):
+    async def test_the_capture_scale_survives_a_moved_window(self) -> None:
+        env = self.make_env()
+        env.recorder.screenshot = {"path": "/tmp/computer-use-fake.png", "width": 800, "height": 600}
+        app = await env.get_app()
+        await app.get_screenshot(attach=False)  # the rect was (100, 50, 400, 300), the png 800x600
+        env.window_rect = (260.0, 12.0, 400.0, 300.0)  # the window moved, same size
+        await app.get_ax_state()
+        await app.click((400.0, 150.0))
+        clicks = env.recorder.calls_named("click")
+        self.assertEqual(clicks[-1]["point"], (460.0, 87.0))  # 260+400/2, 12+150/2
+
+    async def test_a_resized_window_rejects_points_that_no_longer_fit(self) -> None:
+        env = self.make_env()
+        env.recorder.screenshot = {"path": "/tmp/computer-use-fake.png", "width": 800, "height": 600}
+        app = await env.get_app()
+        await app.get_screenshot(attach=False)
+        env.window_rect = (100.0, 50.0, 200.0, 150.0)  # the window shrank
+        await app.get_ax_state()
+        with self.assertRaises(errors.ComputerUseError) as caught:
+            await app.click((400.0, 100.0))  # in the old image, outside the live window
+        self.assertEqual(caught.exception.code, "INVALID_ARGUMENT")
+
+
+class RetinaClickTests(AppTestCase):
+    async def test_click_uses_window_pixels_one_to_one_on_a_one_x_capture(self) -> None:
+        env = self.make_env()
+        app = await env.get_app()
+        result = await app.get_screenshot(attach=False)
+        self.assertEqual((result["width"], result["height"]), (400, 300))  # 1x fake: no scaling
+        await app.click((100.0, 50.0))
+        clicks = env.recorder.calls_named("click")
+        self.assertEqual(clicks[-1]["point"], (200.0, 100.0))  # origin (100, 50) + the window pixels
+
+    async def test_click_scales_a_two_x_capture_back_to_logical_window_space(self) -> None:
+        env = self.make_env()
+        env.recorder.screenshot = {"path": "/tmp/computer-use-fake.png", "width": 800, "height": 600}
+        app = await env.get_app()
+        await app.get_screenshot(attach=False)  # the window rect is 400x300, the PNG is 800x600
+        await app.click((400.0, 150.0))
+        clicks = env.recorder.calls_named("click")
+        self.assertEqual(clicks[-1]["point"], (300.0, 125.0))  # 100+400/2, 50+150/2
+
+    async def test_click_outside_the_captured_image_is_rejected(self) -> None:
+        env = self.make_env()
+        env.recorder.screenshot = {"path": "/tmp/computer-use-fake.png", "width": 800, "height": 600}
+        app = await env.get_app()
+        await app.get_screenshot(attach=False)
+        with self.assertRaises(errors.ComputerUseError) as caught:
+            await app.click((800.0, 150.0))
+        self.assertEqual(caught.exception.code, "INVALID_ARGUMENT")
+        self.assertIn("outside the captured image", caught.exception.message)
+
+    async def test_a_stale_screenshot_never_scales_a_new_window_rect(self) -> None:
+        env = self.make_env()
+        env.recorder.screenshot = {"path": "/tmp/computer-use-fake.png", "width": 800, "height": 600}
+        app = await env.get_app()
+        await app.get_screenshot(attach=False)
+        env.window_rect = (100.0, 50.0, 200.0, 150.0)  # the window resized; the shot is stale
+        await app.get_ax_state()
+        with self.assertRaises(errors.ComputerUseError) as caught:
+            await app.click((400.0, 100.0))  # inside the old 800px image, outside the new window
+        self.assertEqual(caught.exception.code, "INVALID_ARGUMENT")
+
+
+class OffLoopDispatchTests(AppTestCase):
+    async def test_the_action_dispatch_runs_off_the_event_loop_thread(self) -> None:
+        import threading
+
+        from computer_use import inject as inject_module
+
+        env = self.make_env()
+        app = await env.get_app()
+        threads: list[int] = []
+        original = inject_module._click
+
+        def recording_click(pid, point, button="left", count=1):
+            threads.append(threading.get_ident())
+            return original(pid, point, button=button, count=count)
+
+        inject_module._click = recording_click
+        try:
+            await app.click(0)
+        finally:
+            inject_module._click = original
+        self.assertEqual(len(threads), 1)
+        self.assertNotEqual(threads[0], threading.get_ident())
+
+
+class OffLoopThreadTests(AppTestCase):
+    async def test_launch_runs_off_the_event_loop_thread(self) -> None:
+        import threading
+
+        env = self.make_env()
+        env.running = []
+        threads: list[int] = []
+        original = env._launch
+        launched = {"value": None}
+
+        def recording_launch(spec):
+            threads.append(threading.get_ident())
+            launched["value"] = original(spec)
+            return launched["value"]
+
+        apps._launch = recording_launch
+        app = await env.get_app("com.example.app")
+        self.assertEqual(app.bundle_id, env.bundle)
+        self.assertEqual(len(threads), 1)
+        self.assertNotEqual(threads[0], threading.get_ident())
+
+    async def test_screenshot_capture_runs_off_the_event_loop_thread(self) -> None:
+        import threading
+
+        from computer_use import capture as capture_module
+
+        env = self.make_env()
+        threads: list[int] = []
+        original = capture_module._screenshot_window
+
+        def recording_capture(origin, size, window_id=None):
+            threads.append(threading.get_ident())
+            return original(origin, size, window_id=window_id)
+
+        capture_module._screenshot_window = recording_capture
+        app = await env.get_app()
+        result = await app.get_screenshot(attach=False)
+        self.assertIn("path", result)
+        self.assertEqual(len(threads), 1)
+        self.assertNotEqual(threads[0], threading.get_ident())
+
+
 class AppObservationTests(AppTestCase):
     async def test_get_ax_state_diff_flow(self) -> None:
         env = self.make_env()
@@ -853,7 +1018,7 @@ class AppObservationTests(AppTestCase):
         app = await env.get_app()
         result = await app.get_screenshot()
         shots = env.recorder.calls_named("screenshot_window")
-        self.assertEqual(shots, [{"origin": (100, 50), "size": (400, 300)}])
+        self.assertEqual(shots, [{"origin": (100, 50), "size": (400, 300), "window_id": 4321}])
         self.assertEqual(result["path"], env.recorder.screenshot["path"])
         self.assertEqual(result["width"], 400)
         self.assertEqual(result["height"], 300)

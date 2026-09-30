@@ -165,6 +165,7 @@ fn kind_name(kind: RefinementKind) -> &'static str {
         RefinementKind::Memory => "memory",
         RefinementKind::Skill => "skill",
         RefinementKind::Subagent => "subagent",
+        RefinementKind::Factory => "factory",
     }
 }
 
@@ -173,6 +174,7 @@ fn kind_value(name: &str) -> RefinementKind {
         "prompt" => RefinementKind::Prompt,
         "memory" => RefinementKind::Memory,
         "skill" => RefinementKind::Skill,
+        "factory" => RefinementKind::Factory,
         _ => RefinementKind::Subagent,
     }
 }

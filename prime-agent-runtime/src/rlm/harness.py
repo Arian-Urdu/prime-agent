@@ -21,12 +21,14 @@ from pathlib import Path
 from uuid import uuid4
 from typing import Any, Literal
 
-HarnessKind = Literal["prompt", "memory", "skill", "subagent"]
+from .factory import validate_factory_spec
+
+HarnessKind = Literal["prompt", "memory", "skill", "subagent", "factory"]
 HarnessScope = Literal["local", "global"]
 
 _DEFAULT_FILE_NAME = "harness_state.json"
 _DEFAULT_HARNESS_DIR_NAME = "harness"
-_KINDS: tuple[HarnessKind, ...] = ("prompt", "memory", "skill", "subagent")
+_KINDS: tuple[HarnessKind, ...] = ("prompt", "memory", "skill", "subagent", "factory")
 _state_cache: dict[tuple[Path, HarnessScope], "HarnessState"] = {}
 
 
@@ -257,6 +259,44 @@ def _require_optional_record(kind: str, entry_name: str, field: str, value: Any)
         )
 
 
+def _factory_spec_argument(
+    dag: Any, machine: Any
+) -> "tuple[Any, Literal['dag', 'machine']]":
+    """Pick the factory spec payload and its arguments key from the call.
+
+    Supplying both forms at once is an error. A bare ``dag=None,
+    machine=None`` passes ``None`` through in the dag slot so the write-time
+    validation rejects it with the standard wording.
+    """
+    if dag is not None and machine is not None:
+        raise ValueError("pass either dag or machine, not both")
+    if machine is not None:
+        return machine, "machine"
+    return dag, "dag"
+
+
+def _validate_factory_arguments(entry_name: str, arguments: dict[str, Any]) -> None:
+    """Shared-path dry run for every factory write.
+
+    ``create_factory``/``update_factory`` validate their own spec, but a
+    generic ``create``/``update`` (or a refinement edit) writes
+    ``arguments`` directly; an invalid spec must never reach the store
+    through any writer, so the spec found in ``arguments`` is validated
+    here too.
+    """
+    dag, machine = arguments.get("dag"), arguments.get("machine")
+    if dag is not None and machine is not None:
+        raise ValueError(f"factory entry {entry_name!r} rejected: pass either dag or machine, not both")
+    spec = machine if machine is not None else dag
+    if not isinstance(spec, dict):
+        raise ValueError(
+            f"factory entry {entry_name!r} rejected: factory entries require a dag or machine object in arguments"
+        )
+    errors = validate_factory_spec(spec)
+    if errors:
+        raise ValueError(f"factory entry {entry_name!r} rejected: {'; '.join(errors)}")
+
+
 def _validate_entry_shape(
     kind: str,
     entry_id: Any,
@@ -294,6 +334,13 @@ def _validate_entry_shape(
                 raise ValueError(f"skill entry {entry_name!r} rejected: skill entries require a Python reference")
         else:
             _validate_python_skill_reference(reference, entry_name)
+    if kind == "factory" and arguments is not None:
+        # Every factory writer funnels through here, so an invalid spec can
+        # never be persisted -- create_factory validates, and the generic
+        # create/update path (a refinement edit) gets the same dry run. An
+        # update that omits arguments (None) preserves the stored spec and
+        # skips validation, exactly like update_skill treats reference.
+        _validate_factory_arguments(entry_name, arguments)
 
 
 def _validate_refinement_event(trigger: Any, changes: Any, *, evidence: Any, outcome: Any) -> None:
@@ -892,6 +939,75 @@ class HarnessState:
     def delete_subagent(self, id: str, *, global_: bool = False, **kwargs: Any) -> bool:
         return self.delete("subagent", id, global_=global_, **kwargs)
 
+    def create_factory(
+        self,
+        title: str,
+        content: str,
+        *,
+        id: str | None = None,
+        path: str = "general",
+        dag: dict[str, Any] | None = None,
+        machine: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+        global_: bool = False,
+        **kwargs: Any,
+    ) -> HarnessEntry:
+        # Write-time dry run: an invalid spec (either form) never reaches the store.
+        spec, key = _factory_spec_argument(dag, machine)
+        errors = validate_factory_spec(spec)
+        if errors:
+            raise ValueError("; ".join(errors))
+        return self.create(
+            "factory",
+            title,
+            content,
+            id=id,
+            path=path,
+            arguments={key: spec},
+            metadata=metadata,
+            global_=global_,
+            **kwargs,
+        )
+
+    def update_factory(
+        self,
+        id: str,
+        title: str,
+        content: str,
+        *,
+        path: str | None = None,
+        dag: dict[str, Any] | None = None,
+        machine: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+        global_: bool = False,
+        **kwargs: Any,
+    ) -> HarnessEntry:
+        # Only validate a spec when one is supplied; omitting both preserves the
+        # stored arguments (see _upsert) rather than forcing every title/content
+        # update to re-send the full spec, exactly like update_skill treats reference.
+        if dag is not None or machine is not None:
+            spec, key = _factory_spec_argument(dag, machine)
+            errors = validate_factory_spec(spec)
+            if errors:
+                raise ValueError("; ".join(errors))
+            arguments = {key: spec}
+        else:
+            arguments = None
+        return self.update(
+            "factory",
+            id,
+            title,
+            content,
+            path=path,
+            arguments=arguments,
+            metadata=metadata,
+            global_=global_,
+            **kwargs,
+        )
+
+    def delete_factory(self, id: str, *, global_: bool = False, **kwargs: Any) -> bool:
+        return self.delete("factory", id, global_=global_, **kwargs)
+
     def record_refinement(
         self,
         trigger: str,
@@ -956,6 +1072,12 @@ class HarnessState:
             "files; children reply with await agent_message.send(message, receiver_role='parent'). Use "
             "await rlm.list_subagents() to recover direct child handles and await agent_message.send(..., "
             "receiver_role='child', receiver_name=handle.name) for follow-ups.",
+            "Factory entries declare validated state-machine workflows of subagent states in arguments['machine'] "
+            "(the original DAG sugar in arguments['dag'] compiles to machine form): manage them with "
+            "create_factory/update_factory/delete_factory (create_factory validates either form at write time); run "
+            "them with await rlm.factory.run(\"<id>\"), watch with await rlm.factory.status(run_id), stop with "
+            "await rlm.factory.stop(run_id), and resume an escalate-paused run with "
+            "await rlm.factory.resume(run_id).",
         ]
         for kind in _KINDS:
             records = self.list(kind)[:max_entries_per_kind]

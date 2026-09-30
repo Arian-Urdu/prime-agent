@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// Refinement entry kinds (the continual harness component set).
-pub const REFINEMENT_KINDS: [&str; 4] = ["prompt", "memory", "skill", "subagent"];
+pub const REFINEMENT_KINDS: [&str; 5] = ["prompt", "memory", "skill", "subagent", "factory"];
 
 /// Directory name under the agent dir (or session artifact dir).
 pub const HARNESS_STATE_DIR_NAME: &str = "harness";
@@ -28,6 +28,7 @@ pub enum RefinementKind {
     Memory,
     Skill,
     Subagent,
+    Factory,
 }
 
 /// Edit action against a harness entry.
@@ -108,6 +109,7 @@ pub fn empty_harness_state() -> HarnessState {
             (RefinementKind::Memory, BTreeMap::new()),
             (RefinementKind::Skill, BTreeMap::new()),
             (RefinementKind::Subagent, BTreeMap::new()),
+            (RefinementKind::Factory, BTreeMap::new()),
         ]
         .into_iter()
         .collect(),
@@ -120,6 +122,7 @@ fn kind_from_name(name: &str) -> RefinementKind {
         "prompt" => RefinementKind::Prompt,
         "memory" => RefinementKind::Memory,
         "skill" => RefinementKind::Skill,
+        "factory" => RefinementKind::Factory,
         _ => RefinementKind::Subagent,
     }
 }
@@ -498,6 +501,7 @@ fn kind_name(kind: RefinementKind) -> &'static str {
         RefinementKind::Memory => "memory",
         RefinementKind::Skill => "skill",
         RefinementKind::Subagent => "subagent",
+        RefinementKind::Factory => "factory",
     }
 }
 

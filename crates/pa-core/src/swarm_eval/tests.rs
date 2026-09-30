@@ -247,6 +247,21 @@ fn drops_non_positive_sizes_and_requires_at_least_one() {
 }
 
 #[test]
+fn non_finite_gap_seconds_fall_back_to_the_immediate_reply_zero() {
+    // `1e999` parses to infinity and would emit `asyncio.sleep(inf)`
+    // (NaN for child 0) into the child prompts, stalling every staggered
+    // reply until the trial timeout; `NaN` already degraded via the
+    // clamp, the infinities did not.
+    for raw in ["inf", "Infinity", "1e999", "nan", "-inf"] {
+        let config =
+            parse_eval_args(&args(&["--model", "m", "--gap-seconds", raw])).expect("parses");
+        assert_eq!(config.gap_seconds, 0.0, "{raw}");
+    }
+    let config = parse_eval_args(&args(&["--model", "m", "--gap-seconds", "3.5"])).expect("parses");
+    assert_eq!(config.gap_seconds, 3.5);
+}
+
+#[test]
 fn rejects_sizes_above_the_supported_maximum() {
     // The 900-value 3-digit secret space bounds a crew whose ANSWER can
     // be verified; a huge size would also abort the driver's secret

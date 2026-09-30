@@ -188,15 +188,23 @@ fn extract_flag(argv: &[String], flag: &str) -> (Option<String>, bool, Vec<Strin
     (value, given, rest)
 }
 
-fn run(socket: &Path, config: &SwarmEvalConfig) -> Result<(), String> {
-    let mut client = Client::connect(socket)?;
-    let runs_root = std::env::temp_dir().join(format!(
-        "swarm-eval-{}",
+/// The per-run scratch root: the process id plus the start time keeps two
+/// harness processes launched in the same millisecond from sharing trial
+/// directories and `swarm-eval-{size}-{trial}` daemon session names.
+fn runs_root_path() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "swarm-eval-{}-{}",
+        std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis()
-    ));
+    ))
+}
+
+fn run(socket: &Path, config: &SwarmEvalConfig) -> Result<(), String> {
+    let mut client = Client::connect(socket)?;
+    let runs_root = runs_root_path();
     fs::create_dir_all(&runs_root).map_err(|error| format!("create runs root: {error}"))?;
 
     let mut results: Vec<SwarmEvalTrialResult> = Vec::new();
@@ -472,7 +480,7 @@ mod tests {
     use pa_core::swarm_eval::{seeded_secrets, ArrivalPattern, MessageSize, SwarmEvalConfig};
     use serde_json::{json, Value};
 
-    use super::{run, run_trial, socket_from_args, Client};
+    use super::{run, run_trial, runs_root_path, socket_from_args, Client};
 
     /// A scripted daemon socket: greets the client, then answers each
     /// command by its `type` from `script`, recording every command in
@@ -658,6 +666,22 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn the_runs_root_is_process_unique() {
+        // Two harness processes launched in the same millisecond must not
+        // share a scratch root: their trial directories and daemon session
+        // names would collide.
+        let name = runs_root_path()
+            .file_name()
+            .expect("a name")
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            name.starts_with(&format!("swarm-eval-{}-", std::process::id())),
+            "{name}"
+        );
     }
 
     #[test]

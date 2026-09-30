@@ -285,7 +285,8 @@ pub enum EvalArgsError {
 /// [`EvalArgsError::Message`] for an unknown flag, a flag missing its value,
 /// a missing `--model`, a `--sizes` list with no positive size, a size
 /// above [`MAX_CREW_SIZE`], or a sweep whose derived trial seed
-/// (`seed + 31 * size + trial`) cannot be represented in `i64`.
+/// (`seed + 31 * size + trial`) cannot be represented in `i64`. Non-finite
+/// `--gap-seconds` values fall back to the immediate-reply zero.
 pub fn parse_eval_args(argv: &[String]) -> Result<SwarmEvalConfig, EvalArgsError> {
     let mut config = default_eval_config();
     let mut index = 0;
@@ -319,7 +320,16 @@ pub fn parse_eval_args(argv: &[String]) -> Result<SwarmEvalConfig, EvalArgsError
             }
             "--gap-seconds" => {
                 let raw = arg_value(argv, &mut index, arg)?;
-                config.gap_seconds = raw.parse::<f64>().unwrap_or(0.0).max(0.0);
+                // Non-finite values (`1e999`, `inf`, `NaN`) would emit
+                // `asyncio.sleep(inf)` — `NaN` for child 0 — into the child
+                // prompts and stall every staggered reply; they fall back to
+                // the immediate-reply zero like any unparsable value.
+                config.gap_seconds = raw
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|value| value.is_finite())
+                    .unwrap_or(0.0)
+                    .max(0.0);
             }
             "--timeout-minutes" => {
                 let raw = arg_value(argv, &mut index, arg)?;

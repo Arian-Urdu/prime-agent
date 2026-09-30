@@ -160,17 +160,34 @@ class RlmWatchAgentTest(unittest.TestCase):
     def test_watch_reports_the_final_output_after_running_flips(self) -> None:
         """The watcher drains the stdout pump's last bytes before exiting."""
 
-        class LatePumpHandle(FakeJobHandle):
+        class LatePumpHandle:
+            """A reaped job whose final bytes land only after the loop first
+            observes `running == False` — the growth exists solely inside the
+            drain window, so the test fails without the drain."""
+
+            pid = 9999
+            command = "late pump job"
+
             def __init__(self) -> None:
-                super().__init__(9999, [])
-                self.running = False  # the process is reaped...
-                self._pumped = False  # ...but the pump still holds a chunk.
+                self._running_observed = False
+
+            @property
+            def running(self) -> bool:
+                # The loop reads `running` after each peek; the process is
+                # already reaped, but the pump still holds the last chunk.
+                self._running_observed = True
+                return False
 
             def peek_output_bytes(self) -> int:
-                if not self._pumped:
-                    self._pumped = True
-                    return 0
-                return 500  # the final bytes land after `running` went False.
+                # 0 until `running` was observed; 500 once the pump lands
+                # the final bytes inside the drain window.
+                return 500 if self._running_observed else 0
+
+            def output(self) -> str:
+                return ""
+
+            def peek_output(self) -> str:
+                return ""
 
         handle = LatePumpHandle()
         seen: list[tuple[int, int]] = []

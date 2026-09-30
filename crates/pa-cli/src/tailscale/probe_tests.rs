@@ -334,7 +334,10 @@ fn the_public_commands_never_execute_a_tailscale_shadowing_the_cwd() {
     // would otherwise leak the chdir'd directory and the poisoned `PATH`
     // to the binary's other tests.
     let _cwd = CwdGuard::capture();
-    let _path = PathGuard::capture();
+    // The guard restores the `PATH` on drop; the binding is read (not just
+    // dropped), so it keeps the non-underscore name the clippy
+    // `used_underscore_binding` lint requires.
+    let path_guard = PathGuard::capture();
     std::env::set_current_dir(workspace.path()).expect("chdir workspace");
     // The poisoned entries come first; the original `PATH` rides last so
     // the shims' own shell tools (and any concurrently running test's
@@ -346,7 +349,7 @@ fn the_public_commands_never_execute_a_tailscale_shadowing_the_cwd() {
             ".:{}:{}:{}",
             workspace.path().display(),
             real.dir().display(),
-            _path.saved_lossy(),
+            path_guard.saved_lossy(),
         ),
     );
     // Run every public bridge under the poisoned env; the guards restore

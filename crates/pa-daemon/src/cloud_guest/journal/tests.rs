@@ -483,12 +483,15 @@ fn compacted_terminal_id_corruption_fails_closed_before_a_rerun() {
 
 #[test]
 fn uncompacted_transition_id_corruption_also_fails_closed() {
-    // In the UN-compacted shape the running transition still exists,
-    // so a corrupted terminal id would restore the command RUNNING and
-    // uncertain - not an automatic rerun (the honest nuance; the
-    // compacted shape is the auto-rerun vector). The fail-closed rule
-    // refuses the open for BOTH shapes: an orphan version-1 transition
-    // is corruption either way.
+    // The UN-compacted shape, with the FIRST transition line (the
+    // running one) corrupted instead of the terminal: under the old
+    // drop-an-orphan semantics the completed terminal would still fold,
+    // so even this corruption is no auto-rerun vector — but the
+    // fail-closed rule still refuses the open, because an orphan
+    // version-1 transition is corruption in every shape. (Corrupting
+    // the TERMINAL id in this shape would restore the command running
+    // and uncertain — also no auto-rerun; the compacted shape is the
+    // auto-rerun vector, proven by the test above.)
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("command-journal.ndjson");
     {

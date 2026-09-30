@@ -441,6 +441,30 @@ async fn request_auth_carries_the_stored_team_header() {
     );
 }
 
+/// A session whose directory pins a team through the prime CLI directory
+/// context (`.prime/context.json`) sends that team, not the stored one.
+#[tokio::test]
+async fn request_auth_follows_the_session_directory_context() {
+    let dir = tempfile::TempDir::new().unwrap();
+    write_prime_auth(&dir.path().join("agent"));
+    std::fs::create_dir_all(dir.path().join(".prime")).unwrap();
+    std::fs::write(
+        dir.path().join(".prime/context.json"),
+        r#"{"team_id": "pinned-team"}"#,
+    )
+    .unwrap();
+    let engine = restore_test_engine(dir.path(), Some("prime-inference"), None);
+    let model = engine.resolve_registry_model().expect("resolved model");
+    let (_, headers) = engine.resolve_request_key_and_headers(&model);
+    assert_eq!(
+        headers
+            .expect("merged request headers")
+            .get("X-Prime-Team-ID")
+            .map(String::as_str),
+        Some("pinned-team")
+    );
+}
+
 /// The revival race this lane fixes (the 2026-09-23 05:57 fleet kill):
 /// a revived session (scheduled wake / update restore / worker
 /// relaunch — a create without model flags) resolves against the cold

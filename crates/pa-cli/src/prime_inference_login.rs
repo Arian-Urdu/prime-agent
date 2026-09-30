@@ -94,6 +94,9 @@ pub(crate) struct PrimeLoginInputs<'a> {
     pub http: &'a dyn PrimeHttp,
     pub prime_cli_config_path: Option<&'a Path>,
     pub prime_team_id: Option<&'a str>,
+    /// The session directory whose prime CLI directory context
+    /// (`.prime/context.json`) selects the team ahead of the stored one.
+    pub cwd: Option<&'a Path>,
     /// The challenge poll interval (the product's 5s default; tests use
     /// milliseconds so the race's arms resolve deterministically).
     pub poll_interval_ms: Option<u64>,
@@ -258,6 +261,9 @@ async fn complete_login(
         return ProviderAuthOutcome::Cancelled;
     }
     let mut auth = AuthStorage::create(inputs.agent_dir);
+    if let Some(cwd) = inputs.cwd {
+        auth = auth.with_project_dir(cwd);
+    }
     auth.set_prime_inference_api_key(api_key, team);
     if let Some(error) = auth.drain_errors().pop() {
         return ProviderAuthOutcome::Error(format!(
@@ -348,8 +354,8 @@ async fn select_team(
     }
 }
 
-/// TS `getPrimeInferenceDefaultTeamStatus`: the env pin, the stored
-/// selection, else the personal account.
+/// TS `getPrimeInferenceDefaultTeamStatus`: the env pin, the directory
+/// context, the stored selection, else the personal account.
 fn default_team_status(auth: &AuthStorage, prime_team_id: Option<&str>) -> String {
     if prime_team_id
         .map(str::trim)
@@ -357,6 +363,14 @@ fn default_team_status(auth: &AuthStorage, prime_team_id: Option<&str>) -> Strin
         .is_some_and(|value| !value.is_empty())
     {
         return "Using team from PRIME_TEAM_ID.".to_string();
+    }
+    if let Some(directory) = auth.prime_directory_team() {
+        let account = match (directory.team_id, directory.name) {
+            (Some(_), Some(name)) => format!("team \"{name}\""),
+            (Some(team_id), None) => format!("team {team_id}"),
+            (None, _) => "personal account".to_string(),
+        };
+        return format!("Using {account} from {}.", directory.source);
     }
     match auth.get_prime_inference_team_selection() {
         StoredPrimeTeam::Team(team) => format!("Using team \"{}\".", team.name),
@@ -729,6 +743,7 @@ mod tests {
                 http,
                 prime_cli_config_path,
                 prime_team_id,
+                cwd: None,
                 // A short poll keeps the browser arm's pending round
                 // deterministically slower than the armed paste.
                 poll_interval_ms: Some(10),

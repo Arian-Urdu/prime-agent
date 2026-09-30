@@ -2,7 +2,8 @@
 //! locked read/modify/write of the prime-inference credential, the api-key
 //! store with its team selection, the team rebind, and the stored team
 //! read (TS setPrimeInferenceApiKey / setPrimeInferenceTeamSelection /
-//! getPrimeInferenceTeamSelection). The methods stay inherent on
+//! getPrimeInferenceTeamSelection), and the team header those selections
+//! and a prime CLI directory context feed. The methods stay inherent on
 //! `AuthStorage`: the impl owns the private lock and reload machinery they
 //! wrap.
 
@@ -131,5 +132,71 @@ impl AuthStorage {
             },
             _ => StoredPrimeTeam::NotSelected,
         }
+    }
+
+    /// Resolve the Prime Inference team from the prime CLI directory context
+    /// (`.prime/context.json`, or `PRIME_CONTEXT`) of the session directory
+    /// `cwd`, ahead of the stored team. The stored credential is untouched.
+    #[must_use]
+    pub fn with_project_dir(mut self, cwd: impl Into<std::path::PathBuf>) -> Self {
+        self.project_dir = Some(cwd.into());
+        self
+    }
+
+    /// The team the project directory's prime CLI directory context selects,
+    /// if any. A malformed pin or missing context is logged and ignored.
+    pub fn prime_directory_team(&self) -> Option<crate::auth::PrimeDirectoryTeam> {
+        let cwd = self.project_dir.as_deref()?;
+        let prime_dir = self.prime_dir.clone().or_else(|| {
+            crate::auth::default_prime_cli_config_path()
+                .parent()
+                .map(std::path::Path::to_path_buf)
+        })?;
+        let prime_context = self.env_credentials.prime_context();
+        match crate::auth::prime_directory::resolve_directory_team(
+            cwd,
+            &prime_dir,
+            prime_context.as_deref(),
+        ) {
+            Ok(team) => team,
+            Err(error) => {
+                tracing::warn!(%error, "ignoring Prime directory context");
+                None
+            }
+        }
+    }
+
+    /// Provider-scoped request headers (prime-inference team header only):
+    /// `PRIME_TEAM_ID`, then the directory context, then the stored team.
+    /// The stored primeTeam survives runtime and environment API-key
+    /// overrides (fleet P5): an ambient `PRIME_API_KEY` supplies the key,
+    /// never the team.
+    pub fn get_provider_headers(
+        &self,
+        provider_id: &str,
+    ) -> Option<std::collections::HashMap<String, String>> {
+        if provider_id != PRIME_INFERENCE_PROVIDER_ID {
+            return None;
+        }
+        let env_team = self
+            .env_credentials
+            .prime_team_id()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let team_id = match env_team {
+            Some(team_id) => Some(team_id),
+            None => match self.prime_directory_team() {
+                Some(directory) => directory.team_id,
+                None => match self.data.credential(provider_id) {
+                    Some(AuthCredential::ApiKey { prime_team, .. }) => {
+                        prime_team.map(|team| team.team_id)
+                    }
+                    _ => None,
+                },
+            },
+        };
+        team_id.map(|team_id| {
+            std::collections::HashMap::from([("X-Prime-Team-ID".to_string(), team_id)])
+        })
     }
 }

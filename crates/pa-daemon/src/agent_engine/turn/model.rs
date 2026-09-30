@@ -52,11 +52,7 @@ impl AgentSessionEngine {
             .armed_image_route()
             .map_or_else(|| model.clone(), |route| route.target.model);
         if self.config.faux_script.is_none() && self.current_selection().api_key.is_none() {
-            let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
-            let mut registry = pa_core::models::ModelRegistry::create(
-                auth,
-                self.config.agent_dir.join("models.json"),
-            );
+            let mut registry = self.session_model_registry();
             registry.load_private_authorization_from_cache();
             if !registry.has_configured_auth(&preflight_model) {
                 let uses_oauth = registry

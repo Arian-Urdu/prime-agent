@@ -29,6 +29,10 @@ impl EnvCredentialSource for ScriptedEnv {
         self.0.get("PRIME_TEAM_ID").cloned()
     }
 
+    fn prime_context(&self) -> Option<String> {
+        self.0.get("PRIME_CONTEXT").cloned()
+    }
+
     fn ambient_identity_material(&self, provider: &str) -> String {
         format!("{provider}:scripted-ambient")
     }
@@ -288,6 +292,70 @@ fn provider_headers_team_selection() {
         headers.get("X-Prime-Team-ID").map(String::as_str),
         Some("env-team")
     );
+}
+
+#[test]
+fn provider_headers_follow_the_directory_context() {
+    /// (case, pin, env, session dir set, expected team header)
+    type Case<'a> = (
+        &'a str,
+        &'a str,
+        &'a [(&'a str, &'a str)],
+        bool,
+        Option<&'a str>,
+    );
+    let cases: [Case; 5] = [
+        (
+            "team pin",
+            r#"{"team_id": "pinned"}"#,
+            &[],
+            true,
+            Some("pinned"),
+        ),
+        ("personal pin", r#"{"team_id": null}"#, &[], true, None),
+        (
+            "PRIME_TEAM_ID over pin",
+            r#"{"team_id": "pinned"}"#,
+            &[("PRIME_TEAM_ID", "env-team")],
+            true,
+            Some("env-team"),
+        ),
+        ("broken pin", "[]", &[], true, Some("team-1")),
+        (
+            "no session dir",
+            r#"{"team_id": "pinned"}"#,
+            &[],
+            false,
+            Some("team-1"),
+        ),
+    ];
+    for (name, pin, env, with_dir, expected) in cases {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("home/repo");
+        std::fs::create_dir_all(repo.join(".prime")).unwrap();
+        std::fs::write(repo.join(".prime/context.json"), pin).unwrap();
+        let env = env
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()));
+        let mut auth = storage_with_env(
+            &serde_json::json!({
+                "prime-inference": {
+                    "type": "api_key",
+                    "key": "pi-key",
+                    "primeTeam": { "teamId": "team-1", "name": "Team 1" }
+                }
+            }),
+            ScriptedEnv(env.collect()),
+        );
+        if with_dir {
+            auth = auth.with_project_dir(&repo);
+        }
+        auth.prime_dir = Some(root.path().join("home/.prime"));
+        let header = auth
+            .get_provider_headers(PRIME_INFERENCE_PROVIDER_ID)
+            .and_then(|headers| headers.get("X-Prime-Team-ID").cloned());
+        assert_eq!(header.as_deref(), expected, "{name}");
+    }
 }
 
 fn team(id: &str, name: &str) -> PrimeTeamCredential {

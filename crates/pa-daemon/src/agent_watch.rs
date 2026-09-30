@@ -101,7 +101,6 @@ impl AgentWatchRegistry {
     ///
     /// Returns an error when `id` is already registered or the active or
     /// total limit is reached.
-    #[allow(clippy::too_many_arguments)]
     pub fn register(
         &mut self,
         id: &str,

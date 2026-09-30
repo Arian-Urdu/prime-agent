@@ -32,6 +32,9 @@ class FakeJobHandle:
     def peek_output(self) -> str:
         return self.output()
 
+    def peek_output_bytes(self) -> int:
+        return len(self.output().encode("utf-8"))
+
     def _grow(self) -> None:
         if self._index < len(self._chunks):
             self._index += 1

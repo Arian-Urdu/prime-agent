@@ -418,12 +418,6 @@ impl DigestLaneController {
 struct DigestCounters {
     arrivals: VecDeque<u64>,
     controller: DigestLaneController,
-    /// The model/ingestion turn counts, lock-free: the turn runner counts
-    /// from inside its event path (after the abort gate, under the core
-    /// lock), and the controller reads them under its own lock — the
-    /// atomics keep the two lock domains independent.
-    model_turns: std::sync::atomic::AtomicU64,
-    ingestion_turns: std::sync::atomic::AtomicU64,
 }
 
 impl DigestCounters {
@@ -446,20 +440,6 @@ impl DigestCounters {
         self.prune_arrivals(now_ms);
         self.arrivals.len() as u64
     }
-
-    fn note_model_turn(&self, ingestion: bool) {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.model_turns.fetch_add(1, Relaxed);
-        self.ingestion_turns
-            .fetch_add(u64::from(ingestion), Relaxed);
-    }
-
-    fn ingestion_turn_share(&self) -> Option<f64> {
-        use std::sync::atomic::Ordering::Relaxed;
-        let model_turns = self.model_turns.load(Relaxed);
-        let ingestion_turns = self.ingestion_turns.load(Relaxed);
-        (model_turns > 0).then(|| ingestion_turns as f64 / model_turns as f64)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -475,6 +455,13 @@ pub(crate) struct AgentMessageDigest {
     work_notify: Arc<Notify>,
     inbox: Mutex<InboxState>,
     counters: Mutex<DigestCounters>,
+    /// The model/ingestion turn counts, lock-free on purpose: the turn
+    /// runner counts from inside its event path (after the abort gate,
+    /// while it HOLDS the core lock), and the controller reads them while
+    /// holding the counters lock and taking the core lock — a counter
+    /// mutex taken under the core lock would invert that order (ABBA).
+    model_turns: std::sync::atomic::AtomicU64,
+    ingestion_turns: std::sync::atomic::AtomicU64,
 }
 
 impl AgentMessageDigest {
@@ -489,6 +476,8 @@ impl AgentMessageDigest {
             work_notify,
             inbox: Mutex::new(InboxState::default()),
             counters: Mutex::new(DigestCounters::default()),
+            model_turns: std::sync::atomic::AtomicU64::new(0),
+            ingestion_turns: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -503,12 +492,21 @@ impl AgentMessageDigest {
 
     /// Count one model turn (an assistant row the worker persisted, TS's
     /// per-step counter at turn granularity); an ingestion turn is one
-    /// whose turn was driven by an agent-message delivery.
+    /// whose turn was driven by an agent-message delivery. Lock-free (see
+    /// the struct docs) so it stays safe under the caller's core lock.
     pub(crate) fn note_model_turn(&self, ingestion: bool) {
-        self.counters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .note_model_turn(ingestion);
+        use std::sync::atomic::Ordering::Relaxed;
+        self.model_turns.fetch_add(1, Relaxed);
+        self.ingestion_turns
+            .fetch_add(u64::from(ingestion), Relaxed);
+    }
+
+    /// The ingestion-turn share over all model turns.
+    fn ingestion_turn_share(&self) -> Option<f64> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let model_turns = self.model_turns.load(Relaxed);
+        let ingestion_turns = self.ingestion_turns.load(Relaxed);
+        (model_turns > 0).then(|| ingestion_turns as f64 / model_turns as f64)
     }
 
     /// Reset the per-session lane state at a session replacement
@@ -525,18 +523,18 @@ impl AgentMessageDigest {
             core.agent_message_digest_mode = false;
             core.agent_message_digest_pin = DigestLanePin::default();
         }
-        let mut counters = self
-            .counters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        counters.arrivals.clear();
-        counters
-            .model_turns
+        {
+            let mut counters = self
+                .counters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            counters.arrivals.clear();
+            counters.controller = DigestLaneController::default();
+        }
+        self.model_turns
             .store(0, std::sync::atomic::Ordering::Relaxed);
-        counters
-            .ingestion_turns
+        self.ingestion_turns
             .store(0, std::sync::atomic::Ordering::Relaxed);
-        counters.controller = DigestLaneController::default();
     }
 
     /// The user pin (`rlm.inbox.configure`, PR D): "push"/"digest" fixes
@@ -588,7 +586,7 @@ impl AgentMessageDigest {
         if core.agent_message_digest_pin == DigestLanePin::Auto {
             let pending = counters.arrivals_last_5m(now_ms);
             let ingestion_share = context_share_locked(&core);
-            let ingestion_turn_share = counters.ingestion_turn_share();
+            let ingestion_turn_share = self.ingestion_turn_share();
             let decision = counters.controller.evaluate(DigestEvaluation {
                 pending,
                 ingestion_share,
@@ -1031,7 +1029,14 @@ impl AgentMessageDigest {
             core.agent_message_digest_mode
         };
         if digest {
-            {
+            // The same admission cap as digested messages: a watch event at
+            // a full inbox is dropped quietly (advisory range notices never
+            // grow the durable file past the bound). The capacity check and
+            // the append run in separate lock sections — `append_watch_locked`
+            // takes the core lock itself, so holding it here would
+            // self-deadlock.
+            let under_cap = self.inbox_unread_count().unwrap_or(0) < INBOX_MAX_UNREAD;
+            if under_cap {
                 let mut inbox = self
                     .inbox
                     .lock()
@@ -1148,14 +1153,16 @@ fn sender_is_parent_of(sender: &Value, core: &SessionCore) -> bool {
 /// `None` when either side is unmeasured — unmeasured never triggers.
 fn context_share_locked(core: &SessionCore) -> Option<f64> {
     let store = core.store.as_ref()?;
-    // One reversed pass collects both inputs: the newest assistant usage
-    // (the context-token denominator) and EVERY delivered `agent_message`
-    // custom row in the loaded window — the ingested rows can sit anywhere
-    // in the window (older than the newest assistant turn included), so
-    // the walk never stops at the assistant row.
+    // One reversed pass over the ACTIVE BRANCH (the parent chain from the
+    // leaf — the model's real working context) collects both inputs: the
+    // newest assistant usage (the context-token denominator) and EVERY
+    // delivered `agent_message` custom row on it. The whole-file walk the
+    // first round used also counted abandoned-branch rows and entries the
+    // working context dropped.
+    let branch = store.branch();
     let mut context_tokens: Option<u64> = None;
     let mut agent_message_chars: usize = 0;
-    for entry in store.entries().iter().rev() {
+    for entry in branch.iter().rev() {
         if entry.type_ == "message" {
             let message = entry.fields.get("message");
             let role = message

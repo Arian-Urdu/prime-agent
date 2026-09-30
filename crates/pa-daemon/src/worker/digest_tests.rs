@@ -462,6 +462,36 @@ async fn digest_delivery_fails_loudly_when_the_durable_append_fails() {
     assert_eq!(digest.inbox_snapshot()["total"], json!(0));
 }
 
+/// Watch events respect the same admission cap: at a full inbox the
+/// advisory range event is dropped quietly instead of growing the durable
+/// session file past the bound.
+#[tokio::test]
+async fn watch_events_respect_the_inbox_admission_cap() {
+    let worker = created_worker().await;
+    park_runner(&worker).await;
+    worker.agent_digest.configure_pin("digest").unwrap();
+    for index in 0..DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION {
+        deliver(&worker, &format!("capped {index}")).await;
+    }
+    let total = worker.agent_digest.inbox_snapshot()["total"]
+        .as_u64()
+        .unwrap();
+    worker
+        .agent_digest
+        .emit_watch_notice("agent", "[watch-agent child:c1] messages 3..7 (+4)");
+    let snapshot = worker.agent_digest.inbox_snapshot();
+    assert_eq!(
+        snapshot["total"],
+        json!(total),
+        "the capped watch event landed"
+    );
+    assert!(snapshot["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry["kind"] != json!("watch")));
+}
+
 /// A session replacement resets the lane (the TS replacement built a new
 /// `AgentSession` with the default lane and fresh counters).
 #[tokio::test]

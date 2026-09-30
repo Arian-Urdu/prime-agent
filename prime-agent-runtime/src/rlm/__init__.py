@@ -538,20 +538,22 @@ class _RLMInbox:
 _JOB_WATCHES: dict[int, dict[str, Any]] = {}
 
 
-async def _job_watch_loop(handle: Any, interval: float) -> None:
+async def _job_watch_loop(handle: Any, interval: float, baseline: int) -> None:
     pid = int(getattr(handle, "pid"))
     command = str(getattr(handle, "command", "") or "")
     try:
-        # Byte offsets over the UTF-8 encoding (a notice claims bytes, and
-        # non-ASCII text decodes to more chars than bytes), read through
-        # the non-consuming accessor: a watching agent must not mark the
-        # job's result consumed or suppress its `bash.completed` notice.
-        last = len(handle.peek_output().encode("utf-8"))
+        # Byte offsets over the job's stream (not the rendered buffer — it
+        # trims past the caps), read through the non-consuming accessors: a
+        # watching agent must not mark the job's result consumed or suppress
+        # its `bash.completed` notice. The baseline comes from the caller so
+        # output produced between registration and the task's first run
+        # still reports its range instead of silently becoming the baseline.
+        last = baseline
         while pid in _JOB_WATCHES:
             await asyncio.sleep(interval)
             if pid not in _JOB_WATCHES:
                 break
-            current = len(handle.peek_output().encode("utf-8"))
+            current = handle.peek_output_bytes()
             if current > last:
                 await host_request(
                     "bash.progress",
@@ -587,7 +589,12 @@ async def watch_job(handle: Any, interval_seconds: float = 5.0) -> dict[str, Any
         raise ValueError("interval_seconds must be positive")
     if pid in _JOB_WATCHES:
         return {"pid": pid, "watching": True, "already_watched": True}
-    task = asyncio.get_running_loop().create_task(_job_watch_loop(handle, float(interval_seconds)))
+    # The baseline is captured at registration (not inside the scheduled
+    # task): bytes produced before the first poll still report their range.
+    baseline = handle.peek_output_bytes()
+    task = asyncio.get_running_loop().create_task(
+        _job_watch_loop(handle, float(interval_seconds), baseline)
+    )
     _JOB_WATCHES[pid] = {"task": task, "interval": float(interval_seconds)}
     return {"pid": pid, "watching": True}
 

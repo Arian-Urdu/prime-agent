@@ -17,7 +17,9 @@ use serde_json::{json, Value};
 use pa_core::kernel::shared::{host_handler, HostRequestHandlers};
 
 use crate::agent_engine::AgentSessionEngine;
-use crate::agent_watch::{AgentWatchRegistry, AgentWatchSnapshot, AGENT_WATCH_POLL_INTERVAL_MS};
+use crate::agent_watch::{
+    AgentWatchRegistry, AgentWatchSnapshot, AGENT_WATCH_MAX_TOTAL, AGENT_WATCH_POLL_INTERVAL_MS,
+};
 
 /// The inbox listing seam: the `rlm.inbox.list` snapshot.
 pub type InboxListFn = Arc<dyn Fn() -> Value + Send + Sync>;
@@ -26,6 +28,11 @@ pub type InboxListFn = Arc<dyn Fn() -> Value + Send + Sync>;
 pub type InboxReadFn = Arc<dyn Fn(Option<Vec<String>>) -> anyhow::Result<Value> + Send + Sync>;
 /// The pin seam: the `rlm.inbox.configure` result.
 pub type InboxConfigureFn = Arc<dyn Fn(&str) -> anyhow::Result<Value> + Send + Sync>;
+
+/// One child snapshot's bounded wait: a fraction of the shared 5-second
+/// poll cadence, so an unavailable child never stalls the poll for the
+/// healthy subscriptions.
+const WATCH_CHILD_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The worker-installed inbox seams (swarm PR C): the digest inbox reads
 /// and the pin live on the receiving worker; the kernel calls through
@@ -235,8 +242,16 @@ impl AgentSessionEngine {
                         anyhow::bail!("Child \"{target}\" is not inspectable in-process");
                     };
                     let id = format!("watch-agent-{child_id}");
-                    // Re-registration re-baselines (TS `registerAgentWatch`).
-                    engine.register_agent_watch(&id, &child_id, &child_name, initial.clone())?;
+                    // Re-registration re-baselines (TS `registerAgentWatch`),
+                    // preserving the active subscription when the lifetime
+                    // limit rejects the replacement.
+                    engine.register_agent_watch(
+                        &id,
+                        &child_id,
+                        &active_session_id,
+                        &child_name,
+                        initial.clone(),
+                    )?;
                     engine.arm_agent_watch_poller(sink);
                     Ok(json!({
                         "id": id,
@@ -316,7 +331,9 @@ impl AgentSessionEngine {
     }
 
     /// One child's activity snapshot over the supervisor link (`get_state`):
-    /// the message count and the running/idle status.
+    /// the message count and the running/idle status. The timeout stays a
+    /// fraction of the poll interval so one unavailable child cannot stall
+    /// the shared poll (the queries run concurrently, each with this bound).
     async fn watch_child_snapshot(&self, active_session_id: &str) -> Option<AgentWatchSnapshot> {
         let data = self
             .link
@@ -325,7 +342,7 @@ impl AgentSessionEngine {
                     "type": "get_state",
                     "activeSessionId": active_session_id,
                 }),
-                std::time::Duration::from_secs(30),
+                WATCH_CHILD_SNAPSHOT_TIMEOUT,
             )
             .await
             .ok()?;
@@ -343,19 +360,25 @@ impl AgentSessionEngine {
     }
 
     /// Register one watch (re-registration re-baselines by cancelling
-    /// first, TS `registerAgentWatch`).
+    /// first, TS `registerAgentWatch`). The lifetime-capacity check runs
+    /// BEFORE the cancel, so a rejected replacement never silently drops
+    /// the active subscription.
     fn register_agent_watch(
         &self,
         id: &str,
         child_id: &str,
+        active_session_id: &str,
         child_name: &str,
         initial: AgentWatchSnapshot,
     ) -> anyhow::Result<()> {
         let mut state = self.watch_host_state();
+        if !state.registry.can_register() {
+            anyhow::bail!("Agent watch total limit reached ({AGENT_WATCH_MAX_TOTAL})");
+        }
         state.registry.cancel(id);
         state
             .registry
-            .register(id, child_id, child_name, initial)
+            .register(id, child_id, active_session_id, child_name, initial)
             .map(|_| ())
     }
 
@@ -406,12 +429,25 @@ impl AgentSessionEngine {
                     }
                     state.registry.list()
                 };
-                let mut snapshots: HashMap<String, AgentWatchSnapshot> = HashMap::new();
+                // Snapshot the children CONCURRENTLY (an unavailable child
+                // gets its own bounded timeout instead of stalling the
+                // shared poll for every healthy subscription), and query by
+                // the child's ACTIVE SESSION ID — `get_state` routes by
+                // `activeSessionId`, never by the RLM child id.
+                let mut queries = Vec::with_capacity(subscriptions.len());
                 for subscription in &subscriptions {
-                    if let Some(snapshot) =
-                        engine.watch_child_snapshot(&subscription.child_id).await
-                    {
-                        snapshots.insert(subscription.child_id.clone(), snapshot);
+                    let engine = std::sync::Arc::clone(&engine);
+                    let active_session_id = subscription.active_session_id.clone();
+                    let query_id = active_session_id.clone();
+                    queries.push(async move {
+                        let snapshot = engine.watch_child_snapshot(&query_id).await;
+                        (active_session_id, snapshot)
+                    });
+                }
+                let mut snapshots: HashMap<String, AgentWatchSnapshot> = HashMap::new();
+                for (active_session_id, snapshot) in futures::future::join_all(queries).await {
+                    if let Some(snapshot) = snapshot {
+                        snapshots.insert(active_session_id, snapshot);
                     }
                 }
                 let sink = Arc::clone(&sink);

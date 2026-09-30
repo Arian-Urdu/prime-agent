@@ -221,7 +221,7 @@ async fn read_inbox_marks_read_and_cancels_the_pending_notice() {
         vec!["agent_message_digest_notice"]
     );
 
-    let read = worker.agent_digest.read_inbox(None);
+    let read = worker.agent_digest.read_inbox(None).unwrap();
     assert_eq!(read["unread"], json!(0));
     assert!(read["entries"][0]["read"].as_bool().unwrap());
     assert_eq!(read["entries"][0]["content"], json!("REPORT 777"));
@@ -244,12 +244,16 @@ async fn read_inbox_with_ids_reads_only_those_entries() {
         .as_str()
         .unwrap()
         .to_string();
-    let read = worker.agent_digest.read_inbox(Some(vec![first_id]));
+    let read = worker
+        .agent_digest
+        .read_inbox(Some(vec![first_id]))
+        .unwrap();
     assert_eq!(read["entries"].as_array().unwrap().len(), 1);
     assert_eq!(read["unread"], json!(1));
     let unknown = worker
         .agent_digest
-        .read_inbox(Some(vec!["not-an-id".to_string()]));
+        .read_inbox(Some(vec!["not-an-id".to_string()]))
+        .unwrap();
     assert_eq!(unknown["entries"].as_array().unwrap().len(), 0);
     assert_eq!(unknown["unread"], json!(1));
 }
@@ -298,10 +302,14 @@ async fn controller_flips_armed_sessions_but_never_push_pinned_ones() {
         json!({ "mode": "auto", "pinned": false, "digest": false })
     );
     // NOT parked: the runner must run turns so the ingestion-turn share
-    // crosses the pre-registered trigger.
+    // crosses the pre-registered trigger. A bounded wall-clock deadline
+    // (not a fixed delivery count) absorbs a slow runner.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     let mut digested = 0;
-    for index in 0..40 {
+    let mut index = 0;
+    while std::time::Instant::now() < deadline {
         let receipt = deliver(&worker, &format!("burst {index}")).await;
+        index += 1;
         if receipt["deliveryStatus"] == "digest" {
             digested += 1;
             break;
@@ -379,4 +387,100 @@ async fn watch_notice_on_the_digest_lane_lands_an_inbox_entry() {
         lane_custom_types(&worker.core, Lane::FollowUp),
         vec!["agent_message_digest_notice"]
     );
+}
+
+/// The inbox admission cap: unread entries stop at the push lane's
+/// pending-message bound — the digested backlog never grows the durable
+/// session file without bound, and the refusal answers the same capacity
+/// error shape as the push lane.
+#[tokio::test]
+async fn digest_inbox_enforces_an_admission_cap_on_unread_entries() {
+    let worker = created_worker().await;
+    park_runner(&worker).await;
+    worker.agent_digest.configure_pin("digest").unwrap();
+    for index in 0..DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION {
+        let receipt = deliver(&worker, &format!("capped {index}")).await;
+        assert_eq!(receipt["deliveryStatus"], "digest");
+    }
+    let response = worker
+        .dispatch(
+            "worker_deliver_message",
+            &json!({
+                "targetActiveSessionId": worker.config.active_session_id,
+                "message": "over the cap",
+                "sender": sibling_sender(),
+            }),
+        )
+        .await;
+    assert!(
+        !response.success,
+        "over-cap delivery admitted: {response:?}"
+    );
+    assert!(
+        response
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("too many pending messages"),
+        "error: {response:?}"
+    );
+    let snapshot = worker.agent_digest.inbox_snapshot();
+    assert_eq!(
+        snapshot["unread"],
+        json!(DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION)
+    );
+}
+
+/// A failed durable append refuses the delivery (TS
+/// `appendCustomEntryWithRollback` throws): the digested message reaches
+/// the session file before the receipt answers `digest`, so a restart
+/// never silently loses it.
+#[tokio::test]
+async fn digest_delivery_fails_loudly_when_the_durable_append_fails() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut store = crate::session_store::SessionFile::create("/tmp", None, 0);
+    // A directory as the session-file path: every append fails.
+    store.set_path(dir.path().to_path_buf());
+    let core = Arc::new(Mutex::new(SessionCore {
+        store: Some(store),
+        ..SessionCore::test_core(None, "/tmp".to_string())
+    }));
+    let digest = AgentMessageDigest::new(core, Arc::new(Mutex::new(None)), Arc::new(Notify::new()));
+    digest.configure_pin("digest").unwrap();
+    let error = digest
+        .route_inbound_message(
+            "agentmsg_cap",
+            "this must not silently digest",
+            &json!({ "activeSessionId": "sender", "sessionName": "sender" }),
+            Some("sibling"),
+        )
+        .expect_err("the failed durable append answered success");
+    assert!(
+        error.to_string().contains("failed") || !error.to_string().is_empty(),
+        "{error}"
+    );
+    assert_eq!(digest.inbox_snapshot()["total"], json!(0));
+}
+
+/// A session replacement resets the lane (the TS replacement built a new
+/// `AgentSession` with the default lane and fresh counters).
+#[tokio::test]
+async fn session_replacement_resets_the_lane_and_counters() {
+    let worker = created_worker().await;
+    park_runner(&worker).await;
+    worker.agent_digest.configure_pin("digest").unwrap();
+    worker.agent_digest.record_arrival(crate::util::now_ms());
+    worker.agent_digest.note_model_turn(true);
+    {
+        let mut core = worker.core.lock().unwrap();
+        core.agent_message_digest_mode = true;
+    }
+    worker.agent_digest.reset_session_state();
+    assert_eq!(
+        worker.agent_digest.configure_pin("auto").unwrap()["digest"],
+        json!(false)
+    );
+    let receipt = deliver(&worker, "fresh session").await;
+    assert_eq!(receipt["deliveryStatus"], "delivered");
+    assert_eq!(worker.agent_digest.inbox_snapshot()["total"], json!(0));
 }

@@ -319,25 +319,35 @@ impl Worker {
         // answers `digest`. Parent-to-child instructions always stay push.
         let message_id =
             pa_core::session_engine::agent_messaging::create_agent_session_message_id();
-        if let Some(digest) = self.agent_digest.route_inbound_message(
+        let routed = self.agent_digest.route_inbound_message(
             &message_id,
             message,
             &sender,
             from_relationship.map(|relationship| relationship.as_str()),
-        ) {
-            let mut receipt = json!({
-                "id": message_id,
-                "source": AGENT_MESSAGE_SOURCE,
-                "target": digest.get("target").cloned().unwrap_or(Value::Null),
-                "message": message,
-                "deliveryMode": "steer",
-                "deliveryStatus": "digest",
-                "digestAt": digest.get("digestAt").cloned().unwrap_or(Value::Null),
-            });
-            if !sender.is_null() {
-                receipt["from"] = json!(sender);
+        );
+        match routed {
+            Ok(Some(digest)) => {
+                let mut receipt = json!({
+                    "id": message_id,
+                    "source": AGENT_MESSAGE_SOURCE,
+                    "target": digest.get("target").cloned().unwrap_or(Value::Null),
+                    "message": message,
+                    "deliveryMode": "steer",
+                    "deliveryStatus": "digest",
+                    "digestAt": digest.get("digestAt").cloned().unwrap_or(Value::Null),
+                });
+                if !sender.is_null() {
+                    receipt["from"] = json!(sender);
+                }
+                return response_success(None, "worker_deliver_message", Some(receipt));
             }
-            return response_success(None, "worker_deliver_message", Some(receipt));
+            // A failed durable append answers the delivery failure (TS
+            // `appendCustomEntryWithRollback` throws): the message was NOT
+            // digested and must not vanish on restart.
+            Err(error) => {
+                return response_failure(None, "worker_deliver_message", &error.to_string(), None)
+            }
+            Ok(None) => {}
         }
         let prompt = pa_core::session_engine::agent_messaging::create_agent_session_message_prompt(
             &AgentMessagePromptPayload {

@@ -28,6 +28,10 @@ pub struct AgentWatchSubscription {
     pub id: String,
     /// The direct child id (RLM child id) this watch resolves to.
     pub child_id: String,
+    /// The child's live active session id — the supervisor-routable key the
+    /// poller queries (`get_state` routes by `activeSessionId`, never by
+    /// the RLM child id).
+    pub active_session_id: String,
     pub child_name: String,
     pub last_seen_messages: u64,
     pub last_status: String,
@@ -83,16 +87,26 @@ pub struct AgentWatchRegistry {
 }
 
 impl AgentWatchRegistry {
-    /// Register a direct child; errors when the limits are exceeded.
+    /// Whether one more registration fits the lifetime limit (re-baselining
+    /// callers check this BEFORE cancelling the active subscription, so a
+    /// rejected replacement cannot silently drop it).
+    #[must_use]
+    pub fn can_register(&self) -> bool {
+        self.total_registered < AGENT_WATCH_MAX_TOTAL
+    }
+
+    /// Register a direct child.
     ///
     /// # Errors
     ///
     /// Returns an error when `id` is already registered or the active or
     /// total limit is reached.
+    #[allow(clippy::too_many_arguments)]
     pub fn register(
         &mut self,
         id: &str,
         child_id: &str,
+        active_session_id: &str,
         child_name: &str,
         initial: AgentWatchSnapshot,
     ) -> anyhow::Result<AgentWatchSubscription> {
@@ -108,6 +122,7 @@ impl AgentWatchRegistry {
         let subscription = AgentWatchSubscription {
             id: id.to_string(),
             child_id: child_id.to_string(),
+            active_session_id: active_session_id.to_string(),
             child_name: child_name.to_string(),
             last_seen_messages: initial.message_count,
             last_status: initial.status,
@@ -149,7 +164,10 @@ impl AgentWatchRegistry {
     /// A vanished child (no snapshot) is skipped: the baseline holds.
     pub fn poll(&mut self, state: &mut AgentWatchState<'_>) {
         for subscription in self.subscriptions.values_mut() {
-            let Some(snapshot) = (state.message_count)(&subscription.child_id) else {
+            // The snapshot provider is keyed by the child's ACTIVE SESSION
+            // ID — the supervisor-routable form the poller queries
+            // (`get_state` routes by `activeSessionId`).
+            let Some(snapshot) = (state.message_count)(&subscription.active_session_id) else {
                 continue;
             };
             let status_change = (snapshot.status != subscription.last_status).then(|| {
@@ -219,6 +237,7 @@ mod tests {
             .register(
                 "w1",
                 "child-1",
+                "active-1",
                 "c1",
                 AgentWatchSnapshot {
                     message_count: 3,
@@ -229,7 +248,7 @@ mod tests {
 
         let mut seen: Vec<String> = Vec::new();
         let messages = |child: &str| {
-            if child == "child-1" {
+            if child == "active-1" {
                 Some(AgentWatchSnapshot {
                     message_count: 7,
                     status: "running".to_string(),
@@ -275,6 +294,7 @@ mod tests {
                 .register(
                     &format!("w-{index}"),
                     &format!("child-{index}"),
+                    &format!("active-{index}"),
                     "c",
                     AgentWatchSnapshot {
                         message_count: 0,
@@ -287,6 +307,7 @@ mod tests {
             .register(
                 "w-over",
                 "child-over",
+                "active-over",
                 "c",
                 AgentWatchSnapshot {
                     message_count: 0,
@@ -315,10 +336,10 @@ mod tests {
             status: "idle".to_string(),
         };
         registry
-            .register("w1", "child-1", "c1", initial.clone())
+            .register("w1", "child-1", "active-1", "c1", initial.clone())
             .unwrap();
         let error = registry
-            .register("w1", "child-1", "c1", initial)
+            .register("w1", "child-1", "active-1", "c1", initial)
             .unwrap_err();
         assert!(error.to_string().contains("already exists"), "{error}");
     }

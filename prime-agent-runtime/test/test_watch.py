@@ -29,6 +29,9 @@ class FakeJobHandle:
         consumed = "".join(self._chunks[: self._index])
         return consumed
 
+    def peek_output(self) -> str:
+        return self.output()
+
     def _grow(self) -> None:
         if self._index < len(self._chunks):
             self._index += 1
@@ -69,13 +72,49 @@ class RlmWatchJobTest(unittest.TestCase):
                     if seen and seen[-1][1] == 600:
                         break
 
-                self.assertEqual(rlm.rlm.watch.job_cancel(4242), True)
+                # A LIVE watch cancels; the ended watch already cleaned its
+                # entry, so cancelling it again answers False.
+                live = FakeJobHandle(4243, ["z" * 10])
+                live.running = True
+                rlm._JOB_WATCHES.clear()
+                self.assertEqual(await rlm.rlm.watch.job(live, interval_seconds=0.05), {"pid": 4243, "watching": True})
+                self.assertEqual(rlm.rlm.watch.job_cancel(4243), True)
+                self.assertEqual(rlm.rlm.watch.job_cancel(4243), False)
                 self.assertEqual(rlm.rlm.watch.job_cancel(4242), False)
 
         asyncio.run(scenario())
         self.assertTrue(len(seen) >= 1)
         self.assertEqual(seen[0][0], 0)
         self.assertEqual(seen[-1][1], 600)
+        # The watch ended with the job: the table no longer lists it.
+        self.assertEqual(rlm.rlm.watch.job_list(), [])
+
+    def test_job_watch_counts_utf8_bytes_not_characters(self) -> None:
+        handle = FakeJobHandle(4301, ["é" * 100])
+
+        async def fake_host_request(request_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+            if request_type == "bash.progress":
+                seen.append((payload["fromBytes"], payload["toBytes"]))
+            return {"status": "ok"}
+
+        seen: list[tuple[int, int]] = []
+
+        async def scenario() -> None:
+            with patch.object(rlm, "host_request", AsyncMock(side_effect=fake_host_request)):
+                rlm._JOB_WATCHES.clear()
+                await rlm.rlm.watch.job(handle, interval_seconds=0.01)
+                await asyncio.sleep(0.02)
+                handle._grow()
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline and not seen:
+                    await asyncio.sleep(0.01)
+                for _ in range(10):
+                    await asyncio.sleep(0.01)
+
+        asyncio.run(scenario())
+        self.assertTrue(len(seen) >= 1)
+        # "é" is two UTF-8 bytes, so 100 characters report 200 bytes.
+        self.assertEqual(seen[-1][1], 200)
 
     def test_job_watch_rejects_non_handles_and_invalid_intervals(self) -> None:
         async def scenario() -> None:

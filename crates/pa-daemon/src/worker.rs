@@ -706,7 +706,7 @@ impl Worker {
                     Arc::new(move || inbox_digest.inbox_snapshot());
                 let inbox_digest = Arc::clone(&agent_digest);
                 let read: crate::agent_inbox_host::InboxReadFn =
-                    Arc::new(move |ids| Ok(inbox_digest.read_inbox(ids)));
+                    Arc::new(move |ids| inbox_digest.read_inbox(ids));
                 let inbox_digest = Arc::clone(&agent_digest);
                 let configure: crate::agent_inbox_host::InboxConfigureFn =
                     Arc::new(move |mode| inbox_digest.configure_pin(mode));
@@ -813,6 +813,7 @@ impl Worker {
         let navigation = crate::session_navigation::SessionNavigation::new(
             std::sync::Arc::clone(&engine),
             Arc::clone(&core),
+            Arc::clone(&agent_digest),
         );
         Worker {
             config,

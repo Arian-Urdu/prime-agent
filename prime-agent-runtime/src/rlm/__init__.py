@@ -542,12 +542,16 @@ async def _job_watch_loop(handle: Any, interval: float) -> None:
     pid = int(getattr(handle, "pid"))
     command = str(getattr(handle, "command", "") or "")
     try:
-        last = len(handle.output())
+        # Byte offsets over the UTF-8 encoding (a notice claims bytes, and
+        # non-ASCII text decodes to more chars than bytes), read through
+        # the non-consuming accessor: a watching agent must not mark the
+        # job's result consumed or suppress its `bash.completed` notice.
+        last = len(handle.peek_output().encode("utf-8"))
         while pid in _JOB_WATCHES:
             await asyncio.sleep(interval)
             if pid not in _JOB_WATCHES:
                 break
-            current = len(handle.output())
+            current = len(handle.peek_output().encode("utf-8"))
             if current > last:
                 await host_request(
                     "bash.progress",
@@ -560,6 +564,11 @@ async def _job_watch_loop(handle: Any, interval: float) -> None:
         raise
     except Exception:
         # A dead bridge or a reaped job just ends the watch; the handle stays usable.
+        pass
+    finally:
+        # The watch always ends with the job: the entry leaves the table
+        # so `job_list` reports only live watches and a re-registration on
+        # the same pid starts a fresh poller.
         _JOB_WATCHES.pop(pid, None)
 
 

@@ -46,6 +46,12 @@ const ARRIVALS_WINDOW_MS: u64 = 5 * 60 * 1000;
 /// The chars-per-token heuristic of the ingestion share (TS
 /// `estimateMessagingTokens`: chars / 4 over the working context).
 const CONTEXT_TOKENS_PER_CHAR: f64 = 4.0;
+/// The digest inbox's admission cap: the push lane's per-session
+/// pending-message bound (`DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION`),
+/// applied to UNREAD inbox entries so a digested backlog never grows the
+/// durable session file without bound.
+const INBOX_MAX_UNREAD: usize =
+    pa_core::session_engine::agent_messaging::DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION;
 
 /// The user pin for the lane (PR D): "auto" hands control to the daemon-side
 /// controller; a pinned lane never flips. The Rust port ships the controller
@@ -411,9 +417,13 @@ impl DigestLaneController {
 #[derive(Debug, Default)]
 struct DigestCounters {
     arrivals: VecDeque<u64>,
-    model_turns: u64,
-    ingestion_turns: u64,
     controller: DigestLaneController,
+    /// The model/ingestion turn counts, lock-free: the turn runner counts
+    /// from inside its event path (after the abort gate, under the core
+    /// lock), and the controller reads them under its own lock — the
+    /// atomics keep the two lock domains independent.
+    model_turns: std::sync::atomic::AtomicU64,
+    ingestion_turns: std::sync::atomic::AtomicU64,
 }
 
 impl DigestCounters {
@@ -437,13 +447,18 @@ impl DigestCounters {
         self.arrivals.len() as u64
     }
 
-    fn note_model_turn(&mut self, ingestion: bool) {
-        self.model_turns += 1;
-        self.ingestion_turns += u64::from(ingestion);
+    fn note_model_turn(&self, ingestion: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.model_turns.fetch_add(1, Relaxed);
+        self.ingestion_turns
+            .fetch_add(u64::from(ingestion), Relaxed);
     }
 
     fn ingestion_turn_share(&self) -> Option<f64> {
-        (self.model_turns > 0).then(|| self.ingestion_turns as f64 / self.model_turns as f64)
+        use std::sync::atomic::Ordering::Relaxed;
+        let model_turns = self.model_turns.load(Relaxed);
+        let ingestion_turns = self.ingestion_turns.load(Relaxed);
+        (model_turns > 0).then(|| ingestion_turns as f64 / model_turns as f64)
     }
 }
 
@@ -494,6 +509,34 @@ impl AgentMessageDigest {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .note_model_turn(ingestion);
+    }
+
+    /// Reset the per-session lane state at a session replacement
+    /// (`switch_session`/`new_session`/`import_jsonl`/`fork`): the TS
+    /// `AgentSession` was per-session, so its replacement started with the
+    /// default lane and fresh counters — the new Rust session inherits
+    /// neither the retired session's pin nor its traffic.
+    pub(crate) fn reset_session_state(&self) {
+        {
+            let mut core = self
+                .core
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            core.agent_message_digest_mode = false;
+            core.agent_message_digest_pin = DigestLanePin::default();
+        }
+        let mut counters = self
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        counters.arrivals.clear();
+        counters
+            .model_turns
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        counters
+            .ingestion_turns
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        counters.controller = DigestLaneController::default();
     }
 
     /// The user pin (`rlm.inbox.configure`, PR D): "push"/"digest" fixes
@@ -576,7 +619,7 @@ impl AgentMessageDigest {
         message: &str,
         sender: &Value,
         from_relationship: Option<&str>,
-    ) -> Option<Value> {
+    ) -> anyhow::Result<Option<Value>> {
         let now_ms = crate::util::now_ms();
         self.record_arrival(now_ms);
         let sender_is_parent = {
@@ -587,26 +630,54 @@ impl AgentMessageDigest {
             sender_is_parent_of(sender, &core)
         };
         if !self.evaluate_and_decide(now_ms, sender_is_parent) {
-            return None;
+            return Ok(None);
+        }
+        // The inbox admission cap (the push lane's pending-message bound,
+        // applied to unread inbox entries): a digested backlog never grows
+        // the durable store without bound.
+        if self.inbox_unread_count()? >= INBOX_MAX_UNREAD {
+            anyhow::bail!(
+                "Target session has too many pending messages: {INBOX_MAX_UNREAD} unread inbox entries, limit is {INBOX_MAX_UNREAD}"
+            );
         }
         let (target, digest_at) =
-            self.append_inbox_message(message_id, message, sender, from_relationship);
+            self.append_inbox_message(message_id, message, sender, from_relationship)?;
         self.ensure_digest_notice();
-        Some(json!({
+        Ok(Some(json!({
             "target": target,
             "digestAt": digest_at,
-        }))
+        })))
+    }
+
+    /// The unread-entry count for the admission cap.
+    fn inbox_unread_count(&self) -> anyhow::Result<usize> {
+        let mut inbox = self
+            .inbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let core = self
+            .core
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(store) = core.store.as_ref() {
+            inbox.load_from(store);
+        }
+        Ok(inbox.records.iter().filter(|record| !record.read).count())
     }
 
     /// Store one agent message durably and return the receipt's target
     /// endpoint plus the digest timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's error when the durable append fails.
     fn append_inbox_message(
         &self,
         message_id: &str,
         message: &str,
         sender: &Value,
         from_relationship: Option<&str>,
-    ) -> (Value, String) {
+    ) -> anyhow::Result<(Value, String)> {
         let mut inbox = self
             .inbox
             .lock()
@@ -657,8 +728,8 @@ impl AgentMessageDigest {
             kind: "agent_message".to_string(),
             watch: None,
         };
-        Self::append_entry_locked(&mut inbox, &mut core, &data);
-        (target, received_at)
+        Self::append_entry_locked(&mut inbox, &mut core, &data)?;
+        Ok((target, received_at))
     }
 
     /// The receiving session's endpoint (TS `createAgentSessionMessageEndpoint`):
@@ -680,29 +751,37 @@ impl AgentMessageDigest {
     }
 
     /// Append one inbox entry durably (the `agent_message_inbox` custom
-    /// entry) and to the in-memory records. A worker without a session
-    /// store keeps the entry in memory only (the records still serve).
-    fn append_entry_locked(inbox: &mut InboxState, core: &mut SessionCore, data: &InboxEntryData) {
-        let id = core
-            .store
-            .as_mut()
-            .and_then(|store| {
-                store
-                    .persist_entry(
-                        "custom",
-                        json!({
-                            "customType": AGENT_MESSAGE_INBOX_ENTRY_CUSTOM_TYPE,
-                            "data": data,
-                        }),
-                    )
-                    .ok()
-            })
-            .unwrap_or_default();
+    /// entry) and to the in-memory records. The durable write propagates
+    /// its error (TS `appendCustomEntryWithRollback` throws): a digested
+    /// message is only accepted once its entry reached the session file —
+    /// an in-memory-only record would silently vanish on restart. A worker
+    /// without a session store keeps the entry in memory only (the records
+    /// still serve; no durable write was possible).
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's error when the durable append fails.
+    fn append_entry_locked(
+        inbox: &mut InboxState,
+        core: &mut SessionCore,
+        data: &InboxEntryData,
+    ) -> anyhow::Result<()> {
+        let id = match core.store.as_mut() {
+            Some(store) => store.persist_entry(
+                "custom",
+                json!({
+                    "customType": AGENT_MESSAGE_INBOX_ENTRY_CUSTOM_TYPE,
+                    "data": data,
+                }),
+            )?,
+            None => String::new(),
+        };
         inbox.records.push(InboxRecord {
             id,
             data: data.clone(),
             read: false,
         });
+        Ok(())
     }
 
     /// Store one watch event (agent or job) on the digest lane (PR E):
@@ -734,7 +813,7 @@ impl AgentMessageDigest {
             .core
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Self::append_entry_locked(inbox, &mut core, &data);
+        let _ = Self::append_entry_locked(inbox, &mut core, &data);
     }
 
     /// The unread/total counts of the durable inbox.
@@ -768,7 +847,7 @@ impl AgentMessageDigest {
     /// marker), return their full contents, and cancel a still-pending
     /// notice once everything is read. Without ids, reads every unread
     /// entry; unknown ids are ignored.
-    pub(crate) fn read_inbox(&self, ids: Option<Vec<String>>) -> Value {
+    pub(crate) fn read_inbox(&self, ids: Option<Vec<String>>) -> anyhow::Result<Value> {
         let mut inbox = self
             .inbox
             .lock()
@@ -798,15 +877,19 @@ impl AgentMessageDigest {
                     continue;
                 }
                 if !record.read {
-                    let _ = core.store.as_mut().map(|store| {
+                    // The durable read marker writes BEFORE the record
+                    // flips (a failed write answers an error instead of
+                    // marking an unread entry read — a restart must never
+                    // silently redeliver it).
+                    if let Some(store) = core.store.as_mut() {
                         store.persist_entry(
                             "custom",
                             json!({
                                 "customType": AGENT_MESSAGE_INBOX_READ_ENTRY_CUSTOM_TYPE,
                                 "data": { "messageId": record.data.message_id },
                             }),
-                        )
-                    });
+                        )?;
+                    }
                     record.read = true;
                 }
                 entries.push(record.view());
@@ -816,7 +899,7 @@ impl AgentMessageDigest {
         if unread == 0 {
             self.withdraw_pending_digest_notices();
         }
-        json!({ "entries": entries, "unread": unread })
+        Ok(json!({ "entries": entries, "unread": unread }))
     }
 
     /// TS `_ensureAgentMessageDigestNotice`: one live notice covers the
@@ -1065,22 +1148,26 @@ fn sender_is_parent_of(sender: &Value, core: &SessionCore) -> bool {
 /// `None` when either side is unmeasured — unmeasured never triggers.
 fn context_share_locked(core: &SessionCore) -> Option<f64> {
     let store = core.store.as_ref()?;
+    // One reversed pass collects both inputs: the newest assistant usage
+    // (the context-token denominator) and EVERY delivered `agent_message`
+    // custom row in the loaded window — the ingested rows can sit anywhere
+    // in the window (older than the newest assistant turn included), so
+    // the walk never stops at the assistant row.
     let mut context_tokens: Option<u64> = None;
     let mut agent_message_chars: usize = 0;
     for entry in store.entries().iter().rev() {
-        if context_tokens.is_none() && entry.type_ == "message" {
+        if entry.type_ == "message" {
             let message = entry.fields.get("message");
-            if message
+            let role = message
                 .and_then(|message| message.get("role"))
-                .and_then(Value::as_str)
-                == Some("assistant")
-                && message
-                    .and_then(|message| message.get("usage"))
-                    .is_some_and(|usage| !usage.is_null())
-            {
-                let usage = message
-                    .and_then(|message| message.get("usage"))
-                    .expect("usage checked above");
+                .and_then(Value::as_str);
+            let usage = message
+                .and_then(|message| message.get("usage"))
+                .filter(|usage| !usage.is_null());
+            if role == Some("assistant") && context_tokens.is_none() {
+                let Some(usage) = usage else {
+                    continue;
+                };
                 context_tokens = Some(
                     usage
                         .get("input")
@@ -1106,9 +1193,6 @@ fn context_share_locked(core: &SessionCore) -> Option<f64> {
             if let Some(text) = text {
                 agent_message_chars += text.chars().count();
             }
-        }
-        if context_tokens.is_some() {
-            break;
         }
     }
     let context_tokens = context_tokens.filter(|tokens| *tokens > 0)?;
@@ -1296,7 +1380,8 @@ mod tests {
                 }),
                 Some("child"),
             )
-            .expect("digested");
+            .expect("digested")
+            .expect("digest receipt");
         assert!(digested.get("digestAt").is_some());
         let snapshot = digest.inbox_snapshot();
         assert_eq!(snapshot["unread"], json!(1));
@@ -1306,7 +1391,7 @@ mod tests {
 
         // A fresh manager over a reloaded store keeps the entry and the
         // read state (the read markers are durable too).
-        let read = digest.read_inbox(None);
+        let read = digest.read_inbox(None).unwrap();
         assert_eq!(read["unread"], json!(0));
         assert!(read["entries"][0]["read"].as_bool().unwrap());
         assert_eq!(read["entries"][0]["content"], json!("REPORT 481"));

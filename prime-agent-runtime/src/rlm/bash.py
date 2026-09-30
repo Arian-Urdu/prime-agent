@@ -389,6 +389,17 @@ class BashHandle:
         self._note_result_consumed()
         return self._buffer.text()
 
+    def peek_output(self) -> str:
+        """The current output text without marking the result consumed.
+
+        Reading through `output()`/`tail()` consumes the result (the
+        completion notice withdraws), so quiet watchers — `rlm.watch.job`
+        polling growth byte ranges — read through this accessor instead
+        and leave the job's normal completion notice intact.
+        """
+        self._released = True
+        return self._buffer.text()
+
     def tail(self, n: int = 50) -> str:
         self._released = True
         self._note_result_consumed()

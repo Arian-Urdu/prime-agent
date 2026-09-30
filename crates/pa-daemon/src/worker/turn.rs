@@ -619,22 +619,24 @@ impl TurnRunner {
                         | EngineEvent::Done(_)
                         | EngineEvent::DoneAborted
                 );
-                // The digest lane's step counters (swarm PR D): one model
-                // turn per assistant row the persist path accepts (an
-                // `error` stop is not a completed step, TS
-                // `stopReason !== "error"`); the ingestion flag rides the
-                // turn. Counted before the core lock (the digest manager
-                // locks counters, never the other way around).
-                if let EngineEvent::AssistantMessage(message) = &event {
-                    if message.get("stopReason").and_then(Value::as_str) != Some("error") {
-                        agent_digest.note_model_turn(ingestion_turn);
-                    }
-                }
                 let mut core = core.lock().unwrap();
                 if core.abort_requested
                     && (core.suppress_aborted_row || !(abort_settle || aborted_row))
                 {
                     return false;
+                }
+                // The digest lane's step counters (swarm PR D): one model
+                // turn per assistant row the persist path accepts (an
+                // `error` stop is not a completed step, TS
+                // `stopReason !== "error"`); the ingestion flag rides the
+                // turn. Counted only AFTER the abort/suppression gate
+                // accepts the event — a suppressed row is not a step — and
+                // the atomics keep the counter increments independent of
+                // the core lock the counter readers hold.
+                if let EngineEvent::AssistantMessage(message) = &event {
+                    if message.get("stopReason").and_then(Value::as_str) != Some("error") {
+                        agent_digest.note_model_turn(ingestion_turn);
+                    }
                 }
                 // The engine cuts its in-memory entries; its
                 // `firstKeptEntryId` never matches this store's file ids,

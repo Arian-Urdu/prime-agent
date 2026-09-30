@@ -65,11 +65,23 @@ pub(crate) struct PreparedReplacement {
 pub(crate) struct SessionNavigation {
     engine: Arc<dyn SessionEngine>,
     core: Arc<Mutex<SessionCore>>,
+    /// The digest lane (swarm PRs C/D): a replacement session resets the
+    /// lane to its default push state and fresh counters, exactly like the
+    /// TS per-session `AgentSession` a replacement rebuilt.
+    agent_digest: Arc<crate::worker::AgentMessageDigest>,
 }
 
 impl SessionNavigation {
-    pub(crate) fn new(engine: Arc<dyn SessionEngine>, core: Arc<Mutex<SessionCore>>) -> Self {
-        SessionNavigation { engine, core }
+    pub(crate) fn new(
+        engine: Arc<dyn SessionEngine>,
+        core: Arc<Mutex<SessionCore>>,
+        agent_digest: Arc<crate::worker::AgentMessageDigest>,
+    ) -> Self {
+        SessionNavigation {
+            engine,
+            core,
+            agent_digest,
+        }
     }
 
     /// Swap the worker's live session onto `file`: the store, the engine's
@@ -95,6 +107,9 @@ impl SessionNavigation {
             let mut core = self.core.lock().unwrap();
             core.store = Some(file);
         }
+        // The replacement session starts on the default push lane with
+        // fresh counters (the TS replacement built a new AgentSession).
+        self.agent_digest.reset_session_state();
         self.engine.set_session_file(new_path.clone());
         // TS re-restores the moved-to session's saved model at its runtime
         // recreation (`createRuntime` -> `createAgentSession`): the

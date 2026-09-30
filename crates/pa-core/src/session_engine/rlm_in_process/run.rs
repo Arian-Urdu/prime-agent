@@ -109,19 +109,20 @@ async fn closed_or_parent_gone(host: &InProcessRlmHost, record: &Arc<InProcessCh
     }
 }
 
-/// Teardown of a run nobody observes anymore. Abort the run, close the
-/// whole descendant subtree (grandchildren cascade through their own run
-/// tasks), settle the record, and run the terminal sequence so the
-/// engine tears down with this task's exit instead of outliving its
-/// registry removal. The two variants differ only in the settle error:
-/// a closed record leaves the verdict's error to its closer (the delete
-/// path's tombstone reads its own fallback reason whichever settle wins
-/// the race), a dropped parent records the teardown reason.
+/// Teardown of a run closed by its parent (delete or close). Single
+/// ownership of the cancelled verdict: the CLOSER owns the claim, the
+/// notice, and the settle — the delete settles only after its notice is
+/// admitted or durably scheduled, so this task never writes the verdict
+/// and a concurrent collect cannot observe a settle ahead of the notice
+/// scheduling. The task still owns what only it can do: abort its run,
+/// flush its pending usage accounting, close its own descendant subtree
+/// (grandchildren cascade through their own tasks), and release its
+/// event listener so the engine tears down with this task's exit.
 async fn teardown_closed(host: &InProcessRlmHost, record: &Arc<InProcessChildRecord>) {
     record.engine.session.agent().abort();
     record.child_host.close_children().await;
-    record.settle_as("cancelled", None).await;
-    finish_run(host, record, &TaskVerdict::Cancelled).await;
+    flush_pending_usage(host, record).await;
+    record.unsubscribe_listener().await;
 }
 
 /// The parent-engine teardown variant (the binding weak died).

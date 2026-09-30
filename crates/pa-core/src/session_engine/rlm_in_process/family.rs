@@ -369,7 +369,7 @@ impl InProcessFamilyController {
 /// Queue one custom row onto the agent's steering lane (the loop delivers
 /// it at the next turn boundary and persists it through `message_end`,
 /// the same lane the daemon worker's queued items ride).
-pub(crate) fn steer_custom_row(session: &crate::session_engine::AgentSession, row: &CustomMessage) {
+fn steer_custom_row(session: &crate::session_engine::AgentSession, row: &CustomMessage) {
     let Some(message) = session_message_to_loop(&SessionAgentMessage::Custom(row.clone())) else {
         return;
     };

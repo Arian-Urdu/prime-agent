@@ -2,10 +2,10 @@
 //! engine, and settles the result.
 use super::{
     checkpoint_queue_recovery, compact_action_label, create_daemon_event_meta, emit_refinement_row,
-    gather_delivery_batch, json, oneshot, session_snapshot, AssistantSnapshot, DaemonOutbound,
-    EngineEvent, EventPump, Lane, Map, Notify, OutboundFrame, PromptRequest, QueueCheckpoint,
-    QueuedItem, Result, SessionActionSnapshot, SessionCore, SessionEngine, TurnSettle, Value,
-    WorkerRecoveryJournal, ABORTED_TURN_SETTLE_ERROR,
+    gather_delivery_batch, json, oneshot, session_snapshot, AgentMessageDigest, AssistantSnapshot,
+    DaemonOutbound, EngineEvent, EventPump, Lane, Map, Notify, OutboundFrame, PromptRequest,
+    QueueCheckpoint, QueuedItem, Result, SessionActionSnapshot, SessionCore, SessionEngine,
+    TurnSettle, Value, WorkerRecoveryJournal, ABORTED_TURN_SETTLE_ERROR,
 };
 
 use std::sync::{Arc, Mutex};
@@ -30,6 +30,9 @@ pub(super) struct TurnRunner {
     pub(super) roster_pushes: crate::roster_activity::RosterPushQueue,
     /// The user-bash handle: the idle passivation's live-bash gate.
     pub(super) user_bash: std::sync::Arc<crate::user_bash::UserBash>,
+    /// The digest lane's counters (swarm PRs C/D): the runner counts model
+    /// turns and agent-message ingestion turns for the lane controller.
+    pub(super) agent_digest: Arc<AgentMessageDigest>,
     /// The worker config slice the idle passivation needs (agent dir,
     /// supervisor link coordinates).
     pub(super) passivation: PassivationContext,
@@ -498,6 +501,12 @@ impl TurnRunner {
             .iter()
             .filter_map(|item| item.admission_id.clone())
             .collect();
+        // The digest lane's turn counters (swarm PR D): this turn counts as
+        // an ingestion turn when its primary item was an agent-message
+        // delivery (the TS ingestion tag: the run's primary input was an
+        // agent message). Computed before the batched borrow ends and the
+        // items are consumed.
+        let ingestion_turn = first.agent_message.is_some();
         let items_done: Vec<oneshot::Sender<TurnSettle>> =
             items.into_iter().filter_map(|item| item.done).collect();
         let turn_outcome = Arc::new(std::sync::Mutex::new(None::<TurnSettle>));
@@ -512,6 +521,7 @@ impl TurnRunner {
         // run).
         let engine_agent_end = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let engine_agent_end_seen = Arc::clone(&engine_agent_end);
+        let agent_digest = Arc::clone(&self.agent_digest);
         let turn = tokio::task::spawn_blocking(move || {
             // Whether the engine already emitted its own terminal
             // `turn_end` frame this run (the loop emits one per turn —
@@ -609,6 +619,17 @@ impl TurnRunner {
                         | EngineEvent::Done(_)
                         | EngineEvent::DoneAborted
                 );
+                // The digest lane's step counters (swarm PR D): one model
+                // turn per assistant row the persist path accepts (an
+                // `error` stop is not a completed step, TS
+                // `stopReason !== "error"`); the ingestion flag rides the
+                // turn. Counted before the core lock (the digest manager
+                // locks counters, never the other way around).
+                if let EngineEvent::AssistantMessage(message) = &event {
+                    if message.get("stopReason").and_then(Value::as_str) != Some("error") {
+                        agent_digest.note_model_turn(ingestion_turn);
+                    }
+                }
                 let mut core = core.lock().unwrap();
                 if core.abort_requested
                     && (core.suppress_aborted_row || !(abort_settle || aborted_row))

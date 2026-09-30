@@ -311,6 +311,34 @@ impl Worker {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             sender_is_child_of(&sender, &core).then_some(AgentFamilyRelationship::Child)
         };
+        // The digest inbox lane (swarm PR C/D): the receiving worker owns
+        // the lane. The daemon-side controller (hysteresis over per-session
+        // counters) decides before each delivery; senders never choose. On
+        // the digest lane the payload lands in the durable inbox and one
+        // coalesced notice per batch wakes the recipient — the receipt
+        // answers `digest`. Parent-to-child instructions always stay push.
+        let message_id =
+            pa_core::session_engine::agent_messaging::create_agent_session_message_id();
+        if let Some(digest) = self.agent_digest.route_inbound_message(
+            &message_id,
+            message,
+            &sender,
+            from_relationship.map(|relationship| relationship.as_str()),
+        ) {
+            let mut receipt = json!({
+                "id": message_id,
+                "source": AGENT_MESSAGE_SOURCE,
+                "target": digest.get("target").cloned().unwrap_or(Value::Null),
+                "message": message,
+                "deliveryMode": "steer",
+                "deliveryStatus": "digest",
+                "digestAt": digest.get("digestAt").cloned().unwrap_or(Value::Null),
+            });
+            if !sender.is_null() {
+                receipt["from"] = json!(sender);
+            }
+            return response_success(None, "worker_deliver_message", Some(receipt));
+        }
         let prompt = pa_core::session_engine::agent_messaging::create_agent_session_message_prompt(
             &AgentMessagePromptPayload {
                 message: message.to_string(),
@@ -335,7 +363,7 @@ impl Worker {
                 drop(core);
                 return response_failure(None, "worker_deliver_message", &error.to_string(), None);
             }
-            let id = pa_core::session_engine::agent_messaging::create_agent_session_message_id();
+            let id = message_id;
             let queued = core.busy;
             let summary = self.summary_locked(&core);
             // The receiving session's endpoint (TS

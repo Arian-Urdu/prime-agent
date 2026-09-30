@@ -1,0 +1,382 @@
+//! The digest inbox lane's worker-level tests (swarm PRs C/D/E): the
+//! delivery routing (push default, digest on the lane, parent bypass), the
+//! one-per-batch notice, the read state, the pin, and the digest-aware
+//! watch notice routing.
+use super::*;
+
+fn test_worker() -> Arc<Worker> {
+    let dir = std::env::temp_dir().join(format!("pa-worker-digest-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = WorkerConfig {
+        socket_path: dir.join("worker.sock"),
+        supervisor_socket_path: PathBuf::new(),
+        token: "token".to_string(),
+        worker_instance_id: String::new(),
+        active_session_id: "target-session".to_string(),
+        agent_dir: dir.join("agent"),
+        recovery_journal_path: dir.join("recovery.jsonl"),
+        telemetry_disabled: None,
+        script: Some(json!({ "responses": ["ack"] })),
+    };
+    Arc::new(Worker::new(config, None))
+}
+
+async fn created_worker() -> Arc<Worker> {
+    let worker = test_worker();
+    let created = worker
+        .dispatch(
+            "create",
+            &json!({ "noSession": true, "cwd": "/tmp", "name": "target" }),
+        )
+        .await;
+    assert!(created.success, "create failed: {created:?}");
+    worker
+}
+
+fn queue_texts(core: &Mutex<SessionCore>, lane: Lane) -> Vec<String> {
+    let core = core.lock().unwrap();
+    core_lane_items(&core, lane)
+        .iter()
+        .map(|item| item.message.clone())
+        .collect()
+}
+
+fn sibling_sender() -> Value {
+    json!({
+        "activeSessionId": "source-session",
+        "sessionId": "source-file",
+        "sessionName": "source-agent",
+        "runtimeKind": "top-level",
+        "clientId": "cli-1",
+    })
+}
+
+/// Deliver one agent message from the sibling sender and answer the receipt.
+async fn deliver(worker: &Arc<Worker>, message: &str) -> Value {
+    let response = worker
+        .dispatch(
+            "worker_deliver_message",
+            &json!({
+                "targetActiveSessionId": worker.config.active_session_id,
+                "message": message,
+                "sender": sibling_sender(),
+            }),
+        )
+        .await;
+    assert!(response.success, "deliver failed: {response:?}");
+    response.data.expect("receipt data")
+}
+
+/// The custom row types currently parked on a lane (diagnostics for the
+/// coalescing and routing assertions).
+fn lane_custom_types(core: &Mutex<SessionCore>, lane: Lane) -> Vec<String> {
+    let core = core.lock().unwrap();
+    core_lane_items(&core, lane)
+        .iter()
+        .map(|item| {
+            item.custom_message
+                .as_ref()
+                .and_then(|row| row.get("customType"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+fn core_lane_items(core: &SessionCore, lane: Lane) -> Vec<&QueuedItem> {
+    match lane {
+        Lane::Steering => core.steering.iter().collect(),
+        Lane::FollowUp => core.follow_up.iter().collect(),
+    }
+}
+
+/// Park the turn runner (an input-pause lease holds the queue) so the
+/// queue-lane and notice assertions are deterministic.
+async fn park_runner(worker: &Arc<Worker>) {
+    let response = worker
+        .dispatch(
+            "acquire_session_input_pause",
+            &json!({ "leaseKey": "digest-tests" }),
+        )
+        .await;
+    assert!(response.success, "pause failed: {response:?}");
+}
+
+/// Default off: an inbound agent message delivers on the push lane with the
+/// exact current flow, and the inbox stays empty.
+#[tokio::test]
+async fn digest_lane_is_off_by_default_and_delivers_push() {
+    let worker = created_worker().await;
+    park_runner(&worker).await;
+    let receipt = deliver(&worker, "pushed").await;
+    assert_eq!(receipt["deliveryStatus"], "delivered");
+    assert!(
+        receipt.get("digestAt").is_none(),
+        "digestAt on push: {receipt}"
+    );
+    assert!(receipt["deliveredAt"].as_str().is_some());
+    assert_eq!(
+        queue_texts(&worker.core, Lane::Steering),
+        vec!["[agent-message from source-agent]\n\npushed"]
+    );
+    let snapshot = worker.agent_digest.inbox_snapshot();
+    assert_eq!(snapshot["total"], json!(0));
+    assert_eq!(snapshot["unread"], json!(0));
+}
+
+/// The pinned digest lane: the payload never prompts (no steering row, no
+/// rendered prompt), the receipt answers `digest` + `digestAt`, the entry
+/// lands in the durable inbox, and one coalesced notice wakes the session.
+#[tokio::test]
+async fn pinned_digest_lane_digests_messages_with_one_coalesced_notice() {
+    let worker = created_worker().await;
+    park_runner(&worker).await;
+    let pin = worker.agent_digest.configure_pin("digest").unwrap();
+    assert_eq!(pin["digest"], json!(true));
+    assert_eq!(pin["pinned"], json!(true));
+
+    let first = deliver(&worker, "REPORT 481").await;
+    assert_eq!(first["deliveryStatus"], "digest");
+    assert!(first["digestAt"].as_str().is_some(), "digestAt: {first}");
+    assert!(first["id"].as_str().unwrap().starts_with("agentmsg_"));
+    assert_eq!(first["target"]["activeSessionId"], "target-session");
+    assert_eq!(first["from"]["sessionName"], "source-agent");
+
+    let second = deliver(&worker, "REPORT 482").await;
+    assert_eq!(second["deliveryStatus"], "digest");
+
+    // The payloads never queued a prompt anywhere: the only parked row is
+    // the ONE digest notice (the batch coalesces).
+    assert!(queue_texts(&worker.core, Lane::Steering).is_empty());
+    let notice_types = lane_custom_types(&worker.core, Lane::FollowUp);
+    assert_eq!(
+        notice_types,
+        vec!["agent_message_digest_notice"],
+        "follow-up lane"
+    );
+    let notice = {
+        let core = worker.core.lock().unwrap();
+        core.follow_up.front().expect("notice").message.clone()
+    };
+    // The one live notice's text is a snapshot of its batch (TS: one live
+    // notice covers the batch; later arrivals wait for the read).
+    assert!(notice.contains("1 unread inbox item"), "notice: {notice}");
+    assert!(notice.contains("source-agent"));
+
+    let snapshot = worker.agent_digest.inbox_snapshot();
+    assert_eq!(snapshot["unread"], json!(2));
+    assert_eq!(snapshot["total"], json!(2));
+    assert_eq!(snapshot["entries"][0]["content"], json!("REPORT 481"));
+    assert_eq!(snapshot["entries"][1]["content"], json!("REPORT 482"));
+    assert_eq!(snapshot["entries"][0]["fromRelationship"], json!("sibling"));
+}
+
+/// Parent-to-child instructions always stay push — the hard boundary of the
+/// lane, even with the digest lane enabled.
+#[tokio::test]
+async fn parent_instructions_bypass_digest_even_when_enabled() {
+    let worker = created_worker().await;
+    park_runner(&worker).await;
+    {
+        let mut core = worker.core.lock().unwrap();
+        core.parent_active_session_id = Some("parent-active".to_string());
+    }
+    worker.agent_digest.configure_pin("digest").unwrap();
+    let receipt = worker
+        .dispatch(
+            "worker_deliver_message",
+            &json!({
+                "targetActiveSessionId": worker.config.active_session_id,
+                "message": "instruction from parent",
+                "sender": {
+                    "activeSessionId": "parent-active",
+                    "sessionName": "parent",
+                },
+            }),
+        )
+        .await;
+    assert!(receipt.success, "deliver failed: {receipt:?}");
+    let data = receipt.data.expect("receipt");
+    assert_eq!(data["deliveryStatus"], "delivered");
+    assert_eq!(
+        lane_custom_types(&worker.core, Lane::Steering),
+        vec!["agent_message"],
+        "the delivered agent-message row queues on the push lane"
+    );
+    assert!(lane_custom_types(&worker.core, Lane::FollowUp).is_empty());
+    assert_eq!(worker.agent_digest.inbox_snapshot()["total"], json!(0));
+}
+
+/// Reading the inbox marks entries read durably and cancels a still-pending
+/// notice once everything is read.
+#[tokio::test]
+async fn read_inbox_marks_read_and_cancels_the_pending_notice() {
+    let worker = created_worker().await;
+    park_runner(&worker).await;
+    worker.agent_digest.configure_pin("digest").unwrap();
+    deliver(&worker, "REPORT 777").await;
+    assert_eq!(
+        lane_custom_types(&worker.core, Lane::FollowUp),
+        vec!["agent_message_digest_notice"]
+    );
+
+    let read = worker.agent_digest.read_inbox(None);
+    assert_eq!(read["unread"], json!(0));
+    assert!(read["entries"][0]["read"].as_bool().unwrap());
+    assert_eq!(read["entries"][0]["content"], json!("REPORT 777"));
+    // The pending notice withdrew: a read-before-delivery wake cancels.
+    assert!(lane_custom_types(&worker.core, Lane::FollowUp).is_empty());
+    let snapshot = worker.agent_digest.inbox_snapshot();
+    assert_eq!(snapshot["unread"], json!(0));
+    assert_eq!(snapshot["entries"][0]["read"], json!(true));
+}
+
+/// `read(ids)` reads only the requested entries; unknown ids are ignored.
+#[tokio::test]
+async fn read_inbox_with_ids_reads_only_those_entries() {
+    let worker = created_worker().await;
+    park_runner(&worker).await;
+    worker.agent_digest.configure_pin("digest").unwrap();
+    deliver(&worker, "one").await;
+    deliver(&worker, "two").await;
+    let first_id = worker.agent_digest.inbox_snapshot()["entries"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let read = worker.agent_digest.read_inbox(Some(vec![first_id.clone()]));
+    assert_eq!(read["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(read["unread"], json!(1));
+    let unknown = worker
+        .agent_digest
+        .read_inbox(Some(vec!["not-an-id".to_string()]));
+    assert_eq!(unknown["entries"].as_array().unwrap().len(), 0);
+    assert_eq!(unknown["unread"], json!(1));
+}
+
+/// The pin contract: invalid modes rejected, push/digest fix the lane, auto
+/// returns control to the controller.
+#[tokio::test]
+async fn configure_pin_rejects_invalid_modes_and_pins_both_lanes() {
+    let worker = created_worker().await;
+    park_runner(&worker).await;
+    let error = worker.agent_digest.configure_pin("sideways").unwrap_err();
+    assert!(error.to_string().contains("must be"), "{error}");
+
+    let pinned = worker.agent_digest.configure_pin("digest").unwrap();
+    assert_eq!(
+        pinned,
+        json!({ "mode": "digest", "pinned": true, "digest": true })
+    );
+    let receipt = deliver(&worker, "digested").await;
+    assert_eq!(receipt["deliveryStatus"], "digest");
+
+    let pinned = worker.agent_digest.configure_pin("push").unwrap();
+    assert_eq!(pinned["digest"], json!(false));
+    let receipt = deliver(&worker, "pushed").await;
+    assert_eq!(receipt["deliveryStatus"], "delivered");
+
+    let auto = worker.agent_digest.configure_pin("auto").unwrap();
+    assert_eq!(
+        auto,
+        json!({ "mode": "auto", "pinned": false, "digest": false })
+    );
+}
+
+/// The daemon-side controller: a session armed with the auto pin and
+/// crossed counters flips to digest (the ingestion-turn share crosses once
+/// scripted turns run — every delivered agent message turn is an ingestion
+/// turn), and a push-pinned session is never flipped. The controller ships
+/// DORMANT: the default pin is push, so `configure("auto")` is the arm
+/// step.
+#[tokio::test]
+async fn controller_flips_armed_sessions_but_never_push_pinned_ones() {
+    let worker = created_worker().await;
+    let pin = worker.agent_digest.configure_pin("auto").unwrap();
+    assert_eq!(
+        pin,
+        json!({ "mode": "auto", "pinned": false, "digest": false })
+    );
+    // NOT parked: the runner must run turns so the ingestion-turn share
+    // crosses the pre-registered trigger.
+    let mut digested = 0;
+    for index in 0..40 {
+        let receipt = deliver(&worker, &format!("burst {index}")).await;
+        if receipt["deliveryStatus"] == "digest" {
+            digested += 1;
+            break;
+        }
+        // Let the runner settle the turn so the counters advance.
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(digested > 0, "the armed controller never flipped the lane");
+
+    // The dormant default: an untouched session never flips (the
+    // established parent-child reply protocol keeps the push lane).
+    let worker = created_worker().await;
+    for index in 0..8 {
+        let receipt = deliver(&worker, &format!("dormant {index}")).await;
+        assert_eq!(receipt["deliveryStatus"], "delivered");
+    }
+    assert_eq!(worker.agent_digest.inbox_snapshot()["total"], json!(0));
+
+    // A push-pinned session never flips: no crossed counter can digest a
+    // delivery.
+    let worker = created_worker().await;
+    park_runner(&worker).await;
+    worker.agent_digest.configure_pin("push").unwrap();
+    for index in 0..8 {
+        let receipt = deliver(&worker, &format!("held {index}")).await;
+        assert_eq!(receipt["deliveryStatus"], "delivered");
+    }
+    assert_eq!(worker.agent_digest.inbox_snapshot()["total"], json!(0));
+}
+
+/// Watch notices on the push lane: the quiet `agent_watch_notice` row rides
+/// the steering lane (queue-if-busy, resume-if-idle), never the inbox.
+#[tokio::test]
+async fn watch_notice_on_the_push_lane_injects_the_quiet_row() {
+    let worker = created_worker().await;
+    park_runner(&worker).await;
+    worker.agent_digest.emit_watch_notice(
+        "job",
+        "[watch-job pid:99] output +400 bytes (0..400) command: tail -f",
+    );
+    assert_eq!(
+        lane_custom_types(&worker.core, Lane::Steering),
+        vec!["agent_watch_notice"]
+    );
+    let (message, queue_visible) = {
+        let core = worker.core.lock().unwrap();
+        let item = core.steering.front().expect("watch notice");
+        (item.message.clone(), item.queue_visible)
+    };
+    assert!(!queue_visible, "the watch notice stays invisible");
+    assert!(message.contains("[watch-job pid:99] output +400 bytes (0..400)"));
+    assert!(lane_custom_types(&worker.core, Lane::FollowUp).is_empty());
+    assert_eq!(worker.agent_digest.inbox_snapshot()["total"], json!(0));
+}
+
+/// Watch notices on the digest lane: the event lands in the inbox as a
+/// `watch`-kinded entry and the same coalesced notice wakes the session.
+#[tokio::test]
+async fn watch_notice_on_the_digest_lane_lands_an_inbox_entry() {
+    let worker = created_worker().await;
+    park_runner(&worker).await;
+    worker.agent_digest.configure_pin("digest").unwrap();
+    worker
+        .agent_digest
+        .emit_watch_notice("agent", "[watch-agent child:c1] messages 3..7 (+4)");
+    let snapshot = worker.agent_digest.inbox_snapshot();
+    assert_eq!(snapshot["unread"], json!(1));
+    assert_eq!(snapshot["entries"][0]["kind"], json!("watch"));
+    assert_eq!(snapshot["entries"][0]["watch"], json!("agent"));
+    assert_eq!(
+        snapshot["entries"][0]["content"],
+        json!("[watch-agent child:c1] messages 3..7 (+4)")
+    );
+    assert_eq!(
+        lane_custom_types(&worker.core, Lane::FollowUp),
+        vec!["agent_message_digest_notice"]
+    );
+}

@@ -78,6 +78,7 @@ impl FamilyRequestLog {
             let events_path = directory.join(EVENTS_FILE);
             let parent = crate::journal::establish_private_journal_parent(&events_path)?;
             crate::journal::validate_private_journal_parent(&events_path)?;
+            crate::journal::require_trusted_namespace(directory)?;
             let mut log = Self {
                 session_id: session_id.to_string(),
                 events: Vec::new(),
@@ -149,11 +150,15 @@ impl FamilyRequestLog {
         // The pinned openat append: the leaf resolves relative to the
         // verified parent inode with `O_NOFOLLOW` (a replaced or
         // symlinked leaf refuses the append) and is created owner-only.
-        let mut file =
-            pa_core::platform::private_fs::open_append_at(self.pinned_parent()?, EVENTS_FILE)
-                .with_context(|| format!("open {EVENTS_FILE}"))?;
+        // The parent syncs after every append (the keyed append's belt):
+        // a newly created leaf's directory entry is otherwise not
+        // crash-durable.
+        let parent = self.pinned_parent()?;
+        let mut file = pa_core::platform::private_fs::open_append_at(parent, EVENTS_FILE)
+            .with_context(|| format!("open {EVENTS_FILE}"))?;
         file.write_all(line.as_bytes())?;
         file.sync_all()?;
+        parent.sync_all()?;
         self.events.push(event.clone());
         Ok(event)
     }
@@ -220,27 +225,30 @@ impl FamilyRequestLog {
     }
 
     fn load(&mut self) -> Result<()> {
-        let content =
-            match pa_core::platform::private_fs::open_read_at(self.pinned_parent()?, EVENTS_FILE) {
-                Ok(mut file) => {
-                    let mut content = String::new();
-                    file.read_to_string(&mut content)?;
-                    content
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    // A fresh outbox: the empty private file keeps the
-                    // first-append path uniform (read errors other than a
-                    // missing file propagate — corruption never truncates).
-                    drop(pa_core::platform::private_fs::create_replace_at(
-                        self.pinned_parent()?,
-                        EVENTS_FILE,
-                    )?);
-                    return Ok(());
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| format!("read {EVENTS_FILE}"));
-                }
-            };
+        let parent = self.pinned_parent()?;
+        let content = match pa_core::platform::private_fs::open_read_at(parent, EVENTS_FILE) {
+            Ok(mut file) => {
+                let mut content = String::new();
+                file.read_to_string(&mut content)?;
+                content
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A fresh outbox: the empty private file keeps the
+                // first-append path uniform (read errors other than a
+                // missing file propagate — corruption never truncates).
+                // The created entry is synced — a fresh leaf's NAME is
+                // not durable until its directory entry is.
+                drop(pa_core::platform::private_fs::create_replace_at(
+                    parent,
+                    EVENTS_FILE,
+                )?);
+                parent.sync_all()?;
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {EVENTS_FILE}"));
+            }
+        };
         let mut lines: Vec<&str> = content.split('\n').collect();
         let ended = content.ends_with('\n');
         if lines.last() == Some(&"") {
@@ -379,6 +387,10 @@ impl FamilyResultLog {
         {
             let parent = crate::journal::establish_private_journal_parent(path)?;
             crate::journal::validate_private_journal_parent(path)?;
+            crate::journal::require_trusted_namespace(
+                path.parent()
+                    .context("the family result journal needs a parent directory")?,
+            )?;
             let Some(leaf) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
                 anyhow::bail!("the family result journal needs a file name");
             };
@@ -824,6 +836,56 @@ mod tests {
             !outbox.join("outbox-events.ndjson").exists(),
             "the decoy at the swapped path received nothing"
         );
+    }
+
+    /// The trusted-namespace placement policy (the follow-up review's
+    /// integrity finding): an ancestor that could MOVE the verified
+    /// directory between runs makes the placement non-durable, so an
+    /// attacker-mutable ancestor (group/other-writable, sticky-less) is
+    /// rejected at open — and a sticky ancestor (the POSIX /tmp
+    /// contract: only the entry's owner may rename it) is accepted.
+    #[test]
+    fn family_logs_reject_an_attacker_mutable_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        for loose_mode in [0o777, 0o770, 0o702] {
+            // The mutable ancestor is INTERMEDIATE: the open tightens the
+            // log's own parent, and the placement policy then refuses the
+            // chain that could move it between runs.
+            let movable = root.path().join(format!("loose-{loose_mode:o}"));
+            fs::create_dir_all(movable.join("outbox")).unwrap();
+            fs::set_permissions(&movable, fs::Permissions::from_mode(loose_mode)).unwrap();
+            let error = FamilyRequestLog::open(&movable.join("outbox"), "sess_priv", 50)
+                .expect_err("an attacker-mutable ancestor fails closed");
+            assert!(
+                format!("{error:#}").contains("writable by others"),
+                "the mutability policy rejects the placement: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn family_logs_accept_a_sticky_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        // A sticky intermediate (the POSIX /tmp contract: only the entry's
+        // owner may rename it) cannot move another user's entries, so the
+        // placement stays durable.
+        let sticky = root.path().join("sticky");
+        fs::create_dir_all(sticky.join("outbox")).unwrap();
+        fs::set_permissions(&sticky, fs::Permissions::from_mode(0o1777)).unwrap();
+        let mut log = FamilyRequestLog::open(&sticky.join("outbox"), "sess_priv", 50)
+            .expect("the sticky ancestor cannot move another user's entries");
+        log.append(CloudFamilyEventPayload::AgentMessageRequest {
+            request_id: "msgreq_priv".to_string(),
+            from_remote_session_id: "remote_child".to_string(),
+            target_selector: "sibling".to_string(),
+            message: "the plaintext body".to_string(),
+        })
+        .unwrap();
+        let content =
+            fs::read_to_string(sticky.join("outbox").join("outbox-events.ndjson")).unwrap();
+        assert!(content.contains("the plaintext body"));
     }
 
     /// The result journal's appends ride the same pinned handle: the

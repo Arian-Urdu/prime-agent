@@ -194,9 +194,62 @@ pub(crate) fn ensure_private_journal_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The trusted-namespace placement policy for a durable journal parent
+/// (the follow-up review's integrity finding): the pinned handle keeps
+/// the RUNNING process honest, but a placement is only durable ACROSS
+/// RESTARTS when no ancestor can MOVE the directory — an attacker with
+/// rename rights anywhere up the chain could relocate the verified
+/// directory between runs, and a fresh open at the original path would
+/// silently lose every durable record. The policy walks the RESOLVED
+/// chain (symlinks resolved via `canonicalize`) from the filesystem
+/// root and requires every ancestor to be a real directory owned by the
+/// effective user or root (the two identities outside the local-user
+/// threat model — an ancestor owned by another user can be re-chmodded
+/// writable by its owner) and not attacker-mutable: no group/other
+/// write bit, unless the sticky bit pins entry ownership (the POSIX
+/// `/tmp` contract — only the entry's owner may rename it). This is an
+/// open-time PLACEMENT certification, not an append-time recheck: once
+/// accepted, an ancestor can only become mutable through its owner (us
+/// or root, outside the threat model).
+///
+/// # Errors
+///
+/// Returns an error when the chain cannot be resolved or an ancestor is
+/// foreign-owned or attacker-mutable.
+#[cfg(unix)]
+pub(crate) fn require_trusted_namespace(parent: &Path) -> Result<()> {
+    let resolved =
+        std::fs::canonicalize(parent).with_context(|| format!("resolve {}", parent.display()))?;
+    let owner = pa_core::platform::perms::effective_uid()
+        .context("the effective-uid probe is required for a trusted namespace")?;
+    for ancestor in resolved.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor)
+            .with_context(|| format!("inspect {}", ancestor.display()))?;
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "journal ancestor {} must be a real directory",
+            ancestor.display()
+        );
+        anyhow::ensure!(
+            metadata.uid() == owner || metadata.uid() == 0,
+            "journal ancestor {} must be owned by the current user or root",
+            ancestor.display()
+        );
+        let mode = metadata.mode();
+        anyhow::ensure!(
+            mode & 0o022 == 0 || mode & 0o1000 != 0,
+            "journal ancestor {} is writable by others; the placement is not durable",
+            ancestor.display()
+        );
+    }
+    Ok(())
+}
+
 /// [`append_record`] relative to the pinned parent handle: the leaf is
 /// opened with `O_NOFOLLOW` through `openat`, so neither a swapped
-/// ancestor nor a replaced leaf can redirect the append.
+/// ancestor nor a replaced leaf can redirect the append. The parent is
+/// synced after every append (the keyed append's belt): a newly created
+/// leaf's directory entry is otherwise not crash-durable.
 ///
 /// # Errors
 ///
@@ -210,6 +263,9 @@ pub(crate) fn append_record_at(parent: &File, leaf: &str, record: &Value) -> Res
     line.push('\n');
     file.write_all(line.as_bytes())?;
     file.sync_all()?;
+    // The keyed append's belt: a freshly created leaf's NAME is not
+    // durable until its directory entry is synced.
+    parent.sync_all()?;
     Ok(())
 }
 
@@ -2056,6 +2112,9 @@ mod tests {
     /// snapshot, the busy verdict, and the cloud admission together, and
     /// the reopen replays all three (the lane restore and the inbox key
     /// land together or not at all).
+    /// Unix-only: the keyed (cloud) admission path fails closed off
+    /// unix, so its success verifiers run where the path exists.
+    #[cfg(unix)]
     #[test]
     fn checkpoint_transaction_replays_snapshot_and_admission_together() {
         let path = temp_path("transaction.jsonl");
@@ -2539,6 +2598,9 @@ mod tests {
     /// A corrupted-but-parseable transaction line (the digest does not
     /// match its records) replays as nothing — half a transaction is
     /// never a transaction.
+    /// Unix-only: the keyed (cloud) admission path fails closed off
+    /// unix, so its success verifiers run where the path exists.
+    #[cfg(unix)]
     #[test]
     fn a_digest_mismatched_transaction_replays_as_nothing() {
         let path = temp_path("bad-digest.jsonl");

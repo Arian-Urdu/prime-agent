@@ -382,7 +382,11 @@ fn bundled_python_skills() -> Vec<(String, Vec<String>)> {
             // lives); the model-facing surface is the import package, so a
             // skill that also ships tests at its root is not scanned.
             let package_dir = python.package_path.join("src").join(&python.import_name);
-            let scan_root = if package_dir.is_dir() { package_dir } else { python.package_path.clone() };
+            let scan_root = if package_dir.is_dir() {
+                package_dir
+            } else {
+                python.package_path.clone()
+            };
             let mut functions = python_skill_functions(&scan_root)
                 .into_iter()
                 .filter(|name| !name.starts_with('_'))

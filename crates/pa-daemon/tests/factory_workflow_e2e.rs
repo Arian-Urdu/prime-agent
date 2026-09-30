@@ -102,6 +102,20 @@ struct Harness {
     client: Client,
 }
 
+impl Drop for Harness {
+    fn drop(&mut self) {
+        // Kill the supervisor, reap it, remove the scenario tree — the same
+        // teardown shape every other daemon e2e harness's tempfile::TempDir
+        // performs. A worker whose supervisor died can still write one
+        // journal fragment into the removed tree inside its orphan-exit
+        // window (the fleet-wide 15s behavior); the fragment is inert and
+        // dies with the worker.
+        let _ = self._daemon.child.kill();
+        let _ = self._daemon.child.wait();
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
 struct Client {
     reader: BufReader<UnixStream>,
     writer: UnixStream,

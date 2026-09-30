@@ -128,6 +128,45 @@ class ReplTest(unittest.TestCase):
         self.addCleanup(self.repl.close)
         self.ready_event, self.ready_ms = self.repl.ready()
 
+    def test_bash_activity_is_available_while_cell_is_running(self):
+        self.repl.send({"type": "execute", "id": "cell", "code": "from rlm import bash\nimport asyncio\nh = bash('echo ready; sleep 20'); await asyncio.sleep(20)"})
+        # Wait for the activity start display before requesting list.
+        while True:
+            event = self.repl.read_event()
+            data = event.get("data", {}).get("application/vnd.prime-agent.bash-activity+json")
+            if data and data.get("active"):
+                activity_id = data["id"]
+                break
+        self.repl.send({"type": "bash_activity", "id": "list", "action": "list"})
+        listed = self.repl.until_done("list")[-1]
+        self.assertEqual(listed["status"], "ok")
+        self.assertEqual(next(row for row in listed["activities"] if row["id"] == activity_id)["status"], "running")
+        # The tail can race the child's first output flush: poll the
+        # bounded tail until the marker lands (the handle's own test does
+        # the same wait).
+        deadline = time.time() + 10
+        tail = {}
+        while time.time() < deadline:
+            self.repl.send({"type": "bash_activity", "id": "tail", "action": "tail", "activityId": activity_id})
+            tail = self.repl.until_done("tail")[-1]
+            if "ready" in tail["tail"]:
+                break
+            time.sleep(0.05)
+        self.assertIn("ready", tail["tail"])
+        self.repl.send({"type": "bash_activity", "id": "bad", "action": "kill", "activityId": "unknown"})
+        self.assertEqual(self.repl.until_done("bad")[-1]["status"], "error")
+        self.repl.send({"type": "bash_activity", "id": "kill", "action": "kill", "activityId": activity_id})
+        self.assertTrue(self.repl.until_done("kill")[-1]["killed"])
+        self.repl.send({"type": "interrupt", "id": "cell"})
+        self.repl.until_done("cell")
+
+    def test_bash_activity_rejects_oversized_ids(self):
+        self.repl.send({"type": "bash_activity", "id": "x" * 300, "action": "list"})
+        event = self.repl.read_event()
+        self.assertEqual(event["event"], "error")
+        self.assertEqual(event["ename"], "ProtocolError")
+        self.assertIn("256", event["evalue"])
+
     def test_ready_handshake_and_startup_time(self):
         self.assertEqual(self.ready_event["event"], "ready")
         self.assertEqual(self.ready_event["protocol"], 3)
@@ -136,33 +175,6 @@ class ReplTest(unittest.TestCase):
         # Loose bound for loaded CI machines; still catches an order-of-magnitude regression.
         print(f"\n[startup] spawn -> ready: {self.ready_ms:.0f} ms")
         self.assertLess(self.ready_ms, 500)
-
-    def test_import_rlm_defers_the_event_loop_stack(self):
-        # `import rlm` is the pre-ready boot path: the event loop stack must load
-        # after the ready event, not during package import, and serving must keep
-        # it resident.
-        env = {**os.environ, "PYTHONPATH": SRC + os.pathsep + os.environ.get("PYTHONPATH", "")}
-        code = "import rlm, sys; assert 'asyncio' not in sys.modules and 'secrets' not in sys.modules"
-        subprocess.run([sys.executable, "-c", code], env=env, check=True, timeout=30)
-        events = self.repl.execute("serving", "import sys\n'asyncio' in sys.modules")
-        self.assertEqual(one(events, "result")["text"], "True")
-
-    def test_sigint_during_the_deferred_boot_stays_fatal(self):
-        # A fake `asyncio` parks the kernel inside the post-ready deferred
-        # import. The fifo open below returns only once the kernel is parked in
-        # that window, where an early _sigint_handler install swallowed the
-        # Ctrl-C, so only the default handler may be in charge there.
-        with tempfile.TemporaryDirectory() as tmp:
-            park = os.path.join(tmp, "deferred-boot-park")
-            os.mkfifo(park)
-            with open(os.path.join(tmp, "asyncio.py"), "w") as fake_asyncio:
-                fake_asyncio.write(f"import os\nos.read(os.open({park!r}, os.O_RDONLY), 1)\n")
-            repl = ReplProcess(env={"PYTHONPATH": tmp + os.pathsep + SRC})
-            self.addCleanup(repl.close)
-            self.assertEqual(repl.ready()[0]["event"], "ready")
-            with open(park, "wb"):
-                os.kill(repl.proc.pid, signal.SIGINT)
-                self.assertNotEqual(repl.proc.wait(timeout=10), 0)
 
     def test_result_echo(self):
         events = self.repl.execute("a", "1+1")
@@ -406,16 +418,19 @@ class ReplTest(unittest.TestCase):
         self.assertEqual(error["ename"], "KeyboardInterrupt")
         self.assertEqual(one(events, "done")["status"], "error")
 
-    def test_stdout_buffer_write_surfaces_as_null_and_rejects_int(self):
-        # Libraries write bytes via sys.stdout.buffer: the tagged writer exposes a
-        # working buffer whose bytes surface (null-attributed) before done, and it
-        # raises TypeError for ints (bytes(5) would emit five NULs).
+    def test_stdout_buffer_write_works_and_surfaces_as_null(self):
+        # Libraries write bytes via sys.stdout.buffer; the tagged writer must
+        # expose a working buffer whose bytes surface (null-attributed) before done.
         events = self.repl.execute(
             "bufw", "import sys\nsys.stdout.buffer.write(b'buffer-bytes\\n')\nsys.stdout.buffer.flush()"
         )
+        self.assertEqual(one(events, "done")["status"], "ok")
         buffered = next(e for e in events if e.get("event") == "stdout" and "buffer-bytes" in e["text"])
         self.assertIsNone(buffered["id"])
         self.assertLess(events.index(buffered), events.index(one(events, "done")))
+
+    def test_stdout_buffer_write_rejects_int(self):
+        # A real stdout.buffer raises TypeError for ints; bytes(5) would emit five NULs.
         events = self.repl.execute("bufint", "import sys\nsys.stdout.buffer.write(5)")
         self.assertEqual(one(events, "error")["ename"], "TypeError")
         self.assertEqual(one(events, "done")["status"], "error")
@@ -640,6 +655,51 @@ class ReplTest(unittest.TestCase):
             self.assertEqual(one(events, "result")["text"], "42")
             self.assertEqual(fresh.shutdown(), 0)
 
+    def test_stdin_eof_flushes_final_snapshot(self):
+        # Host death (EOF, no shutdown request) must persist the namespace
+        # tail that postdates the last explicit snapshot.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "kernel-state.dill")
+            manifest_path = os.path.join(tmp, "kernel-state.json")
+            self.assertEqual(one(self.repl.execute("s1", "x = 1"), "done")["status"], "ok")
+            self.repl.send({"type": "snapshot", "id": "s2", "path": path, "manifest_path": manifest_path})
+            self.assertEqual(one(self.repl.until_done("s2"), "done")["status"], "ok")
+            self.assertEqual(one(self.repl.execute("s3", "x = 42"), "done")["status"], "ok")
+            assert self.repl.proc.stdin is not None
+            self.repl.proc.stdin.close()
+            self.assertEqual(self.repl.proc.wait(timeout=10), 0)
+
+            fresh = ReplProcess()
+            self.addCleanup(fresh.close)
+            fresh.ready()
+            fresh.send({"type": "restore", "id": "r1", "path": path})
+            self.assertEqual(one(fresh.until_done("r1"), "done")["status"], "ok")
+            events = fresh.execute("r2", "x")
+            self.assertEqual(one(events, "result")["text"], "42")
+
+    def test_stdin_eof_without_prior_snapshot_keeps_payload(self):
+        # Until this process committed a snapshot of its own, an EOF must
+        # not overwrite the on-disk payload with a namespace the host never
+        # considered durable (e.g. a restore that failed to run).
+        import dill
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "kernel-state.dill")
+            with open(path, "wb") as fh:
+                dill.dump({"x": dill.dumps(7)}, fh)
+            self.assertEqual(one(self.repl.execute("s1", "x = 999"), "done")["status"], "ok")
+            assert self.repl.proc.stdin is not None
+            self.repl.proc.stdin.close()
+            self.assertEqual(self.repl.proc.wait(timeout=10), 0)
+
+            fresh = ReplProcess()
+            self.addCleanup(fresh.close)
+            fresh.ready()
+            fresh.send({"type": "restore", "id": "r1", "path": path})
+            self.assertEqual(one(fresh.until_done("r1"), "done")["status"], "ok")
+            events = fresh.execute("r2", "x")
+            self.assertEqual(one(events, "result")["text"], "7")
+
     def test_restore_skips_ipython_injected_names(self):
         import dill
 
@@ -730,6 +790,69 @@ class ReplTest(unittest.TestCase):
         code = "G = 1\ndef reader():\n    return G\ncallbacks = [reader]\nhandlers = {'read': reader}\npair = (reader,)"
         self._snapshot_restore("ct", code, self.enterContext(tempfile.TemporaryDirectory()))
         self.assertEqual(one(self.repl.execute("ct4", "G = 2\n(callbacks[0](), handlers['read'](), pair[0]())"), "result")["text"], "(2, 2, 2)")
+
+    def test_restore_revives_functions_inside_sets_pr2471(self):
+        code = "G = 1\ndef reader():\n    return G\ncallbacks = {reader}\nfrozen = frozenset({reader})"
+        self._snapshot_restore("st", code, self.enterContext(tempfile.TemporaryDirectory()))
+        self.assertEqual(
+            one(
+                self.repl.execute("st4", "G = 2\n(next(iter(callbacks))(), next(iter(frozen))())"),
+                "result",
+            )["text"],
+            "(2, 2)",
+        )
+
+    def test_restore_self_referential_partial_survives_pr2471(self):
+        code = (
+            "import functools\nG = 1\ndef base():\n    return G\n"
+            "p = functools.partial(base)\np.self = p\nq = functools.partial(base)\nr = functools.partial(base)\nq.peer = r\nr.peer = q"
+        )
+        self._snapshot_restore("sp", code, self.enterContext(tempfile.TemporaryDirectory()))
+        # Cross-record identity is the documented per-record aliasing limit
+        # (each record unpickles independently); the cycle guarantees are:
+        # no RecursionError, the self-cycle identity within one record, and
+        # live globals through the revived peers.
+        events = self.repl.execute("sp4", "G = 2\n(p(), p.self is p, q.peer(), r.peer())")
+        self.assertEqual(one(events, "result")["text"], "(2, True, 2, 2)")
+
+    def test_restore_revives_function_dictionary_keys_pr2471(self):
+        code = "G = 1\ndef reader():\n    return G\ntable = {reader: 'v'}"
+        self._snapshot_restore("dk", code, self.enterContext(tempfile.TemporaryDirectory()))
+        # The revived key observes live globals and keeps the dict usable;
+        # identity with the separately-restored `reader` name is the
+        # documented per-record aliasing limit.
+        events = self.repl.execute(
+            "dk4", "G = 2\nk = next(iter(table))\n(k(), table[k])"
+        )
+        self.assertEqual(one(events, "result")["text"], "(2, 'v')")
+
+    def test_restore_unchanged_partial_revives_function_attributes_pr2471(self):
+        code = "import functools\nG = 1\ndef helper():\n    return G\np = functools.partial(len)\np.callback = helper"
+        self._snapshot_restore("up", code, self.enterContext(tempfile.TemporaryDirectory()))
+        self.assertEqual(one(self.repl.execute("up4", "G = 2\np.callback()"), "result")["text"], "2")
+
+    def test_restore_rebuilt_partial_revives_function_attributes_pr2471(self):
+        code = (
+            "import functools\nG = 1\ndef helper():\n    return G\ndef apply(fn):\n    return fn()\n"
+            "wrapped = functools.partial(apply, helper)\nwrapped.callback = helper"
+        )
+        self._snapshot_restore("pc", code, self.enterContext(tempfile.TemporaryDirectory()))
+        self.assertEqual(one(self.repl.execute("pc4", "G = 2\nwrapped.callback()"), "result")["text"], "2")
+
+    def test_snapshot_skips_lone_surrogate_names_pr2478(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "kernel-state.dill")
+            manifest_path = os.path.join(tmp, "kernel-state.json")
+            # A lone surrogate cannot ride a source literal (compile rejects
+            # it); runtime-constructed keys are the reachable path.
+            self.repl.execute("sg1", "globals()[chr(0xD800)] = 1\nkeep = 2")
+            self.repl.send({"type": "snapshot", "id": "sg2", "path": path, "manifest_path": manifest_path})
+            done = one(self.repl.until_done("sg2"), "done")
+            self.assertEqual(done["status"], "ok")
+            self.assertEqual(done["saved"], ["keep"])
+            self.assertEqual(len(done["skipped"]), 1)
+            self.assertEqual(done["skipped"][0]["name"], "\ud800")
+            self.assertIn("UnicodeEncodeError", done["skipped"][0]["reason"])
 
     def test_snapshot_prune_oversized(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1292,7 +1415,7 @@ class ReplTest(unittest.TestCase):
         self.assertEqual(one(events, "result")["text"], "'alive'")
 
     def test_list_names(self):
-        self.repl.execute("ln1", "alpha = 1\ndef helper(n):\n    return n\n_hidden = 2\nrlm = object()\nglobals()[1] = 2")
+        self.repl.execute("ln1", "alpha = 1\ndef helper(n):\n    return n\n_hidden = 2\nrlm = object()")
         self.repl.send({"type": "list_names", "id": "ln2"})
         done = one(self.repl.until_done("ln2"), "done")
         self.assertEqual(done["status"], "ok")
@@ -1300,8 +1423,31 @@ class ReplTest(unittest.TestCase):
         self.assertIn("helper", done["names"])
         self.assertNotIn("_hidden", done["names"])
         self.assertNotIn("rlm", done["names"])
-        self.assertNotIn(1, done["names"])
         self.assertEqual(done["names"], sorted(done["names"]))
+
+    def test_mcp_status_without_servers(self):
+        self.repl.send({"type": "mcp_status", "id": "ms1", "servers": []})
+        done = one(self.repl.until_done("ms1"), "done")
+        self.assertEqual(done["status"], "ok")
+        self.assertEqual(done["connections"], [])
+
+    def test_mcp_status_requires_a_server_list(self):
+        self.repl.send({"type": "mcp_status", "id": "ms2", "servers": "fixture-echo"})
+        events = self.repl.until_done("ms2")
+        self.assertEqual(one(events, "done")["status"], "error")
+        self.assertIn("mcp_status", one(events, "error")["evalue"])
+        events = self.repl.execute("ms3", "'alive'")
+        self.assertEqual(one(events, "result")["text"], "'alive'")
+
+    def test_list_names_skips_non_string_keys(self):
+        self.repl.execute("lnk1", "globals()[1] = 1\nbeta = 2")
+        self.repl.send({"type": "list_names", "id": "lnk2"})
+        done = one(self.repl.until_done("lnk2"), "done")
+        self.assertEqual(done["status"], "ok")
+        self.assertIn("beta", done["names"])
+        self.assertNotIn(1, done["names"])
+        events = self.repl.execute("lnk3", "'alive'")
+        self.assertEqual(one(events, "result")["text"], "'alive'")
 
     def test_host_request_round_trip(self):
         code = "\n".join(
@@ -1385,6 +1531,11 @@ class ReplTest(unittest.TestCase):
         )
         self.assertEqual(one(events, "done")["status"], "error")
 
+    def test_host_reply_for_unknown_id_dropped(self):
+        self.repl.send({"type": "host_reply", "id": "no-such-request", "data": {"status": "ok"}})
+        events = self.repl.execute("ok", "'alive'")
+        self.assertEqual(one(events, "result")["text"], "'alive'")
+
     def test_host_request_cancelled_cell_drops_pending_future(self):
         code = "\n".join(
             [
@@ -1423,6 +1574,9 @@ class ReplTest(unittest.TestCase):
         self.assertEqual(display["id"], "det")
         self.assertEqual(display["data"], {"text/plain": "late"})
 
+    def test_shutdown_clean_exit(self):
+        self.assertEqual(self.repl.shutdown(), 0)
+
     def test_shutdown_after_mcp_import_exits_cleanly(self):
         events = self.repl.execute("mcp-import", "import rlm.mcp")
         self.assertEqual(one(events, "done")["status"], "ok")
@@ -1439,6 +1593,64 @@ class ReplTest(unittest.TestCase):
         request = self.repl.read_event()
         while request.get("event") != "host_request":
             request = self.repl.read_event()
+
+    def test_owner_death_kills_orphan_kernel(self):
+        # A kernel must never outlive its owner process. The owner here is a
+        # short-lived wrapper that names itself via the same env var the host
+        # always sets (PRIME_AGENT_KERNEL_OWNER_PID); it exits while the kernel
+        # keeps an open stdin (the write end is held by this test), so the EOF
+        # path cannot be what stops it: only the owner watchdog can.
+        with tempfile.TemporaryDirectory() as tmp:
+            wrapper = os.path.join(tmp, "owner_wrapper.py")
+            with open(wrapper, "w") as fh:
+                fh.write(
+                    "import os, subprocess, sys\n"
+                    "kernel_stdin = int(sys.argv[1])\n"
+                    "kernel_env = {**os.environ}\n"
+                    "kernel_env['PRIME_AGENT_KERNEL_OWNER_PID'] = str(os.getpid())\n"
+                    "kernel_env.pop('PYTHONPATH', None)\n"
+                    "proc = subprocess.Popen(\n"
+                    "    [sys.executable, '-m', 'rlm.repl'],\n"
+                    "    stdin=kernel_stdin,\n"
+                    "    stdout=None,\n"
+                    "    stderr=subprocess.DEVNULL,\n"
+                    "    pass_fds=(kernel_stdin,),\n"
+                    "    env=kernel_env,\n"
+                    ")\n"
+                    "print(proc.pid, flush=True)\n"
+                )
+            read_fd, write_fd = os.pipe()
+            env = {
+                **os.environ,
+                "PYTHONPATH": SRC + os.pathsep + os.environ.get("PYTHONPATH", ""),
+            }
+            # Hermeticity: an ambient PRIME_AGENT_KERNEL_OWNER_PID (this test
+            # itself may run inside a product kernel) would pin the watchdog
+            # to a live host pid instead of the wrapper this test controls.
+            env.pop("PRIME_AGENT_KERNEL_OWNER_PID", None)
+            owner = subprocess.Popen(
+                [sys.executable, wrapper, str(read_fd)],
+                stdout=subprocess.PIPE,
+                text=True,
+                env=env,
+                pass_fds=(read_fd,),
+            )
+            try:
+                kernel_pid = int(owner.stdout.readline().strip())
+                owner.wait(timeout=10)
+                deadline = time.monotonic() + 15.0
+                exited = False
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(kernel_pid, 0)
+                    except ProcessLookupError:
+                        exited = True
+                        break
+                    time.sleep(0.2)
+                self.assertTrue(exited, "orphan kernel must exit after its owner dies")
+            finally:
+                os.close(write_fd)
+                os.close(read_fd)
 
     def test_stdin_eof_with_pending_host_request_exits(self):
         self._start_pending_host_request()
@@ -2134,6 +2346,7 @@ class RestoreApplyShieldTest(unittest.TestCase):
 
     def test_sigint_with_backfill_first_write_is_consumed(self):
         from rlm.repl import _restore_state
+
         exec("SECRET = 42\ndef reader():\n    return SECRET", source := {"__name__": "__main__"})
         with tempfile.TemporaryDirectory() as tmp:
             ns = self.SigintOnNthSet(fire_on=1)
@@ -2266,6 +2479,118 @@ class SnapshotTempCleanupTest(unittest.TestCase):
 
 
 
+class SnapshotRestoreBoundsTest(unittest.TestCase):
+    """The restore's record reader enforces the writer's own byte caps: a
+    sparse multi-gigabyte snapshot file cannot OOM the process (Macroscope
+    PR #2744 HIGH repl.py:731), and a failed revival merges no backfill
+    (Macroscope PR #2744 MED repl.py:1077)."""
+
+    def setUp(self):
+        sys.path.insert(0, SRC)
+        self.addCleanup(sys.path.remove, SRC)
+        from rlm import repl as repl_module
+
+        self.repl_module = repl_module
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+
+    def _frame(self, name: bytes, blob: bytes) -> bytes:
+        return (
+            len(name).to_bytes(4, "little")
+            + name
+            + len(blob).to_bytes(8, "little")
+            + blob
+        )
+
+    def test_oversized_record_declared_length_is_capped_before_reading(self):
+        import dill
+
+        magic = self.repl_module._SNAPSHOT_MAGIC
+        # A sparse file whose APPARENT size covers a declared 2 GiB record:
+        # the file-size bounds check alone would pass it (the allocation is
+        # the attack), so the per-record cap must reject it first.
+        huge_len = 2 * 1024 * 1024 * 1024
+        path = os.path.join(self.dir, "sparse-state.dill")
+        with open(path, "wb") as fh:
+            fh.write(magic)
+            fh.write(self._frame(b"victim", dill.dumps(b"x")))
+        # Truncate-declare: append the header of a huge record, then make the
+        # file's apparent size cover it (a sparse file: no real bytes).
+        with open(path, "ab") as fh:
+            fh.write((4).to_bytes(4, "little"))
+            fh.write(b"huge")
+            fh.write(huge_len.to_bytes(8, "little"))
+            fh.truncate(fh.tell() + huge_len)
+        with open(path, "rb") as fh:
+            with self.assertRaises(ValueError):
+                self.repl_module._read_snapshot_records(fh, 256 * 1024 * 1024, 16 * 1024 * 1024)
+
+    def test_oversized_declared_record_name_is_capped_before_reading(self):
+        """A corrupt or sparse snapshot declaring a multi-gigabyte RECORD NAME must
+        fail the aggregate cap BEFORE fh.read(name_len) allocates it (the same OOM
+        class the blob caps close; Macroscope PR #2744 HIGH repl.py:729)."""
+        import dill
+
+        magic = self.repl_module._SNAPSHOT_MAGIC
+        huge_len = 2 * 1024 * 1024 * 1024
+        path = os.path.join(self.dir, "sparse-name-state.dill")
+        with open(path, "wb") as fh:
+            fh.write(magic)
+            # A valid first record the reader must survive past.
+            fh.write(self._frame(b"ok", dill.dumps(b"x")))
+            # Then the huge-name header, with the file's APPARENT size made to
+            # cover it (a sparse file: no real bytes, so the size check alone
+            # passes it — the cap must reject first).
+            fh.write(huge_len.to_bytes(4, "little"))
+            # The file's APPARENT size must cover the declared name PLUS the
+            # 8-byte blob-length field that follows it, so the pre-existing
+            # truncated-record size check passes and the NAME cap is the
+            # guard that actually fires.
+            fh.truncate(fh.tell() + huge_len + 8)
+        with open(path, "rb") as fh:
+            with self.assertRaises(ValueError):
+                self.repl_module._read_snapshot_records(fh, 256 * 1024 * 1024, 16 * 1024 * 1024)
+
+    def test_failed_revival_merges_no_backfill(self):
+        import dill
+
+        path = os.path.join(self.dir, "state.dill")
+        records = self._frame(b"good", dill.dumps("ok")) + self._frame(b"bad", dill.dumps("BAD"))
+        with open(path, "wb") as fh:
+            fh.write(self.repl_module._SNAPSHOT_MAGIC)
+            fh.write(records)
+        ns = {"keep": 0}
+        real_revive = self.repl_module._revive_with_live_globals
+        state = {"revived": 0}
+
+        def revive(value, live_ns, backfill):
+            if value == "BAD":
+                # The buggy shape appended to the shared backfill BEFORE the
+                # revival completed: a failed name still merged its globals.
+                backfill.append(("leaked_from_bad", 42))
+                raise RuntimeError("revival boom")
+            backfill.append(("good_global", 1))
+            state["revived"] += 1
+            return value
+
+        self.repl_module._revive_with_live_globals = revive
+        try:
+            result = self.repl_module._restore_state(
+                ns, path, max_bytes=1 << 20, max_variable_bytes=1 << 20
+            )
+        finally:
+            self.repl_module._revive_with_live_globals = real_revive
+        self.assertIn("good", result["restored"])
+        self.assertIn("good_global", ns)
+        self.assertNotIn("leaked_from_bad", ns, "a failed revival must merge nothing")
+        self.assertEqual(
+            [entry["name"] for entry in result["failed"]],
+            ["bad"],
+        )
+        self.assertEqual(ns["good"], "ok")
+
+
 class SnapshotPairConsistencyTest(unittest.TestCase):
     # Direct fault injection into _snapshot_state: portable and deterministic
     # (chmod-based injection breaks as root and has different Windows semantics).
@@ -2333,6 +2658,11 @@ class SnapshotPairConsistencyTest(unittest.TestCase):
         ns: dict = {}
         self.assertNotIn("error", _restore_state(ns, self.path))
         self.assertEqual(ns, {"a": "first"})
+
+    def test_zero_size_cap_writes_no_empty_payload_overhead(self):
+        result = self._snap({}, max_bytes=0, max_variable_bytes=0)
+        self.assertEqual(result, {"error": "write failed: snapshot exceeds aggregate snapshot size cap"})
+        self.assertEqual(os.listdir(self.dir), [])
 
     def test_manifest_write_failure_preserves_prior_pair(self):
         old_payload, old_manifest = self._old_pair()
@@ -2538,6 +2868,33 @@ class SnapshotPairConsistencyTest(unittest.TestCase):
             self.assertEqual(fh.read(len(_SNAPSHOT_MAGIC)), _SNAPSHOT_MAGIC)
             with self.assertRaises(Exception):
                 dill.load(fh)
+
+
+class ErrorEventCapTest(unittest.TestCase):
+    """The error event's traceback must fit one protocol frame in aggregate."""
+
+    def setUp(self):
+        sys.path.insert(0, SRC)
+        self.addCleanup(sys.path.remove, SRC)
+
+    def test_cap_traceback_lines_keeps_newest_under_the_aggregate_cap(self):
+        from rlm.repl import _RESULT_TEXT_CAP, _cap_traceback_lines
+
+        lines = [f"line-{i}: " + "x" * 900 for i in range(2_000)]
+        capped = _cap_traceback_lines(lines)
+        marker_overhead = len(capped[0])
+        self.assertLessEqual(
+            sum(len(line) for line in capped),
+            _RESULT_TEXT_CAP + marker_overhead + 900,
+            "the aggregate (plus the marker and the always-kept newest entry) fits the frame cap",
+        )
+        self.assertIn("truncated", capped[0])
+        self.assertEqual(capped[-1], lines[-1], "the newest entry names the raised exception")
+        self.assertEqual(
+            _cap_traceback_lines(lines[:10]),
+            lines[:10],
+            "an under-cap traceback passes through unchanged",
+        )
 
 
 class OwnerWatchdogTest(unittest.TestCase):

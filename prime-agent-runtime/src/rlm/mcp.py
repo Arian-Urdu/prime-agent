@@ -10,6 +10,9 @@ Two surfaces, one module:
   ``describe_tool`` (live tool metadata). Inventory calls are bounded and never
   return credentials; live tool schemas and results are passed through
   unmodified.
+- Host view: ``status(servers, timeout_ms)`` feeds the daemon's MCP
+  connections view (one bounded per-server listing, errors reported per
+  server).
 """
 
 from __future__ import annotations
@@ -18,23 +21,18 @@ import asyncio
 import copy
 import hashlib
 import io
+import json
 import os
 import re
 import threading
 import time
 from contextlib import AsyncExitStack
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any, TypeVar
 
 from . import host_request
-from .mcp_base import (
-    _EXPIRY_SKEW_SECONDS,
-    McpToolError,
-    _parse_result,
-    _read_auth,
-    _resolve_config_value,
-    _resolve_streamable_http,
-)
+from .mcp_base import McpToolError
 
 __all__ = [
     "McpCredentialsUnavailable",
@@ -596,6 +594,34 @@ async def list_tools(server: str) -> list[dict[str, Any]]:
     return await _dispatch(lambda: _registry.tools(server))
 
 
+async def status(servers: list[str], timeout_ms: float) -> list[dict[str, Any]]:
+    """Per-server tool listing for the host's MCP connections view.
+
+    Each requested server is listed concurrently, bounded by `timeout_ms`
+    per server; a server that fails or times out reports its error instead
+    of failing the whole request. Opening a not-yet-connected server is
+    intended: the view exists to show what each connection offers.
+    """
+    timeout = max(timeout_ms, 1.0) / 1000.0
+
+    async def _one(server: str) -> dict[str, Any]:
+        try:
+            tools = await asyncio.wait_for(list_tools(server), timeout=timeout)
+        except BaseException as exc:  # noqa: BLE001 - one broken server reports alone
+            return {"server": server, "tools": None, "error": f"{type(exc).__name__}: {exc}"}
+        return {
+            "server": server,
+            "tools": [
+                {"name": tool.get("name"), "description": tool.get("description") or ""}
+                for tool in tools
+            ],
+            "error": None,
+        }
+
+    results = await asyncio.gather(*(_one(server) for server in servers))
+    return list(results)
+
+
 async def call_tool(server: str, tool: str, arguments: dict[str, Any] | None = None) -> Any:
     _validate_name(tool, "tool")
     if arguments is not None and not isinstance(arguments, dict):
@@ -899,7 +925,7 @@ async def _auth_identity(server: str, config: dict[str, Any]) -> str:
         provider = f"mcp:{server}"
         cred = _bound_auth(provider, config)
         expires = (cred or {}).get("expires")
-        if isinstance(expires, (int, float)) and expires <= time.time() * 1000 + _EXPIRY_SKEW_SECONDS * 1000:
+        if isinstance(expires, (int, float)) and expires <= time.time() * 1000 + 30_000:
             try:
                 await host_request("mcp.refresh", {"server": server})
             except Exception as exc:
@@ -1042,3 +1068,87 @@ def _seconds(value: Any, default: float) -> float:
 
 def _strings(value: Any) -> bool:
     return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _agent_dir() -> Path:
+    """Resolve the Prime Agent config dir the same way the rest of the runtime does."""
+    raw = (
+        os.environ.get("PRIME_AGENT_CODING_AGENT_DIR")
+        or os.environ.get("PI_CODING_AGENT_DIR")
+        or str(Path.home() / ".prime" / "agent")
+    )
+    # resolve() so a relative env override reads auth.json from the right place,
+    # not relative to the kernel's cwd.
+    return Path(raw).expanduser().resolve()
+
+
+def _read_auth(provider: str) -> dict[str, Any] | None:
+    """Read one credential entry from auth.json. Returns None if absent/unreadable."""
+    try:
+        data = json.loads((_agent_dir() / "auth.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    cred = data.get(provider)
+    return cred if isinstance(cred, dict) else None
+
+
+def _resolve_config_value(value: str) -> str:
+    """Resolve a stored api_key value the way the host does.
+
+    A value may be a literal, an env-var name, or a `!command` indirection. The
+    command form can't run safely in the kernel (the host injects those resolved),
+    so skip it; otherwise treat the value as an env-var name if set, else literal.
+    """
+    value = value.strip()
+    if not value or value.startswith("!"):
+        return ""
+    return (os.environ.get(value) or value).strip()
+
+
+def _resolve_streamable_http():
+    """Return an SDK streamable-HTTP transport callable.
+
+    SDK versions vary: some expose ``streamablehttp_client(url, headers=...)``,
+    others ``streamable_http_client(url, *, http_client=...)``, and some expose
+    both with *different* signatures.
+    """
+    from mcp.client import streamable_http as mod
+
+    for name in ("streamablehttp_client", "streamable_http_client"):
+        fn = getattr(mod, name, None)
+        if fn is not None:
+            return fn
+    raise ImportError(
+        "the installed `mcp` SDK exposes no streamable-HTTP client; upgrade `mcp`"
+    )
+
+
+def _parse_result(result: Any) -> Any:
+    """Normalize a CallToolResult into plain Python (structured output preferred).
+
+    Raises McpToolError when the server flags the result as an error, so a failed
+    tool call doesn't look like a successful one to the caller.
+    """
+    texts: list[str] = []
+    for block in getattr(result, "content", None) or []:
+        text = getattr(block, "text", None)
+        if text is not None:
+            texts.append(text)
+    is_error = getattr(result, "is_error", getattr(result, "isError", False))
+    if is_error:
+        raise McpToolError("\n".join(texts) or "MCP tool returned an error")
+
+    structured = getattr(result, "structured_content", getattr(result, "structuredContent", None))
+    if structured is not None:  # falsy-but-valid payloads ({} / []) are real results
+        return structured
+    if texts:
+        return "\n".join(texts)
+
+    # Non-text content (images, embedded resources): return them as plain dicts
+    # rather than the opaque SDK object so callers get usable data.
+    blocks = getattr(result, "content", None) or []
+    if blocks:
+        return [b.model_dump(mode="json") if hasattr(b, "model_dump") else b for b in blocks]
+    return result

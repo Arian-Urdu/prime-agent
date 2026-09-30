@@ -1,1 +1,0 @@
-- Changed Prime Inference to use the team a prime CLI directory context (`.prime/context.json`, e.g. `prime switch <team> --local`) or `PRIME_CONTEXT` selects for the session's working directory, ahead of the stored team; `PRIME_TEAM_ID` still wins.

@@ -194,8 +194,7 @@ mod tests {
             serde_json::json!({"id": "sb-1"}),
             serde_json::Value::String("nope".to_string()),
         ] {
-            let rendered = broken.to_string();
-            assert!(parse_sandbox(broken).is_err(), "{rendered}");
+            assert!(parse_sandbox(broken).is_err());
         }
         let mut wire = sandbox_wire();
         wire["status"] = serde_json::json!("STARTING_LATER");

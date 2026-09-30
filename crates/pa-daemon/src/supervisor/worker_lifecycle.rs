@@ -246,6 +246,14 @@ impl Supervisor {
             "extensions",
             "tools",
             "autonomous",
+            // The child-runtime verification seam (worker create.rs reads this
+            // key into the RLM identity, so a scripted parent session passes
+            // its children's engine file down the recursion): it must ride
+            // the durable create command like every other rest key the
+            // worker replays — dropping it here left every scripted parent's
+            // children scriptless (the factory workflow e2e caught the loss:
+            // children settled with empty answers and no assistant row).
+            "childScript",
         ] {
             if let Some(value) = config_object.and_then(|config| config.get(key)) {
                 durable_rest.insert(key.to_string(), value.clone());

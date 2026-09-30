@@ -50,7 +50,7 @@ use pa_core::factory_eval::{
     build_baseline_prompt, build_factory_parent_prompt, build_harness_state_file,
     build_reference_factories, check_replay_ledger, check_task_success, find_reference_factory,
     parse_answer_line, parse_eval_args, render_markdown_report, run_replay_checks,
-    serialize_eval_report, EvalArm, EvalArgsError, FactoryEvalConfig, FactoryEvalTrialResult,
+    serialize_eval_report, EvalArgsError, EvalArm, FactoryEvalConfig, FactoryEvalTrialResult,
     ReferenceFactoryKind, TrialVerdict, FACTORY_KERNEL_VENV_RECIPE,
 };
 use serde_json::{json, Value};
@@ -64,12 +64,20 @@ struct Client {
 
 impl Client {
     fn connect(socket: &Path) -> Result<Self, String> {
-        let stream = std::os::unix::net::UnixStream::connect(socket)
-            .map_err(|error| format!("connect to the eval supervisor at {}: {error}", socket.display()))?;
+        let stream = std::os::unix::net::UnixStream::connect(socket).map_err(|error| {
+            format!(
+                "connect to the eval supervisor at {}: {error}",
+                socket.display()
+            )
+        })?;
         let writer = stream
             .try_clone()
             .map_err(|error| format!("clone the eval supervisor socket: {error}"))?;
-        let mut client = Self { reader: BufReader::new(stream), writer, request_id: 0 };
+        let mut client = Self {
+            reader: BufReader::new(stream),
+            writer,
+            request_id: 0,
+        };
         let hello = client.read_line(Duration::from_secs(15))?;
         if hello.get("type").and_then(Value::as_str) != Some("daemon_hello") {
             return Err(format!("unexpected supervisor greeting: {hello}"));
@@ -93,7 +101,8 @@ impl Client {
                 // discarding them and failing the frame's parse.
                 Ok(_) if line.trim().is_empty() => line.clear(),
                 Ok(_) => {
-                    return serde_json::from_str(line.trim()).map_err(|error| format!("invalid supervisor line: {error}"));
+                    return serde_json::from_str(line.trim())
+                        .map_err(|error| format!("invalid supervisor line: {error}"));
                 }
                 Err(error) => {
                     if Instant::now() >= deadline {
@@ -113,13 +122,15 @@ impl Client {
             "protocol": { "name": "prime-agent.daemon", "version": 7 },
             "command": command,
         });
-        let mut line =
-            serde_json::to_string(&envelope).map_err(|error| format!("serialize command: {error}"))?;
+        let mut line = serde_json::to_string(&envelope)
+            .map_err(|error| format!("serialize command: {error}"))?;
         line.push('\n');
         self.writer
             .write_all(line.as_bytes())
             .map_err(|error| format!("send command: {error}"))?;
-        self.writer.flush().map_err(|error| format!("flush command: {error}"))?;
+        self.writer
+            .flush()
+            .map_err(|error| format!("flush command: {error}"))?;
         // One fixed budget for the whole command: the supervisor broadcasts
         // unsolicited frames, and a full-timeout retry per frame would let a
         // steady broadcast stream delay the response indefinitely.
@@ -139,7 +150,10 @@ impl Client {
     fn command_data(&mut self, command: &Value, timeout: Duration) -> Result<Value, String> {
         let response = self.command(command, timeout)?;
         if response.get("success").and_then(Value::as_bool) != Some(true) {
-            let error = response.get("error").and_then(Value::as_str).unwrap_or("unknown error");
+            let error = response
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
             return Err(error.to_string());
         }
         Ok(response.get("data").cloned().unwrap_or(Value::Null))
@@ -198,7 +212,7 @@ impl Drop for Supervisor {
 }
 
 /// Spawn the eval's dedicated supervisor on a private socket. The kernel
-/// harness store is the seeded eval dir (RLM_HARNESS_STATE_DIR flows to
+/// harness store is the seeded eval dir (`RLM_HARNESS_STATE_DIR` flows to
 /// every worker and kernel), and a pinned kernel python keeps a dev
 /// checkout from rebuilding the shared kernel venv live sessions use.
 fn spawn_supervisor(
@@ -244,11 +258,17 @@ fn spawn_supervisor(
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if socket.exists() {
-            return Ok(Supervisor { child, socket: socket.to_path_buf() });
+            return Ok(Supervisor {
+                child,
+                socket: socket.to_path_buf(),
+            });
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    panic!("eval supervisor socket never appeared at {}", socket.display());
+    panic!(
+        "eval supervisor socket never appeared at {}",
+        socket.display()
+    );
 }
 
 fn now_iso() -> String {
@@ -296,6 +316,97 @@ fn probe_model(client: &mut Client, config: &FactoryEvalConfig, root: &Path) -> 
     Ok(())
 }
 
+/// What one driven trial captured before its cleanup: the session to kill,
+/// the parsed ANSWER, and the session's context/total token counts.
+struct TrialCaptured {
+    session_id: String,
+    answer: Option<pa_core::factory_eval::ParsedAnswer>,
+    context_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+}
+
+/// Create the trial session, drive its parent turn to completion, and
+/// capture the ANSWER and the token counts. Cleanup is the caller's
+/// (`run_trial` kills the session and removes the trial dir on every
+/// path).
+#[allow(clippy::too_many_arguments)]
+fn drive_trial(
+    client: &mut Client,
+    config: &FactoryEvalConfig,
+    factory: &pa_core::factory_eval::ReferenceFactory,
+    arm: EvalArm,
+    trial: u64,
+    trial_root: &Path,
+    sessions_dir: &Path,
+    ledger_path: &Path,
+) -> Result<TrialCaptured, String> {
+    fs::create_dir_all(&sessions_dir).map_err(|error| format!("create the trial dir: {error}"))?;
+    let Some((provider, model_id)) = config.model.split_once('/') else {
+        return Err(format!("model must be provider/id, got {}", config.model));
+    };
+    let prompt = match arm {
+        EvalArm::Factory => build_factory_parent_prompt(factory, &ledger_path.to_string_lossy()),
+        EvalArm::Baseline => build_baseline_prompt(factory, &ledger_path.to_string_lossy()),
+    };
+    let created = client.command_data(
+        &json!({
+            "type": "create",
+            "name": format!("factory-eval-{}-{}-{trial}", factory.kind.as_str(), arm.as_str()),
+            "config": {
+                "cwd": trial_root.to_string_lossy(),
+                "sessionDir": sessions_dir.to_string_lossy(),
+                "provider": provider,
+                "model": model_id,
+            }
+        }),
+        Duration::from_mins(2),
+    )?;
+    let session_id = created
+        .get("activeSessionId")
+        .and_then(Value::as_str)
+        .or_else(|| created.get("sessionId").and_then(Value::as_str))
+        .ok_or_else(|| format!("create returned no session id: {created}"))?
+        .to_string();
+
+    // The whole trial is one parent turn, bounded by the trial timeout:
+    // `prompt_and_wait` answers only when the turn completes.
+    client.command_data(
+        &json!({
+            "type": "prompt_and_wait",
+            "activeSessionId": session_id,
+            "message": prompt,
+        }),
+        Duration::from_secs(config.timeout_minutes * 60),
+    )?;
+    let final_text = client
+        .command_data(
+            &json!({ "type": "get_last_assistant_text", "activeSessionId": session_id }),
+            Duration::from_secs(30),
+        )?
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let answer = parse_answer_line(final_text.as_deref());
+    let stats = client.command_data(
+        &json!({ "type": "get_session_stats", "activeSessionId": session_id }),
+        Duration::from_secs(30),
+    )?;
+    let context_tokens = stats
+        .get("contextUsage")
+        .and_then(|usage| usage.get("tokens"))
+        .and_then(Value::as_u64);
+    let total_tokens = stats
+        .get("tokens")
+        .and_then(|tokens| tokens.get("total"))
+        .and_then(Value::as_u64);
+    Ok(TrialCaptured {
+        session_id,
+        answer,
+        context_tokens,
+        total_tokens,
+    })
+}
+
 /// Run one factory- or baseline-arm trial: create the isolated session,
 /// drive the parent prompt to completion, score the answer against the
 /// ledger the parent saved, and clean up on every path.
@@ -309,95 +420,52 @@ fn run_trial(
     runs_root: &Path,
 ) -> FactoryEvalTrialResult {
     let started = Instant::now();
-    let trial_root = runs_root.join(format!("{}-{}-trial-{trial}", factory.kind.as_str(), arm.as_str()));
+    let trial_root = runs_root.join(format!(
+        "{}-{}-trial-{trial}",
+        factory.kind.as_str(),
+        arm.as_str()
+    ));
     let sessions_dir = trial_root.join("sessions");
     let ledger_path = trial_root.join("ledger.json");
-    let outcome: Result<(String, Option<pa_core::factory_eval::ParsedAnswer>, Option<u64>, Option<u64>), String> = (|| {
-        fs::create_dir_all(&sessions_dir).map_err(|error| format!("create the trial dir: {error}"))?;
-        let Some((provider, model_id)) = config.model.split_once('/') else {
-            return Err(format!("model must be provider/id, got {}", config.model));
-        };
-        let prompt = match arm {
-            EvalArm::Factory => build_factory_parent_prompt(factory, &ledger_path.to_string_lossy()),
-            EvalArm::Baseline => build_baseline_prompt(factory, &ledger_path.to_string_lossy()),
-        };
-        let created = client.command_data(
-            &json!({
-                "type": "create",
-                "name": format!("factory-eval-{}-{}-{trial}", factory.kind.as_str(), arm.as_str()),
-                "config": {
-                    "cwd": trial_root.to_string_lossy(),
-                    "sessionDir": sessions_dir.to_string_lossy(),
-                    "provider": provider,
-                    "model": model_id,
-                }
-            }),
-            Duration::from_mins(2),
-        )?;
-        let session_id = created
-            .get("activeSessionId")
-            .and_then(Value::as_str)
-            .or_else(|| created.get("sessionId").and_then(Value::as_str))
-            .ok_or_else(|| format!("create returned no session id: {created}"))?
-            .to_string();
-
-        // The whole trial is one parent turn, bounded by the trial timeout:
-        // `prompt_and_wait` answers only when the turn completes.
-        client.command_data(
-            &json!({
-                "type": "prompt_and_wait",
-                "activeSessionId": session_id,
-                "message": prompt,
-            }),
-            Duration::from_secs(config.timeout_minutes * 60),
-        )?;
-        let final_text = client
-            .command_data(
-                &json!({ "type": "get_last_assistant_text", "activeSessionId": session_id }),
-                Duration::from_secs(30),
-            )?
-            .get("text")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let answer = parse_answer_line(final_text.as_deref());
-        let stats = client.command_data(
-            &json!({ "type": "get_session_stats", "activeSessionId": session_id }),
-            Duration::from_secs(30),
-        )?;
-        let context_tokens = stats
-            .get("contextUsage")
-            .and_then(|usage| usage.get("tokens"))
-            .and_then(Value::as_u64);
-        let total_tokens = stats
-            .get("tokens")
-            .and_then(|tokens| tokens.get("total"))
-            .and_then(Value::as_u64);
-        Ok((session_id, answer, context_tokens, total_tokens))
-    })();
+    let outcome: Result<TrialCaptured, String> = drive_trial(
+        client,
+        config,
+        factory,
+        arm,
+        trial,
+        &trial_root,
+        &sessions_dir,
+        &ledger_path,
+    );
     // Cleanup on every path: the session is killed and the trial dir removed
     // whether the trial scored or errored, so a failed trial can never leave
     // a live session issuing real model requests after it ends.
-    match &outcome {
-        Ok((session_id, _, _, _)) => {
-            let _ = client.command(
-                &json!({ "type": "kill", "activeSessionId": session_id }),
-                Duration::from_secs(30),
-            );
-        }
-        Err(_) => {}
+    if let Ok(captured) = &outcome {
+        let _ = client.command(
+            &json!({ "type": "kill", "activeSessionId": captured.session_id }),
+            Duration::from_secs(30),
+        );
     }
     let _ = fs::remove_dir_all(&trial_root);
-    let wall_ms = started.elapsed().as_millis() as u64;
+    let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     match outcome {
-        Err(message) => FactoryEvalTrialResult::error_row(factory, arm, trial, &config.model, &message, wall_ms),
-        Ok((_, answer, context_tokens, total_tokens)) => match arm {
+        Err(message) => {
+            FactoryEvalTrialResult::error_row(factory, arm, trial, &config.model, &message, wall_ms)
+        }
+        Ok(captured) => match arm {
             EvalArm::Factory => {
                 let ledger = read_json_file(&ledger_path);
-                let check = check_task_success(factory, answer.as_ref(), ledger.as_ref(), EvalArm::Factory, None);
-                let problems = Vec::new();
+                let check = check_task_success(
+                    factory,
+                    captured.answer.as_ref(),
+                    ledger.as_ref(),
+                    EvalArm::Factory,
+                    None,
+                );
                 let replay = ledger.as_ref().map(check_replay_ledger);
-                let ledger_missing = ledger.is_none() && factory.kind != ReferenceFactoryKind::DryRunReject;
-                let mut problems = problems;
+                let ledger_missing =
+                    ledger.is_none() && factory.kind != ReferenceFactoryKind::DryRunReject;
+                let mut problems = Vec::new();
                 if ledger_missing {
                     problems.push("status ledger was not written".to_string());
                 }
@@ -405,30 +473,35 @@ fn run_trial(
                     factory,
                     trial,
                     &config.model,
-                    check,
+                    &check,
                     problems,
-                    answer,
+                    captured.answer,
                     ledger,
-                    replay,
+                    replay.as_ref(),
                     wall_ms,
-                    context_tokens,
-                    total_tokens,
+                    captured.context_tokens,
+                    captured.total_tokens,
                 )
             }
             EvalArm::Baseline => {
                 let baseline_ledger = read_json_file(&ledger_path);
-                let check =
-                    check_task_success(factory, answer.as_ref(), None, EvalArm::Baseline, baseline_ledger.as_ref());
+                let check = check_task_success(
+                    factory,
+                    captured.answer.as_ref(),
+                    None,
+                    EvalArm::Baseline,
+                    baseline_ledger.as_ref(),
+                );
                 FactoryEvalTrialResult::baseline_row(
                     factory,
                     trial,
                     &config.model,
-                    check,
+                    &check,
                     Vec::new(),
-                    answer,
+                    captured.answer,
                     wall_ms,
-                    context_tokens,
-                    total_tokens,
+                    captured.context_tokens,
+                    captured.total_tokens,
                 )
             }
         },
@@ -446,8 +519,9 @@ fn main() {
         }
         let data = match fs::read_to_string(&replay_path)
             .map_err(|error| format!("{error}"))
-            .and_then(|content| serde_json::from_str::<Value>(&content).map_err(|error| format!("{error}")))
-        {
+            .and_then(|content| {
+                serde_json::from_str::<Value>(&content).map_err(|error| format!("{error}"))
+            }) {
             Ok(data) => data,
             Err(error) => {
                 eprintln!("cannot read replay input {replay_path}: {error}");
@@ -456,7 +530,11 @@ fn main() {
         };
         let replay = run_replay_checks(&data);
         for entry in &replay.ledgers {
-            println!("replay {}: {}", entry.id, if entry.result.ok { "ok" } else { "failed" });
+            println!(
+                "replay {}: {}",
+                entry.id,
+                if entry.result.ok { "ok" } else { "failed" }
+            );
             for problem in &entry.result.problems {
                 println!("  - {problem}");
             }
@@ -508,7 +586,8 @@ fn run(config: &FactoryEvalConfig) -> Result<(), String> {
     // Kernel python: pin whenever a candidate probes factory-capable. A
     // stale shared venv must never be rebuilt under this harness.
     let explicit_pin = std::env::var_os("PRIME_AGENT_KERNEL_PYTHON").map(PathBuf::from);
-    let (kernel, shared_venv_exists) = pa_core::factory_eval::resolve_factory_kernel_python(explicit_pin);
+    let (kernel, shared_venv_exists) =
+        pa_core::factory_eval::resolve_factory_kernel_python(explicit_pin);
     if kernel.is_none() && shared_venv_exists {
         return Err(format!(
             "No factory-capable kernel python: point PRIME_AGENT_KERNEL_PYTHON at a python with a \
@@ -534,22 +613,51 @@ fn run(config: &FactoryEvalConfig) -> Result<(), String> {
                 config.trials,
                 config.model
             );
-            results.push(run_trial(&mut client, config, factory, EvalArm::Factory, trial, &runs_root));
+            results.push(run_trial(
+                &mut client,
+                config,
+                factory,
+                EvalArm::Factory,
+                trial,
+                &runs_root,
+            ));
             println!(
                 "running {} baseline trial {trial}/{} on {}",
                 factory.kind.as_str(),
                 config.trials,
                 config.model
             );
-            results.push(run_trial(&mut client, config, factory, EvalArm::Baseline, trial, &runs_root));
+            results.push(run_trial(
+                &mut client,
+                config,
+                factory,
+                EvalArm::Baseline,
+                trial,
+                &runs_root,
+            ));
         }
     }
-    let escalation = find_reference_factory(&reference_factories, ReferenceFactoryKind::ReviewSweepFail);
+    let escalation =
+        find_reference_factory(&reference_factories, ReferenceFactoryKind::ReviewSweepFail);
     println!("running review-sweep escalation probe (one trial)");
-    results.push(run_trial(&mut client, config, escalation, EvalArm::Factory, 1, &runs_root));
+    results.push(run_trial(
+        &mut client,
+        config,
+        escalation,
+        EvalArm::Factory,
+        1,
+        &runs_root,
+    ));
     let broken = find_reference_factory(&reference_factories, ReferenceFactoryKind::DryRunReject);
     println!("running dry-run rejection probe (one trial)");
-    results.push(run_trial(&mut client, config, broken, EvalArm::Factory, 1, &runs_root));
+    results.push(run_trial(
+        &mut client,
+        config,
+        broken,
+        EvalArm::Factory,
+        1,
+        &runs_root,
+    ));
     drop(client);
     drop(supervisor);
     if results.is_empty() {
@@ -558,7 +666,8 @@ fn run(config: &FactoryEvalConfig) -> Result<(), String> {
 
     let markdown = render_markdown_report(&results, config);
     let out_dir = PathBuf::from(&config.out_dir);
-    fs::create_dir_all(&out_dir).map_err(|error| format!("create {}: {error}", out_dir.display()))?;
+    fs::create_dir_all(&out_dir)
+        .map_err(|error| format!("create {}: {error}", out_dir.display()))?;
     fs::write(out_dir.join("report.md"), &markdown)
         .map_err(|error| format!("write report.md: {error}"))?;
     let report = serialize_eval_report(config, results, &now_iso());

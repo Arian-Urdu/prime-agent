@@ -109,7 +109,12 @@ pub fn review_issue_ids() -> Vec<&'static str> {
 fn mini_repo_listing() -> String {
     REVIEW_FILES
         .iter()
-        .map(|file| format!("[{}] {} // audit {}: {}", file.name, file.code, file.issue_id, file.audit))
+        .map(|file| {
+            format!(
+                "[{}] {} // audit {}: {}",
+                file.name, file.code, file.issue_id, file.audit
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -194,7 +199,10 @@ pub fn build_collector_prompt(width: u64) -> String {
         .map(|i| format!("{{line-{i}}}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let markers = (1..=width).map(builder_marker).collect::<Vec<_>>().join(" ");
+    let markers = (1..=width)
+        .map(builder_marker)
+        .collect::<Vec<_>>()
+        .join(" ");
     [
         &format!("You are the collector of a {width}-wide build. One line per builder node arrived:"),
         "",
@@ -371,6 +379,11 @@ pub fn build_review_sweep_dag() -> Value {
 
 /// review-sweep plus a planted failing reviewer: admission of an
 /// unresolvable model pin — deterministic, zero child tokens.
+///
+/// # Panics
+///
+/// Panics only on an internal invariant violation (the json! literal and
+/// the sweep fixture always build).
 #[must_use]
 pub fn build_review_sweep_fail_dag() -> Value {
     let mut dag = build_review_sweep_dag();
@@ -467,7 +480,7 @@ pub fn build_broken_dag() -> Value {
 /// The pr-manager reference machine: entry -> reviewing -> (fixing ->
 /// reviewing)* -> monitoring, driven by the approved verdict guard. The
 /// fixing state reports the ids it fixed through a json `fix_report`
-/// output; reviewing's optional fix_report input re-binds that report on
+/// output; reviewing's optional `fix_report` input re-binds that report on
 /// every re-entry (it binds null on the first review, before the fixer ever
 /// runs), so a consistent reviewer rejects round 1 and approves once the
 /// report covers its findings. Monitoring stays resident until the caller
@@ -581,7 +594,12 @@ impl ReferenceFactoryKind {
     /// Every selectable kind, in the report's canonical order.
     #[must_use]
     pub fn selections() -> [Self; 4] {
-        [Self::ReviewSweep, Self::Builder, Self::ResidentWatcher, Self::PrManager]
+        [
+            Self::ReviewSweep,
+            Self::Builder,
+            Self::ResidentWatcher,
+            Self::PrManager,
+        ]
     }
 }
 
@@ -603,6 +621,11 @@ pub struct ReferenceFactory {
 
 impl ReferenceFactory {
     /// The stored arguments payload: machine form wins when present.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a machine-form reference carries no machine (an
+    /// internal invariant: every reference is built with exactly one form).
     #[must_use]
     pub fn spec_arguments(&self) -> Value {
         if let Some(machine) = &self.machine {
@@ -695,7 +718,10 @@ pub fn build_reference_factories(width: u64) -> Vec<ReferenceFactory> {
         .into_iter()
         .map(|kind| reference_factory(kind, width))
         .collect();
-    factories.push(reference_factory(ReferenceFactoryKind::ReviewSweepFail, width));
+    factories.push(reference_factory(
+        ReferenceFactoryKind::ReviewSweepFail,
+        width,
+    ));
     factories.push(reference_factory(ReferenceFactoryKind::DryRunReject, width));
     factories
 }
@@ -707,10 +733,10 @@ pub fn build_reference_factories(width: u64) -> Vec<ReferenceFactory> {
 /// Panics when the registry does not carry the kind (an internal invariant:
 /// the registry is built from the closed kind set).
 #[must_use]
-pub fn find_reference_factory<'a>(
-    factories: &'a [ReferenceFactory],
+pub fn find_reference_factory(
+    factories: &[ReferenceFactory],
     kind: ReferenceFactoryKind,
-) -> &'a ReferenceFactory {
+) -> &ReferenceFactory {
     factories
         .iter()
         .find(|factory| factory.kind == kind)
@@ -720,6 +746,11 @@ pub fn find_reference_factory<'a>(
 /// Full `harness_state.json` file body seeding the given factory entries
 /// (the exact file the kernel's harness store loads through
 /// `RLM_HARNESS_STATE_DIR`).
+///
+/// # Panics
+///
+/// Panics only when serialization fails (the state body always
+/// serializes).
 #[must_use]
 pub fn build_harness_state_file(specs: &[ReferenceFactory], now_iso: &str) -> String {
     let mut entries = BTreeMap::new();
@@ -748,7 +779,10 @@ pub fn build_harness_state_file(specs: &[ReferenceFactory], now_iso: &str) -> St
         "entries": { "prompt": {}, "memory": {}, "skill": {}, "subagent": {}, "factory": entries },
         "refinements": []
     });
-    format!("{}\n", serde_json::to_string_pretty(&body).expect("harness state serializes"))
+    format!(
+        "{}\n",
+        serde_json::to_string_pretty(&body).expect("harness state serializes")
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1168,9 +1202,11 @@ pub fn parse_answer_line(text: Option<&str>) -> Option<ParsedAnswer> {
     let text = text?;
     // The TS regex: /ANSWER:\s*(.+?)(?:\r?\n|$)/i — case-insensitive, the
     // first ANSWER-prefixed line.
-    let line = text
-        .lines()
-        .find(|line| line.to_ascii_lowercase().trim_start().starts_with("answer:"))?;
+    let line = text.lines().find(|line| {
+        line.to_ascii_lowercase()
+            .trim_start()
+            .starts_with("answer:")
+    })?;
     let rest = line
         .split_once(':')
         .map(|(_, rest)| rest)
@@ -1216,10 +1252,10 @@ pub fn parse_answer_line(text: Option<&str>) -> Option<ParsedAnswer> {
     Some(parsed)
 }
 
-/// Parse the last fenced ```json block in a captured answer preview; `None`
+/// Parse the last fenced JSON block in a captured answer preview; `None`
 /// when absent or malformed. Multi-line fenced objects parse (the accepted
-/// review fix for the TS `.*?` non-dotAll miss): a pretty-printed verdict
-/// is a valid verdict.
+/// review fix for the TS-era `.*?` non-dotAll miss): a pretty-printed
+/// verdict is a valid verdict.
 #[must_use]
 pub fn parse_fenced_json(text: &str) -> Option<Map<String, Value>> {
     let mut last: Option<&str> = None;
@@ -1313,14 +1349,22 @@ fn is_ledger_shape(value: &Value) -> bool {
 /// identities (contiguous seq, closed kind/stage vocabularies, valid node
 /// refs) and complete resource accounting (every spawned instance settled
 /// with a duration, cancelled, or still in flight on a paused run; usage
-/// counts match the event stream). Machine-form ledgers add the state_entry
-/// contiguity, transition endpoint, wait-settled, and transitions_fired
-/// rules.
+/// counts match the event stream). Machine-form ledgers add the
+/// `state_entry` contiguity, transition endpoint, wait-settled, and
+/// `transitions_fired` rules.
+///
+/// # Panics
+///
+/// Panics only on internal shape violations that the leading shape check
+/// already ruled out (the `expect` calls sit behind `is_ledger_shape`).
 #[must_use]
 pub fn check_replay_ledger(ledger: &Value) -> LedgerCheckResult {
     let mut problems: Vec<String> = Vec::new();
     if !is_ledger_shape(ledger) {
-        return LedgerCheckResult { ok: false, problems: vec!["ledger does not match the factory status shape".to_string()] };
+        return LedgerCheckResult {
+            ok: false,
+            problems: vec!["ledger does not match the factory status shape".to_string()],
+        };
     }
     let nodes = ledger["nodes"].as_array().expect("checked shape");
     let state = ledger["state"].as_str().expect("checked shape");
@@ -1346,7 +1390,8 @@ pub fn check_replay_ledger(ledger: &Value) -> LedgerCheckResult {
     let mut settled: BTreeMap<String, i64> = BTreeMap::new();
     let mut cancelled: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut state_entries: BTreeMap<String, Vec<i64>> = BTreeMap::new();
-    let mut wait_settled_nodes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut wait_settled_nodes: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
     let mut milestones: Vec<String> = Vec::new();
     let mut run_stopped = false;
     let mut transitions_fired: i64 = 0;
@@ -1375,7 +1420,10 @@ pub fn check_replay_ledger(ledger: &Value) -> LedgerCheckResult {
             truncated = true;
         }
         last_seq = seq;
-        let kind = event.get("kind").and_then(Value::as_str).unwrap_or_default();
+        let kind = event
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if !KNOWN_FACTORY_EVENT_KINDS.contains(&kind) {
             problems.push(format!("events[{index}] has an unknown kind: {kind:?}"));
         }
@@ -1391,16 +1439,25 @@ pub fn check_replay_ledger(ledger: &Value) -> LedgerCheckResult {
         }
         if kind == "transition_fired" || kind == "transition_blocked" {
             // The executor always emits both endpoints; absence is drift.
-            match (event.get("from").and_then(Value::as_str), event.get("to").and_then(Value::as_str)) {
+            match (
+                event.get("from").and_then(Value::as_str),
+                event.get("to").and_then(Value::as_str),
+            ) {
                 (Some(from), Some(to)) => {
                     if !node_exists(from) {
-                        problems.push(format!("events[{index}] transitions from unknown state {from:?}"));
+                        problems.push(format!(
+                            "events[{index}] transitions from unknown state {from:?}"
+                        ));
                     }
                     if !node_exists(to) {
-                        problems.push(format!("events[{index}] transitions to unknown state {to:?}"));
+                        problems.push(format!(
+                            "events[{index}] transitions to unknown state {to:?}"
+                        ));
                     }
                 }
-                _ => problems.push(format!("events[{index}] {kind} requires from and to states")),
+                _ => problems.push(format!(
+                    "events[{index}] {kind} requires from and to states"
+                )),
             }
         }
         if kind == "state_entry" {
@@ -1408,7 +1465,10 @@ pub fn check_replay_ledger(ledger: &Value) -> LedgerCheckResult {
             let entry = event.get("entry").and_then(Value::as_i64);
             match (node, entry) {
                 (Some(node), Some(entry)) if node_exists(node) && entry >= 0 => {
-                    state_entries.entry(node.to_string()).or_default().push(entry);
+                    state_entries
+                        .entry(node.to_string())
+                        .or_default()
+                        .push(entry);
                 }
                 (Some(node), _) if node_exists(node) => {
                     problems.push(format!(
@@ -1418,7 +1478,8 @@ pub fn check_replay_ledger(ledger: &Value) -> LedgerCheckResult {
                 }
                 _ => problems.push(format!(
                     "events[{index}] state_entry references unknown node {}",
-                    node.map(str::to_string).map(|n| format!("{n:?}")).unwrap_or_else(|| "null".to_string())
+                    node.map(str::to_string)
+                        .map_or_else(|| "null".to_string(), |n| format!("{n:?}"))
                 )),
             }
         }
@@ -1447,12 +1508,16 @@ pub fn check_replay_ledger(ledger: &Value) -> LedgerCheckResult {
                 let status = event.get("status").and_then(Value::as_str);
                 if status == Some("done") {
                     let duration = event.get("duration_ms").and_then(Value::as_i64);
-                    if !duration.is_some_and(|duration| duration >= 0) {
-                        problems.push(format!("events[{index}] settles done without a duration_ms"));
+                    if duration.is_none_or(|duration| duration < 0) {
+                        problems.push(format!(
+                            "events[{index}] settles done without a duration_ms"
+                        ));
                     }
                 }
-                if status == Some("error") && !event.get("error").and_then(Value::as_str).is_some() {
-                    problems.push(format!("events[{index}] settles error without an error message"));
+                if status == Some("error") && event.get("error").and_then(Value::as_str).is_none() {
+                    problems.push(format!(
+                        "events[{index}] settles error without an error message"
+                    ));
                 }
                 if let Some(status) = status {
                     if !matches!(status, "done" | "error") {
@@ -1477,7 +1542,9 @@ pub fn check_replay_ledger(ledger: &Value) -> LedgerCheckResult {
         }
     }
     if truncated {
-        problems.push("event window is truncated (first seq is not 1); count assertions skipped".to_string());
+        problems.push(
+            "event window is truncated (first seq is not 1); count assertions skipped".to_string(),
+        );
     }
 
     if !truncated {
@@ -1486,7 +1553,9 @@ pub fn check_replay_ledger(ledger: &Value) -> LedgerCheckResult {
         for node_id in &wait_settled_nodes {
             let spawned = spawned_per_node.get(node_id).copied().unwrap_or(0);
             if spawned > 0 {
-                problems.push(format!("node {node_id} settled a wait but spawned {spawned} instance(s)"));
+                problems.push(format!(
+                    "node {node_id} settled a wait but spawned {spawned} instance(s)"
+                ));
             }
         }
         // state_entry indices are contiguous 0..n-1 per state and match the
@@ -1497,7 +1566,10 @@ pub fn check_replay_ledger(ledger: &Value) -> LedgerCheckResult {
             };
             let mut indices = state_entries.get(id).cloned().unwrap_or_default();
             indices.sort_unstable();
-            let contiguous = indices.iter().enumerate().all(|(position, entry)| *entry == position as i64);
+            let contiguous = indices
+                .iter()
+                .enumerate()
+                .all(|(position, entry)| *entry == position as i64);
             if !contiguous {
                 problems.push(format!(
                     "node {id} state_entry indices are not contiguous 0..n-1: {indices:?}"
@@ -1533,25 +1605,36 @@ pub fn check_replay_ledger(ledger: &Value) -> LedgerCheckResult {
                 let key = format!("{id}#{index}");
                 let has_spawn = spawned.get(&key).copied().unwrap_or(0) > 0;
                 let settle_count = settled.get(&key).copied().unwrap_or(0);
-                let status = instance.get("status").and_then(Value::as_str).unwrap_or_default();
+                let status = instance
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 match status {
                     "done" => {
                         if settle_count == 0 {
-                            problems.push(format!("node {id} instance {index} is done without a settle event"));
+                            problems.push(format!(
+                                "node {id} instance {index} is done without a settle event"
+                            ));
                         } else {
                             let duration = instance.get("duration_ms").and_then(Value::as_i64);
-                            if !duration.is_some_and(|duration| duration >= 0) {
-                                problems.push(format!("node {id} instance {index} is done without a duration_ms"));
+                            if duration.is_none_or(|duration| duration < 0) {
+                                problems.push(format!(
+                                    "node {id} instance {index} is done without a duration_ms"
+                                ));
                             }
                         }
                     }
                     "error" => {
                         if settle_count == 0 {
-                            problems.push(format!("node {id} instance {index} errored without a settle event"));
+                            problems.push(format!(
+                                "node {id} instance {index} errored without a settle event"
+                            ));
                         } else {
                             let error = instance.get("error").and_then(Value::as_str);
-                            if !error.is_some_and(|error| !error.is_empty()) {
-                                problems.push(format!("node {id} instance {index} errored without an error message"));
+                            if error.is_none_or(str::is_empty) {
+                                problems.push(format!(
+                                    "node {id} instance {index} errored without an error message"
+                                ));
                             }
                         }
                         if has_spawn && instance.get("duration_ms").is_none() {
@@ -1567,12 +1650,10 @@ pub fn check_replay_ledger(ledger: &Value) -> LedgerCheckResult {
                             ));
                         }
                     }
-                    "running" | "pending" => {
-                        if !in_flight_ok {
-                            problems.push(format!(
-                                "node {id} instance {index} is {status} in a {state} ledger"
-                            ));
-                        }
+                    "running" | "pending" if !in_flight_ok => {
+                        problems.push(format!(
+                            "node {id} instance {index} is {status} in a {state} ledger"
+                        ));
                     }
                     _ => {}
                 }
@@ -1585,19 +1666,21 @@ pub fn check_replay_ledger(ledger: &Value) -> LedgerCheckResult {
                 let still_in_flight = in_flight_ok
                     && nodes.iter().any(|node| {
                         node.get("id").and_then(Value::as_str) == Some(node_id)
-                            && node
-                                .get("instances")
-                                .and_then(Value::as_array)
-                                .is_some_and(|instances| {
+                            && node.get("instances").and_then(Value::as_array).is_some_and(
+                                |instances| {
                                     instances.iter().any(|instance| {
-                                        let index = instance.get("index").and_then(Value::as_i64).unwrap_or(-1);
+                                        let index = instance
+                                            .get("index")
+                                            .and_then(Value::as_i64)
+                                            .unwrap_or(-1);
                                         format!("{node_id}#{index}") == *key
                                             && matches!(
                                                 instance.get("status").and_then(Value::as_str),
                                                 Some("pending" | "running")
                                             )
                                     })
-                                })
+                                },
+                            )
                     });
                 if !still_in_flight {
                     problems.push(format!(
@@ -1613,16 +1696,17 @@ pub fn check_replay_ledger(ledger: &Value) -> LedgerCheckResult {
                 let node_id = key.split('#').next().unwrap_or_default();
                 let admission_failure = nodes.iter().any(|node| {
                     node.get("id").and_then(Value::as_str) == Some(node_id)
-                        && node
-                            .get("instances")
-                            .and_then(Value::as_array)
-                            .is_some_and(|instances| {
+                        && node.get("instances").and_then(Value::as_array).is_some_and(
+                            |instances| {
                                 instances.iter().any(|instance| {
-                                    let index = instance.get("index").and_then(Value::as_i64).unwrap_or(-1);
+                                    let index =
+                                        instance.get("index").and_then(Value::as_i64).unwrap_or(-1);
                                     format!("{node_id}#{index}") == *key
-                                        && instance.get("status").and_then(Value::as_str) == Some("error")
+                                        && instance.get("status").and_then(Value::as_str)
+                                            == Some("error")
                                 })
-                            })
+                            },
+                        )
                 });
                 if !admission_failure {
                     problems.push(format!("instance {key} settled without ever being spawned"));
@@ -1669,7 +1753,10 @@ pub fn check_replay_ledger(ledger: &Value) -> LedgerCheckResult {
         }
         if state == "paused"
             && !milestones.iter().any(|milestone| {
-                matches!(milestone.as_str(), "paused" | "budget_exceeded" | "max_transitions_exceeded")
+                matches!(
+                    milestone.as_str(),
+                    "paused" | "budget_exceeded" | "max_transitions_exceeded"
+                )
             })
         {
             problems.push(
@@ -1681,7 +1768,10 @@ pub fn check_replay_ledger(ledger: &Value) -> LedgerCheckResult {
             problems.push("run state stopped without a run_stopped event".to_string());
         }
     }
-    LedgerCheckResult { ok: problems.is_empty(), problems }
+    LedgerCheckResult {
+        ok: problems.is_empty(),
+        problems,
+    }
 }
 
 /// Run the replay check over a saved `report.json` or a single status
@@ -1717,7 +1807,10 @@ pub fn run_replay_checks(data: &Value) -> ReplayOutcome {
         }
     } else {
         let result = check_replay_ledger(data);
-        ledgers.push(ReplayLedgerOutcome { id: "ledger".to_string(), result });
+        ledgers.push(ReplayLedgerOutcome {
+            id: "ledger".to_string(),
+            result,
+        });
     }
     let ok = !ledgers.is_empty() && ledgers.iter().all(|entry| entry.result.ok);
     ReplayOutcome { ok, ledgers }
@@ -1767,8 +1860,6 @@ impl EvalArm {
 /// so a planted id the children never reported cannot hide inside an array.
 #[must_use]
 fn baseline_ledger_text(baseline_ledger: Option<&Value>) -> Option<String> {
-    let baseline = baseline_ledger?.as_object()?;
-    let mut parts: Vec<String> = Vec::new();
     fn walk(value: &Value, parts: &mut Vec<String>) {
         match value {
             Value::String(text) => parts.push(text.clone()),
@@ -1777,6 +1868,8 @@ fn baseline_ledger_text(baseline_ledger: Option<&Value>) -> Option<String> {
             _ => {}
         }
     }
+    let baseline = baseline_ledger?.as_object()?;
+    let mut parts: Vec<String> = Vec::new();
     baseline.values().for_each(|value| walk(value, &mut parts));
     Some(parts.join("\n"))
 }
@@ -1784,7 +1877,9 @@ fn baseline_ledger_text(baseline_ledger: Option<&Value>) -> Option<String> {
 fn ledger_node<'a>(ledger: Option<&'a Value>, id: &str) -> Option<&'a Value> {
     let ledger = ledger?;
     let nodes = ledger.get("nodes")?.as_array()?;
-    nodes.iter().find(|node| node.get("id").and_then(Value::as_str) == Some(id))
+    nodes
+        .iter()
+        .find(|node| node.get("id").and_then(Value::as_str) == Some(id))
 }
 
 /// Check the parent's ANSWER against the factory's checkable answer. The
@@ -1809,12 +1904,16 @@ pub fn check_task_success(
     };
     let baseline = arm == EvalArm::Baseline;
     let width = factory.width.unwrap_or(DEFAULT_WIDTH);
-    let ledger_text = baseline.then(|| baseline_ledger_text(baseline_ledger)).flatten();
+    let ledger_text = baseline
+        .then(|| baseline_ledger_text(baseline_ledger))
+        .flatten();
     match factory.kind {
         ReferenceFactoryKind::ReviewSweep => {
             for issue_id in review_issue_ids() {
                 if !answer.issues.iter().any(|known| known == issue_id) {
-                    problems.push(format!("planted issue {issue_id} missing from the ANSWER line"));
+                    problems.push(format!(
+                        "planted issue {issue_id} missing from the ANSWER line"
+                    ));
                 }
             }
             if baseline {
@@ -1855,7 +1954,11 @@ pub fn check_task_success(
                         ));
                     }
                     let report = ledger_node(Some(ledger), "report");
-                    if report.and_then(|node| node.get("status")).and_then(Value::as_str) != Some("done") {
+                    if report
+                        .and_then(|node| node.get("status"))
+                        .and_then(Value::as_str)
+                        != Some("done")
+                    {
                         problems.push("ledger report node is not done".to_string());
                     }
                     for issue_id in review_issue_ids() {
@@ -1915,7 +2018,11 @@ pub fn check_task_success(
                         ));
                     }
                     let collector = ledger_node(Some(ledger), "collector");
-                    if collector.and_then(|node| node.get("status")).and_then(Value::as_str) != Some("done") {
+                    if collector
+                        .and_then(|node| node.get("status"))
+                        .and_then(Value::as_str)
+                        != Some("done")
+                    {
                         problems.push("ledger collector node is not done".to_string());
                     }
                     for marker in &markers {
@@ -1924,7 +2031,9 @@ pub fn check_task_success(
                             .and_then(Value::as_str)
                             .is_some_and(|text| text.contains(marker))
                         {
-                            problems.push(format!("{marker} missing from the collector answer preview"));
+                            problems.push(format!(
+                                "{marker} missing from the collector answer preview"
+                            ));
                         }
                     }
                 }
@@ -1977,16 +2086,20 @@ pub fn check_task_success(
                     }
                 }
                 let watcher = ledger_node(Some(ledger), "watcher");
-                if watcher.and_then(|node| node.get("status")).and_then(Value::as_str) != Some("cancelled") {
+                if watcher
+                    .and_then(|node| node.get("status"))
+                    .and_then(Value::as_str)
+                    != Some("cancelled")
+                {
                     problems.push("ledger watcher node is not cancelled".to_string());
                 }
                 let watcher_cancelled = watcher
                     .and_then(|node| node.get("instances"))
                     .and_then(Value::as_array)
                     .is_some_and(|instances| {
-                        instances
-                            .iter()
-                            .any(|instance| instance.get("status").and_then(Value::as_str) == Some("cancelled"))
+                        instances.iter().any(|instance| {
+                            instance.get("status").and_then(Value::as_str) == Some("cancelled")
+                        })
                     });
                 if !watcher_cancelled {
                     problems.push("ledger watcher instance is not cancelled".to_string());
@@ -1997,22 +2110,30 @@ pub fn check_task_success(
             if answer.approved != Some(true) {
                 problems.push(format!(
                     "ANSWER approved is {}, expected yes",
-                    answer.approved.map_or_else(|| "unset".to_string(), |approved| approved.to_string())
+                    answer
+                        .approved
+                        .map_or_else(|| "unset".to_string(), |approved| approved.to_string())
                 ));
             }
             if answer.rounds != Some(2) {
                 problems.push(format!(
                     "ANSWER rounds is {}, expected 2",
-                    answer.rounds.map_or_else(|| "unset".to_string(), |rounds| rounds.to_string())
+                    answer
+                        .rounds
+                        .map_or_else(|| "unset".to_string(), |rounds| rounds.to_string())
                 ));
             }
             for issue_id in review_issue_ids() {
                 if !answer.defects.iter().any(|known| known == issue_id) {
-                    problems.push(format!("planted issue {issue_id} missing from the ANSWER line"));
+                    problems.push(format!(
+                        "planted issue {issue_id} missing from the ANSWER line"
+                    ));
                 }
             }
             if !answer.stopped.iter().any(|known| known == "monitoring") {
-                problems.push("ANSWER does not report the resident monitoring state as stopped".to_string());
+                problems.push(
+                    "ANSWER does not report the resident monitoring state as stopped".to_string(),
+                );
             }
             if baseline {
                 match &ledger_text {
@@ -2056,7 +2177,11 @@ pub fn check_task_success(
                 let monitoring = ledger_node(Some(ledger), "monitoring");
                 // rounds is the review-loop length: the reviewing state's
                 // entries_used.
-                if reviewing.and_then(|node| node.get("entries_used")).and_then(Value::as_i64) != Some(2) {
+                if reviewing
+                    .and_then(|node| node.get("entries_used"))
+                    .and_then(Value::as_i64)
+                    != Some(2)
+                {
                     problems.push(format!(
                         "ledger reviewing entries_used is {}, expected 2",
                         reviewing
@@ -2065,7 +2190,11 @@ pub fn check_task_success(
                             .map_or_else(|| "unset".to_string(), |used| used.to_string())
                     ));
                 }
-                if fixing.and_then(|node| node.get("entries_used")).and_then(Value::as_i64) != Some(1) {
+                if fixing
+                    .and_then(|node| node.get("entries_used"))
+                    .and_then(Value::as_i64)
+                    != Some(1)
+                {
                     problems.push(format!(
                         "ledger fixing entries_used is {}, expected 1",
                         fixing
@@ -2074,7 +2203,11 @@ pub fn check_task_success(
                             .map_or_else(|| "unset".to_string(), |used| used.to_string())
                     ));
                 }
-                if reviewing.and_then(|node| node.get("status")).and_then(Value::as_str) != Some("done") {
+                if reviewing
+                    .and_then(|node| node.get("status"))
+                    .and_then(Value::as_str)
+                    != Some("done")
+                {
                     problems.push("ledger reviewing state is not done".to_string());
                 }
                 // The final verdict must be a fenced json block (multi-line
@@ -2093,7 +2226,11 @@ pub fn check_task_success(
                 if approved != Some(Value::Bool(true)) {
                     problems.push("final reviewing verdict is not approved true".to_string());
                 }
-                if reviewing.and_then(|node| node.get("max_entries")).and_then(Value::as_i64) != Some(4) {
+                if reviewing
+                    .and_then(|node| node.get("max_entries"))
+                    .and_then(Value::as_i64)
+                    != Some(4)
+                {
                     problems.push(format!(
                         "ledger reviewing max_entries is {}, expected 4",
                         reviewing
@@ -2112,11 +2249,16 @@ pub fn check_task_success(
                     .to_string()];
                 if let Some(events) = ledger.get("events").and_then(Value::as_array) {
                     for event in events {
-                        let is_fix_captured = event.get("kind").and_then(Value::as_str) == Some("answer_captured")
+                        let is_fix_captured = event.get("kind").and_then(Value::as_str)
+                            == Some("answer_captured")
                             && event.get("node").and_then(Value::as_str) == Some("fixing");
                         if is_fix_captured {
                             fix_texts.push(
-                                event.get("answer").and_then(Value::as_str).unwrap_or_default().to_string(),
+                                event
+                                    .get("answer")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
                             );
                         }
                     }
@@ -2124,13 +2266,23 @@ pub fn check_task_success(
                 let fix_text = fix_texts.join("\n");
                 for issue_id in review_issue_ids() {
                     if !fix_text.contains(issue_id) {
-                        problems.push(format!("planted issue {issue_id} missing from the fixing ledger"));
+                        problems.push(format!(
+                            "planted issue {issue_id} missing from the fixing ledger"
+                        ));
                     }
                 }
-                if monitoring.and_then(|node| node.get("lifecycle")).and_then(Value::as_str) != Some("resident") {
+                if monitoring
+                    .and_then(|node| node.get("lifecycle"))
+                    .and_then(Value::as_str)
+                    != Some("resident")
+                {
                     problems.push("ledger monitoring state is not resident".to_string());
                 }
-                if monitoring.and_then(|node| node.get("status")).and_then(Value::as_str) != Some("cancelled") {
+                if monitoring
+                    .and_then(|node| node.get("status"))
+                    .and_then(Value::as_str)
+                    != Some("cancelled")
+                {
                     problems.push("ledger monitoring state is not cancelled".to_string());
                 }
             }
@@ -2162,13 +2314,17 @@ pub fn check_task_success(
                     ));
                 }
                 let broken = ledger_node(Some(ledger), "review-broken");
-                if broken.and_then(|node| node.get("status")).and_then(Value::as_str) != Some("error") {
+                if broken
+                    .and_then(|node| node.get("status"))
+                    .and_then(Value::as_str)
+                    != Some("error")
+                {
                     problems.push("ledger review-broken node is not error".to_string());
                 }
-                if !broken
+                if broken
                     .and_then(|node| node.get("error"))
                     .and_then(Value::as_str)
-                    .is_some_and(|error| !error.is_empty())
+                    .is_none_or(str::is_empty)
                 {
                     problems.push("ledger review-broken node has no error message".to_string());
                 }
@@ -2179,27 +2335,30 @@ pub fn check_task_success(
                 {
                     problems.push("ledger report node is not pending".to_string());
                 }
-                let report_started = ledger
-                    .get("events")
-                    .and_then(Value::as_array)
-                    .is_some_and(|events| {
-                        events.iter().any(|event| {
-                            event.get("kind").and_then(Value::as_str) == Some("spawned")
-                                && event.get("node").and_then(Value::as_str) == Some("report")
-                        })
-                    });
+                let report_started =
+                    ledger
+                        .get("events")
+                        .and_then(Value::as_array)
+                        .is_some_and(|events| {
+                            events.iter().any(|event| {
+                                event.get("kind").and_then(Value::as_str) == Some("spawned")
+                                    && event.get("node").and_then(Value::as_str) == Some("report")
+                            })
+                        });
                 if report_started {
                     problems.push("report node started despite the escalation pause".to_string());
                 }
-                let paused_milestone = ledger
-                    .get("events")
-                    .and_then(Value::as_array)
-                    .is_some_and(|events| {
-                        events.iter().any(|event| {
-                            event.get("kind").and_then(Value::as_str) == Some("milestone")
-                                && event.get("milestone").and_then(Value::as_str) == Some("paused")
-                        })
-                    });
+                let paused_milestone =
+                    ledger
+                        .get("events")
+                        .and_then(Value::as_array)
+                        .is_some_and(|events| {
+                            events.iter().any(|event| {
+                                event.get("kind").and_then(Value::as_str) == Some("milestone")
+                                    && event.get("milestone").and_then(Value::as_str)
+                                        == Some("paused")
+                            })
+                        });
                 if !paused_milestone {
                     problems.push("ledger has no paused milestone".to_string());
                 }
@@ -2212,7 +2371,9 @@ pub fn check_task_success(
             if answer.children != Some(0) {
                 problems.push(format!(
                     "ANSWER children count is {}, expected 0",
-                    answer.children.map_or_else(|| "unset".to_string(), |children| children.to_string())
+                    answer
+                        .children
+                        .map_or_else(|| "unset".to_string(), |children| children.to_string())
                 ));
             }
             if !answer
@@ -2220,11 +2381,16 @@ pub fn check_task_success(
                 .as_deref()
                 .is_some_and(|message| message.contains("no-such-subagent-entry"))
             {
-                problems.push("ANSWER message does not mention the unknown subagent reference".to_string());
+                problems.push(
+                    "ANSWER message does not mention the unknown subagent reference".to_string(),
+                );
             }
         }
     }
-    TaskCheckOutcome { ok: problems.is_empty(), problems }
+    TaskCheckOutcome {
+        ok: problems.is_empty(),
+        problems,
+    }
 }
 
 /// The outcome of one [`check_task_success`] call.
@@ -2336,11 +2502,11 @@ impl FactoryEvalTrialResult {
         factory: &ReferenceFactory,
         trial: u64,
         model: &str,
-        task_check: TaskCheckOutcome,
+        task_check: &TaskCheckOutcome,
         mut problems: Vec<String>,
         answer: Option<ParsedAnswer>,
         ledger: Option<Value>,
-        replay: Option<LedgerCheckResult>,
+        replay: Option<&LedgerCheckResult>,
         wall_ms: u64,
         context_tokens: Option<u64>,
         total_tokens: Option<u64>,
@@ -2352,9 +2518,9 @@ impl FactoryEvalTrialResult {
         // Factory arms use the run ledger's elapsed_ms against the declared
         // run budget; an absent ledger counts as zero overshoot only when the
         // trial is a probe without a ledger (the dry-run probe).
-        let budget_overshoot_ms = elapsed_ms
-            .map(|elapsed| elapsed.saturating_sub(factory.declared_budget_ms))
-            .unwrap_or(0);
+        let budget_overshoot_ms = elapsed_ms.map_or(0, |elapsed| {
+            elapsed.saturating_sub(factory.declared_budget_ms)
+        });
         problems.extend(task_check.problems.iter().cloned());
         let replay_problems: Vec<String> = replay
             .as_ref()
@@ -2414,11 +2580,12 @@ impl FactoryEvalTrialResult {
     /// Build the baseline-arm row: the wall clock is the arm's overshoot
     /// upper bound against the same declared budget.
     #[allow(clippy::too_many_arguments)]
+    #[must_use]
     pub fn baseline_row(
         factory: &ReferenceFactory,
         trial: u64,
         model: &str,
-        task_check: TaskCheckOutcome,
+        task_check: &TaskCheckOutcome,
         problems: Vec<String>,
         answer: Option<ParsedAnswer>,
         wall_ms: u64,
@@ -2426,8 +2593,11 @@ impl FactoryEvalTrialResult {
         total_tokens: Option<u64>,
     ) -> Self {
         let budget_overshoot_ms = wall_ms.saturating_sub(factory.declared_budget_ms);
-        let verdict =
-            if task_check.ok && problems.is_empty() { TrialVerdict::Pass } else { TrialVerdict::Fail };
+        let verdict = if task_check.ok && problems.is_empty() {
+            TrialVerdict::Pass
+        } else {
+            TrialVerdict::Fail
+        };
         let mut problems = problems;
         problems.extend(task_check.problems.iter().cloned());
         Self {
@@ -2461,7 +2631,15 @@ impl FactoryEvalTrialResult {
     /// failure): the sweep can never cover a subset of its planned trials
     /// (the accepted review fix — a thrown trial is logged and counted,
     /// never swallowed).
-    pub fn error_row(factory: &ReferenceFactory, arm: EvalArm, trial: u64, model: &str, error: &str, wall_ms: u64) -> Self {
+    #[must_use]
+    pub fn error_row(
+        factory: &ReferenceFactory,
+        arm: EvalArm,
+        trial: u64,
+        model: &str,
+        error: &str,
+        wall_ms: u64,
+    ) -> Self {
         Self {
             factory: factory.kind.as_str().to_string(),
             arm,
@@ -2544,24 +2722,32 @@ fn average_or_none(values: &[Option<u64>]) -> Option<u64> {
 /// dry-run probes never enter the budget sum; unrun probes report
 /// `Inconclusive`, never a silent pass.
 #[must_use]
-pub fn compute_verdicts(results: &[FactoryEvalTrialResult], reference_prompts: Option<&[String]>) -> EvalVerdicts {
+pub fn compute_verdicts(
+    results: &[FactoryEvalTrialResult],
+    reference_prompts: Option<&[String]>,
+) -> EvalVerdicts {
     let is_paired_factory = |row: &FactoryEvalTrialResult| {
         row.arm == EvalArm::Factory
             && row.factory != ReferenceFactoryKind::ReviewSweepFail.as_str()
             && row.factory != ReferenceFactoryKind::DryRunReject.as_str()
     };
-    let factory_arms: Vec<&FactoryEvalTrialResult> = results.iter().filter(|row| is_paired_factory(row)).collect();
-    let escalation = results
+    let factory_arms: Vec<&FactoryEvalTrialResult> = results
         .iter()
-        .find(|row| row.factory == ReferenceFactoryKind::ReviewSweepFail.as_str() && row.arm == EvalArm::Factory);
-    let dry_run = results
-        .iter()
-        .find(|row| row.factory == ReferenceFactoryKind::DryRunReject.as_str() && row.arm == EvalArm::Factory);
+        .filter(|row| is_paired_factory(row))
+        .collect();
+    let escalation = results.iter().find(|row| {
+        row.factory == ReferenceFactoryKind::ReviewSweepFail.as_str() && row.arm == EvalArm::Factory
+    });
+    let dry_run = results.iter().find(|row| {
+        row.factory == ReferenceFactoryKind::DryRunReject.as_str() && row.arm == EvalArm::Factory
+    });
     let budget_overshoot_ms: u64 = factory_arms.iter().map(|row| row.budget_overshoot_ms).sum();
     let mut context_pairs: Vec<ContextPair> = Vec::new();
     for kind in ReferenceFactoryKind::selections() {
-        let factory_rows: Vec<&&FactoryEvalTrialResult> =
-            factory_arms.iter().filter(|row| row.factory == kind.as_str()).collect();
+        let factory_rows: Vec<&&FactoryEvalTrialResult> = factory_arms
+            .iter()
+            .filter(|row| row.factory == kind.as_str())
+            .collect();
         let baseline_rows: Vec<&FactoryEvalTrialResult> = results
             .iter()
             .filter(|row| row.arm == EvalArm::Baseline && row.factory == kind.as_str())
@@ -2570,9 +2756,17 @@ pub fn compute_verdicts(results: &[FactoryEvalTrialResult], reference_prompts: O
             continue;
         }
         let factory_context = average_or_none(
-            &factory_rows.iter().map(|row| row.context_tokens).collect::<Vec<_>>(),
+            &factory_rows
+                .iter()
+                .map(|row| row.context_tokens)
+                .collect::<Vec<_>>(),
         );
-        let baseline_context = average_or_none(&baseline_rows.iter().map(|row| row.context_tokens).collect::<Vec<_>>());
+        let baseline_context = average_or_none(
+            &baseline_rows
+                .iter()
+                .map(|row| row.context_tokens)
+                .collect::<Vec<_>>(),
+        );
         context_pairs.push(ContextPair {
             factory: kind.as_str().to_string(),
             factory_context_tokens: factory_context,
@@ -2585,17 +2779,20 @@ pub fn compute_verdicts(results: &[FactoryEvalTrialResult], reference_prompts: O
                 && baseline_rows.iter().all(|row| row.task_success),
         });
     }
-    let prompts = reference_prompts.map(<[String]>::to_vec).unwrap_or_else(|| build_reference_parent_prompts(DEFAULT_WIDTH));
+    let prompts = reference_prompts.map_or_else(
+        || build_reference_parent_prompts(DEFAULT_WIDTH),
+        <[String]>::to_vec,
+    );
     EvalVerdicts {
         // Computed from the built prompts (check_no_orchestration_code),
         // not a constant.
         no_orchestration_code: check_no_orchestration_code(&prompts),
-        failure_policy_matched: escalation
-            .map(|row| DefenseVerdict::from(Some(row.verdict == TrialVerdict::Pass)))
-            .unwrap_or(DefenseVerdict::Inconclusive),
-        dry_run_rejected: dry_run
-            .map(|row| DefenseVerdict::from(Some(row.verdict == TrialVerdict::Pass)))
-            .unwrap_or(DefenseVerdict::Inconclusive),
+        failure_policy_matched: escalation.map_or(DefenseVerdict::Inconclusive, |row| {
+            DefenseVerdict::from(Some(row.verdict == TrialVerdict::Pass))
+        }),
+        dry_run_rejected: dry_run.map_or(DefenseVerdict::Inconclusive, |row| {
+            DefenseVerdict::from(Some(row.verdict == TrialVerdict::Pass))
+        }),
         budget_overshoot_ms,
         budget_overshoot_zero: if factory_arms.is_empty() {
             DefenseVerdict::Inconclusive
@@ -2617,7 +2814,10 @@ fn render_defense_verdict(value: DefenseVerdict) -> &'static str {
 /// Render the markdown report: the trial table, the factory-vs-baseline
 /// context pairs, the pre-registered verdict rules, and every problem.
 #[must_use]
-pub fn render_markdown_report(results: &[FactoryEvalTrialResult], config: &FactoryEvalConfig) -> String {
+pub fn render_markdown_report(
+    results: &[FactoryEvalTrialResult],
+    config: &FactoryEvalConfig,
+) -> String {
     let header = [
         "# Factory capability eval report".to_string(),
         String::new(),
@@ -2650,13 +2850,20 @@ pub fn render_markdown_report(results: &[FactoryEvalTrialResult], config: &Facto
                 row.factory.clone(),
                 row.arm.as_str().to_string(),
                 row.trial.to_string(),
-                if row.task_success { "ok".to_string() } else { "failed".to_string() },
+                if row.task_success {
+                    "ok".to_string()
+                } else {
+                    "failed".to_string()
+                },
                 row.state.clone().unwrap_or_else(|| "n/a".to_string()),
                 format!("{:.1}", row.wall_ms as f64 / 1000.0),
-                row.context_tokens.map_or_else(|| "n/a".to_string(), |tokens| tokens.to_string()),
-                row.total_tokens.map_or_else(|| "n/a".to_string(), |tokens| tokens.to_string()),
+                row.context_tokens
+                    .map_or_else(|| "n/a".to_string(), |tokens| tokens.to_string()),
+                row.total_tokens
+                    .map_or_else(|| "n/a".to_string(), |tokens| tokens.to_string()),
                 row.declared_fan_in.to_string(),
-                row.teardown_latency_ms.map_or_else(|| "n/a".to_string(), |latency| latency.to_string()),
+                row.teardown_latency_ms
+                    .map_or_else(|| "n/a".to_string(), |latency| latency.to_string()),
                 row.budget_overshoot_ms.to_string(),
                 match row.replay_ok {
                     None => "n/a".to_string(),
@@ -2676,8 +2883,10 @@ pub fn render_markdown_report(results: &[FactoryEvalTrialResult], config: &Facto
             format!(
                 "| {} | {} | {} | {} | {} |",
                 pair.factory,
-                pair.factory_context_tokens.map_or_else(|| "n/a".to_string(), |tokens| tokens.to_string()),
-                pair.baseline_context_tokens.map_or_else(|| "n/a".to_string(), |tokens| tokens.to_string()),
+                pair.factory_context_tokens
+                    .map_or_else(|| "n/a".to_string(), |tokens| tokens.to_string()),
+                pair.baseline_context_tokens
+                    .map_or_else(|| "n/a".to_string(), |tokens| tokens.to_string()),
                 match pair.lower {
                     None => "n/a".to_string(),
                     Some(true) => "yes".to_string(),
@@ -2690,7 +2899,12 @@ pub fn render_markdown_report(results: &[FactoryEvalTrialResult], config: &Facto
     let mut problems: Vec<String> = Vec::new();
     for row in results {
         for problem in row.problems.iter().chain(row.replay_problems.iter()) {
-            problems.push(format!("- {}/{}/trial {}: {problem}", row.factory, row.arm.as_str(), row.trial));
+            problems.push(format!(
+                "- {}/{}/trial {}: {problem}",
+                row.factory,
+                row.arm.as_str(),
+                row.trial
+            ));
         }
     }
     if problems.is_empty() {
@@ -2729,7 +2943,12 @@ pub fn render_markdown_report(results: &[FactoryEvalTrialResult], config: &Facto
     ]);
     summary.extend(problems);
     summary.push(String::new());
-    header.into_iter().chain(rows).chain(summary).collect::<Vec<_>>().join("\n")
+    header
+        .into_iter()
+        .chain(rows)
+        .chain(summary)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The exact object `report.json` is written from (the shape `--replay`
@@ -2744,9 +2963,18 @@ pub struct EvalReportFile {
 
 /// Build the report.json payload.
 #[must_use]
-pub fn serialize_eval_report(config: &FactoryEvalConfig, results: Vec<FactoryEvalTrialResult>, generated_at: &str) -> EvalReportFile {
+pub fn serialize_eval_report(
+    config: &FactoryEvalConfig,
+    results: Vec<FactoryEvalTrialResult>,
+    generated_at: &str,
+) -> EvalReportFile {
     let verdicts = compute_verdicts(&results, None);
-    EvalReportFile { config: config.clone(), generated_at: generated_at.to_string(), results, verdicts }
+    EvalReportFile {
+        config: config.clone(),
+        generated_at: generated_at.to_string(),
+        results,
+        verdicts,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2822,7 +3050,9 @@ pub fn parse_eval_args(argv: &[String]) -> Result<FactoryEvalConfig, EvalArgsErr
         raw.parse::<u64>()
             .ok()
             .filter(|value| *value >= 1)
-            .ok_or_else(|| EvalArgsError::Message(format!("{flag} requires a positive integer, got {raw}")))
+            .ok_or_else(|| {
+                EvalArgsError::Message(format!("{flag} requires a positive integer, got {raw}"))
+            })
     };
     while index < argv.len() {
         let flag = argv[index].as_str();
@@ -2831,11 +3061,15 @@ pub fn parse_eval_args(argv: &[String]) -> Result<FactoryEvalConfig, EvalArgsErr
             "--model" => config.model = take_value(&mut index, flag)?,
             "--out" => config.out_dir = take_value(&mut index, flag)?,
             "--trials" => config.trials = positive_integer(flag, &take_value(&mut index, flag)?)?,
-            "--timeout-minutes" => config.timeout_minutes = positive_integer(flag, &take_value(&mut index, flag)?)?,
+            "--timeout-minutes" => {
+                config.timeout_minutes = positive_integer(flag, &take_value(&mut index, flag)?)?;
+            }
             "--width" => {
                 let parsed = positive_integer(flag, &take_value(&mut index, flag)?)?;
                 if parsed < 2 {
-                    return Err(EvalArgsError::Message(format!("{flag} requires an integer >= 2, got {parsed}")));
+                    return Err(EvalArgsError::Message(format!(
+                        "{flag} requires an integer >= 2, got {parsed}"
+                    )));
                 }
                 config.width = parsed.min(MAX_WIDTH);
             }
@@ -2855,8 +3089,9 @@ pub fn parse_eval_args(argv: &[String]) -> Result<FactoryEvalConfig, EvalArgsErr
                     match ReferenceFactoryKind::parse(name) {
                         Ok(kind) => selected.push(kind),
                         Err(unknown) => {
-                            let known: Vec<&str> =
-                                ReferenceFactoryKind::selections().map(ReferenceFactoryKind::as_str).to_vec();
+                            let known: Vec<&str> = ReferenceFactoryKind::selections()
+                                .map(ReferenceFactoryKind::as_str)
+                                .to_vec();
                             return Err(EvalArgsError::Message(format!(
                                 "Unknown factory in --factories: {unknown} (known: {})",
                                 known.join(", ")
@@ -2950,7 +3185,10 @@ pub fn checkout_runtime_dirs() -> (Option<std::path::PathBuf>, Option<std::path:
         .as_ref()
         .map(|runtime| runtime.join(".venv").join("bin").join("python"))
         .filter(|python| python.exists());
-    let source = runtime_root.as_ref().map(|runtime| runtime.join("src")).filter(|src| src.join("rlm").is_dir());
+    let source = runtime_root
+        .as_ref()
+        .map(|runtime| runtime.join("src"))
+        .filter(|src| src.join("rlm").is_dir());
     (venv, source)
 }
 
@@ -2976,10 +3214,15 @@ fn xdg_kernel_venv_dir() -> std::path::PathBuf {
     let data_home = std::env::var("XDG_DATA_HOME")
         .ok()
         .filter(|value| !value.is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            pa_types::platform::home_dir().unwrap_or_default().join(".local").join("share")
-        });
+        .map_or_else(
+            || {
+                pa_types::platform::home_dir()
+                    .unwrap_or_default()
+                    .join(".local")
+                    .join("share")
+            },
+            std::path::PathBuf::from,
+        );
     data_home.join("prime").join("agent").join("kernel-venv")
 }
 
@@ -2998,7 +3241,9 @@ fn xdg_kernel_venv_dir() -> std::path::PathBuf {
 /// must fail fast instead of letting the standard bootstrap rebuild the
 /// shared venv that live sessions run on.
 #[must_use]
-pub fn resolve_factory_kernel_python(explicit_pin: Option<std::path::PathBuf>) -> (Option<FactoryKernelPython>, bool) {
+pub fn resolve_factory_kernel_python(
+    explicit_pin: Option<std::path::PathBuf>,
+) -> (Option<FactoryKernelPython>, bool) {
     let (_, checkout_src) = checkout_runtime_dirs();
     let checkout_src = checkout_src.unwrap_or_else(|| {
         // No checkout source: the explicit candidates must stand alone.
@@ -3022,8 +3267,16 @@ pub fn resolve_factory_kernel_python(explicit_pin: Option<std::path::PathBuf>) -
     // 1. The caller's explicit pin: trusted as-is (the pin is the caller's
     // statement that this python is the right one), but still probed.
     if let Some(python) = explicit_pin {
-        if python.exists() && probe_factory_kernel_python(&python, std::env::var("PYTHONPATH").ok().as_deref()) {
-            return (Some(FactoryKernelPython { python, python_path: std::env::var("PYTHONPATH").ok() }), shared_exists);
+        if python.exists()
+            && probe_factory_kernel_python(&python, std::env::var("PYTHONPATH").ok().as_deref())
+        {
+            return (
+                Some(FactoryKernelPython {
+                    python,
+                    python_path: std::env::var("PYTHONPATH").ok(),
+                }),
+                shared_exists,
+            );
         }
     }
     // 2. The checkout-local runtime venv: an editable install of this
@@ -3031,7 +3284,13 @@ pub fn resolve_factory_kernel_python(explicit_pin: Option<std::path::PathBuf>) -
     let (venv, _) = checkout_runtime_dirs();
     if let Some(python) = venv {
         if probe_factory_kernel_python(&python, std::env::var("PYTHONPATH").ok().as_deref()) {
-            return (Some(FactoryKernelPython { python, python_path: std::env::var("PYTHONPATH").ok() }), shared_exists);
+            return (
+                Some(FactoryKernelPython {
+                    python,
+                    python_path: std::env::var("PYTHONPATH").ok(),
+                }),
+                shared_exists,
+            );
         }
     }
     // 3. The shared kernel venv (primary, then the XDG fallback): the venv's
@@ -3046,14 +3305,24 @@ pub fn resolve_factory_kernel_python(explicit_pin: Option<std::path::PathBuf>) -
         }
         let python_path = prepend_source(std::env::var("PYTHONPATH").ok());
         if probe_factory_kernel_python(&python, python_path.as_deref()) {
-            return (Some(FactoryKernelPython { python, python_path }), shared_exists);
+            return (
+                Some(FactoryKernelPython {
+                    python,
+                    python_path,
+                }),
+                shared_exists,
+            );
         }
     }
     (None, shared_exists)
 }
 
 fn path_sep() -> &'static str {
-    if cfg!(windows) { ";" } else { ":" }
+    if cfg!(windows) {
+        ";"
+    } else {
+        ":"
+    }
 }
 
 /// The venv recipe the fail-fast message carries (the TS-era recipe, still

@@ -610,6 +610,48 @@ impl SupervisorChildSessions {
     /// Test seam: admit one child record without the supervisor round trip
     /// (the controller tests exercise the family join on registry state).
     #[cfg(test)]
+    /// Push a child that already settled (test-only): the capture-recovery
+    /// regression — a settle that raced the admission-to-run hand-off left
+    /// the record settled with no captured answer, and the answer must
+    /// re-capture on the next refresh/collect read.
+    #[cfg(test)]
+    pub(crate) async fn push_test_settled_child(
+        &self,
+        identity: RlmChildIdentity,
+        settled_status: Option<&'static str>,
+        answer_preview: Option<String>,
+    ) {
+        self.inner
+            .children
+            .lock()
+            .await
+            .push(Arc::new(Mutex::new(ChildRecord {
+                rlm_child_id: identity.rlm_child_id,
+                session_name: identity.session_name,
+                active_session_id: identity.active_session_id,
+                session_id: identity.session_id.clone(),
+                session_dir: String::new(),
+                label: String::new(),
+                started_at_ms: 0,
+                settled_status,
+                answer_captured: answer_preview.is_some(),
+                answer_preview,
+                replied_since_task: false,
+                notice_delivered: false,
+                prompt_admitted: true,
+                error: None,
+                closed_by_parent: false,
+                session_file: None,
+                attributed_rows: 0,
+                usage_watch_live: false,
+                usage_rearm: false,
+                emit_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            })));
+    }
+
+    /// Test seam: admit one child record without the supervisor round trip
+    /// (the controller tests exercise the family join on registry state).
+    #[cfg(test)]
     pub(crate) async fn push_test_child(&self, identity: RlmChildIdentity) {
         self.inner
             .children

@@ -2164,6 +2164,20 @@ fn rejects_an_empty_factories_selection_instead_of_running_the_defaults() {
 }
 
 #[test]
+fn rejects_the_probe_kinds_as_factories_selections() {
+    // The probes run automatically once per sweep and have no baseline
+    // arm; selecting one would panic the baseline build, so the flag
+    // rejects them with the selections list.
+    for probe in ["review-sweep-fail", "dry-run-reject"] {
+        let result = parse_eval_args(&["--factories".to_string(), probe.to_string()]);
+        assert!(
+            matches!(&result, Err(EvalArgsError::Message(message)) if message.contains("is a probe, not a selectable factory")),
+            "--factories {probe} must be rejected as a probe: {result:?}"
+        );
+    }
+}
+
+#[test]
 fn rejects_an_unknown_factory_before_any_token_is_spent() {
     let result = parse_eval_args(&["--factories".to_string(), "review-sweep,typo".to_string()]);
     assert!(

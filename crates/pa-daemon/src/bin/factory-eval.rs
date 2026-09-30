@@ -325,6 +325,15 @@ struct TrialCaptured {
     total_tokens: Option<u64>,
 }
 
+/// A drive failure: the error message plus the created session id when one
+/// exists — the cleanup kills that session instead of leaking it (a failed
+/// trial must never leave a live session spending tokens after its row is
+/// recorded).
+struct TrialDriveError {
+    message: String,
+    session_id: Option<String>,
+}
+
 /// Create the trial session, drive its parent turn to completion, and
 /// capture the ANSWER and the token counts. Cleanup is the caller's
 /// (`run_trial` kills the session and removes the trial dir on every
@@ -339,58 +348,90 @@ fn drive_trial(
     trial_root: &Path,
     sessions_dir: &Path,
     ledger_path: &Path,
-) -> Result<TrialCaptured, String> {
-    fs::create_dir_all(sessions_dir).map_err(|error| format!("create the trial dir: {error}"))?;
+) -> Result<TrialCaptured, TrialDriveError> {
+    let fail = |message: String| TrialDriveError {
+        message,
+        session_id: None,
+    };
+    fs::create_dir_all(sessions_dir).map_err(|error| TrialDriveError {
+        message: format!("create the trial dir: {error}"),
+        session_id: None,
+    })?;
     let Some((provider, model_id)) = config.model.split_once('/') else {
-        return Err(format!("model must be provider/id, got {}", config.model));
+        return Err(fail(format!(
+            "model must be provider/id, got {}",
+            config.model
+        )));
     };
     let prompt = match arm {
         EvalArm::Factory => build_factory_parent_prompt(factory, &ledger_path.to_string_lossy()),
         EvalArm::Baseline => build_baseline_prompt(factory, &ledger_path.to_string_lossy()),
     };
-    let created = client.command_data(
-        &json!({
-            "type": "create",
-            "name": format!("factory-eval-{}-{}-{trial}", factory.kind.as_str(), arm.as_str()),
-            "config": {
-                "cwd": trial_root.to_string_lossy(),
-                "sessionDir": sessions_dir.to_string_lossy(),
-                "provider": provider,
-                "model": model_id,
-            }
-        }),
-        Duration::from_mins(2),
-    )?;
+    let created = client
+        .command_data(
+            &json!({
+                "type": "create",
+                "name": format!("factory-eval-{}-{}-{trial}", factory.kind.as_str(), arm.as_str()),
+                "config": {
+                    "cwd": trial_root.to_string_lossy(),
+                    "sessionDir": sessions_dir.to_string_lossy(),
+                    "provider": provider,
+                    "model": model_id,
+                }
+            }),
+            Duration::from_mins(2),
+        )
+        .map_err(|message| TrialDriveError {
+            message,
+            session_id: None,
+        })?;
     let session_id = created
         .get("activeSessionId")
         .and_then(Value::as_str)
         .or_else(|| created.get("sessionId").and_then(Value::as_str))
-        .ok_or_else(|| format!("create returned no session id: {created}"))?
+        .ok_or_else(|| TrialDriveError {
+            message: format!("create returned no session id: {created}"),
+            session_id: None,
+        })?
         .to_string();
 
     // The whole trial is one parent turn, bounded by the trial timeout:
     // `prompt_and_wait` answers only when the turn completes.
-    client.command_data(
-        &json!({
-            "type": "prompt_and_wait",
-            "activeSessionId": session_id,
-            "message": prompt,
-        }),
-        Duration::from_secs(config.timeout_minutes * 60),
-    )?;
+    client
+        .command_data(
+            &json!({
+                "type": "prompt_and_wait",
+                "activeSessionId": session_id,
+                "message": prompt,
+            }),
+            Duration::from_secs(config.timeout_minutes * 60),
+        )
+        .map_err(|message| TrialDriveError {
+            message,
+            session_id: Some(session_id.clone()),
+        })?;
     let final_text = client
         .command_data(
             &json!({ "type": "get_last_assistant_text", "activeSessionId": session_id }),
             Duration::from_secs(30),
-        )?
+        )
+        .map_err(|message| TrialDriveError {
+            message,
+            session_id: Some(session_id.clone()),
+        })?
         .get("text")
         .and_then(Value::as_str)
         .map(str::to_string);
     let answer = parse_answer_line(final_text.as_deref());
-    let stats = client.command_data(
-        &json!({ "type": "get_session_stats", "activeSessionId": session_id }),
-        Duration::from_secs(30),
-    )?;
+    let stats = client
+        .command_data(
+            &json!({ "type": "get_session_stats", "activeSessionId": session_id }),
+            Duration::from_secs(30),
+        )
+        .map_err(|message| TrialDriveError {
+            message,
+            session_id: Some(session_id.clone()),
+        })?;
     let context_tokens = stats
         .get("contextUsage")
         .and_then(|usage| usage.get("tokens"))
@@ -427,7 +468,7 @@ fn run_trial(
     ));
     let sessions_dir = trial_root.join("sessions");
     let ledger_path = trial_root.join("ledger.json");
-    let outcome: Result<TrialCaptured, String> = drive_trial(
+    let outcome: Result<TrialCaptured, TrialDriveError> = drive_trial(
         client,
         config,
         factory,
@@ -437,74 +478,90 @@ fn run_trial(
         &sessions_dir,
         &ledger_path,
     );
+    // The parent's ledger dump is read BEFORE the cleanup deletes the trial
+    // dir (a factory arm scores against this dump; a baseline arm reads its
+    // own collect dump from the same path).
+    let ledger_dump = read_json_file(&ledger_path);
     // Cleanup on every path: the session is killed and the trial dir removed
     // whether the trial scored or errored, so a failed trial can never leave
-    // a live session issuing real model requests after it ends.
-    if let Ok(captured) = &outcome {
+    // a live session issuing real model requests after it ends — a drive
+    // that failed after its create still carries the created session id on
+    // the error for exactly this kill.
+    let kill_session_id = match &outcome {
+        Ok(captured) => Some(captured.session_id.clone()),
+        Err(drive_error) => drive_error.session_id.clone(),
+    };
+    if let Some(session_id) = kill_session_id {
         let _ = client.command(
-            &json!({ "type": "kill", "activeSessionId": captured.session_id }),
+            &json!({ "type": "kill", "activeSessionId": session_id }),
             Duration::from_secs(30),
         );
     }
     let _ = fs::remove_dir_all(&trial_root);
     let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     match outcome {
-        Err(message) => {
-            FactoryEvalTrialResult::error_row(factory, arm, trial, &config.model, &message, wall_ms)
-        }
-        Ok(captured) => match arm {
-            EvalArm::Factory => {
-                let ledger = read_json_file(&ledger_path);
-                let check = check_task_success(
-                    factory,
-                    captured.answer.as_ref(),
-                    ledger.as_ref(),
-                    EvalArm::Factory,
-                    None,
-                );
-                let replay = ledger.as_ref().map(check_replay_ledger);
-                let ledger_missing =
-                    ledger.is_none() && factory.kind != ReferenceFactoryKind::DryRunReject;
-                let mut problems = Vec::new();
-                if ledger_missing {
-                    problems.push("status ledger was not written".to_string());
+        Err(drive_error) => FactoryEvalTrialResult::error_row(
+            factory,
+            arm,
+            trial,
+            &config.model,
+            &drive_error.message,
+            wall_ms,
+        ),
+        Ok(captured) => {
+            let ledger = ledger_dump;
+            match arm {
+                EvalArm::Factory => {
+                    let check = check_task_success(
+                        factory,
+                        captured.answer.as_ref(),
+                        ledger.as_ref(),
+                        EvalArm::Factory,
+                        None,
+                    );
+                    let replay = ledger.as_ref().map(check_replay_ledger);
+                    let ledger_missing =
+                        ledger.is_none() && factory.kind != ReferenceFactoryKind::DryRunReject;
+                    let mut problems = Vec::new();
+                    if ledger_missing {
+                        problems.push("status ledger was not written".to_string());
+                    }
+                    FactoryEvalTrialResult::factory_row(
+                        factory,
+                        trial,
+                        &config.model,
+                        &check,
+                        problems,
+                        captured.answer,
+                        ledger,
+                        replay.as_ref(),
+                        wall_ms,
+                        captured.context_tokens,
+                        captured.total_tokens,
+                    )
                 }
-                FactoryEvalTrialResult::factory_row(
-                    factory,
-                    trial,
-                    &config.model,
-                    &check,
-                    problems,
-                    captured.answer,
-                    ledger,
-                    replay.as_ref(),
-                    wall_ms,
-                    captured.context_tokens,
-                    captured.total_tokens,
-                )
+                EvalArm::Baseline => {
+                    let check = check_task_success(
+                        factory,
+                        captured.answer.as_ref(),
+                        None,
+                        EvalArm::Baseline,
+                        ledger.as_ref(),
+                    );
+                    FactoryEvalTrialResult::baseline_row(
+                        factory,
+                        trial,
+                        &config.model,
+                        &check,
+                        Vec::new(),
+                        captured.answer,
+                        wall_ms,
+                        captured.context_tokens,
+                        captured.total_tokens,
+                    )
+                }
             }
-            EvalArm::Baseline => {
-                let baseline_ledger = read_json_file(&ledger_path);
-                let check = check_task_success(
-                    factory,
-                    captured.answer.as_ref(),
-                    None,
-                    EvalArm::Baseline,
-                    baseline_ledger.as_ref(),
-                );
-                FactoryEvalTrialResult::baseline_row(
-                    factory,
-                    trial,
-                    &config.model,
-                    &check,
-                    Vec::new(),
-                    captured.answer,
-                    wall_ms,
-                    captured.context_tokens,
-                    captured.total_tokens,
-                )
-            }
-        },
+        }
     }
 }
 

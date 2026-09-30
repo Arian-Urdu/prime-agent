@@ -601,6 +601,15 @@ impl ReferenceFactoryKind {
             Self::PrManager,
         ]
     }
+
+    /// Whether the kind is one of the sweep's automatic probes (they run
+    /// once per sweep, never as `--factories` selections — a probe has no
+    /// baseline arm, and the old TS harness rejected them from the flag
+    /// the same way).
+    #[must_use]
+    pub fn is_probe(self) -> bool {
+        matches!(self, Self::ReviewSweepFail | Self::DryRunReject)
+    }
 }
 
 /// One reference factory: the stored spec plus its declared shape (the
@@ -2497,6 +2506,8 @@ impl TrialVerdict {
 
 impl FactoryEvalTrialResult {
     /// Build the factory-arm row from a scored trial.
+    // The row carries every measured dimension of one trial (the TS-era row
+    // had the same width); the inputs ARE the trial's outputs.
     #[allow(clippy::too_many_arguments)]
     pub fn factory_row(
         factory: &ReferenceFactory,
@@ -2522,11 +2533,10 @@ impl FactoryEvalTrialResult {
             elapsed.saturating_sub(factory.declared_budget_ms)
         });
         problems.extend(task_check.problems.iter().cloned());
-        let replay_problems: Vec<String> = replay
-            .as_ref()
-            .map(|replay| replay.problems.clone())
-            .unwrap_or_default();
-        problems.extend(replay_problems.iter().cloned());
+        // The replay problems ride their own field (the renderer chains
+        // row.problems with row.replay_problems, exactly like the TS-era
+        // row split — merging them here would double-list every replay
+        // problem in the report).
         let replay_ok = replay.as_ref().map(|replay| replay.ok);
         let verdict = if task_check.ok
             && problems.is_empty()
@@ -2570,7 +2580,10 @@ impl FactoryEvalTrialResult {
                 .and_then(|usage| usage.get("settled"))
                 .and_then(Value::as_u64),
             replay_ok,
-            replay_problems,
+            replay_problems: replay
+                .as_ref()
+                .map(|replay| replay.problems.clone())
+                .unwrap_or_default(),
             answer,
             ledger,
             verdict,
@@ -2579,6 +2592,8 @@ impl FactoryEvalTrialResult {
 
     /// Build the baseline-arm row: the wall clock is the arm's overshoot
     /// upper bound against the same declared budget.
+    // The row carries every measured dimension of one trial (the TS-era row
+    // had the same width); the inputs ARE the trial's outputs.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn baseline_row(
@@ -3087,7 +3102,22 @@ pub fn parse_eval_args(argv: &[String]) -> Result<FactoryEvalConfig, EvalArgsErr
                 let mut selected: Vec<ReferenceFactoryKind> = Vec::new();
                 for name in &names {
                     match ReferenceFactoryKind::parse(name) {
-                        Ok(kind) => selected.push(kind),
+                        Ok(kind) if !kind.is_probe() => selected.push(kind),
+                        Ok(probe) => {
+                            // A probe runs automatically once per sweep and
+                            // has no baseline arm — selecting one would
+                            // panic the baseline build, so the flag rejects
+                            // it with the selections list.
+                            let known: Vec<&str> = ReferenceFactoryKind::selections()
+                                .map(ReferenceFactoryKind::as_str)
+                                .to_vec();
+                            return Err(EvalArgsError::Message(format!(
+                                "{} is a probe, not a selectable factory; the probes run \
+                                 automatically once per sweep (the selections are: {})",
+                                probe.as_str(),
+                                known.join(", ")
+                            )));
+                        }
                         Err(unknown) => {
                             let known: Vec<&str> = ReferenceFactoryKind::selections()
                                 .map(ReferenceFactoryKind::as_str)

@@ -1,9 +1,20 @@
-//! The parent's terminal notices: the durable custom rows a child run's
-//! end delivers to its parent — no-reply completion, failure, and the
-//! delete-path cancellation (TS `createRlmChildTerminalNoticeMessage` /
-//! `createRlmChildFailureMessage`, `_deferRlmTerminalNotice`'s two arms).
+//! The parent's terminal notices: the retained custom rows a child
+//! run's end leaves on its parent — no-reply completion, failure, and
+//! the delete-path cancellation (TS `createRlmChildTerminalNoticeMessage`
+//! / `createRlmChildFailureMessage`).
+//!
+//! Delivery is one coherent contract, no spawns, no retries, no
+//! volatile fallbacks: the row is retained on the parent BEFORE the
+//! caller records the settled state. An idle parent receives it as its
+//! own admitted turn (the loop persists the row through its
+//! `message_end`); a busy parent gets the row appended to its session
+//! file immediately (the durable store: visible to `/resume`, the agents
+//! view, offline inspection, and the next context rebuild). Live
+//! delivery into the CURRENT turn's context is the embedding's queue
+//! pump — the daemon's lanes, a guest input surface — and is a reported
+//! boundary of this host, not a hidden untracked task.
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use super::registry::InProcessChildRecord;
 use super::{now_ms, InProcessRlmHost};
@@ -12,96 +23,55 @@ use crate::session_engine::rlm_notices::{
     create_rlm_child_failure_message, create_rlm_child_terminal_notice, RlmChildTerminalNotice,
 };
 
-/// How many idle windows a deferred notice admission may lose to a busy
-/// race before the volatile next-turn mailbox becomes the terminal
-/// fallback (a genuine admission failure, not a busy race, drops to it
-/// immediately).
-const DEFERRED_ADMISSION_ATTEMPTS: u8 = 3;
-
-/// Deliver one terminal custom row to the parent session (TS's deferred
-/// immediate action): while the parent is idle, the row is admitted as
-/// its own turn through the admission-only prompt (TS
-/// `_enqueueRlmTerminalNoticeAction`); while the parent runs, the row is
-/// parked and a deferred admission task — owned by this host, holding
-/// only a weak parent edge — admits it as the parent's own turn when the
-/// current run ends (an abort included), so no future user turn is ever
-/// required. The caller may settle the child once this returns: the row
-/// is admitted or durably scheduled.
+/// Retain one terminal notice row on the parent.
+///
+/// Idle parent: admit the row as its own turn through the admission-only
+/// prompt — the run is live, its `message_end` persists the row, and the
+/// caller's settle follows the acknowledged admission. Busy parent (or a
+/// turn racing the idle check, or a genuine admission failure): append the
+/// row to the parent's session file NOW — the durable retention TS
+/// achieves with its admitted action; no future user turn is required
+/// for the row to exist. The parent engine is held for the whole
+/// retention (a strong Arc across the append), so a concurrent parent
+/// drop cannot lose the row mid-delivery.
 async fn deliver_notice_row(host: &InProcessRlmHost, row: pa_types::session::CustomMessage) {
     let Some(parent) = host.parent_engine() else {
         return;
     };
     let session = &parent.session;
-    if session.agent().state().await.is_streaming {
-        defer_notice_row(Arc::downgrade(&parent), row);
+    if !session.agent().state().await.is_streaming
+        && session
+            .prompt_injected_message_until_accepted(&row)
+            .await
+            .is_ok()
+    {
         return;
     }
-    match session.prompt_injected_message_until_accepted(&row).await {
-        Ok(_) => {}
-        Err(error) => {
-            if session.agent().state().await.is_streaming {
-                // A turn raced the idle check: the deferred action owns
-                // the busy arm, same as above.
-                defer_notice_row(Arc::downgrade(&parent), row);
-            } else {
-                // A genuine admission failure (a digest capture, say) is
-                // exceptional: the next-turn mailbox is the terminal
-                // fallback so the row is never dropped outright.
-                let _ = error;
-                session.queue_next_turn_row(row);
-            }
-        }
-    }
+    retain_notice_row(&parent, &row).await;
 }
 
-/// Park the row and admit it as the parent's own turn once the current
-/// run ends (TS `_deferRlmTerminalNotice`'s admitted action, without the
-/// steer lane's drain-only-while-looping failure: an aborted run ends
-/// without draining, and this task still delivers). Weak-held: a parent
-/// that goes away cancels the deferral with it.
-fn defer_notice_row(parent_weak: Weak<SessionEngine>, row: pa_types::session::CustomMessage) {
-    tokio::spawn(async move {
-        for _ in 0..DEFERRED_ADMISSION_ATTEMPTS {
-            let Some(parent) = parent_weak.upgrade() else {
-                return;
-            };
-            let agent = parent.session.agent().clone();
-            drop(parent);
-            agent.wait_for_idle().await;
-            let Some(parent) = parent_weak.upgrade() else {
-                return;
-            };
-            if parent
-                .session
-                .prompt_injected_message_until_accepted(&row)
-                .await
-                .is_ok()
-            {
-                return;
-            }
-            if parent.session.agent().state().await.is_streaming {
-                // A new turn started between the idle window and the
-                // admission: wait for the next one.
-                continue;
-            }
-            // Exceptional (non-busy) failure: the durable next-turn
-            // mailbox as the terminal fallback.
-            parent.session.queue_next_turn_row(row);
-            return;
-        }
-    });
+/// Append the row to the parent's session file (the durable store for a
+/// busy or unadmittable notice). Failures are swallowed like TS swallows
+/// a failed `_deferRlmTerminalNotice` fence: the retention is
+/// best-effort against I/O, never against ownership.
+async fn retain_notice_row(parent: &Arc<SessionEngine>, row: &pa_types::session::CustomMessage) {
+    let persistence = parent.session.shared_persistence();
+    let mut session = persistence.lock().await;
+    let _ = session.append_custom_message(
+        &row.custom_type,
+        row.content.clone(),
+        row.display,
+        row.details.clone(),
+    );
 }
 
 /// The child failed: `[child-failed child:<name>]` (TS
-/// `createRlmChildFailureMessage`), claimed exactly once.
+/// `createRlmChildFailureMessage`). The caller holds the claimed notice.
 pub(super) async fn deliver_failure_notice(
     host: &InProcessRlmHost,
     record: &Arc<InProcessChildRecord>,
     error: &str,
 ) {
-    if !record.claim_notice().await {
-        return;
-    }
     let row = create_rlm_child_failure_message(
         &record.rlm_child_id,
         &record.session_name,
@@ -113,14 +83,11 @@ pub(super) async fn deliver_failure_notice(
 
 /// The child finished without an agent-message reply: `[child-exited:
 /// no-reply child:<name>]` with the last assistant text (TS
-/// `completed_without_reply`), claimed exactly once.
+/// `completed_without_reply`). The caller holds the claimed notice.
 pub(super) async fn deliver_no_reply_notice(
     host: &InProcessRlmHost,
     record: &Arc<InProcessChildRecord>,
 ) {
-    if !record.claim_notice().await {
-        return;
-    }
     let preview = record.state().await.answer_preview.clone();
     let row = create_rlm_child_terminal_notice(
         &RlmChildTerminalNotice::CompletedWithoutReply {
@@ -134,16 +101,13 @@ pub(super) async fn deliver_no_reply_notice(
 }
 
 /// The parent deleted a still-running child: `[child-exited: cancelled
-/// child:<name>]` (TS `completeDeletion`). The delete path owns this
-/// notice; the run arm already suppressed its own through the claim.
+/// child:<name>]` (TS `completeDeletion`). The delete path holds the
+/// claimed notice.
 pub(super) async fn deliver_cancelled_notice(
     host: &InProcessRlmHost,
     record: &Arc<InProcessChildRecord>,
     reason: &str,
 ) {
-    if !record.claim_notice().await {
-        return;
-    }
     let row = create_rlm_child_terminal_notice(
         &RlmChildTerminalNotice::Cancelled {
             child_id: record.rlm_child_id.clone(),

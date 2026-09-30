@@ -16,6 +16,21 @@
 //! in-process parent/siblings/children). Divergences are documented on
 //! each seam.
 //!
+//! Terminal-notice contract (one coherent rule, no background tasks): a
+//! child's settled verdict is owned by whoever wins its notice claim,
+//! the notice is RETAINED on the parent before the verdict becomes
+//! observable (an idle parent admits it as its own turn — the loop
+//! persists the row; a busy parent gets the row appended to its session
+//! file immediately), and the settled verdict always agrees with the
+//! claimed notice. A delete that loses the claim (the run's notice is
+//! mid-flight) waits for the agreed verdict and reports it in its
+//! receipt instead of racing a cancelled over it. Reported boundary,
+//! not a hidden mechanism: live delivery into the CURRENT turn's context
+//! requires the embedding's queue pump (the daemon's lanes, a guest
+//! input surface) — a busy-parent notice is durably retained, and it
+//! enters the live context at the next admitted turn or context
+//! rebuild; this host claims no mid-run live-delivery parity.
+//!
 //! Remote family boundary: a resident embedding that adopts this host as
 //! its ROOT must supply the [`RlmRemoteFamily`] seam at composition time
 //! — the guest root's cloud parent/siblings live beyond the sandbox, and
@@ -357,10 +372,11 @@ impl InProcessRlmHost {
     pub async fn close_children(&self) {
         let children = self.children().await;
         for record in &children {
-            // No notice is owed (the parent is going away), and the
-            // closed watch wakes the run task's prompt race so its own
-            // descendants cascade through the teardown.
-            record.state().await.notice_delivered = true;
+            // No notice is owed or delivered (the parent is going away):
+            // the suppression claim keeps every racing claimant deferred,
+            // and the closed watch wakes the run task's prompt race so its
+            // own descendants cascade through the teardown.
+            record.suppress_notice().await;
             record.mark_closed().await;
             let () = record
                 .settle_as("cancelled", Some("Closed with parent session".to_string()))

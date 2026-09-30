@@ -735,14 +735,13 @@ async fn deleting_a_child_closes_its_own_running_descendants() {
 }
 
 #[tokio::test]
-async fn a_notice_to_a_busy_parent_delivers_with_no_future_user_turn() {
+async fn a_notice_to_a_busy_parent_is_retained_durably_before_the_run_ends() {
     let rig = TestRig::new().await;
     // The parent runs a stalled turn; the child fails instantly, so its
-    // failure notice fires while the parent is busy. The notice must NOT
-    // ride the steering lane (an aborted run never drains it) nor wait
-    // for a future user prompt: the host's deferred admission task admits
-    // it as the parent's own turn once the current run ends — here by
-    // ABORT, with no further prompt from the test.
+    // failure notice fires while the parent is busy. The row must be
+    // RETAINED on the parent (durable session-file append) BEFORE the
+    // child's settle becomes observable — no user turn, no run end, no
+    // steering lane, no background task.
     rig.catalog.provider("glm-5.3").push_stalled_turn("busy");
     rig.engine
         .session
@@ -772,52 +771,59 @@ async fn a_notice_to_a_busy_parent_delivers_with_no_future_user_turn() {
         ))
         .await
         .unwrap();
-    // Abort the busy parent — the ONLY thing that ends its run. No user
-    // turn is ever prompted afterwards; the deferred admission task must
-    // deliver the notice on its own.
-    rig.catalog
-        .provider("glm-5.3")
-        .push_text_turn("notice reply");
-    rig.engine.session.agent().abort();
-    let parent = Arc::clone(&rig.engine);
+    // The collect settles only after the retention, so at its return the
+    // failure row is already in the parent's durable entries — while the
+    // parent's own run is STILL streaming.
+    rig.catalog.provider("glm-5.3").push_text_turn("after");
+    let collected = rig
+        .host
+        .collect(vec![handle.rlm_child_id.clone()], 10_000)
+        .await
+        .unwrap();
+    assert_eq!(one(&collected).status, "error");
+    assert!(
+        rig.engine.session.agent().state().await.is_streaming,
+        "the parent's stalled turn is still running at the collect return"
+    );
     let target_id = handle.rlm_child_id.clone();
-    eventually("the failure notice row after the abort", move || {
-        let parent = Arc::clone(&parent);
-        let target_id = target_id.clone();
-        async move {
-            let rows = parent
-                .session
-                .shared_persistence()
-                .lock()
-                .await
-                .get_entries();
-            rows.iter().any(|entry| {
-                matches!(
-                    entry,
-                    pa_types::session::FileEntry::CustomMessage { payload, .. }
-                        if payload.custom_type
-                            == crate::session_engine::rlm_notices::RLM_CHILD_FAILURE_CUSTOM_TYPE
-                            && payload.details.as_ref()
-                                .and_then(|details| details.get("childId"))
-                                .and_then(serde_json::Value::as_str)
-                                == Some(target_id.as_str())
-                )
-            })
-        }
-    })
-    .await;
-    // The delivered row never rode the steering lane (the failed steer
-    // design is gone): nothing is queued on it.
+    let retained = rig.parent_rows().await.iter().any(|entry| {
+        matches!(
+            entry,
+            pa_types::session::FileEntry::CustomMessage { payload, .. }
+                if payload.custom_type
+                    == crate::session_engine::rlm_notices::RLM_CHILD_FAILURE_CUSTOM_TYPE
+                    && payload.details.as_ref()
+                        .and_then(|details| details.get("childId"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(target_id.as_str())
+        )
+    });
+    assert!(
+        retained,
+        "the failure notice is retained in the parent's entries before the busy run ends"
+    );
+    // Nothing ever rode the steering lane.
     assert!(rig.engine.session.agent().steering_previews().is_empty());
+    // End the parent's stalled turn: the retained row survives.
+    rig.engine.session.agent().abort();
+    let retained_after = rig.parent_rows().await.iter().any(|entry| {
+        matches!(
+            entry,
+            pa_types::session::FileEntry::CustomMessage { payload, .. }
+                if payload.custom_type
+                    == crate::session_engine::rlm_notices::RLM_CHILD_FAILURE_CUSTOM_TYPE
+        )
+    });
+    assert!(retained_after);
 }
 
 #[tokio::test]
-async fn a_delete_on_a_busy_parent_settles_then_delivers_the_cancelled_notice() {
+async fn a_delete_on_a_busy_parent_retains_the_cancelled_notice_at_the_receipt() {
     let rig = TestRig::new().await;
-    // The parent is busy when the delete's cancellation notice fires, so
-    // the notice is durably scheduled (the deferred admission task) and
-    // the delete settles its receipt; the notice delivers once the busy
-    // turn ends — no user turn after the abort.
+    // The parent is busy when the delete's cancellation notice fires: the
+    // row is appended durably BEFORE the cancelled verdict settles, so
+    // the delete receipt itself implies retention — a concurrent collect
+    // can never observe the settled verdict ahead of it.
     rig.catalog.provider("glm-5.3").push_stalled_turn("busy");
     rig.engine
         .session
@@ -852,49 +858,71 @@ async fn a_delete_on_a_busy_parent_settles_then_delivers_the_cancelled_notice() 
         .delete_subagent(handle.rlm_child_id.clone())
         .await
         .unwrap();
-    // The receipt settles (the notice is durably scheduled — single
-    // ownership holds: the run task never wrote the verdict, so no
-    // collect could observe the settle before this scheduling).
     assert_eq!(deleted.outcome, Some("deleted"));
-    assert_eq!(deleted.subagent.status, "cancelled");
+    // At the receipt's return the cancelled notice row is already in the
+    // parent's durable entries — while the parent's run still streams,
+    // with no user turn and no background delivery.
+    let target_id = handle.rlm_child_id.clone();
+    let retained = rig.parent_rows().await.iter().any(|entry| {
+        matches!(
+            entry,
+            pa_types::session::FileEntry::CustomMessage { payload, .. }
+                if payload.custom_type
+                    == crate::session_engine::rlm_notices::RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE
+                    && payload.details.as_ref()
+                        .and_then(|details| details.get("childId"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(target_id.as_str())
+        )
+    });
+    assert!(
+        retained,
+        "the cancelled notice is retained before the delete receipt returns"
+    );
+    assert!(
+        rig.engine.session.agent().state().await.is_streaming,
+        "no delivery task ran: the parent's stalled turn is still going"
+    );
+    // The tombstone envelope answers the deleted selector.
     let collected = rig
         .host
         .collect(vec![handle.rlm_child_id.clone()], 0)
         .await
         .unwrap();
     assert_eq!(one(&collected).status, "cancelled");
-    // End the busy turn WITHOUT a user prompt: the deferred task delivers.
-    rig.catalog
-        .provider("glm-5.3")
-        .push_text_turn("notice reply");
     rig.engine.session.agent().abort();
-    let parent = Arc::clone(&rig.engine);
-    let target_id = handle.rlm_child_id.clone();
-    eventually("the cancelled notice row after the abort", move || {
-        let parent = Arc::clone(&parent);
-        let target_id = target_id.clone();
-        async move {
-            let rows = parent
-                .session
-                .shared_persistence()
-                .lock()
-                .await
-                .get_entries();
-            rows.iter().any(|entry| {
-                matches!(
-                    entry,
-                    pa_types::session::FileEntry::CustomMessage { payload, .. }
-                        if payload.custom_type
-                            == crate::session_engine::rlm_notices::RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE
-                            && payload.details.as_ref()
-                                .and_then(|details| details.get("childId"))
-                                .and_then(serde_json::Value::as_str)
-                                == Some(target_id.as_str())
-                )
-            })
-        }
-    })
-    .await;
+}
+
+#[tokio::test]
+async fn deleting_a_settled_child_reports_the_agreed_verdict() {
+    let rig = TestRig::new().await;
+    rig.catalog.provider("glm-5.3-turbo").push_text_turn("done");
+    let handle = rig
+        .host
+        .spawn(spawn_request(
+            Some("finished"),
+            Some("test-provider/glm-5.3-turbo"),
+        ))
+        .await
+        .unwrap();
+    let collected = rig
+        .host
+        .collect(vec![handle.rlm_child_id.clone()], 10_000)
+        .await
+        .unwrap();
+    assert_eq!(one(&collected).status, "done");
+    // The run's no-reply notice owns the done verdict; the delete's
+    // cancelled claim loses and the receipt reports the AGREED verdict.
+    let deleted = rig
+        .host
+        .delete_subagent(handle.rlm_child_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(deleted.outcome, Some("deleted"));
+    assert_eq!(
+        deleted.subagent.status, "completed",
+        "the receipt reports the run's claimed verdict, not a racing cancelled"
+    );
 }
 
 #[tokio::test]

@@ -6,6 +6,7 @@
 use pa_types::ai::Usage;
 use pa_types::session::ChildUsageOrigin;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{watch, Mutex};
 
 use super::InProcessRlmHost;
@@ -28,6 +29,21 @@ pub struct ChildIdentity {
     pub rlm_child_id: String,
     pub session_id: String,
     pub session_name: String,
+}
+
+/// The kind of terminal notice one record may owe its parent — and the
+/// settled verdict that agrees with it (the claim fixes both).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoticeKind {
+    /// Completed without an agent-message reply: the no-reply row, the
+    /// `done` verdict.
+    NoReply,
+    /// Failed: the failure row, the `error` verdict.
+    Failure,
+    /// Deleted by the parent: the cancelled row, the `cancelled` verdict.
+    Cancelled,
+    /// Closed with the parent session: no notice is owed or delivered.
+    Suppressed,
 }
 
 /// The live child activity (TS `RlmChildRun.activity`): `waiting` while a
@@ -81,9 +97,12 @@ pub(crate) struct ChildRunState {
     /// was admitted (TS `_parentReplyCount`): the no-reply terminal notice
     /// is withheld once set.
     pub(crate) replied_since_task: bool,
-    /// Exactly one of the settle arm, the delete arm, or a late natural
-    /// settle delivers the terminal notice (double-claim races collapse).
-    pub(crate) notice_delivered: bool,
+    /// The terminal-notice claim: single ownership of the notice AND the
+    /// settled verdict that must agree with it. `None` until claimed;
+    /// once taken, every later claimant observes `None` and defers to the
+    /// holder. `NoticeKind::Suppressed` marks `close_children`'s no-notice
+    /// verdict.
+    pub(crate) notice: Option<NoticeKind>,
     /// The task prompt was admitted. Readers must not settle a pre-prompt
     /// child: it is idle by construction.
     pub(crate) prompt_admitted: bool,
@@ -137,7 +156,7 @@ impl InProcessChildRecord {
                 answer_preview: None,
                 error: None,
                 replied_since_task: false,
-                notice_delivered: false,
+                notice: None,
                 prompt_admitted: false,
                 closed_by_parent: false,
                 tool_use_count: 0,
@@ -226,17 +245,38 @@ impl InProcessChildRecord {
         }
     }
 
-    /// Claim the terminal notice exactly once: `true` for the caller that
-    /// must deliver it. A failed claim leaves the delivered flag
-    /// untouched (an already-delivered notice never re-arms for a later
-    /// claimant).
-    pub(crate) async fn claim_notice(&self) -> bool {
+    /// Claim the terminal notice. The FIRST claim wins and fixes the
+    /// settled verdict the claimant must then deliver and settle with;
+    /// every later claimant observes `None` and defers to the holder
+    /// (the delete arm waits for the holder's settle instead of racing
+    /// its own verdict). A failed claim changes nothing.
+    pub(crate) async fn claim_notice(&self, kind: NoticeKind) -> Option<NoticeKind> {
         let mut state = self.state().await;
-        if state.notice_delivered {
-            return false;
+        if state.notice.is_some() {
+            return None;
         }
-        state.notice_delivered = true;
-        true
+        state.notice = Some(kind);
+        Some(kind)
+    }
+
+    /// Suppress the notice (close with the parent session): no delivery
+    /// and no retention; later claims observe the suppression and defer.
+    pub(crate) async fn suppress_notice(&self) {
+        let mut state = self.state().await;
+        if state.notice.is_none() {
+            state.notice = Some(NoticeKind::Suppressed);
+        }
+    }
+
+    /// Await the settled signal (the delete arm's lost-claim wait for the
+    /// holder's agreed verdict). `false` on the timeout, with the caller
+    /// surfacing an honest error instead of a racing receipt.
+    pub(crate) async fn await_settled(&self, timeout: Duration) -> bool {
+        let mut settled = self.settled_tx.subscribe();
+        let awaited = tokio::time::timeout(timeout, async { settled.wait_for(|v| *v).await })
+            .await
+            .is_ok();
+        awaited
     }
 
     /// The roster row (live introspection: real activity, tool counts, the

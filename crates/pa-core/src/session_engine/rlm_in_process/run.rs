@@ -12,7 +12,7 @@ use std::time::Duration;
 use pa_agent::types::{AgentEvent, StopReason};
 use pa_types::session::{ChildUsageOrigin, FileEntry};
 
-use super::registry::{compact_rlm_text, record_matches, InProcessChildRecord};
+use super::registry::{compact_rlm_text, record_matches, InProcessChildRecord, NoticeKind};
 use super::{now_ms, InProcessRlmHost};
 use crate::session_engine::agent_messaging::AGENT_MESSAGE_CUSTOM_TYPE;
 use crate::session_engine::rlm_host::{
@@ -144,38 +144,42 @@ enum TaskVerdict {
 }
 
 /// The run's terminal sequence, in the order TS resolves settlement
-/// (`_startRlmChildRun`'s `finally`): flush the child's usage accounting,
-/// deliver the parent's terminal notice, THEN record the settled state and
-/// publish the wake signal — the run state never exposes `settled` before
-/// the parent's notice is admitted, and a `collect` result never precedes
-/// the notice — and finally release the event listener so the record —
+/// (`_startRlmChildRun`'s `finally`), with single notice ownership: flush
+/// the child's usage accounting, claim the terminal notice (the claim
+/// fixes the verdict this arm settles with), retain the notice on the
+/// parent (a live admitted turn on an idle parent, a durable session-file
+/// row on a busy one) BEFORE recording the settled state, publish the wake
+/// signal only then, and release the event listener so the record —
 /// engine and kernel included — drops with the registry entry instead of
-/// leaking through the agent's listener list.
+/// leaking through the agent's listener list. The run state never
+/// exposes `settled` before the notice is retained, and the settled
+/// verdict always agrees with the claimed notice.
 async fn finish_run(
     host: &InProcessRlmHost,
     record: &Arc<InProcessChildRecord>,
     verdict: &TaskVerdict,
 ) {
     flush_pending_usage(host, record).await;
-    // A cancel or close claimed the notice already (nothing to deliver);
-    // a failed run reports its failure, a completed one without an
-    // explicit reply reports the no-reply notice.
+    // A parent teardown settles without a notice (nobody to retain to);
+    // every other verdict claims first — a lost claim means a delete (or
+    // close) owns the notice and the verdict, and this arm defers.
     match verdict {
         TaskVerdict::Error(error) => {
-            super::notices::deliver_failure_notice(host, record, error).await;
+            if record.claim_notice(NoticeKind::Failure).await.is_some() {
+                super::notices::deliver_failure_notice(host, record, error).await;
+            }
+            record.settle_as("error", Some(error.clone())).await;
         }
         TaskVerdict::Done => {
             let replied = record.state().await.replied_since_task;
-            if !replied {
+            if !replied && record.claim_notice(NoticeKind::NoReply).await.is_some() {
                 super::notices::deliver_no_reply_notice(host, record).await;
             }
+            record.settle_as("done", None).await;
         }
-        TaskVerdict::Cancelled => {}
-    }
-    match verdict {
-        TaskVerdict::Done => record.settle_as("done", None).await,
-        TaskVerdict::Error(error) => record.settle_as("error", Some(error.clone())).await,
-        TaskVerdict::Cancelled => record.settle_as("cancelled", None).await,
+        TaskVerdict::Cancelled => {
+            record.settle_as("cancelled", None).await;
+        }
     }
     record.publish_settled();
     record.unsubscribe_listener().await;
@@ -597,20 +601,26 @@ pub(super) fn delete_subagent(
         // tears itself down (its own descendants cascade through it).
         record.mark_closed().await;
         if was_running {
-            // The cancellation notice admits BEFORE the settled state
-            // lands: a concurrent collect never observes the cancelled
-            // verdict ahead of the notice admission, and the delete
-            // receipt itself (built after the settle) implies it. The
-            // notice claim is the delete's — the run arm's racing claim
-            // collapses into it. No recorded error: the tombstone's
-            // envelope reads the TS fallback reason.
-            super::notices::deliver_cancelled_notice(
-                &host,
-                &record,
-                "Deleted by parent orchestrator",
-            )
-            .await;
-            record.settle_as("cancelled", None).await;
+            // Single notice ownership: win the cancelled claim and the
+            // verdict with it, or defer to the run arm's already-claimed
+            // notice (its retention and settle are mid-flight — the
+            // receipt reports the AGREED verdict, never a racing
+            // cancelled over a pending failure/no-reply).
+            if record.claim_notice(NoticeKind::Cancelled).await.is_some() {
+                // Retention BEFORE the settled state: the notice is
+                // retained on the parent (live admission on an idle
+                // parent, a durable session-file row on a busy one) before
+                // the cancelled verdict becomes observable.
+                super::notices::deliver_cancelled_notice(
+                    &host,
+                    &record,
+                    "Deleted by parent orchestrator",
+                )
+                .await;
+                record.settle_as("cancelled", None).await;
+            } else if !record.await_settled(Duration::from_secs(5)).await {
+                anyhow::bail!("delete timed out waiting for the child's terminal state");
+            }
             record.engine.session.agent().abort();
         }
         host.remember_deleted_child(&record).await;

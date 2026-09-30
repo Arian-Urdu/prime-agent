@@ -175,7 +175,7 @@ fn resolution_takes_the_first_trusted_absolute_entry() {
     let cwd = tempfile::tempdir().expect("temp dir");
     let path = std::env::join_paths([first.path(), second.path()]).expect("join paths");
     assert_eq!(
-        resolve_tailscale_binary(path.as_os_str(), cwd.path()),
+        resolve_tailscale_binary(path.as_os_str(), cwd.path(), "tailscale"),
         Some(first.path().join("tailscale"))
     );
 }
@@ -196,12 +196,12 @@ fn resolution_skips_relative_entries_and_the_current_directory() {
     let path =
         std::env::join_paths([Path::new("."), workspace.path(), real.path()]).expect("join paths");
     assert_eq!(
-        resolve_tailscale_binary(path.as_os_str(), workspace.path()),
+        resolve_tailscale_binary(path.as_os_str(), workspace.path(), "tailscale"),
         Some(real.path().join("tailscale"))
     );
     // The empty entry is the current directory in shell `PATH` semantics.
     assert_eq!(
-        resolve_tailscale_binary(OsStr::new(""), workspace.path()),
+        resolve_tailscale_binary(OsStr::new(""), workspace.path(), "tailscale"),
         None
     );
     std::env::set_current_dir(previous_cwd).expect("restore cwd");
@@ -220,7 +220,7 @@ fn resolution_reports_no_cli_when_only_untrusted_entries_hold_it() {
     let path = std::env::join_paths([Path::new("."), Path::new(""), workspace.path()])
         .expect("join paths");
     assert_eq!(
-        resolve_tailscale_binary(path.as_os_str(), workspace.path()),
+        resolve_tailscale_binary(path.as_os_str(), workspace.path(), "tailscale"),
         None
     );
     std::env::set_current_dir(previous_cwd).expect("restore cwd");
@@ -236,10 +236,31 @@ fn resolution_skips_a_non_executable_candidate() {
     let cwd = tempfile::tempdir().expect("temp dir");
     let path = std::env::join_paths([plain.path(), executable.path()]).expect("join paths");
     assert_eq!(
-        resolve_tailscale_binary(path.as_os_str(), cwd.path()),
+        resolve_tailscale_binary(path.as_os_str(), cwd.path(), "tailscale"),
         Some(executable.path().join("tailscale"))
     );
 }
+/// Windows installs `tailscale.exe`; the resolution must accept the
+/// platform's binary name (`tailscale.exe` on Windows, selected by
+/// [`tailscale_program_name`]).
+#[test]
+fn resolution_finds_the_windows_binary_name() {
+    let trusted = tempfile::tempdir().expect("temp dir");
+    write_executable(&trusted.path().join("tailscale.exe"), "#!/bin/sh\nexit 0\n");
+    let cwd = tempfile::tempdir().expect("temp dir");
+    let path = std::env::join_paths([trusted.path()]).expect("join paths");
+    assert_eq!(
+        resolve_tailscale_binary(path.as_os_str(), cwd.path(), "tailscale.exe"),
+        Some(trusted.path().join("tailscale.exe"))
+    );
+    // The probe name is what the resolution joins: the unix name must not
+    // find the exe-named install.
+    assert_eq!(
+        resolve_tailscale_binary(path.as_os_str(), cwd.path(), "tailscale"),
+        None
+    );
+}
+
 /// The regression the trusted resolution exists for: the public commands
 /// must not execute a `tailscale` planted in the current directory,
 /// reachable through a relative `PATH` entry or an entry naming the

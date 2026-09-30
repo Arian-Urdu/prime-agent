@@ -5,6 +5,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use pa_core::platform::is_executable;
 use serde_json::Value;
 
 use super::{run_tailscale, trim_trailing_dots, TailscaleProbe, TAILSCALE_BINARY};
@@ -130,17 +131,31 @@ pub(crate) async fn doctor_facts(program: &OsStr) -> Vec<String> {
 /// as absent instead of executing anything untrusted.
 const NO_TRUSTED_TAILSCALE: &str = "/nonexistent/tailscale-cli-not-found-on-a-trusted-path";
 
+/// The `tailscale` program name a `PATH` entry is probed with: Windows
+/// installs `tailscale.exe` (what a bare `tailscale` spawn used to resolve
+/// through `PATHEXT`); everywhere else the binary is `tailscale`.
+fn tailscale_program_name() -> &'static str {
+    if cfg!(windows) {
+        "tailscale.exe"
+    } else {
+        TAILSCALE_BINARY
+    }
+}
+
 /// The `tailscale` CLI the public commands spawn: [`resolve_tailscale_binary`]
 /// over the ambient `PATH`, or [`NO_TRUSTED_TAILSCALE`] when no trusted entry
 /// holds it.
 pub(super) fn trusted_tailscale_path() -> PathBuf {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::new());
-    resolve_tailscale_binary(&path, &cwd).unwrap_or_else(|| PathBuf::from(NO_TRUSTED_TAILSCALE))
+    resolve_tailscale_binary(&path, &cwd, tailscale_program_name())
+        .unwrap_or_else(|| PathBuf::from(NO_TRUSTED_TAILSCALE))
 }
 
 /// Resolve the `tailscale` CLI over `path_env` to the absolute path the
-/// public commands spawn. Which-style first match, but fail closed:
+/// public commands spawn. Which-style first match over `program` (the
+/// platform's binary name, see [`tailscale_program_name`]), but fail
+/// closed:
 ///
 /// - only absolute `PATH` entries are considered; a relative entry (including
 ///   the empty entry) resolves to the current directory, whose contents are
@@ -148,30 +163,21 @@ pub(super) fn trusted_tailscale_path() -> PathBuf {
 /// - an entry that *is* the current directory is skipped the same way, so a
 ///   `./tailscale` planted in the working directory can never supply the
 ///   binary that runs with the CLI's credentials and environment.
-pub(crate) fn resolve_tailscale_binary(path_env: &OsStr, cwd: &Path) -> Option<PathBuf> {
+pub(crate) fn resolve_tailscale_binary(
+    path_env: &OsStr,
+    cwd: &Path,
+    program: &str,
+) -> Option<PathBuf> {
     let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     std::env::split_paths(path_env)
         .filter(|entry| entry.is_absolute())
         .filter(|entry| std::fs::canonicalize(entry).map_or(true, |real| real != cwd))
-        .map(|entry| entry.join(TAILSCALE_BINARY))
-        .find(|candidate| is_executable_file(candidate))
-}
-
-/// Whether `path` is a regular file the current user can execute.
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+        .map(|entry| entry.join(program))
+        .find(|candidate| {
+            // The platform execute-bit probe, narrowed to regular files:
+            // `pa_core`'s unix arm accepts any mode with an execute bit, and
+            // a `PATH` entry holding a directory named like the program must
+            // not resolve.
+            candidate.is_file() && is_executable(candidate)
+        })
 }

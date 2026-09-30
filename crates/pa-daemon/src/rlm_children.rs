@@ -626,8 +626,8 @@ impl SupervisorChildSessions {
         }
     }
 
-    /// Test seam: settle a pushed child record (the passivation-gate
-    /// tests exercise a registry that holds only settled children).
+    /// Test seam: settle a pushed child record the way a finished run
+    /// ends (terminal status and the settle funnel's flag).
     #[cfg(test)]
     pub(crate) async fn settle_test_child(&self, child_active_session_id: &str) {
         let children = self.inner.children.lock().await;
@@ -635,6 +635,7 @@ impl SupervisorChildSessions {
             let mut record = record.lock().await;
             if record.active_session_id == child_active_session_id {
                 record.settled_status = Some("done");
+                record.settled = true;
             }
         }
     }

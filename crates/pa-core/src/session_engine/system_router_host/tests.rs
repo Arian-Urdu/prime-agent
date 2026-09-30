@@ -160,13 +160,141 @@ fn a_non_catalog_session_model_still_resolves_as_the_action_model() {
     assert_eq!(model.id, "session-model");
 }
 
+/// The short-form session-model fallback (the "Short-form session
+/// fallback misses" review finding): a reference that names the session
+/// model in the TS short form — a suffix of the full selector, so the
+/// bare id "session-model" names "testprov/session-model" — must reach
+/// the same session-model crossing as the full form when the catalog does
+/// not carry the session model, instead of reporting it unavailable. TS
+/// parity (`_resolveRlmSubagentModel`): "The parent model can be missing
+/// from the authenticated catalog (offline discovery or expired
+/// credentials) while staying selectable, so it backs the short-form
+/// lookup when the catalog has no match."
+#[test]
+fn a_short_form_session_model_still_resolves_as_the_action_model() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path()).unwrap();
+    // A catalog that carries other testprov models (one with a slashed
+    // id, the private prime-inference shape) but no model whose selector
+    // ends with "/session-model": the short form has no catalog match,
+    // so the session model backs it.
+    std::fs::write(
+        dir.path().join("models.json"),
+        r#"{
+          "providers": {
+            "testprov": {
+              "baseUrl": "http://localhost:9",
+              "apiKey": "router-key",
+              "api": "openai-completions",
+              "models": [
+                { "id": "action-model", "name": "Action Model", "contextWindow": 128000 },
+                { "id": "internal/glm-5.3-fast", "name": "GLM 5.3 Fast", "contextWindow": 400000 }
+              ]
+            }
+          }
+        }"#,
+    )
+    .unwrap();
+    let config = host_config(dir.path(), None, None);
+    // The bare-id short form of the session selector, as the spec's model.
+    let (model, api_key, _headers) = resolve_action_model(&config, Some("session-model")).unwrap();
+    assert_eq!(model.provider, "testprov");
+    assert_eq!(model.id, "session-model");
+    assert_eq!(model.api, "openai-completions");
+    assert_eq!(model.base_url, "http://localhost:9");
+    assert_eq!(model.context_window, 128_000);
+    assert_eq!(model.max_tokens, 4096);
+    // The fallback model runs the same auth preflight as a catalog model:
+    // the provider's credential resolves from the registry.
+    assert_eq!(api_key.as_deref(), Some("router-key"));
+    // The suffix rule is case-insensitive.
+    let (model, _, _) = resolve_action_model(&config, Some("Session-Model")).unwrap();
+    assert_eq!(model.id, "session-model");
+    // A short-form subagent default takes the same path (the TS
+    // resolution takes `spec.model ?? default` as one reference).
+    let config = host_config(dir.path(), Some("session-model"), None);
+    let (model, _, _) = resolve_action_model(&config, None).unwrap();
+    assert_eq!(model.id, "session-model");
+}
+
+/// The documented short-form fallback order (TS `_resolveRlmSubagentModel`:
+/// the exact match, then a unique catalog short form, then the parent
+/// model when the catalog has no match; "Several catalog matches still
+/// leave the reference unresolved"): a unique catalog suffix match
+/// resolves before the session model backs the lookup, and several
+/// matches leave the reference unresolved even when the session model
+/// would back it.
+#[test]
+fn the_short_form_falls_back_in_the_documented_order() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path()).unwrap();
+    std::fs::write(
+        dir.path().join("models.json"),
+        r#"{
+          "providers": {
+            "testprov": {
+              "baseUrl": "http://localhost:9",
+              "apiKey": "router-key",
+              "api": "openai-completions",
+              "models": [
+                { "id": "internal/glm-5.3-fast", "name": "GLM 5.3 Fast", "contextWindow": 400000 },
+                { "id": "nested/session-model", "name": "Nested Session Model", "contextWindow": 128000 }
+              ]
+            }
+          }
+        }"#,
+    )
+    .unwrap();
+    let config = host_config(dir.path(), None, None);
+    // A catalog model the exact matcher cannot reach by its slashed id
+    // resolves by its unique short form.
+    let (model, _, _) = resolve_action_model(&config, Some("glm-5.3-fast")).unwrap();
+    assert_eq!(model.provider, "testprov");
+    assert_eq!(model.id, "internal/glm-5.3-fast");
+    // The unique catalog short form resolves before the session model
+    // backs the lookup: "nested/session-model" and the session selector
+    // both end with "/session-model", and the catalog model wins.
+    let (model, _, _) = resolve_action_model(&config, Some("session-model")).unwrap();
+    assert_eq!(model.id, "nested/session-model");
+    assert_ne!(model.id, config.session_model.id);
+
+    // Several catalog matches still leave the reference unresolved, even
+    // though the session model would back the same short form.
+    std::fs::write(
+        dir.path().join("models.json"),
+        r#"{
+          "providers": {
+            "testprov": {
+              "baseUrl": "http://localhost:9",
+              "apiKey": "router-key",
+              "api": "openai-completions",
+              "models": [
+                { "id": "first/nested/session-model", "name": "First", "contextWindow": 128000 },
+                { "id": "second/nested/session-model", "name": "Second", "contextWindow": 128000 }
+              ]
+            }
+          }
+        }"#,
+    )
+    .unwrap();
+    let config = host_config(dir.path(), None, None);
+    let error = resolve_action_model(&config, Some("session-model")).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("is unavailable, unauthenticated, or expired"),
+        "unexpected error: {error}"
+    );
+}
+
 /// A stale or expired session-model provider must fail the resolution
 /// loudly (the TS parent-model branch: "a stale or expired provider has
 /// to fail the spawn here instead of starting a child that fails its
 /// first model request") instead of resolving the fallback model with a
 /// dead credential. The catalog itself cannot carry the session model
 /// here (the stale filter keeps the provider out of the searchable set),
-/// so this pins the fallback's own gate.
+/// so this pins the fallback's own gate, for the full form and the short
+/// form alike.
 #[test]
 fn a_stale_session_model_provider_fails_instead_of_resolving() {
     let auth_data = crate::auth::types::AuthStorageData(
@@ -185,6 +313,15 @@ fn a_stale_session_model_provider_fails_instead_of_resolving() {
     let config = host_config(dir.path(), None, None);
     let selector = session_selector(&config);
     let error = resolve_reference(&registry, &config, &selector, &selector).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("is unavailable, unauthenticated, or expired"),
+        "unexpected error: {error}"
+    );
+    // The gate covers the short form too: a bare-id reference to a stale
+    // session model fails just as loudly.
+    let error = resolve_reference(&registry, &config, "session-model", &selector).unwrap_err();
     assert!(
         error
             .to_string()

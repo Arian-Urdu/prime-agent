@@ -115,7 +115,8 @@ type ResolvedActionModel = (AiModel, Option<String>, Option<BTreeMap<String, Str
 /// The session model resolves through the catalog like any other selector
 /// (the pa-agent model on this side is lossy: it carries no input
 /// modalities), with the agent-model field mapping as the fallback for a
-/// session model the catalog does not carry.
+/// session model the catalog does not carry, named in the full form or in
+/// the TS short form.
 fn resolve_action_model(
     config: &SystemRouterHostConfig,
     reference: Option<&str>,
@@ -163,7 +164,8 @@ fn session_selector(config: &SystemRouterHostConfig) -> String {
 
 /// Resolve one model reference against the credential-backed catalog. The
 /// session model itself falls back to the agent-model field mapping when
-/// the catalog does not carry it (a scripted or in-memory model).
+/// the catalog does not carry it (a scripted or in-memory model), named in
+/// the full `provider/id` form or in the TS short form.
 fn resolve_reference(
     registry: &ModelRegistry,
     config: &SystemRouterHostConfig,
@@ -181,27 +183,87 @@ fn resolve_reference(
         return Ok(model.clone());
     }
     if reference.eq_ignore_ascii_case(session_selector) {
-        // The catalog miss for the session's own model means the same thing
-        // as for any other reference: unauthenticated, absent, or expired.
-        // A stale or expired provider must fail here instead of starting a
-        // segment whose first decision call fails its model request (the
-        // TS parent-model branch); every other miss crosses back to the ai
-        // side field by field, which covers a session model the catalog
-        // does not carry (a scripted or in-memory model).
-        let status = registry.get_provider_auth_status(&config.session_model.provider);
-        if status.source != Some(crate::auth::types::AuthSource::Stale)
-            && status.label.as_deref() != Some("expired")
-        {
-            return Ok(
-                crate::session_engine::provider_adapter::agent_model_to_ai_model(
-                    &config.session_model,
-                ),
-            );
-        }
+        // The catalog miss for the session's own model means the same
+        // thing as for any other reference: unauthenticated, absent, or
+        // expired. A stale or expired provider must fail here instead of
+        // starting a segment whose first decision call fails its model
+        // request (the TS parent-model branch); every other miss crosses
+        // back to the ai side field by field, which covers a session
+        // model the catalog does not carry (a scripted or in-memory
+        // model). The full form resolves before any catalog short-form
+        // match below (TS runs the parent equality first).
+        return session_model_fallback(registry, config, reference);
     }
-    Err(anyhow::anyhow!(
+    // The TS short-form tail (`_resolveRlmSubagentModel`:
+    // `candidates.find(exact) ?? findUniqueRlmShortFormModelMatch(reference,
+    // candidates, parentModel)`): a unique catalog match resolves first,
+    // several still leave the reference unresolved, and the session model
+    // backs the lookup only when the catalog has no match at all ("The
+    // parent model can be missing from the authenticated catalog (offline
+    // discovery or expired credentials) while staying selectable, so it
+    // backs the short-form lookup when the catalog has no match. Several
+    // catalog matches still leave the reference unresolved."). The daemon
+    // child-model resolution (resolve_child_model_unchecked) pins the
+    // same suffix rule.
+    let short_form_matches: Vec<&AiModel> = searchable
+        .iter()
+        .filter(|model| is_short_form_selector(reference, &model.provider, &model.id))
+        .collect();
+    if short_form_matches.len() == 1 {
+        return Ok(short_form_matches[0].clone());
+    }
+    if short_form_matches.is_empty()
+        && is_short_form_selector(
+            reference,
+            &config.session_model.provider,
+            &config.session_model.id,
+        )
+    {
+        // The same session-model fallback as the full form above, gate
+        // included: a short-form name for a stale session provider fails
+        // just as loudly.
+        return session_model_fallback(registry, config, reference);
+    }
+    Err(unavailable_error(reference))
+}
+
+/// The TS short form (`findRlmShortFormModelMatches`): a reference names a
+/// model when the full selector ends with `"/<reference>"`, so a bare id
+/// like "glm-5.3" also matches "prime-inference/z-ai/glm-5.3".
+fn is_short_form_selector(reference: &str, provider: &str, id: &str) -> bool {
+    let normalized = reference.trim().to_lowercase();
+    !normalized.is_empty()
+        && format!("{provider}/{id}")
+            .to_lowercase()
+            .ends_with(&format!("/{normalized}"))
+}
+
+/// The session model's fallback crossing, under the stale/expired gate: a
+/// stale or expired provider fails the reference loudly instead of
+/// starting a segment whose first decision call fails its model request
+/// (the TS parent-model branch); any other provider crosses the agent
+/// descriptor back to the ai side field by field.
+fn session_model_fallback(
+    registry: &ModelRegistry,
+    config: &SystemRouterHostConfig,
+    reference: &str,
+) -> anyhow::Result<AiModel> {
+    let status = registry.get_provider_auth_status(&config.session_model.provider);
+    if status.source != Some(crate::auth::types::AuthSource::Stale)
+        && status.label.as_deref() != Some("expired")
+    {
+        Ok(crate::session_engine::provider_adapter::agent_model_to_ai_model(&config.session_model))
+    } else {
+        Err(unavailable_error(reference))
+    }
+}
+
+/// The unavailable-model refusal (the TS `formatRlmModelUnavailableError`
+/// base and hint, without the close-match list).
+fn unavailable_error(reference: &str) -> anyhow::Error {
+    anyhow::anyhow!(
         "Requested system-router model \"{reference}\" is unavailable, unauthenticated, or expired; selectors use the form \"provider/model-id\" (e.g. \"prime-inference/internal/glm-5.3-fast\")"
-    ))
+    )
 }
 
 // The unit battery lives in the child module (system_router_host::tests).

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import sys
+import time
 import types
 from dataclasses import dataclass
 from pathlib import Path
@@ -562,6 +563,29 @@ async def _job_watch_loop(handle: Any, interval: float, baseline: int) -> None:
                 )
                 last = current
             if not handle.running:
+                # The stdout pump may still be copying the process's final
+                # bytes (`running` flips at reap, before the pump drains), so
+                # the watcher drains briefly: the job's final output range
+                # still reports instead of vanishing with the loop's exit.
+                stable = 0
+                drain_deadline = time.monotonic() + 1.0
+                while time.monotonic() < drain_deadline and stable < 2:
+                    await asyncio.sleep(0.05)
+                    current = handle.peek_output_bytes()
+                    if current > last:
+                        await host_request(
+                            "bash.progress",
+                            {
+                                "pid": pid,
+                                "command": command,
+                                "fromBytes": last,
+                                "toBytes": current,
+                            },
+                        )
+                        last = current
+                        stable = 0
+                    else:
+                        stable += 1
                 break
     except asyncio.CancelledError:
         raise

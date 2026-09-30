@@ -157,6 +157,44 @@ class RlmWatchAgentTest(unittest.TestCase):
             asyncio.run(rlm.rlm.watch.agent_cancel("watch-agent-sub-1"))
         host_request.assert_awaited_once_with("rlm.watch.agent_cancel", {"id": "watch-agent-sub-1"})
 
+    def test_watch_reports_the_final_output_after_running_flips(self) -> None:
+        """The watcher drains the stdout pump's last bytes before exiting."""
+
+        class LatePumpHandle(FakeJobHandle):
+            def __init__(self) -> None:
+                super().__init__(9999, [])
+                self.running = False  # the process is reaped...
+                self._pumped = False  # ...but the pump still holds a chunk.
+
+            def peek_output_bytes(self) -> int:
+                if not self._pumped:
+                    self._pumped = True
+                    return 0
+                return 500  # the final bytes land after `running` went False.
+
+        handle = LatePumpHandle()
+        seen: list[tuple[int, int]] = []
+
+        async def fake_host_request(request_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+            if request_type == "bash.progress":
+                seen.append((payload["fromBytes"], payload["toBytes"]))
+            return {"status": "ok"}
+
+        async def scenario() -> None:
+            with patch.object(rlm, "host_request", AsyncMock(side_effect=fake_host_request)):
+                rlm._JOB_WATCHES.clear()
+                await rlm.rlm.watch.job(handle, interval_seconds=0.01)
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline and not seen:
+                    await asyncio.sleep(0.01)
+                # Let the drain finish.
+                await asyncio.sleep(0.2)
+
+        asyncio.run(scenario())
+        self.assertTrue(len(seen) >= 1, "the final output range never reported")
+        self.assertEqual(seen[-1], (0, 500))
+        self.assertEqual(rlm.rlm.watch.job_list(), [])
+
     def test_cancelled_watch_finally_does_not_pop_a_replacement(self) -> None:
         """A re-registration on the same pid survives the cancelled task's cleanup."""
 

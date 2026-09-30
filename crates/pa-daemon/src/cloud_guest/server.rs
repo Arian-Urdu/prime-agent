@@ -31,9 +31,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
-use pa_types::daemon::cloud::{
-    CloudCommandId, CloudCommandReceipt, CloudCursor, CloudEvent, CloudSessionStatus,
-};
+#[cfg(test)]
+use pa_types::daemon::cloud::CloudCommandReceipt;
+use pa_types::daemon::cloud::{CloudCommandId, CloudCursor, CloudEvent, CloudSessionStatus};
 use tokio::sync::{watch, Notify};
 
 use crate::cloud_guest::dispatch::{GuestDispatchOutcome, GuestSessionSnapshot};
@@ -43,8 +43,6 @@ use crate::cloud_guest::outbox::{GuestEventInput, GuestEventOutbox};
 
 mod clients;
 mod submit;
-
-pub use clients::MAX_CLIENTS;
 
 /// One serve loop's claim retry backoff (TS `dispatchLoop`'s 100ms catch
 /// arm).
@@ -66,6 +64,7 @@ pub struct GuestProtocolServer {
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
     status_file: Option<PathBuf>,
+    status_file_write: Mutex<()>,
     work_admitted: AtomicBool,
     retention_stalled: AtomicBool,
     stopping: AtomicBool,
@@ -111,6 +110,7 @@ impl GuestProtocolServer {
             shutdown_tx,
             shutdown_rx,
             status_file: Some(status_file),
+            status_file_write: Mutex::new(()),
             work_admitted: AtomicBool::new(false),
             retention_stalled: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
@@ -138,12 +138,14 @@ impl GuestProtocolServer {
     /// Terminal receipts restored without a settle record; surfaced
     /// honestly (TS `listUncertainCommands`).
     #[must_use]
+    #[cfg(test)]
     pub fn list_uncertain(&self) -> Vec<CloudCommandReceipt> {
         self.journal_lock().list_uncertain()
     }
 
     /// Ids of admitted commands the dispatcher has not claimed yet.
     #[must_use]
+    #[cfg(test)]
     pub fn list_pending_command_ids(&self) -> Vec<CloudCommandId> {
         self.journal_lock()
             .list_pending()
@@ -160,6 +162,7 @@ impl GuestProtocolServer {
     ///
     /// Returns the TS error when the command is unknown or not
     /// uncertain, or the durable transition fails.
+    #[cfg(test)]
     pub fn requeue_command(&self, command_id: &str) -> anyhow::Result<()> {
         self.journal_lock().requeue(command_id)?;
         self.notify_work();
@@ -217,6 +220,7 @@ impl GuestProtocolServer {
     }
 
     /// Stop serving outside a release command (the harness's kill).
+    #[cfg(test)]
     pub fn begin_shutdown(&self) {
         self.stopping.store(true, Ordering::SeqCst);
         self.shutdown_tx.send_replace(true);
@@ -456,6 +460,14 @@ impl GuestProtocolServer {
         let Some(path) = self.status_file.clone() else {
             return;
         };
+        // One writer at a time: the dispatch loop's status transitions
+        // and a connection task's retention-stall edge can otherwise
+        // interleave open-truncate-write pairs on the same temp file and
+        // rename a torn probe into place.
+        let _one_writer = self
+            .status_file_write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let status = self.status();
         let idle_after_work =
             self.work_admitted.load(Ordering::SeqCst) && status == CloudSessionStatus::Idle;
@@ -474,7 +486,7 @@ impl GuestProtocolServer {
             let mut file = options.open(&temp)?;
             file.write_all(payload.as_bytes())?;
             file.sync_all()?;
-            std::fs::rename(temp, path)
+            pa_core::platform::rename_onto(&temp, &path)
         })();
         if let Err(error) = result {
             self.record_dispatch_error(&format!("status file: {error}"));

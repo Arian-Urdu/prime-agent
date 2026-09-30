@@ -29,33 +29,30 @@
 //! which means the v1 event stream only, and the local daemon's
 //! `default_server_capabilities` stays untouched).
 
-pub mod dispatch;
+pub(crate) mod dispatch;
 #[cfg(test)]
 mod engine_turn_tests;
-pub mod executor;
-pub mod journal;
-pub mod outbox;
-pub mod server;
+pub(crate) mod executor;
+pub(crate) mod journal;
+pub(crate) mod outbox;
+pub(crate) mod server;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_support;
 
-pub use dispatch::{GuestDispatchOutcome, GuestExecutor, GuestSessionSnapshot};
-pub use executor::EngineGuestExecutor;
-pub use journal::{parse_claimed_request, ClaimedCommand, GuestAdmission, GuestCommandJournal};
-pub use outbox::{GuestEventInput, GuestEventOutbox};
-pub use server::{GuestProtocolServer, MAX_CLIENTS};
+use executor::EngineGuestExecutor;
+use server::GuestProtocolServer;
 
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 
-pub use crate::util::now_iso;
+pub(crate) use crate::util::now_iso;
 
 /// Durable outbox record cap (TS `DEFAULT_MAX_RECORDS`, shared with the
 /// family slice's replay span).
-pub use crate::cloud_family::DEFAULT_OUTBOX_RECORDS;
+pub(crate) use crate::cloud_family::DEFAULT_OUTBOX_RECORDS;
 
 /// The hidden role env the bridge sets on the guest daemon process (TS
 /// `PRIME_AGENT_INTERNAL_CLOUD_DAEMON`, checked by `main.ts` inside
@@ -65,7 +62,7 @@ pub const GUEST_ROLE_ENV: &str = "PRIME_AGENT_INTERNAL_CLOUD_DAEMON";
 /// The guest daemon's environment (TS `CLOUD_DAEMON_ENV_KEYS` /
 /// `parseCloudDaemonEnv`): the bridge provisions every coordinate, so
 /// each required key's absence is a hard boot error.
-pub mod env_keys {
+pub(crate) mod env_keys {
     pub const SOCKET: &str = "PRIME_AGENT_CLOUD_DAEMON_SOCKET";
     pub const SESSION_ID: &str = "PRIME_AGENT_CLOUD_SESSION_ID";
     pub const GENERATION: &str = "PRIME_AGENT_CLOUD_GENERATION";
@@ -79,11 +76,11 @@ pub mod env_keys {
 }
 
 /// TS `DEFAULT_STATE_DIR`.
-pub const DEFAULT_STATE_DIR: &str = "/opt/prime-agent/daemon-state";
+pub(crate) const DEFAULT_STATE_DIR: &str = "/opt/prime-agent/daemon-state";
 
 /// A missing or invalid guest env coordinate (TS `CloudDaemonEnvError`).
 #[derive(Debug)]
-pub struct CloudGuestEnvError(pub String);
+pub(crate) struct CloudGuestEnvError(pub String);
 
 impl std::fmt::Display for CloudGuestEnvError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -95,7 +92,7 @@ impl std::error::Error for CloudGuestEnvError {}
 
 /// The parsed guest daemon environment (TS `ParsedCloudDaemonEnv`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CloudGuestEnv {
+pub(crate) struct CloudGuestEnv {
     pub socket_path: PathBuf,
     pub session_id: String,
     pub generation: u64,
@@ -126,7 +123,7 @@ impl CloudGuestEnv {
 ///
 /// Returns the TS error message when a required key is missing or the
 /// generation is invalid.
-pub fn parse_cloud_guest_env(
+pub(crate) fn parse_cloud_guest_env(
     vars: &dyn Fn(&str) -> Option<String>,
     default_state_dir: Option<&std::path::Path>,
 ) -> std::result::Result<CloudGuestEnv, CloudGuestEnvError> {

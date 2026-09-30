@@ -175,6 +175,7 @@ impl GuestEventOutbox {
 
     /// The acknowledged-cursor position.
     #[must_use]
+    #[cfg(test)]
     pub fn acknowledged_cursor(&self) -> CloudCursor {
         CloudCursor {
             generation: self.meta.generation,
@@ -456,7 +457,7 @@ impl GuestEventOutbox {
             writer.flush()?;
             writer.get_ref().sync_all()?;
         }
-        fs::rename(&temp, self.meta_path())
+        pa_core::platform::rename_onto(&temp, &self.meta_path())
             .with_context(|| format!("persist {}", self.meta_path().display()))?;
         Ok(())
     }

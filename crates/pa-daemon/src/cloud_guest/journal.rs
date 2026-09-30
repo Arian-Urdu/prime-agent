@@ -243,6 +243,7 @@ impl GuestCommandJournal {
     ///
     /// Returns the TS error when the command is unknown or not uncertain,
     /// or an error when the durable transition fails.
+    #[cfg(test)]
     pub fn requeue(&mut self, command_id: &str) -> Result<()> {
         let Some(entry) = self.entries.get(command_id) else {
             return Err(anyhow!("unknown command: {command_id}"));
@@ -264,6 +265,7 @@ impl GuestCommandJournal {
     /// Receipts of commands restored without a terminal record, awaiting
     /// host reconciliation.
     #[must_use]
+    #[cfg(test)]
     pub fn list_uncertain(&self) -> Vec<CloudCommandReceipt> {
         self.order
             .iter()

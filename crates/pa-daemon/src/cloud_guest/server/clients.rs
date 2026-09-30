@@ -321,8 +321,11 @@ impl ClientHandle {
 }
 
 /// The per-client writer: drain the bounded channel onto the transport.
-/// A transport failure ends the writer and drops the client; the
-/// reader observes the closed flag.
+/// A transport failure ends the writer; the connection task frees the
+/// slot because the same peer hangup that failed the write makes the
+/// read half return EOF (the connection task's drop runs at that
+/// break), and a subscribed client is dropped by the next
+/// `write_line`, whose send on the dropped receiver fails.
 async fn write_task(
     server: Arc<GuestProtocolServer>,
     mut out: mpsc::Receiver<String>,

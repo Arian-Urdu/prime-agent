@@ -90,6 +90,7 @@ impl EngineGuestExecutor {
     /// The turns this executor ran (the loopback battery's
     /// duplicate-proof witness).
     #[must_use]
+    #[cfg(test)]
     pub fn turn_count(&self) -> u64 {
         self.turn_count.load(Ordering::SeqCst)
     }

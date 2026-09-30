@@ -8,7 +8,6 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use pa_types::daemon::cloud::{
     CloudCommandId, CloudCommandRequest, CloudCommandState, CloudCursor, CloudGetCommand,
@@ -506,9 +505,25 @@ fn crash_mid_run_restores_uncertain_and_never_answers_or_reruns() {
             CloudCommandState::Failed,
             "a crash gap must never fabricate a durable failure answer"
         );
-        // Give the second life's claim loop its chance: it must not
-        // pick the uncertain command up.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The probe settles only if the loop already skipped the
+        // uncertain command: claims are FIFO, so cmd_probe would stay
+        // queued behind cmd_crash forever if cmd_crash were claimable.
+        client
+            .submit(
+                session_id,
+                generation,
+                "cmd_probe",
+                CloudCommandRequest::Abort,
+            )
+            .await;
+        client
+            .await_receipt(
+                session_id,
+                generation,
+                "cmd_probe",
+                CloudCommandState::Failed,
+            )
+            .await;
         assert_eq!(
             prompt_count.load(Ordering::SeqCst),
             0,

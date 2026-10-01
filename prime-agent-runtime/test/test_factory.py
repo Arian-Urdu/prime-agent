@@ -2796,6 +2796,59 @@ class FactoryExecutorTest(unittest.TestCase):
         self.assertEqual(len(cancelled), 3)
         self.assertTrue(all(e.get("detail") == "entry failed before admission" for e in cancelled))
 
+    @async_test
+    async def test_foreach_sibling_failure_after_terminal_entry_settles_without_retry(self) -> None:
+        # Review finding (Cursor Bugbot): a foreach sibling failing with
+        # retries left AFTER its entry is already terminal was reset to
+        # pending -- _next_pending_instance serves running entries only, so
+        # the instance was never re-admitted, while _run_complete and the
+        # stall detector both counted it as in-flight: the control loop
+        # never finished the run. A terminal entry cannot re-admit a
+        # retry, so the sibling settles error instead.
+        self.host.outcomes["src"] = {"status": "done", "answer": '{"items": ["a", "b"]}'}
+        self.store_factory(
+            {
+                "run": {"failure_policy": "continue", "max_parallel": 8},
+                "nodes": [
+                    {"id": "src", "subagent": "worker", "outputs": [{"name": "items", "type": "json"}]},
+                    {
+                        "id": "fan",
+                        "subagent": "worker",
+                        "depends_on": ["src"],
+                        "inputs": [{"name": "items", "type": "json", "from": "src.items"}],
+                        "foreach": {"over": "items", "max": 2},
+                        "retries": 1,
+                    },
+                ],
+            }
+        )
+        result = await self.start()
+        run = self.executor._runs[result["run_id"]]
+        # src is child-1; fan instances are child-2 (i0) and child-3 (i1).
+        # i0 fails (attempt 1 <= retries 1 -> retry), is re-admitted as
+        # child-4, and fails again (attempt 2 > retries 1 -> the entry is
+        # terminal error while i1 is still running).
+        self.host.child_outcomes["child-2"] = {"status": "error", "error": "boom-1"}
+        self.host.child_outcomes["child-4"] = {"status": "error", "error": "boom-2"}
+        self.host.child_outcomes["child-3"] = {"status": "running"}
+        await self.wait_until(
+            lambda: any(entry.status == "error" for entry in run.states["fan"].entries)
+        )
+        self.assertEqual(len(self.host.spawn_calls("fan")), 3)
+        # i1 fails now with retries remaining, but the entry is terminal:
+        # no retry is queued, the run finishes instead of hanging.
+        self.host.child_outcomes["child-3"] = {"status": "error", "error": "boom-3"}
+        status = await self.settle(result)
+        self.assertEqual(status["state"], "failed")
+        fan = self.node_status(status, "fan")
+        self.assertEqual(fan["status"], "error")
+        self.assertEqual([i["status"] for i in fan["instances"]], ["error", "error"])
+        self.assertEqual([i["attempt"] for i in fan["instances"]], [2, 1])
+        # only i0's failure was ever retried; i1 settled without a re-spawn
+        self.assertEqual(len(self.host.spawn_calls("fan")), 3)
+        retries = [e for e in self.all_events_of(result, "retry") if e.get("node") == "fan"]
+        self.assertEqual([e["instance"] for e in retries], [0])
+
     # -- failure policies ---------------------------------------------------------
 
     @async_test
@@ -4073,6 +4126,71 @@ class FactoryExecutorTest(unittest.TestCase):
         self.assertEqual(status["usage"]["transitions_fired"], 3)
 
     @async_test
+    async def test_machine_optional_foreach_over_expands_empty_then_the_real_settle(self) -> None:
+        # Review finding (PR #3199): marking the foreach.over input
+        # optional used to hit "foreach entry did not resolve its over
+        # input" -- a hard failure where the required form only waits. The
+        # optional over input now expands to zero items when its source
+        # never settled (the same done-with-no-instances path as a settled
+        # empty list), and the re-entry binds the real list.
+        self.host.outcomes["src"] = {
+            "status": "done",
+            "answer": '```json\n{"items": ["a", "b", "c"]}\n```',
+        }
+        self.store_machine(
+            {
+                "run": {"failure_policy": "continue", "max_parallel": 4},
+                "states": [
+                    {"id": "seed", "entry": True, "subagent": "worker"},
+                    {
+                        "id": "fan",
+                        "subagent": {"prompt": "Process item {items}."},
+                        "inputs": [{"name": "items", "type": "json", "from": "src.items", "optional": True}],
+                        "foreach": {"over": "items", "max": 4},
+                        "max_entries": 2,
+                    },
+                    {
+                        "id": "src",
+                        "subagent": "worker",
+                        "outputs": [{"name": "items", "type": "json"}],
+                        "max_entries": 1,
+                    },
+                ],
+                "transitions": [
+                    {"from": "seed", "to": "fan"},
+                    {"from": "fan", "to": "src"},
+                    {"from": "src", "to": "fan"},
+                ],
+            }
+        )
+        result = await self.start()
+        status = await self.settle(result)
+        self.assertEqual(status["state"], "done")
+        # round 1: src never settled, so the optional over input expanded to
+        # zero items -- the entry settled done with NO spawn and NO error.
+        fan = self.state_report(status, "fan")
+        self.assertEqual(fan["entries_used"], 2)
+        self.assertEqual([entry["status"] for entry in fan["entries"]], ["done", "done"])
+        self.assertEqual(self.all_events_of(result, "node_error"), [])
+        self.assertEqual(
+            [
+                e["detail"]
+                for e in self.all_events_of(result, "node_ready")
+                if e.get("node") == "fan" and e.get("entry") == 0
+            ],
+            ["foreach expanded to zero items; nothing to run"],
+        )
+        # round 2: the re-entry bound the real list and ran one instance
+        # per item (the fan->src transition after it is blocked by
+        # src's max_entries).
+        self.assertEqual(
+            [call["prompt"] for call in self.host.spawn_calls("fan")],
+            ["Process item a.", "Process item b.", "Process item c."],
+        )
+        self.assertEqual(self.state_report(status, "src")["entries_used"], 1)
+        self.assertEqual(status["usage"]["transitions_fired"], 3)
+
+    @async_test
     async def test_resident_node_spawns_stays_alive_and_stops(self) -> None:
         self.host.outcomes["watcher"] = {"status": "running"}
         self.store_factory(
@@ -4142,6 +4260,84 @@ class FactoryExecutorTest(unittest.TestCase):
         stopped = await rlm_module.rlm.factory.stop(result["run_id"])
         self.assertEqual(stopped["cancelled"], ["watcher"])
         self.assertEqual(self.host.deleted_targets(), ["child-2"])
+
+    @async_test
+    async def test_resident_saturated_cap_fails_the_run_instead_of_wedging(self) -> None:
+        # Cursor review finding (PR #3199): with every max_parallel slot held
+        # by resident instances, queued work can never be admitted -- a
+        # resident never settles, so no slot ever frees, _run_complete stays
+        # false, and the residents keep children in flight so the no-in-flight
+        # stall detector never fires. The loop would poll forever; it now
+        # fails the run with a deterministic executor error instead.
+        self.host.outcomes["r1"] = {"status": "running"}  # residents never settle
+        self.host.outcomes["r2"] = {"status": "running"}
+        self.store_machine(
+            {
+                "run": {"max_parallel": 1},
+                "states": [
+                    {"id": "r1", "entry": True, "subagent": "worker", "lifecycle": "resident"},
+                    {"id": "r2", "entry": True, "subagent": "worker", "lifecycle": "resident"},
+                ],
+                "transitions": [],
+            }
+        )
+        result = await self.start()
+        self.assertEqual(result["started"], ["r1"])  # the second resident queues behind the cap
+        status = await self.settle(result)  # never leaves "running" without the fix
+        self.assertEqual(status["state"], "failed")
+        errors = self.events_of(status, "executor_error")
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(
+            errors[0]["error"],
+            "control loop stalled: resident instances hold every max_parallel 1 slot; "
+            "queued instances can never be admitted",
+        )
+        self.assertIn("failed", self.host.notice_kinds())
+        # The queued resident was never admitted; stop() still cancels its
+        # queued entry and tears the admitted child down.
+        self.assertEqual(self.host.spawn_calls("r2"), [])
+        stopped = await rlm_module.rlm.factory.stop(result["run_id"])
+        self.assertEqual(stopped["cancelled"], ["r1", "r2"])
+        self.assertEqual(self.host.deleted_targets(), ["child-1"])
+
+    @async_test
+    async def test_resident_in_flight_stall_fails_the_run_instead_of_wedging(self) -> None:
+        # Bugbot review finding (PR #3199): the dead-end stall check only ran
+        # with NOTHING in flight, but an admitted resident never settles, so a
+        # pending entry waiting on an input source that never settled kept the
+        # loop polling collect forever (in_flight true, _run_complete false,
+        # _resident_cap_starved false: it sees queued instances, not
+        # unprepared entries). Residents can never unblock a pending entry
+        # (no outputs, no outgoing transitions), so the stall detection must
+        # fire with only resident instances in flight too.
+        self.host.outcomes["watcher"] = {"status": "running"}  # residents never settle
+        self.store_machine(
+            {
+                "run": {"failure_policy": "continue"},
+                "states": [
+                    {"id": "watcher", "entry": True, "subagent": "worker", "lifecycle": "resident"},
+                    {"id": "a", "entry": True, "subagent": "worker", "outputs": [{"name": "o", "type": "text"}]},
+                    {"id": "b", "subagent": "worker", "inputs": [{"name": "i", "type": "text", "from": "c.o"}]},
+                    {"id": "c", "subagent": "worker", "outputs": [{"name": "o", "type": "text"}]},
+                ],
+                "transitions": [{"from": "a", "to": "b"}],
+            }
+        )
+        result = await self.start()
+        self.assertEqual(result["started"], ["watcher", "a"])
+        status = await self.settle(result)  # never leaves "running" without the fix
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(self.state_report(status, "b")["status"], "pending")
+        stall_events = self.events_of(status, "executor_error")
+        self.assertEqual(len(stall_events), 1)
+        self.assertIn("pending entry of state 'b'", stall_events[0]["error"])
+        self.assertIn("never settled", stall_events[0]["error"])
+        self.assertIn("failed", self.host.notice_kinds())
+        # stop() still tears the resident child down and cancels the stuck
+        # entries; the never-entered source state c reads cancelled too.
+        stopped = await rlm_module.rlm.factory.stop(result["run_id"])
+        self.assertEqual(stopped["cancelled"], ["watcher", "b", "c"])
+        self.assertEqual(self.host.deleted_targets(), ["child-1"])
 
     @async_test
     async def test_resume_bumps_the_loop_generation_no_double_admission(self) -> None:

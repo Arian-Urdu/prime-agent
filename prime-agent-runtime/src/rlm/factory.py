@@ -1749,7 +1749,17 @@ class FactoryExecutor:
                     # never settled, so loop states can re-enter before their
                     # upstream partner has run (a compiled dag never sets
                     # optional: its input edges are transitions, so the
-                    # wait-for-the-source semantics stay V1-exact).
+                    # wait-for-the-source semantics stay V1-exact). The
+                    # foreach.over input is the one optional that cannot
+                    # bind a sentinel: expansion would hit "did not resolve
+                    # its over input" -- a hard failure where the required
+                    # form only waits -- so an unsettled optional over
+                    # expands to zero items (the same done-with-no-instances
+                    # path as a settled empty list) and a later re-entry
+                    # binds the real list.
+                    if foreach is not None and foreach.get("over") == name:
+                        items = []
+                        continue
                     values[name] = "null" if port_type == "json" else "None"
                     continue
                 return None, None  # wait for the source's first settle
@@ -2014,7 +2024,16 @@ class FactoryExecutor:
             duration_ms=instance.duration_ms,
         )
         retries = state.spec.get("retries", NODE_RETRIES_DEFAULT)
-        if retry and instance.attempt <= retries:
+        # A retry is only queued when the entry can re-admit it: a foreach
+        # sibling failing with retries left after its entry already went
+        # terminal (a sibling failed it permanently first) would otherwise
+        # sit pending forever -- _next_pending_instance serves running
+        # entries only, while _run_complete and the stall detector both
+        # count the pending instance as in-flight, so the control loop
+        # would never finish the run. The failed instance settles as an
+        # error instead; the policy call below is a no-op on a terminal
+        # entry.
+        if retry and instance.attempt <= retries and entry.status == "running":
             instance.status = "pending"
             instance.error = None
             self._event(
@@ -2353,15 +2372,40 @@ class FactoryExecutor:
                 remaining = run.admission_backoff_until - self._now_fn()
                 await self._sleep_fn(min(remaining, POLL_TIMEOUT_MS / 1000))
                 continue
+            if not run.pending_evaluations and self._resident_cap_starved(run):
+                # Residents never settle, so a max_parallel cap held entirely
+                # by resident instances never frees a slot: the queued work
+                # would wait forever, and the no-in-flight stall check below
+                # never fires because the residents keep children in flight.
+                # End the run instead of polling a dead end; stop() still
+                # tears the resident children down.
+                reason = (
+                    f"control loop stalled: resident instances hold every max_parallel {run.max_parallel} slot; "
+                    "queued instances can never be admitted"
+                )
+                self._event(run, "executor_error", error=reason)
+                run.state = "failed"
+                try:
+                    await self._milestone(run, "failed", reason)
+                except Exception:
+                    pass
+                return
+            resident_only_in_flight = all(
+                state.lifecycle == "resident" for state, _, _ in in_flight
+            )
             if (
-                not in_flight
+                (not in_flight or resident_only_in_flight)
                 and not started
                 and not self._has_pending_instance(run)
                 and not run.pending_evaluations
             ):
                 # Defensive: nothing in flight, nothing admitted, nothing
-                # pending. The one reachable shape is a pending entry whose
-                # input source never settled; end the run instead of spinning.
+                # pending -- or only resident instances in flight, which
+                # never settle and can never unblock anything (residents
+                # declare no outputs and no outgoing transitions, so a
+                # pending entry's input source can only stay unsettled).
+                # The one reachable shape is a pending entry whose input
+                # source never settled; end the run instead of spinning.
                 stuck = [
                     state_id
                     for state_id in run.order
@@ -2398,6 +2442,27 @@ class FactoryExecutor:
             for instance in entry.instances
             if instance.status == "running"
         )
+
+    def _resident_cap_starved(self, run: FactoryRun) -> bool:
+        """True when queued instances can never be admitted: every
+        ``max_parallel`` slot is held by a never-settling resident instance.
+
+        Residents stay running until ``stop()`` tears them down, so a cap
+        held entirely by resident instances never frees a slot and pending
+        instances behind that cap would wait forever. One task instance in
+        flight means a slot can still open on its settle, so that is not a
+        dead end.
+        """
+        running = [
+            state.lifecycle == "resident"
+            for state in run.states.values()
+            for entry in state.entries
+            for instance in entry.instances
+            if instance.status == "running"
+        ]
+        if len(running) < run.max_parallel or not self._has_pending_instance(run):
+            return False
+        return all(running)
 
     def _has_pending_instance(self, run: FactoryRun) -> bool:
         return any(

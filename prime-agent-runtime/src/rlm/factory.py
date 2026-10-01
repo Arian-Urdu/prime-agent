@@ -438,6 +438,21 @@ def validate_factory_machine(machine: Any) -> list[str]:
             errors.append(f"state {state_id} max_entries must be an integer >= {STATE_MAX_ENTRIES_DEFAULT}")
         if state.get("entry") is True and _port_list(state, "inputs"):
             errors.append(f"entry state {state_id} cannot declare inputs")
+        # A REQUIRED self-input can never bind: the state's first entry needs
+        # its own prior settle, and no settle exists before an entry settles.
+        # Optional self-inputs are the loop form (the first entry binds the
+        # null sentinel, re-entries re-bind the previous settle), so only the
+        # required variant is rejected -- the machine-form mirror of the dag
+        # compiler's "node b cannot depend on itself" rule.
+        for inp in _port_list(state, "inputs"):
+            if not isinstance(inp, dict) or inp.get("optional"):
+                continue
+            source = inp.get("from")
+            if isinstance(source, str) and "." in source and source.partition(".")[0] == state_id:
+                errors.append(
+                    f"state {state_id} input {inp.get('name')!r} cannot require itself: "
+                    "mark the self-input optional - a required one can never bind on the state's first entry"
+                )
 
     # The entry check needs at least one well-formed state: a machine whose
     # only state failed its id check reports that problem alone, and a flag

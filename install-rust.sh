@@ -134,6 +134,10 @@
 # channel's current version; the script is idempotent (a re-run replaces
 # the payload, keeps one .old rollback generation, and re-runs the
 # takeover steps as no-ops when there is nothing left to take over).
+# install-rust.sh --rollback republishes that kept generation, and
+# install-rust.sh --archive <path> publishes a local release archive
+# instead of a channel download (`prime-agent update --rollback` and
+# `--archive` run the copy of this script bundled into the binary).
 #
 # PREREQUISITES: curl + sh (+ the network for the download). The installer
 # needs a Python for its own scripting steps (the store guard's realpath,
@@ -178,8 +182,13 @@ warning and the first session bootstraps the kernel itself — it needs the
 network once.
 
 Options:
-  --update    the documented alias the update entry points exec (identical run)
-  --verbose   the progress detail also goes to stdout, not just fd 3
+  --update          the documented alias the update entry points exec (identical run)
+  --rollback        restore the previous version the last install kept
+                    (share/prime-agent.old.*); the replaced version is kept in
+                    its place, so a second --rollback undoes the first
+  --archive <path>  install a local prime-agent-<version>-<platform>.tar.gz
+                    release archive instead of downloading from the channel
+  --verbose         the progress detail also goes to stdout, not just fd 3
 Output:
   stdout      the essentials (the success block, the actionable takeover
               facts, the PATH warning when it applies, the next-step line)
@@ -204,16 +213,30 @@ USAGE
 # points (`prime-agent update`, the TUI /update) exec — identical to the default
 # run because the flow is idempotent by construction. --verbose folds the fd-3
 # progress detail onto stdout (PRIME_AGENT_RUST_VERBOSE=1 does the same).
+# --rollback and --archive pick the payload source (MODE); the default is the
+# channel download.
 VERBOSE="${PRIME_AGENT_RUST_VERBOSE:-0}"
+MODE="channel"
+ARCHIVE=""
 # Every argument is scanned (no positionals exist): the flags compose, so
 # `--update --verbose` sets both effects instead of silently dropping one.
-for arg in "$@"; do
-  case "$arg" in
+while [ $# -gt 0 ]; do
+  case "$1" in
     --update) ;;
+    --rollback)
+      [ "$MODE" = archive ] && die "--rollback and --archive are exclusive"
+      MODE="rollback" ;;
+    --archive)
+      [ "$MODE" = rollback ] && die "--rollback and --archive are exclusive"
+      [ $# -ge 2 ] || { usage >&2; die "--archive needs the path of a release archive"; }
+      MODE="archive"
+      ARCHIVE="$2"
+      shift ;;
     --verbose|-v) VERBOSE=1 ;;
     -h|--help) usage; exit 0 ;;
-    *) usage >&2; die "unknown argument: ${arg}" ;;
+    *) usage >&2; die "unknown argument: $1" ;;
   esac
+  shift
 done
 
 # --- the output contract ------------------------------------------------------
@@ -445,7 +468,34 @@ old_layout_dir="${PREFIX}/share/prime-agent-rust"
 legacy_dir="${PREFIX}/share/prime-agent-legacy"
 lock_link="${PREFIX}/share/.prime-agent-install.lock"
 legacy_lock="${PREFIX}/share/.prime-agent-rust-install.lock"
+generations_record="${PREFIX}/share/.prime-agent-install-generations"
 guard_preserved "$share_dir" "$launcher" "$old_layout_dir" "$legacy_dir" "$lock_link"
+
+# --- --rollback: the newest kept generation ------------------------------------
+# The rollback source is the newest generation in the generations record (the
+# record is append-only, so the last usable line is the newest) that still
+# exists, carries this installer's marker, and holds a payload binary. Its
+# marker supplies the channel and version; the publish below moves it back
+# into place and keeps the replaced payload as the new generation.
+rollback_from=""
+if [ "$MODE" = rollback ]; then
+  if [ -f "$generations_record" ]; then
+    while IFS= read -r recorded; do
+      case "$recorded" in
+        "${PREFIX}/share/prime-agent.old."*) ;;
+        *) continue ;;
+      esac
+      [ -d "$recorded" ] && [ -x "${recorded}/prime-agent" ] || continue
+      head -n 1 "${recorded}/.prime-agent-install" 2>/dev/null \
+        | grep -q '^install-rust.sh channel ' || continue
+      rollback_from="$recorded"
+    done < "$generations_record"
+  fi
+  [ -n "$rollback_from" ] || die "nothing to roll back: no previous version is kept under ${PREFIX}/share
+(each update keeps the version it replaced; a fresh install has none)"
+  CHANNEL="$(sed -n '1s/^install-rust.sh channel //p' "${rollback_from}/.prime-agent-install")"
+  VERSION="$(sed -n '2s/^version //p' "${rollback_from}/.prime-agent-install")"
+fi
 
 # --- platform detection ----------------------------------------------------
 # uname -m maps directly to the built target: an Apple-Silicon Mac whose
@@ -496,6 +546,26 @@ compiled against glibc 2.35 (Ubuntu 22.04) and will not start here"
   say "glibc ${glibc} >= 2.35: supported"
 fi
 
+# --- --archive: a local release archive ------------------------------------------
+# The archive must carry the channel naming for this platform; the version
+# comes from the name. The channel download and its checksum checks are
+# skipped: the operator named the payload (the tarball must still contain an
+# executable prime-agent, checked at extraction).
+if [ "$MODE" = archive ]; then
+  [ -f "$ARCHIVE" ] || die "the release archive ${ARCHIVE} does not exist"
+  archive_name="${ARCHIVE##*/}"
+  case "$archive_name" in
+    prime-agent-?*-"${CHANNEL_PLATFORM}".tar.gz) ;;
+    *) die "${archive_name} is not a ${CHANNEL_PLATFORM} release archive (expected prime-agent-<version>-${CHANNEL_PLATFORM}.tar.gz)" ;;
+  esac
+  VERSION="${archive_name#prime-agent-}"
+  VERSION="${VERSION%-"${CHANNEL_PLATFORM}".tar.gz}"
+  asset="$ARCHIVE"
+  say "installing prime-agent ${VERSION} from the local archive ${ARCHIVE}"
+elif [ "$MODE" = rollback ]; then
+  say "rolling back to prime-agent ${VERSION} (${rollback_from})"
+fi
+
 # --- the R2 channel (the user path never touches GitHub) --------------------
 # THE CHANNEL RESOLUTION (the TS install.sh parity): the channel pointer
 # file gives the version, the channel manifest gives this platform's
@@ -507,6 +577,11 @@ case "$CHANNEL" in
   beta) CHANNEL_MANIFEST="beta.json" ;;
   *) die "unknown release channel: ${CHANNEL} (stable or beta)" ;;
 esac
+dl="$(mktemp -d "${TMPDIR:-/tmp}/prime-agent-download.XXXXXX")"
+# The local modes (--rollback, --archive) already have their payload: the
+# channel resolution, the download, and the checksum checks below run only
+# for the channel install (the block is not re-indented).
+if [ "$MODE" = channel ]; then
 case "$BASE_URL" in
   https://*) ;;
   *) die "the download base URL must be an https URL: ${BASE_URL}" ;;
@@ -556,7 +631,6 @@ say "installing prime-agent ${VERSION} from the ${CHANNEL} channel (${CHANNEL_PL
 # The row reader rides a FILE, not a heredoc inside a command substitution
 # (the probe-py pattern: macOS ships bash 3.2 as /bin/sh, and its
 # POSIX-mode parser cannot close a $( ) that spans a heredoc body).
-dl="$(mktemp -d "${TMPDIR:-/tmp}/prime-agent-download.XXXXXX")"
 if [ "$VERSION_PINNED" = "yes" ]; then
   asset_name="prime-agent-${VERSION}-${CHANNEL_PLATFORM}.tar.gz"
   manifest_sha=""
@@ -643,6 +717,7 @@ else
   die "no sha256 tool found (sha256sum or shasum is required to verify the download)"
 fi
 say "checksum verified: ${asset_name} (${VERSION}, the ${CHANNEL} channel)"
+fi
 
 # --- the TypeScript takeover, step 1: stop BOTH daemons ALWAYS ----------------
 # THE ALWAYS-STOP CONTRACT (PR1's field ruling, hardened + the second
@@ -1217,6 +1292,11 @@ fi
 # new stage is in place, so the live tree is never rm'd while the launcher
 # still points into it. The renamed-aside tree is KEPT as a one-generation
 # rollback (prime-agent.old.<pid>); the next successful install sweeps it.
+# A rollback publishes the kept generation itself as the stage: it already
+# carries its payload and its marker.
+if [ -n "$rollback_from" ]; then
+  stage="$rollback_from"
+else
 stage="$(mktemp -d "${PREFIX}/share/prime-agent.stage.XXXXXX")"
 guard_preserved "$stage"
 tar -xzf "$asset" -C "$stage"
@@ -1229,6 +1309,7 @@ tar -xzf "$asset" -C "$stage"
 # user instead).
 printf 'install-rust.sh channel %s\nversion %s\n' "$CHANNEL" "$VERSION" \
   > "${stage}/.prime-agent-install"
+fi
 
 # A lock left by the pre-takeover installer (name .prime-agent-rust-install.lock):
 # a live holder still owns the publish, a dead one can never publish again —
@@ -1295,10 +1376,11 @@ trap on_exit EXIT
 # payload, not that the SLOT is a rollback generation: a user who COPIES the
 # payload into the namespace (marker and all) keeps their copy. Pre-takeover-era
 # crash leftovers (prime-agent-rust.old.*, never stamped) are left in place —
-# harmless, and the user's to remove.
-generations_record="${PREFIX}/share/.prime-agent-install-generations"
+# harmless, and the user's to remove. A rollback's source generation is the
+# payload being published, never swept.
 for sweep_dir in "${PREFIX}"/share/prime-agent.old.* "${PREFIX}"/share/prime-agent-rust.old.*; do
   [ -d "$sweep_dir" ] || continue
+  [ "$sweep_dir" != "$rollback_from" ] || continue
   [ -f "${sweep_dir}/.prime-agent-install" ] || continue
   grep -qxF -- "$sweep_dir" "$generations_record" 2>/dev/null || continue
   # Best-effort: an un-sweepable generation (a mounted dir, a permission
@@ -1667,11 +1749,16 @@ echo "launcher:  ${launcher}"
 echo "payload:   ${share_dir}"
 if [ -d "$old" ] && grep -qxF -- "$old" "$generations_record" 2>/dev/null; then
   echo "rollback:  ${old} (the previous payload, one generation; swept on the next install)"
+  echo "           restore it with: prime-agent update --rollback"
 elif [ -d "$old" ]; then
   echo "rollback:  ${old} (the migrated pre-takeover tree; kept — remove it by hand"
   echo "            once you no longer need the rollback)"
 fi
-echo "source:    the ${CHANNEL} channel at ${BASE_URL} (prime-agent ${VERSION})"
+case "$MODE" in
+  rollback) echo "source:    the kept previous version (prime-agent ${VERSION}, the ${CHANNEL} channel)" ;;
+  archive) echo "source:    the local archive ${ARCHIVE} (prime-agent ${VERSION})" ;;
+  *) echo "source:    the ${CHANNEL} channel at ${BASE_URL} (prime-agent ${VERSION})" ;;
+esac
 if [ -n "$ts_stop_summary" ]; then
   printf '%s' "$ts_stop_summary"
 elif [ -z "$ts_stop_found_any" ] && [ -z "$ts_stop_refused" ]; then

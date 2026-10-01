@@ -38,6 +38,12 @@ pub const DEFAULT_DOWNLOAD_BASE_URL: &str = "https://pub-728493de92a943e2a9b2d17
 /// override env var stays for tests and pinned installs).
 pub const OFFICIAL_INSTALLER_URL: &str = "https://app.primeintellect.ai/prime-agent/install.sh";
 
+/// `install-rust.sh` as this build shipped it. The local operations
+/// (`prime-agent update --rollback` and `--archive`) run this copy: they
+/// need no network, and the script matches the layout this build was
+/// installed with.
+pub const BUNDLED_INSTALLER: &str = include_str!("../../../../install-rust.sh");
+
 /// The small-file budget for the script download (the script is a few KB;
 /// a hung fetch must not hang the update).
 const SCRIPT_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -190,9 +196,63 @@ pub async fn run_installer_from(
     let script = fetch_script(url).await.map_err(|error| UpdateFailure {
         message: format!("could not download the installer from {url}: {error:#}"),
     })?;
-    execute_script(&script, prefix, channel, output).await?;
+    execute_script(&script, &[], prefix, channel, output).await?;
     let version = launcher_version(prefix).await;
     Ok(Installed { version })
+}
+
+/// Run the [`BUNDLED_INSTALLER`] with `args` (`--rollback`, or `--archive
+/// <path>`) against the install under `prefix`. On success the version is
+/// the one the published payload's install marker records.
+///
+/// # Errors
+/// Returns the failure message when the script cannot be written or run,
+/// or exits nonzero (its own message already streamed to the terminal).
+pub async fn run_bundled_installer(
+    prefix: &Path,
+    args: &[&std::ffi::OsStr],
+) -> std::result::Result<Installed, UpdateFailure> {
+    let script = write_script(BUNDLED_INSTALLER.as_bytes()).map_err(|error| UpdateFailure {
+        message: format!("could not write the bundled installer: {error:#}"),
+    })?;
+    let result = execute_script(&script, args, prefix, None, InstallerOutput::Inherit).await;
+    let _ = std::fs::remove_file(&script);
+    result?;
+    Ok(Installed {
+        version: installed_version(prefix),
+    })
+}
+
+/// The install prefix of an installer-owned binary: `exe` is
+/// `<prefix>/share/prime-agent/prime-agent` and that payload carries the
+/// installer's marker. `None` for any other binary (a managed release, a
+/// development build).
+#[must_use]
+pub fn installer_prefix_of(exe: &Path) -> Option<PathBuf> {
+    let payload = exe.parent()?;
+    let share = payload.parent()?;
+    let owned = exe.file_name()? == "prime-agent"
+        && payload.file_name()? == "prime-agent"
+        && share.file_name()? == "share";
+    let prefix = share.parent()?;
+    (owned && installed_channel(prefix).is_some()).then(|| prefix.to_path_buf())
+}
+
+/// The install prefix of the running binary when the installer owns it
+/// (see [`installer_prefix_of`]).
+#[must_use]
+pub fn running_installer_prefix() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    installer_prefix_of(&exe)
+}
+
+/// The installed payload's version, read from the install marker's
+/// "version <v>" line.
+fn installed_version(prefix: &Path) -> Option<String> {
+    let marker =
+        std::fs::read_to_string(prefix.join("share/prime-agent/.prime-agent-install")).ok()?;
+    let version = marker.lines().nth(1)?.strip_prefix("version ")?.trim();
+    (!version.is_empty()).then(|| version.to_string())
 }
 
 /// The installed payload's channel, read from the install marker (the
@@ -247,11 +307,16 @@ async fn fetch_script(url: &str) -> Result<PathBuf> {
     if bytes.is_empty() {
         anyhow::bail!("the installer script at {url} was empty");
     }
+    write_script(&bytes)
+}
+
+/// Write installer script bytes to a per-run temp file.
+fn write_script(bytes: &[u8]) -> Result<PathBuf> {
     let script = std::env::temp_dir().join(format!(
         "prime-agent-update-{}.sh",
         uuid::Uuid::now_v7().simple()
     ));
-    std::fs::write(&script, &bytes).with_context(|| format!("write {}", script.display()))?;
+    std::fs::write(&script, bytes).with_context(|| format!("write {}", script.display()))?;
     Ok(script)
 }
 
@@ -270,12 +335,13 @@ async fn fetch_script(url: &str) -> Result<PathBuf> {
 /// Returns the failure when the script cannot start or exits nonzero.
 async fn execute_script(
     script: &Path,
+    args: &[&std::ffi::OsStr],
     prefix: &Path,
     channel: Option<&'static str>,
     output: InstallerOutput,
 ) -> std::result::Result<(), UpdateFailure> {
     let mut command = tokio::process::Command::new("/bin/sh");
-    command.arg(script).env(ENV_PREFIX, prefix);
+    command.arg(script).args(args).env(ENV_PREFIX, prefix);
     // The requested channel wins; otherwise the update stays on the channel
     // the install marker records (the fetched script's own default is the
     // stable render, so a beta install would silently switch channels).
@@ -430,6 +496,32 @@ mod tests {
         // the update rides the fetched script's own default.
         std::fs::write(share.join(".prime-agent-install"), "channel beta\n").unwrap();
         assert_eq!(installed_channel(&prefix), None);
+    }
+
+    /// Only the payload binary of a marked installer tree is
+    /// installer-owned; the marker's version line is the installed
+    /// version.
+    #[test]
+    fn installer_prefix_of_needs_the_payload_path_and_the_marker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let prefix = dir.path().join("prefix");
+        let payload = prefix.join("share/prime-agent");
+        std::fs::create_dir_all(&payload).unwrap();
+        let exe = payload.join("prime-agent");
+        assert_eq!(installer_prefix_of(&exe), None, "no marker: not owned");
+        std::fs::write(
+            payload.join(".prime-agent-install"),
+            "install-rust.sh channel beta\nversion 0.9.9-beta.10\n",
+        )
+        .unwrap();
+        assert_eq!(installer_prefix_of(&exe), Some(prefix.clone()));
+        assert_eq!(installed_version(&prefix).as_deref(), Some("0.9.9-beta.10"));
+        // A binary elsewhere in the tree, or a managed release, is not.
+        assert_eq!(installer_prefix_of(&payload.join("other")), None);
+        assert_eq!(
+            installer_prefix_of(&prefix.join("releases/0.9.8/prime-agent")),
+            None
+        );
     }
 
     /// Serve `body` over one plain HTTP request (the hermetic source the

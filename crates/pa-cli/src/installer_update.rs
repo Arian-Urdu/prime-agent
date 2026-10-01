@@ -125,6 +125,48 @@ pub fn run(options: &UpdateOptions) -> i32 {
     }
 }
 
+/// The local operation on an installer install: `--rollback` restores the
+/// previous version the last install kept, `--archive` installs a local
+/// release archive. Both run the installer script bundled into this build
+/// against the prefix the running binary was installed under. Returns the
+/// process exit code.
+pub fn run_local(prefix: &std::path::Path, archive: Option<&std::path::Path>) -> i32 {
+    let archive = match archive.map(std::path::absolute).transpose() {
+        Ok(archive) => archive,
+        Err(error) => {
+            eprintln!("Error: could not resolve the archive path: {error}");
+            return 1;
+        }
+    };
+    let args: Vec<&std::ffi::OsStr> = match &archive {
+        Some(path) => vec!["--archive".as_ref(), path.as_os_str()],
+        None => vec!["--rollback".as_ref()],
+    };
+    let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    else {
+        eprintln!("Error: could not start the update runtime.");
+        return 1;
+    };
+    match runtime.block_on(installer::run_bundled_installer(prefix, &args)) {
+        Ok(installed) => {
+            let done = if archive.is_some() {
+                "installed"
+            } else {
+                "rolled back to"
+            };
+            let version = installed.version.as_deref().unwrap_or("the previous build");
+            println!("{done} {version} — restart prime-agent to run it");
+            0
+        }
+        Err(failure) => {
+            eprintln!("Error: {}", failure.message);
+            1
+        }
+    }
+}
+
 /// Persist an explicit channel switch (`--nightly` / `--stable`) after a
 /// completed update.
 fn save_channel(channel: UpdateChannel) {

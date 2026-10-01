@@ -54,8 +54,7 @@ pays one cold build; every build after that is warm.
   host: the GNU `aarch64-linux-gnu` toolchain links against the Ubuntu
   22.04 cross sysroot (the same GLIBC 2.35 baseline), and every gate still
   runs:
-  - the GLIBC gate reads the arm64 ELF with the host's multi-target
-    `objdump`;
+  - the GLIBC gate reads the arm64 ELF with `aarch64-linux-gnu-objdump`;
   - the livechecks execute the produced arm64 binary on the x64 host under
     `qemu-user` binfmt (`QEMU_LD_PREFIX=/usr/aarch64-linux-gnu` points qemu
     at the cross sysroot's dynamic linker);
@@ -109,15 +108,21 @@ lifetime cap) lives in the fleet tools, not in this repo.
 GitHub warns against self-hosted runners on public repos because a runner
 executes workflow code on your infra. This design answers each half:
 
-- **What code runs here**: only `main`-merged or tagged code — the PR wave
-  (`ci.yml`) stays on GitHub-hosted runners. The build jobs hold no secrets:
+- **What code runs here**: our workflows send only `main` pushes
+  (continuous) and tags (release) to these labels, and the PR wave
+  (`ci.yml`) stays on GitHub-hosted runners. GitHub does not enforce this
+  for repository runners: a workflow edited in a branch or a pull request
+  (once its run is approved) can target the labels too. Keep fork pull
+  request runs behind approval, or register the runners in an org runner
+  group limited to this repository and to the `continuous.yml` and
+  `release.yml` workflows. The build jobs hold no secrets:
   `permissions: contents: read`, and every publish credential (R2 keys, the
   release environment) stays on the GitHub-hosted `promote` job.
-- **What the code can touch**: a disposable microVM. The build runs as the
-  sudo-less `gh-runner` user inside an ephemeral VM that is destroyed at
-  teardown; a compromise is a burned sandbox, not a foothold. Egress can be
-  narrowed further with the sandbox network allowlist (GitHub endpoints +
-  crates.io) if the fleet wants it.
+- **What the code can touch**: the runner VM, as the sudo-less `gh-runner`
+  user. The VM and its `target/` cache live until the weekly rotation, so a
+  job that tampers with the cache can affect the artifacts of later builds
+  on that runner until it is re-created. Egress can be narrowed with the
+  sandbox network allowlist (GitHub endpoints + crates.io).
 - **What it costs to be wrong**: a runner VM can be deleted and re-created
   in seconds from the pinned image; the registration is a one-script
   provision.

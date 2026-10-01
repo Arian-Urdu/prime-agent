@@ -140,7 +140,7 @@ jobs:
           set -euo pipefail
           tools=(gcc curl python3 git objcopy)
           if [[ "${{ matrix.target }}" == aarch64-unknown-linux-gnu ]]; then
-            tools+=(aarch64-linux-gnu-gcc aarch64-linux-gnu-objcopy)
+            tools+=(aarch64-linux-gnu-gcc aarch64-linux-gnu-objcopy aarch64-linux-gnu-objdump)
             [[ -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]] \
               || { echo "::error::qemu-aarch64 binfmt is not enabled; re-provision with scripts/ci/register_runner.sh"; exit 1; }
           fi
@@ -192,12 +192,13 @@ jobs:
         run: |
           set -euo pipefail
           bin="target/${{ matrix.target }}/dist/prime-agent"
-          # Plain objdump reads the cross leg's aarch64 ELF too (the host
-          # binutils is built multi-target; the promote job's verify_decoders
-          # readelf already relies on that for every target's artifacts).
-          syms="$(objdump -T "${bin}" | grep -o 'GLIBC_[0-9.]*' || true)"
+          # The cross leg reads its aarch64 ELF with the matching cross
+          # binutils, like the split/assemble steps do.
+          objdump=objdump
+          [[ "${{ matrix.target }}" == aarch64-unknown-linux-gnu ]] && objdump=aarch64-linux-gnu-objdump
+          syms="$("${objdump}" -T "${bin}" | grep -o 'GLIBC_[0-9.]*' || true)"
           if [ -z "${syms}" ]; then
-            echo "::error::could not inspect ${bin} with objdump (no GLIBC symbols found) - refusing to pass the gate without evidence"
+            echo "::error::could not inspect ${bin} with ${objdump} (no GLIBC symbols found) - refusing to pass the gate without evidence"
             exit 1
           fi
           max_glibc="$(printf '%s\n' "${syms}" | sort -Vu | tail -1)"

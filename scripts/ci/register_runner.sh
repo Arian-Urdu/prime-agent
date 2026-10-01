@@ -98,6 +98,9 @@ su -s /bin/bash "${RUNNER_USER}" -c "cd '${RUNNER_DIR}' && ./config.sh --unatten
   --token '${RUNNER_TOKEN}' \
   --name '${RUNNER_NAME}' \
   --labels '${RUNNER_LABELS}'"
+# su keeps the caller's environment: drop the token so the supervisor, the
+# agent, and every job it runs never see it.
+unset RUNNER_TOKEN
 
 # Sandboxes have no systemd (the sandbox init is not systemd): run the agent
 # under a restart-on-exit supervision loop instead of svc.sh. The loop is a

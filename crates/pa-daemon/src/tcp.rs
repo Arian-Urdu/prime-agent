@@ -11,12 +11,14 @@
 //! was configured.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use pa_core::platform::{is_executable, is_executable_by_process};
 use serde_json::Value;
 
 /// Environment variable checked for the daemon TCP port (after the CLI
@@ -49,6 +51,12 @@ pub const DAEMON_TCP_IDLE_TIMEOUT: Duration = Duration::from_mins(10);
 /// written (TS #2517's `DAEMON_TCP_PRE_READY_TIMEOUT_MS`, the review
 /// round that stopped the auth window from closing pre-ready clients).
 pub const DAEMON_TCP_PRE_READY_TIMEOUT: Duration = Duration::from_secs(120);
+/// Bound on the bind-address probe's `tailscale status --json` spawn (TS
+/// #2517's `DAEMON_TCP_TAILSCALE_TIMEOUT_MS`, SIGKILL past the window): the
+/// probe runs during startup after the unix socket is bound but before the
+/// accept loops serve, so a wedged `tailscaled` must die at the window
+/// instead of parking the daemon with a bound-but-never-accepting socket.
+const DAEMON_TCP_TAILSCALE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One TCP command line's auth verdict (TS `DaemonTcpAuthVerdict`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,6 +177,21 @@ pub fn resolve_daemon_tcp_listener_host(
     env: &HashMap<String, String>,
     probe: &dyn Fn() -> Option<IpAddr>,
 ) -> Result<IpAddr> {
+    if let Some(host) = configured_daemon_tcp_listener_host(explicit, settings_host, env)? {
+        return Ok(host);
+    }
+    probe().ok_or_else(daemon_tcp_bind_host_missing)
+}
+
+/// The configured bind host when a source provides one (the precedence
+/// chain the pure resolver and the production probe share): explicit CLI
+/// flag > env var > settings `daemonTcpBindHost`, first non-empty source
+/// wins (including its parse error).
+fn configured_daemon_tcp_listener_host(
+    explicit: Option<&str>,
+    settings_host: Option<&str>,
+    env: &HashMap<String, String>,
+) -> Result<Option<IpAddr>> {
     let candidates = [
         (explicit, "--daemon-bind"),
         (
@@ -179,40 +202,62 @@ pub fn resolve_daemon_tcp_listener_host(
     ];
     for (value, source) in candidates {
         if let Some(value) = value.filter(|value| !value.is_empty()) {
-            return daemon_tcp_bind_host_from_source(value, source);
+            return daemon_tcp_bind_host_from_source(value, source).map(Some);
         }
     }
-    let tailscale_address = probe().ok_or_else(|| {
-        anyhow!(
-            "Refusing to start the daemon TCP listener: this machine has no Tailscale address to bind and no bind host was configured. The per-machine token travels in plaintext over TCP, so the listener binds the tailnet only. Set {DAEMON_TCP_BIND_HOST_ENV}, the --daemon-bind flag, or settings daemonTcpBindHost to the local address to listen on (only when that network is trusted), or unset the daemon port to disable the listener."
-        )
-    })?;
-    Ok(tailscale_address)
+    Ok(None)
+}
+
+/// The fail-closed refusal when no source provides a host and the probe
+/// cannot find a tailnet address (a wildcard default is never returned).
+fn daemon_tcp_bind_host_missing() -> anyhow::Error {
+    anyhow!(
+        "Refusing to start the daemon TCP listener: this machine has no Tailscale address to bind and no bind host was configured. The per-machine token travels in plaintext over TCP, so the listener binds the tailnet only. Set {DAEMON_TCP_BIND_HOST_ENV}, the --daemon-bind flag, or settings daemonTcpBindHost to the local address to listen on (only when that network is trusted), or unset the daemon port to disable the listener."
+    )
 }
 
 /// The tailscale CLI this module spawns: which-style first match over the
-/// ambient `PATH`, but fail closed - only absolute `PATH` entries are
-/// considered (a relative entry, or an entry that is the current
-/// directory, resolves to attacker-controllable contents). Mirrors the
-/// detection core's trusted-path resolution (the #3181 tailscale probe).
+/// ambient `PATH`, but fail closed. Mirrors the detection core's
+/// trusted-path resolution (the #3181 tailscale probe, the CLI's
+/// `resolve_tailscale_binary`) exactly.
 fn trusted_tailscale_path() -> Option<PathBuf> {
     let path_env = std::env::var_os("PATH")?;
     let cwd = std::env::current_dir().ok()?;
+    trusted_tailscale_path_over(&path_env, &cwd)
+}
+
+/// The trusted-path resolver core: which-style first match over `path_env`
+/// for the `tailscale` program, fail closed (the CLI detection core's
+/// contract, kept the same on both sides of the daemon/CLI split - the
+/// probe's output picks the listener's bind address, so a weaker lookup
+/// here would let a planted binary name the interface the plaintext
+/// token rides):
+///
+/// - only absolute `PATH` entries are considered (a relative entry, or an
+///   entry that is the current directory, resolves to
+///   attacker-controllable contents);
+/// - an entry that *is* the current directory is skipped canonically
+///   (`canonicalize` on both sides), so a `./tailscale` planted in the
+///   working directory - reached through an absolute entry that is a
+///   symlink to it - can never supply the binary either;
+/// - a candidate must be executable by this process, not just present:
+///   a first entry whose `tailscale` is a non-executable file yields to a
+///   later usable CLI instead of stranding it (the spawn would die with
+///   permission denied and fail-close the listener).
+fn trusted_tailscale_path_over(path_env: &OsStr, cwd: &Path) -> Option<PathBuf> {
+    let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let program = if cfg!(windows) {
         "tailscale.exe"
     } else {
         "tailscale"
     };
-    for entry in std::env::split_paths(&path_env) {
-        if !entry.is_absolute() || entry == cwd {
-            continue;
-        }
-        let candidate = entry.join(program);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    std::env::split_paths(path_env)
+        .filter(|entry| entry.is_absolute())
+        .filter(|entry| std::fs::canonicalize(entry).map_or(true, |real| real != cwd))
+        .map(|entry| entry.join(program))
+        .find(|candidate| {
+            candidate.is_file() && is_executable(candidate) && is_executable_by_process(candidate)
+        })
 }
 
 /// Resolve this machine's own Tailscale address for the default listener
@@ -224,15 +269,25 @@ fn trusted_tailscale_path() -> Option<PathBuf> {
 /// read mirrors the detection core's probe: `tailscale status --json`,
 /// `Self.Online`/`BackendState` (a Running-but-offline daemon keeps its
 /// assigned address), IPv4 preferred.
-fn detect_tailscale_bind_address() -> Option<IpAddr> {
+async fn detect_tailscale_bind_address() -> Option<IpAddr> {
     let program = trusted_tailscale_path()?;
-    let output = std::process::Command::new(program)
+    detect_tailscale_bind_address_with(&program, DAEMON_TCP_TAILSCALE_TIMEOUT).await
+}
+
+/// One bounded `tailscale status --json` probe (TS `detectTailscaleBindAddress`'s
+/// `timeout: DAEMON_TCP_TAILSCALE_TIMEOUT_MS`, `killSignal: SIGKILL`): the
+/// spawn dies at `timeout` instead of parking startup with it - the probe
+/// runs after the unix socket is bound, and a wedged `tailscaled` must not
+/// leave clients connected to a daemon that never accepts.
+async fn detect_tailscale_bind_address_with(program: &Path, timeout: Duration) -> Option<IpAddr> {
+    let probe = tokio::process::Command::new(program)
         .args(["status", "--json"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
         .output();
-    let Ok(output) = output else {
+    let Ok(Ok(output)) = tokio::time::timeout(timeout, probe).await else {
         return None;
     };
     if !output.status.success() {
@@ -263,19 +318,27 @@ fn detect_tailscale_bind_address() -> Option<IpAddr> {
         .copied()
 }
 
-/// Resolve the listener bind host with the production probe
-/// (module-private detection: callers resolve through
-/// [`resolve_daemon_tcp_listener_host`], tests inject their own probe).
+/// Resolve the listener bind host with the production probe (module-private
+/// detection: the precedence core is shared with
+/// [`resolve_daemon_tcp_listener_host`], whose tests inject their own
+/// probe). The probe is the bounded `tailscale status --json` spawn: it
+/// awaits instead of blocking, and a wedged `tailscaled` dies at
+/// [`DAEMON_TCP_TAILSCALE_TIMEOUT`] instead of parking startup.
 ///
 /// # Errors
 ///
 /// See [`resolve_daemon_tcp_listener_host`].
-pub fn resolve_daemon_tcp_listener_host_production(
+pub async fn resolve_daemon_tcp_listener_host_production(
     explicit: Option<&str>,
     settings_host: Option<&str>,
     env: &HashMap<String, String>,
 ) -> Result<IpAddr> {
-    resolve_daemon_tcp_listener_host(explicit, settings_host, env, &detect_tailscale_bind_address)
+    if let Some(host) = configured_daemon_tcp_listener_host(explicit, settings_host, env)? {
+        return Ok(host);
+    }
+    detect_tailscale_bind_address()
+        .await
+        .ok_or_else(daemon_tcp_bind_host_missing)
 }
 
 /// Timing-safe token comparison that does not leak content through early
@@ -983,5 +1046,130 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600, "the reuse re-restricts the token file");
+    }
+
+    // ------------------------------------------------------------------
+    // The bind-address probe's trusted resolution and its bounded spawn
+    // (the Bugbot round: the probe picks the interface the plaintext
+    // token rides, and it runs after the unix socket is bound).
+    // ------------------------------------------------------------------
+
+    /// The probe's spawn budget is the TS window (TS #2517
+    /// `DAEMON_TCP_TAILSCALE_TIMEOUT_MS = 15_000`): the constants test
+    /// stands in for a virtual-time wait the same way the idle-window
+    /// pin does.
+    #[test]
+    fn tailscale_probe_budget_is_the_ts_window() {
+        assert_eq!(
+            DAEMON_TCP_TAILSCALE_TIMEOUT,
+            Duration::from_secs(15),
+            "TS #2517's DAEMON_TCP_TAILSCALE_TIMEOUT_MS"
+        );
+    }
+
+    /// A wedged `tailscale` CLI (the spawn never answers) dies at the
+    /// window instead of parking startup with it: the probe runs after
+    /// the unix socket is bound, so an unbounded spawn would leave
+    /// clients connected to a daemon that never accepts (Bugbot's
+    /// startup-hang finding, TS's `timeout`/`SIGKILL` contract).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hung_tailscale_probe_dies_at_the_window() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("tailscale");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        make_executable(&script);
+        let started = std::time::Instant::now();
+        let address = detect_tailscale_bind_address_with(&script, Duration::from_millis(300)).await;
+        assert!(
+            address.is_none(),
+            "a wedged CLI yields no bind address: {address:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wedged spawn died at the window, took {}s",
+            started.elapsed().as_secs_f32()
+        );
+    }
+
+    /// A first `PATH` entry whose `tailscale` is not executable yields to
+    /// a later usable CLI instead of stranding it: the old first-file
+    /// match fail-closed the listener with permission-denied spawns even
+    /// while the real CLI sat in a later entry (Bugbot's stranding arm).
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_first_match_yields_to_a_later_cli() {
+        let base = tempfile::TempDir::new().unwrap();
+        let stranded = base.path().join("stranded");
+        let real = base.path().join("real");
+        std::fs::create_dir_all(&stranded).unwrap();
+        std::fs::create_dir_all(&real).unwrap();
+        let decoy = stranded.join("tailscale");
+        std::fs::write(&decoy, "#!/bin/sh\nexit 0\n").unwrap();
+        let usable = real.join("tailscale");
+        std::fs::write(&usable, "#!/bin/sh\nexit 0\n").unwrap();
+        make_executable(&usable);
+        let path_env = format!("{}:{}", stranded.display(), real.display());
+        let resolved = trusted_tailscale_path_over(OsStr::new(&path_env), base.path());
+        assert_eq!(
+            resolved,
+            Some(usable),
+            "the later executable CLI wins over the non-executable first match"
+        );
+    }
+
+    /// The cwd skip is canonical: a `PATH` entry that is an absolute
+    /// symlink to the current directory is skipped the same way the
+    /// entry-equals-cwd case is, so a `./tailscale` planted in the
+    /// working directory can never supply the binary that names the
+    /// listener's bind address (Bugbot's weaker-lookup finding).
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_entry_pointing_at_the_cwd_is_skipped() {
+        let base = tempfile::TempDir::new().unwrap();
+        let planted = base.path().join("tailscale");
+        std::fs::write(&planted, "#!/bin/sh\nexit 0\n").unwrap();
+        make_executable(&planted);
+        let link = base.path().join("link-to-cwd");
+        std::os::unix::fs::symlink(std::fs::canonicalize(base.path()).unwrap(), &link).unwrap();
+        let path_env = link.display().to_string();
+        let resolved = trusted_tailscale_path_over(OsStr::new(&path_env), base.path());
+        assert_eq!(
+            resolved, None,
+            "a symlinked cwd entry never supplies the CLI"
+        );
+    }
+
+    /// Relative and cwd `PATH` entries never supply the CLI (the
+    /// fail-closed pins the resolver shares with the CLI detection core).
+    #[cfg(unix)]
+    #[test]
+    fn relative_and_cwd_entries_never_supply_the_cli() {
+        let base = tempfile::TempDir::new().unwrap();
+        let planted = base.path().join("tailscale");
+        std::fs::write(&planted, "#!/bin/sh\nexit 0\n").unwrap();
+        make_executable(&planted);
+        let relative = OsStr::new(".");
+        assert_eq!(
+            trusted_tailscale_path_over(relative, base.path()),
+            None,
+            "a relative entry resolves to the cwd and is skipped"
+        );
+        let cwd_entry = OsStr::new(base.path().as_os_str());
+        assert_eq!(
+            trusted_tailscale_path_over(cwd_entry, base.path()),
+            None,
+            "the cwd entry is skipped"
+        );
+    }
+
+    /// Make a test script executable by this process (the resolver's
+    /// execute gate requires it).
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
     }
 }

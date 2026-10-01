@@ -74,7 +74,8 @@ impl Supervisor {
             self.options.tcp_bind_host.as_deref(),
             settings.get_daemon_tcp_bind_host().as_deref(),
             &env,
-        )?;
+        )
+        .await?;
         if crate::tcp::is_wildcard_bind_host(&host.to_string()) {
             self.log_line(&format!(
                 "Daemon TCP listener is binding every interface ({host}): the per-machine token and its commands travel in plaintext, so any on-path peer can capture them. Use the tailnet address unless this network is trusted."

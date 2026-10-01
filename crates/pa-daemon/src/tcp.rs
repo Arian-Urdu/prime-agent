@@ -171,6 +171,12 @@ fn daemon_tcp_bind_host_from_source(raw: &str, source: &str) -> Result<IpAddr> {
 /// Returns an error when no source provides a host and the probe cannot
 /// find a tailnet address (fail closed), or when a configured source is
 /// not an IP literal.
+///
+/// Test-only: the lib resolves through
+/// [`resolve_daemon_tcp_listener_host_production`]; this seam exists for
+/// the probe-injected precedence tests (the shared core is
+/// [`configured_daemon_tcp_listener_host`]).
+#[cfg(test)]
 pub fn resolve_daemon_tcp_listener_host(
     explicit: Option<&str>,
     settings_host: Option<&str>,

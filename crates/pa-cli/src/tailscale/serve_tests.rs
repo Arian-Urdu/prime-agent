@@ -208,11 +208,12 @@ async fn serve_uses_a_real_suffix_instead_of_advertising_a_trailing_dot_host() {
     let shim = Shim::write(&payload, &serve_status_for(3000));
     let program = shim.path();
     let mut buf = Vec::new();
-    assert_eq!(
-        run_serve_to(&mut buf, program.as_os_str(), 3000.0, false).await,
-        0
-    );
+    let code = run_serve_to(&mut buf, program.as_os_str(), 3000.0, false).await;
     let text = String::from_utf8(buf).expect("utf8");
+    // The serve output rides the assertion: a transient spawn failure exits
+    // 1 through one of the failure branches, and the printed branch is the
+    // diagnosis the CI log needs (the exit code alone says nothing).
+    assert_eq!(code, 0, "serve must succeed: {text}");
     assert!(
         text.contains("Now reachable on your tailnet as milk.tailnet.ts.net\n"),
         "{text}"

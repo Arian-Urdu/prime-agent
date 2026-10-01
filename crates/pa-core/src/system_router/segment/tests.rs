@@ -208,6 +208,87 @@ async fn the_adapter_runs_in_the_session_working_directory_by_default() {
     assert_eq!(actual, expected);
 }
 
+/// A relative declared adapter cwd joins the session working directory
+/// instead of resolving against the host process cwd (#3184 review): the
+/// two differ in a daemon worker switched onto another session, and
+/// `current_dir` on the raw relative path would run the adapter in the
+/// wrong place.
+#[tokio::test]
+async fn a_relative_adapter_cwd_joins_the_session_working_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("adapter-sub");
+    std::fs::create_dir(&nested).unwrap();
+    let marker = nested.join("adapter-cwd.txt");
+    let command = format!("pwd > {} ; exit 0", marker.display());
+    let payload = json!({
+        "goal": "reach the overworld",
+        "timeoutMs": 2_000,
+        "actions": { "look": { "description": "Look." } },
+        "environment": {
+            "stdio": { "command": ["sh", "-c", command], "cwd": "adapter-sub" }
+        }
+    });
+    let spec = parse_system_router_run_spec(&payload).unwrap();
+    let options = RouterSegmentOptions {
+        model: action_model(),
+        api_key: Some("test-key".to_string()),
+        headers: None,
+        session_id: None,
+        policy: crate::session_engine::provider_retry::DEFAULT_PROVIDER_RETRY_POLICY,
+        env: None,
+        decide: Some(support::scripted_decide(vec![])),
+        default_cwd: Some(dir.path().to_string_lossy().into_owned()),
+        signal: None,
+    };
+    // The adapter cannot speak the protocol, so the segment fails after the
+    // shell wrote its cwd.
+    let _ = run_router_segment(&spec, options).await;
+    let written =
+        std::fs::read_to_string(&marker).expect("the adapter ran in the session's subdirectory");
+    let expected = std::fs::canonicalize(&nested).unwrap();
+    let actual = std::fs::canonicalize(written.trim()).unwrap();
+    assert_eq!(actual, expected);
+}
+
+/// An absolute declared adapter cwd wins as-is: the session working
+/// directory is only the anchor for relative paths and the undeclared
+/// default, never an override.
+#[tokio::test]
+async fn an_absolute_adapter_cwd_wins_over_the_session_directory() {
+    let session_dir = tempfile::tempdir().unwrap();
+    let declared_dir = tempfile::tempdir().unwrap();
+    let marker = declared_dir.path().join("adapter-cwd.txt");
+    let command = format!("pwd > {} ; exit 0", marker.display());
+    let payload = json!({
+        "goal": "reach the overworld",
+        "timeoutMs": 2_000,
+        "actions": { "look": { "description": "Look." } },
+        "environment": {
+            "stdio": {
+                "command": ["sh", "-c", command],
+                "cwd": declared_dir.path().to_string_lossy().into_owned()
+            }
+        }
+    });
+    let spec = parse_system_router_run_spec(&payload).unwrap();
+    let options = RouterSegmentOptions {
+        model: action_model(),
+        api_key: Some("test-key".to_string()),
+        headers: None,
+        session_id: None,
+        policy: crate::session_engine::provider_retry::DEFAULT_PROVIDER_RETRY_POLICY,
+        env: None,
+        decide: Some(support::scripted_decide(vec![])),
+        default_cwd: Some(session_dir.path().to_string_lossy().into_owned()),
+        signal: None,
+    };
+    let _ = run_router_segment(&spec, options).await;
+    let written = std::fs::read_to_string(&marker).expect("the adapter ran in the declared cwd");
+    let expected = std::fs::canonicalize(declared_dir.path()).unwrap();
+    let actual = std::fs::canonicalize(written.trim()).unwrap();
+    assert_eq!(actual, expected);
+}
+
 /// A slow adapter `init` spends part of the declared budget; every timeout
 /// summary must still report the figure System 2 set, not the leftover the
 /// loop runs on.

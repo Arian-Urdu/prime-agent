@@ -3,6 +3,7 @@
 //! and close the adapter on every path. Rust port of
 //! `packages/coding-agent/src/core/system-router/segment.ts` (#2484).
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,9 +43,37 @@ pub struct RouterSegmentOptions {
     /// session passes its own working directory, so a relative adapter
     /// command or path resolves against the session, not the host process
     /// (the two differ in a daemon worker switched onto another session).
+    /// A relative declared `environment.stdio.cwd` joins this directory too
+    /// ([`resolve_adapter_cwd`]): `current_dir` on a raw relative path
+    /// would resolve against the host process cwd instead.
     pub default_cwd: Option<String>,
     /// External abort (host shutdown): ends the run `failed("aborted")`.
     pub signal: Option<AbortSignal>,
+}
+
+/// Resolve the adapter's working directory: the spec's declared cwd wins,
+/// but a relative one joins the session working directory (the
+/// `default_cwd`), because `current_dir` on a raw relative path resolves
+/// against the host process cwd and the two differ in a daemon worker
+/// switched onto another session: the adapter would run in the wrong
+/// place (#3184 review). A declared cwd stays raw when the session
+/// declares no working directory: there is nothing to resolve against, so
+/// it keeps the host-process semantics of the TS `spawn` default.
+fn resolve_adapter_cwd(declared: Option<&str>, session: Option<&str>) -> Option<String> {
+    match (declared, session) {
+        (Some(declared), Some(session))
+            if !declared.is_empty() && !Path::new(declared).is_absolute() =>
+        {
+            Some(
+                Path::new(session)
+                    .join(declared)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        }
+        (Some(declared), _) => Some(declared.to_string()),
+        (None, session) => session.map(str::to_string),
+    }
 }
 
 /// Run one bounded router segment. The adapter is closed on every path,
@@ -63,11 +92,10 @@ pub async fn run_router_segment(
     let env: Arc<dyn RouterSegmentEnvironment> = options.env.clone().unwrap_or_else(|| {
         Arc::new(StdioRouterEnvironment::new(
             spec.environment.stdio.command.clone(),
-            spec.environment
-                .stdio
-                .cwd
-                .clone()
-                .or_else(|| options.default_cwd.clone()),
+            resolve_adapter_cwd(
+                spec.environment.stdio.cwd.as_deref(),
+                options.default_cwd.as_deref(),
+            ),
             spec.environment.stdio.request_timeout_ms,
             spec.environment.stdio.init.clone(),
         ))

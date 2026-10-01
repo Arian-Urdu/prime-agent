@@ -1749,7 +1749,17 @@ class FactoryExecutor:
                     # never settled, so loop states can re-enter before their
                     # upstream partner has run (a compiled dag never sets
                     # optional: its input edges are transitions, so the
-                    # wait-for-the-source semantics stay V1-exact).
+                    # wait-for-the-source semantics stay V1-exact). The
+                    # foreach.over input is the one optional that cannot
+                    # bind a sentinel: expansion would hit "did not resolve
+                    # its over input" -- a hard failure where the required
+                    # form only waits -- so an unsettled optional over
+                    # expands to zero items (the same done-with-no-instances
+                    # path as a settled empty list) and a later re-entry
+                    # binds the real list.
+                    if foreach is not None and foreach.get("over") == name:
+                        items = []
+                        continue
                     values[name] = "null" if port_type == "json" else "None"
                     continue
                 return None, None  # wait for the source's first settle

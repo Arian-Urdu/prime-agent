@@ -4126,6 +4126,71 @@ class FactoryExecutorTest(unittest.TestCase):
         self.assertEqual(status["usage"]["transitions_fired"], 3)
 
     @async_test
+    async def test_machine_optional_foreach_over_expands_empty_then_the_real_settle(self) -> None:
+        # Review finding (PR #3199): marking the foreach.over input
+        # optional used to hit "foreach entry did not resolve its over
+        # input" -- a hard failure where the required form only waits. The
+        # optional over input now expands to zero items when its source
+        # never settled (the same done-with-no-instances path as a settled
+        # empty list), and the re-entry binds the real list.
+        self.host.outcomes["src"] = {
+            "status": "done",
+            "answer": '```json\n{"items": ["a", "b", "c"]}\n```',
+        }
+        self.store_machine(
+            {
+                "run": {"failure_policy": "continue", "max_parallel": 4},
+                "states": [
+                    {"id": "seed", "entry": True, "subagent": "worker"},
+                    {
+                        "id": "fan",
+                        "subagent": {"prompt": "Process item {items}."},
+                        "inputs": [{"name": "items", "type": "json", "from": "src.items", "optional": True}],
+                        "foreach": {"over": "items", "max": 4},
+                        "max_entries": 2,
+                    },
+                    {
+                        "id": "src",
+                        "subagent": "worker",
+                        "outputs": [{"name": "items", "type": "json"}],
+                        "max_entries": 1,
+                    },
+                ],
+                "transitions": [
+                    {"from": "seed", "to": "fan"},
+                    {"from": "fan", "to": "src"},
+                    {"from": "src", "to": "fan"},
+                ],
+            }
+        )
+        result = await self.start()
+        status = await self.settle(result)
+        self.assertEqual(status["state"], "done")
+        # round 1: src never settled, so the optional over input expanded to
+        # zero items -- the entry settled done with NO spawn and NO error.
+        fan = self.state_report(status, "fan")
+        self.assertEqual(fan["entries_used"], 2)
+        self.assertEqual([entry["status"] for entry in fan["entries"]], ["done", "done"])
+        self.assertEqual(self.all_events_of(result, "node_error"), [])
+        self.assertEqual(
+            [
+                e["detail"]
+                for e in self.all_events_of(result, "node_ready")
+                if e.get("node") == "fan" and e.get("entry") == 0
+            ],
+            ["foreach expanded to zero items; nothing to run"],
+        )
+        # round 2: the re-entry bound the real list and ran one instance
+        # per item (the fan->src transition after it is blocked by
+        # src's max_entries).
+        self.assertEqual(
+            [call["prompt"] for call in self.host.spawn_calls("fan")],
+            ["Process item a.", "Process item b.", "Process item c."],
+        )
+        self.assertEqual(self.state_report(status, "src")["entries_used"], 1)
+        self.assertEqual(status["usage"]["transitions_fired"], 3)
+
+    @async_test
     async def test_resident_node_spawns_stays_alive_and_stops(self) -> None:
         self.host.outcomes["watcher"] = {"status": "running"}
         self.store_factory(

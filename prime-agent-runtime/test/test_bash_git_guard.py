@@ -873,8 +873,3 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
                 bash("git status")
         self.assertIn("changes directory (or repository) first", str(caught.exception))
         probe.assert_not_called()
-
-
-# Vectors for the recursive-force rm guard: an rm invocation must combine a
-# recursive flag (-r/-R/--recursive) with a force flag (-f) in any position;
-# a lone -r or lone -f must stay untouched.

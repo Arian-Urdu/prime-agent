@@ -8,10 +8,11 @@
 #   RUNNER_TOKEN   REQUIRED. A fresh registration token (minted per
 #                  provision; see docs/sandbox-runners.md for both mint
 #                  routes). Missing => hard fail, no partial state.
-#   RUNNER_URL     Registration scope. Default: the org
-#                  (https://github.com/PrimeIntellect-ai). Use the repo URL
-#                  to scope the runner to one repository instead.
-#   RUNNER_NAME    Runner name shown in the org/repo runner list.
+#   RUNNER_URL     Registration scope. Default: this repository
+#                  (https://github.com/PrimeIntellect-ai/prime-agent), so no
+#                  other repository can run jobs on the runner. An org URL
+#                  is only safe with a runner group limited to this repo.
+#   RUNNER_NAME    Runner name shown in the repo runner list.
 #                  Default: prime-runner-<sandbox hostname suffix>.
 #   RUNNER_LABELS  Comma-separated labels jobs target.
 #                  Default: prime-linux-x64.
@@ -23,7 +24,7 @@
 # like any other dependency pin. Pinned: v2.337.0.
 set -euo pipefail
 
-RUNNER_URL="${RUNNER_URL:-https://github.com/PrimeIntellect-ai}"
+RUNNER_URL="${RUNNER_URL:-https://github.com/PrimeIntellect-ai/prime-agent}"
 RUNNER_NAME="${RUNNER_NAME:-prime-runner-$(hostname | tail -c 5)}"
 RUNNER_LABELS="${RUNNER_LABELS:-prime-linux-x64}"
 RUNNER_DIR="${RUNNER_DIR:-/opt/gh-runner}"

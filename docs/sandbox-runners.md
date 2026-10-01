@@ -2,7 +2,7 @@
 
 The Linux legs of `continuous.yml` and `release.yml` build on our own infra:
 Prime sandbox microVMs that run the GitHub Actions runner agent, registered
-to the org with the labels `prime-linux-x64` and `prime-linux-arm64`.
+to this repository with the labels `prime-linux-x64` and `prime-linux-arm64`.
 The macOS legs stay on GitHub's runners. This document is the contract the
 workflow changes rely on: what the runner host is, how it is provisioned and
 teared down, what the labels guarantee, and the operational rules that keep
@@ -87,11 +87,13 @@ provision as root and:
 The registration token is a one-hour credential minted per provision:
 
 ```
-# org-level (serves every org repo; needs org admin)
-gh api -X POST orgs/PrimeIntellect-ai/actions/runners/registration-token
-# repo-level (serves only this repo; needs repo runners permission)
 gh api -X POST repos/PrimeIntellect-ai/prime-agent/actions/runners/registration-token
 ```
+
+The runners are repository-scoped on purpose: they build release artifacts
+and keep their workspace between jobs, so no other repository may run jobs
+on them. Registering at the org level is only safe inside a runner group
+that is limited to `prime-agent`.
 
 The token is passed to the fleet driver as a sandbox *secret* (encrypted at
 rest, materialized as an env var inside the VM, never logged, never in an
@@ -131,7 +133,7 @@ executes workflow code on your infra. This design answers each half:
   its next failed poll) and provisions a fresh one with a fresh token. The
   first build after each rotation is cold.
 - **Teardown**: delete the VM; remove the dead runner entry
-  (`gh api -X DELETE repos/…/actions/runners/<id>` or the org equivalent)
+  (`gh api -X DELETE repos/PrimeIntellect-ai/prime-agent/actions/runners/<id>`)
   at the next convenience.
 - **Monitoring**: a runner that stops polling shows *Offline* in the runner
   list; a job stuck in *Queued* with no *Idle* runner for its label means

@@ -483,6 +483,11 @@ impl Supervisor {
             if !Arc::ptr_eq(&current, &timer_resident) {
                 return;
             }
+            // Descriptor and registry reads can yield while the owner
+            // reconnects. Recheck immediately before claiming the stop.
+            if supervisor.client_connected(&owner) {
+                return;
+            }
             match supervisor.stop_worker(&timer_resident).await {
                 Ok(()) => supervisor.log_line(&format!(
                     "stopped client-owned worker {} after its owner {owner} disconnected",
@@ -1420,6 +1425,77 @@ mod tests {
             "the roster_unsubscribe response: {response}"
         );
         (connection, client_write)
+    }
+
+    /// Reconnecting while an expired timer waits on the descriptor must
+    /// prevent a stop. The first connectivity check already happened when
+    /// the slot clears, but the descriptor read can yield to a new client.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconnect_during_expired_cleanup_keeps_owned_worker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let supervisor = Arc::new(
+            Supervisor::new(SupervisorOptions {
+                socket_path: dir.path().join("daemon.sock"),
+                agent_dir: dir.path().join("agent"),
+            })
+            .expect("supervisor"),
+        );
+        let descriptor: DaemonWorkerDescriptor = serde_json::from_value(json!({
+            "version": 2,
+            "workerId": "w-reconnect",
+            "pid": 0,
+            "socketPath": "/tmp/none.sock",
+            "recoveryJournalPath": "/tmp/none.jsonl",
+            "supervisorSocketPath": "/tmp/none.sock",
+            "authenticationToken": "token",
+            "rootActiveSessionId": "w-reconnect",
+            "ownerClientId": "acp:reconnect",
+            "createdAt": "t",
+            "updatedAt": "t",
+            "lifecycle": "ready",
+            "createCommand": {},
+            "consecutiveFailures": 0,
+        }))
+        .expect("descriptor");
+        let resident = ResidentWorker::new(
+            "w-reconnect".to_string(),
+            descriptor,
+            dir.path().join("w-reconnect.json"),
+        );
+        supervisor.registry.insert(Arc::clone(&resident)).await;
+        let (first, first_write) = connect_as(&supervisor, "acp:reconnect").await;
+        drop(first_write);
+        first.await.expect("first connection").unwrap();
+        assert!(resident.owner_cleanup.lock().unwrap().is_some());
+
+        // Hold the descriptor AFTER arming, while the expired timer passes
+        // its first client_connected check and waits to read ownership.
+        let guard = resident.descriptor.lock().await;
+        tokio::time::pause();
+        tokio::time::advance(OWNED_WORKER_DISCONNECT_GRACE + Duration::from_secs(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            resident.owner_cleanup.lock().unwrap().is_none(),
+            "timer expired"
+        );
+        let (reconnected, reconnected_write) = connect_as(&supervisor, "acp:reconnect").await;
+        drop(guard);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            supervisor.registry.get("w-reconnect").await.is_some(),
+            "reconnected owner keeps worker even when old timer expired"
+        );
+        assert!(
+            resident.descriptor.lock().await.stop_requested_at.is_none(),
+            "reconnect must veto the stop tombstone"
+        );
+        drop(reconnected_write);
+        reconnected.await.expect("reconnected connection").unwrap();
     }
 
     /// A client-owned worker stops 30 seconds after its owner's LAST

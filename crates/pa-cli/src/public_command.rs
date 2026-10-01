@@ -1063,12 +1063,15 @@ mod tailscale_dispatch_tests {
     }
 
     #[test]
-    fn the_tailscale_help_matches_the_ts_spec() {
+    fn the_tailscale_help_marks_the_subcommand_optional() {
         let help = format_command_help(&["tailscale"]).expect("the tailscale spec");
+        // Bare `tailscale` and `tailscale --json` dispatch to status, so the
+        // top-level usage cannot document the subcommand as required.
         assert!(
-            help.contains("prime-agent tailscale <status|serve>"),
+            help.contains("prime-agent tailscale [status|serve]"),
             "{help}"
         );
+        assert!(!help.contains("<status|serve>"), "{help}");
         assert!(help.contains("status"), "{help}");
         assert!(help.contains("serve"), "{help}");
         let serve = format_command_help(&["tailscale", "serve"]).expect("the tailscale serve spec");

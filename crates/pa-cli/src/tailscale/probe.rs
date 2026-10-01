@@ -56,14 +56,11 @@ pub(crate) async fn probe_tailscale(program: &OsStr) -> TailscaleProbe {
             let online = self_field
                 .and_then(|value| value.get("Online"))
                 .and_then(Value::as_bool);
-            let dns_name = self_field
-                .and_then(|value| value.get("DNSName"))
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    self_field
-                        .and_then(|value| value.get("HostName"))
-                        .and_then(Value::as_str)
-                });
+            // An empty or dot-only `DNSName` carries no name, so it yields to
+            // `HostName` instead of winning the choice and then trimming to
+            // no hostname (which serve would advertise as `.<suffix>`).
+            let dns_name =
+                node_name(self_field, "DNSName").or_else(|| node_name(self_field, "HostName"));
             // Top-level MagicDNSSuffix is deprecated upstream; prefer
             // CurrentTailnet's.
             let suffix = parsed
@@ -72,16 +69,21 @@ pub(crate) async fn probe_tailscale(program: &OsStr) -> TailscaleProbe {
                 .and_then(Value::as_str)
                 .or_else(|| parsed.get("MagicDNSSuffix").and_then(Value::as_str))
                 .map(str::to_string);
-            let hostname = dns_name.filter(|name| !name.is_empty()).map(|name| {
-                let mut host = trim_trailing_dots(name).to_string();
-                if let Some(suffix) = &suffix {
-                    let suffix = trim_trailing_dots(suffix);
-                    if let Some(stripped) = host.strip_suffix(&format!(".{suffix}")) {
-                        host = stripped.to_string();
+            let hostname = dns_name
+                .map(|name| {
+                    let mut host = trim_trailing_dots(name).to_string();
+                    if let Some(suffix) = &suffix {
+                        let suffix = trim_trailing_dots(suffix);
+                        if let Some(stripped) = host.strip_suffix(&format!(".{suffix}")) {
+                            host = stripped.to_string();
+                        }
                     }
-                }
-                host
-            });
+                    host
+                })
+                // The hostname is either a real machine label or nothing: a
+                // name that trims or strips to empty must never surface as an
+                // empty host (serve would advertise it as `.<suffix>`).
+                .filter(|host| !host.is_empty());
             TailscaleProbe {
                 cli_path,
                 on_tailnet: online == Some(true) || backend == "Running",
@@ -97,6 +99,16 @@ pub(crate) async fn probe_tailscale(program: &OsStr) -> TailscaleProbe {
             ..TailscaleProbe::default()
         },
     }
+}
+
+/// The raw `Self.<field>` name when it carries a real hostname: empty and
+/// dot-only strings trim to no hostname, so they read as absent and the next
+/// candidate (e.g. `HostName`) takes over.
+fn node_name<'a>(self_field: Option<&'a Value>, field: &str) -> Option<&'a str> {
+    self_field
+        .and_then(|value| value.get(field))
+        .and_then(Value::as_str)
+        .filter(|name| !trim_trailing_dots(name).is_empty())
 }
 
 /// One-line doctor facts for `prime-agent doctor` (TS `tailscaleDoctorFacts`).

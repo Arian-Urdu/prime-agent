@@ -96,6 +96,64 @@ async fn falls_back_to_hostname_when_the_dns_name_is_absent() {
 }
 
 #[tokio::test]
+async fn falls_back_to_hostname_when_the_dns_name_is_empty() {
+    // A present-but-empty DNSName must yield to HostName instead of winning
+    // the choice and then being dropped as nameless.
+    let payload = serde_json::json!({
+        "BackendState": "Running",
+        "Self": { "Online": true, "DNSName": "", "HostName": "milk" },
+        "CurrentTailnet": { "MagicDNSSuffix": "tailnet.ts.net." },
+    })
+    .to_string();
+    let shim = Shim::write(&payload, "{}");
+    let probe = probe_tailscale(shim.path().as_os_str()).await;
+    assert_eq!(probe.hostname.as_deref(), Some("milk"));
+}
+
+#[tokio::test]
+async fn falls_back_to_hostname_when_the_dns_name_is_dots_only() {
+    // A dot-only DNSName trims to no hostname; it must yield to HostName,
+    // never surface as an empty host.
+    let payload = serde_json::json!({
+        "BackendState": "Running",
+        "Self": { "Online": true, "DNSName": ".", "HostName": "milk" },
+        "CurrentTailnet": { "MagicDNSSuffix": "tailnet.ts.net." },
+    })
+    .to_string();
+    let shim = Shim::write(&payload, "{}");
+    let probe = probe_tailscale(shim.path().as_os_str()).await;
+    assert_eq!(probe.hostname.as_deref(), Some("milk"));
+}
+
+#[tokio::test]
+async fn reports_no_hostname_when_no_self_name_carries_one() {
+    // Empty and dot-only candidates read as absent, so an unusable DNSName
+    // and HostName leave the probe without a hostname rather than with an
+    // empty one.
+    let payload = serde_json::json!({
+        "BackendState": "Running",
+        "Self": { "Online": true, "DNSName": ".", "HostName": "" },
+        "CurrentTailnet": { "MagicDNSSuffix": "tailnet.ts.net." },
+    })
+    .to_string();
+    let shim = Shim::write(&payload, "{}");
+    let probe = probe_tailscale(shim.path().as_os_str()).await;
+    assert_eq!(probe.hostname, None);
+
+    // The suffix-equal corner: a DNSName that strips to nothing also leaves
+    // no hostname instead of an empty one.
+    let payload = serde_json::json!({
+        "BackendState": "Running",
+        "Self": { "Online": true, "DNSName": ".tailnet.ts.net." },
+        "CurrentTailnet": { "MagicDNSSuffix": "tailnet.ts.net." },
+    })
+    .to_string();
+    let shim = Shim::write(&payload, "{}");
+    let probe = probe_tailscale(shim.path().as_os_str()).await;
+    assert_eq!(probe.hostname, None);
+}
+
+#[tokio::test]
 async fn does_not_mark_a_healthy_online_node_as_offline() {
     let shim = Shim::write(ONLINE, &serve_status_for(3000));
     let program = shim.path();

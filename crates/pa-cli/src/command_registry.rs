@@ -127,7 +127,7 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
     ]),
     CommandSpec::new(
         &["tailscale"],
-        "tailscale <status|serve>",
+        "tailscale [status|serve]",
         "Tailscale tailnet support: status, and expose a local port via serve/funnel",
     ),
     CommandSpec::new(

@@ -141,3 +141,27 @@ async fn serve_treats_a_null_serve_status_as_nothing_served_not_a_parse_failure(
     assert!(text.contains("interactive enable flow"), "{text}");
     assert!(!text.contains("unparseable"), "{text}");
 }
+
+#[tokio::test]
+async fn serve_never_advertises_an_empty_host_as_the_tailnet_url() {
+    // A dot-only DNSName with no usable HostName reads as nameless, so the
+    // success path skips the reachability line instead of advertising the
+    // tailnet URL as `.<suffix>`.
+    let nameless = serde_json::json!({
+        "BackendState": "Running",
+        "Self": { "Online": true, "DNSName": "." },
+        "CurrentTailnet": { "MagicDNSSuffix": "tailnet.ts.net." },
+    })
+    .to_string();
+    let shim = Shim::write(&nameless, &serve_status_for(3000));
+    let program = shim.path();
+    let mut buf = Vec::new();
+    assert_eq!(
+        run_serve_to(&mut buf, program.as_os_str(), 3000.0, false).await,
+        0
+    );
+    let text = String::from_utf8(buf).expect("utf8");
+    assert!(!text.contains("Now reachable"), "{text}");
+    assert!(!text.contains(".tailnet.ts.net as"), "{text}");
+    assert!(!text.contains("Public URL: https://."), "{text}");
+}

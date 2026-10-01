@@ -135,11 +135,14 @@ pub(crate) async fn run_serve_to<W: Write>(
         return 1;
     }
     let _ = writeln!(out);
-    if let Some(hostname) = &probe.hostname {
-        let suffix = probe
-            .magic_dns_suffix
-            .as_deref()
-            .map_or("ts.net", trim_trailing_dots);
+    // Advertise only a REAL tailnet host: the reachability line needs both a
+    // usable hostname and the tailnet's real MagicDNS suffix. A missing
+    // suffix must skip the line (like the missing-hostname case) instead of
+    // composing a made-up domain: a short `HostName` under `ts.net` is not
+    // this node's MagicDNS name, so `{hostname}.ts.net` would not reach
+    // the node.
+    if let (Some(hostname), Some(raw_suffix)) = (&probe.hostname, &probe.magic_dns_suffix) {
+        let suffix = trim_trailing_dots(raw_suffix);
         // Exact domain-suffix match: the hostname must end with ".<suffix>" (or
         // equal it).
         let host = if hostname.ends_with(&format!(".{suffix}")) || hostname == suffix {

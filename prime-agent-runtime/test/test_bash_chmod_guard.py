@@ -1834,6 +1834,17 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
 class FrozenBypassEnvLaunchTest(unittest.TestCase):
     """Launch-level behavior of the frozen bypass env var, in fresh kernels."""
 
+    def setUp(self):
+        # A full env snapshot, like the sibling guard suites: cleanup restores
+        # what the runner launched with, so this suite can write a bypass
+        # value without dropping (or leaving) one for later suites.
+        self._prev_env = dict(os.environ)
+        self.addCleanup(self._restore_env)
+
+    def _restore_env(self):
+        os.environ.clear()
+        os.environ.update(self._prev_env)
+
     def _workspace_with_outside_sibling(self) -> tuple[str, str]:
         workspace = tempfile.mkdtemp(prefix="chmod-guard-launch-")
         self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
@@ -1908,7 +1919,6 @@ class FrozenBypassEnvLaunchTest(unittest.TestCase):
         # A mid-session os.environ write must not arm a nested kernel: the
         # child launch env drops a bypass value absent at kernel start.
         os.environ[BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV] = "1"
-        self.addCleanup(os.environ.pop, BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV, None)
         # The launch-time snapshot is a module attribute frozen at import;
         # pin it to "unset" so the late-write rule decides, not the parent
         # process's launch environment (a runner launched with the bypass
@@ -1920,6 +1930,31 @@ class FrozenBypassEnvLaunchTest(unittest.TestCase):
         # A value the kernel actually started with is the intentional state.
         with mock.patch.object(bash_module, "_DESTRUCTIVE_CHMOD_BYPASS_AT_KERNEL_START", True):
             self.assertIn(BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV, bash_module._child_env())
+
+    def test_suite_restores_a_runner_supplied_bypass_value(self):
+        # Cleanup must restore the launch environment, not pop the bypass
+        # var: a runner that launched with PI_BASH_ALLOW_DESTRUCTIVE_CHMOD
+        # set would otherwise lose the value once this suite runs, and
+        # later suites would see a different launch environment.
+        probe = (
+            "import os\n"
+            "import unittest\n"
+            "import test_bash_chmod_guard as suite\n"
+            "case = suite.FrozenBypassEnvLaunchTest('test_child_env_strips_late_bypass')\n"
+            "result = unittest.TestResult()\n"
+            "case.run(result)\n"
+            "assert result.wasSuccessful(), result.errors + result.failures\n"
+            f"raise SystemExit(0 if os.environ.get({BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV!r}) == 'runner-value' else 1)\n"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=str(Path(__file__).resolve().parent),
+            env={**os.environ, BASH_DESTRUCTIVE_CHMOD_BYPASS_ENV: "runner-value"},
+            capture_output=True,
+            text=True,
+            timeout=SUBPROCESS_TIMEOUT,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_mid_session_os_environ_write_does_not_unlock_a_fresh_kernel(self):
         workspace, outside = self._workspace_with_outside_sibling()

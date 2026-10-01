@@ -22,8 +22,8 @@ use pa_agent::abort::AbortSignal;
 use tokio::time::Instant;
 
 use super::action_space::{
-    compile_action_space, compile_decision_prompt, format_history_entry, gate_threshold,
-    observation_digest, CompiledActionSpace,
+    compile_action_space, compile_decision_prompt, format_history_entry, gate_label,
+    gate_threshold, observation_digest, CompiledActionSpace,
 };
 use super::decide::RouterDecisionFn;
 use super::types::{
@@ -413,7 +413,7 @@ async fn run_loop(
             let result = format!(
                 "refused: confidence {:.2} below {} gate {:.2}",
                 confidence,
-                action.risk.as_str(),
+                gate_label(action),
                 threshold
             );
             state.trace.push(RouterStepTrace {

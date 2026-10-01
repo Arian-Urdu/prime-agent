@@ -187,6 +187,19 @@ pub fn gate_threshold(gate: RouterGateSpec, action: &CompiledAction) -> f64 {
     }
 }
 
+/// The name of the gate whose threshold [`gate_threshold`] applies, as the
+/// refusal diagnostic labels it. `finish` is compiled with the `read` risk but
+/// gated by `gate.finish`, so its label must be `finish`; every other action
+/// is labeled by its own risk (escalation is never gated, so its label never
+/// appears in a refusal).
+#[must_use]
+pub fn gate_label(action: &CompiledAction) -> &'static str {
+    if action.name == FINISH_ACTION {
+        return "finish";
+    }
+    action.risk.as_str()
+}
+
 /// Render one action into the decision prompt.
 fn render_action(action: &CompiledAction) -> String {
     let mut rendered = String::new();

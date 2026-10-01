@@ -138,6 +138,36 @@ async fn three_low_confidence_decisions_end_the_segment_stuck() {
     );
 }
 
+/// A below-gate `finish` refusal names the `finish` gate its threshold came
+/// from, not the `read` risk the action is compiled with.
+#[tokio::test]
+async fn a_below_gate_finish_refusal_names_the_finish_gate() {
+    let env = support::ScriptedEnvironment::with_observation(support::observation("title screen"));
+    let low_finish = || support::valid_decision(FINISH_ACTION, &[], 0.4);
+    let mut run_options = options(
+        Arc::clone(&env),
+        support::scripted_decide(vec![low_finish(), low_finish(), low_finish()]),
+    );
+    // Diverge the gates: `read` is loose, `finish` is strict, so a refusal
+    // labeled `read` would also expose the wrong threshold source.
+    run_options.gate = RouterGateSpec {
+        read: Some(0.1),
+        write: Some(0.1),
+        destructive: Some(0.1),
+        finish: Some(0.9),
+    };
+    let result = run_system_router_loop(run_options).await.unwrap();
+    assert_eq!(result.status, RouterRunStatus::Stuck);
+    assert_eq!(result.reason, "no_confident_decision");
+    assert_eq!(result.refused, 3);
+    assert_eq!(result.trace[0].gate.threshold, 0.9);
+    assert_eq!(result.trace[0].gate.verdict, RouterGateVerdict::Refused);
+    assert_eq!(
+        result.trace[0].result,
+        "refused: confidence 0.40 below finish gate 0.90"
+    );
+}
+
 #[tokio::test]
 async fn three_unparseable_decisions_end_the_segment_stuck() {
     let env = support::ScriptedEnvironment::with_observation(support::observation("wall"));

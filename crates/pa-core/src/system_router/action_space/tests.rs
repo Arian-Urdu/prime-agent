@@ -93,6 +93,16 @@ fn gates_follow_the_action_risk_and_never_gate_escalation() {
 }
 
 #[test]
+fn the_gate_label_names_the_gate_the_threshold_came_from() {
+    let actions = compile_action_space(&support::sample_action_space()).unwrap();
+    // `finish` is compiled with the `read` risk but gated by `gate.finish`,
+    // so its refusal diagnostic must name the `finish` gate, not `read`.
+    assert_eq!(gate_label(&actions.by_name[FINISH_ACTION]), "finish");
+    assert_eq!(gate_label(&actions.by_name["look"]), "read");
+    assert_eq!(gate_label(&actions.by_name["press"]), "write");
+}
+
+#[test]
 fn the_compiled_space_appends_the_loop_owned_actions_in_order() {
     let compiled = compile_action_space(&support::sample_action_space()).unwrap();
     assert_eq!(

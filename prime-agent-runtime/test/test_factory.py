@@ -1022,6 +1022,44 @@ class ValidateFactoryMachineTest(unittest.TestCase):
                 repr(bad),
             )
 
+    def test_required_self_input_is_rejected_optional_stays_the_loop_form(self) -> None:
+        # A required self-input can never bind: the first entry waits for its
+        # own prior settle, which cannot exist yet -- the entry stays pending
+        # until the stall detector fails the run naming the state. Optional
+        # self-inputs are the designed loop form (first entry binds the null
+        # sentinel) and stay valid; the rule is the machine-form mirror of
+        # the dag compiler's "cannot depend on itself" rejection.
+        absent = object()  # sentinel: the optional key is omitted entirely
+
+        def machine(optional: Any = absent) -> dict[str, Any]:
+            loop_inputs: list[dict[str, Any]] = [{"name": "last", "type": "text", "from": "loop.last"}]
+            if optional is not absent:
+                loop_inputs[0]["optional"] = optional
+            return {
+                "states": [
+                    {"id": "seed", "entry": True, "subagent": "w", "outputs": [{"name": "go", "type": "text"}]},
+                    {
+                        "id": "loop",
+                        "subagent": "w",
+                        "inputs": loop_inputs,
+                        "outputs": [{"name": "last", "type": "text"}],
+                        "max_entries": 3,
+                    },
+                ],
+                "transitions": [{"from": "seed", "to": "loop"}, {"from": "loop", "to": "loop"}],
+            }
+
+        self.assertEqual(validate_factory_machine(machine(True)), [])
+        for required in (False, absent):
+            self.assertEqual(
+                validate_factory_machine(machine(required)),
+                [
+                    "state loop input 'last' cannot require itself: mark the self-input optional - "
+                    "a required one can never bind on the state's first entry"
+                ],
+                repr(required),
+            )
+
     def test_entry_states_cannot_declare_inputs(self) -> None:
         with_inputs = {
             "states": [

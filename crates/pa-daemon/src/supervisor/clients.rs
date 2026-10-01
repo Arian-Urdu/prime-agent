@@ -449,10 +449,16 @@ impl Supervisor {
         let timer_resident = Arc::clone(resident);
         let task = tokio::spawn(async move {
             tokio::time::sleep(OWNED_WORKER_DISCONNECT_GRACE).await;
-            // This timer's own handle goes first, so a later arm can only
-            // ever abort a sleeping timer, never a stop in progress (TS
-            // clears `ownerCleanupTimer` first in its callback too).
-            timer_resident.owner_cleanup.lock().unwrap().take();
+            // Clear this timer's own handle first, so a later arm can only
+            // abort a sleeping timer, never a stop in progress. A newer arm's
+            // handle in the slot means this timer was replaced (and aborted).
+            {
+                let mut slot = timer_resident.owner_cleanup.lock().unwrap();
+                if slot.as_ref().map(tokio::task::AbortHandle::id) != Some(tokio::task::id()) {
+                    return;
+                }
+                slot.take();
+            }
             if supervisor.shutting_down.load(Ordering::SeqCst) {
                 return;
             }
@@ -1454,7 +1460,7 @@ mod tests {
             descriptor,
             dir.path().join("w-owned.json"),
         );
-        supervisor.registry.insert(resident).await;
+        supervisor.registry.insert(Arc::clone(&resident)).await;
 
         // Phase 1: two connections speak for acp:1; closing one must leave
         // the worker alone while the other still holds the id.
@@ -1474,6 +1480,10 @@ mod tests {
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
+        assert!(
+            resident.owner_cleanup.lock().unwrap().is_none(),
+            "the expiry ran"
+        );
         assert!(
             supervisor.registry.get("w-owned").await.is_some(),
             "the reconnecting owner keeps its worker"

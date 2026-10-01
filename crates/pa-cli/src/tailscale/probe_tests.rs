@@ -82,6 +82,59 @@ async fn prefers_current_tailnet_magic_dns_suffix_and_trims_the_hostname() {
 }
 
 #[tokio::test]
+async fn falls_back_to_the_top_level_suffix_when_current_tailnets_is_empty() {
+    // A present-but-empty CurrentTailnet.MagicDNSSuffix must not block the
+    // deprecated top-level fallback: an empty suffix carries no domain.
+    let payload = serde_json::json!({
+        "BackendState": "Running",
+        "Self": { "Online": true, "DNSName": "milk.tailnet.ts.net." },
+        "MagicDNSSuffix": "tailnet.ts.net.",
+        "CurrentTailnet": { "MagicDNSSuffix": "" },
+    })
+    .to_string();
+    let shim = Shim::write(&payload, "{}");
+    let probe = probe_tailscale(shim.path().as_os_str()).await;
+    assert_eq!(probe.magic_dns_suffix.as_deref(), Some("tailnet.ts.net."));
+    assert_eq!(probe.hostname.as_deref(), Some("milk"));
+}
+
+#[tokio::test]
+async fn falls_back_to_the_top_level_suffix_when_current_tailnets_is_dots_only() {
+    // A dot-only suffix trims to no domain; it yields to the fallback the
+    // same way an empty one does.
+    let payload = serde_json::json!({
+        "BackendState": "Running",
+        "Self": { "Online": true, "DNSName": "milk.tailnet.ts.net." },
+        "MagicDNSSuffix": "tailnet.ts.net.",
+        "CurrentTailnet": { "MagicDNSSuffix": "." },
+    })
+    .to_string();
+    let shim = Shim::write(&payload, "{}");
+    let probe = probe_tailscale(shim.path().as_os_str()).await;
+    assert_eq!(probe.magic_dns_suffix.as_deref(), Some("tailnet.ts.net."));
+    assert_eq!(probe.hostname.as_deref(), Some("milk"));
+}
+
+#[tokio::test]
+async fn reports_no_suffix_when_no_candidate_carries_a_domain() {
+    // Empty and dot-only candidates read as absent, so no usable suffix
+    // leaves the probe without one instead of holding an empty string
+    // (serve would advertise the reachability URL as the trailing-dot
+    // host `milk.`).
+    let payload = serde_json::json!({
+        "BackendState": "Running",
+        "Self": { "Online": true, "DNSName": "milk.tailnet.ts.net." },
+        "MagicDNSSuffix": ".",
+        "CurrentTailnet": { "MagicDNSSuffix": "" },
+    })
+    .to_string();
+    let shim = Shim::write(&payload, "{}");
+    let probe = probe_tailscale(shim.path().as_os_str()).await;
+    assert_eq!(probe.magic_dns_suffix, None);
+    assert_eq!(probe.hostname.as_deref(), Some("milk.tailnet.ts.net"));
+}
+
+#[tokio::test]
 async fn falls_back_to_hostname_when_the_dns_name_is_absent() {
     let payload = serde_json::json!({
         "BackendState": "Running",

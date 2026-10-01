@@ -62,12 +62,12 @@ pub(crate) async fn probe_tailscale(program: &OsStr) -> TailscaleProbe {
             let dns_name =
                 node_name(self_field, "DNSName").or_else(|| node_name(self_field, "HostName"));
             // Top-level MagicDNSSuffix is deprecated upstream; prefer
-            // CurrentTailnet's.
-            let suffix = parsed
-                .get("CurrentTailnet")
-                .and_then(|value| value.get("MagicDNSSuffix"))
-                .and_then(Value::as_str)
-                .or_else(|| parsed.get("MagicDNSSuffix").and_then(Value::as_str))
+            // CurrentTailnet's. An empty or dot-only suffix carries no
+            // domain, so it reads as absent and yields to the next candidate
+            // instead of blocking it (serve would otherwise trim it to no
+            // suffix and advertise a trailing-dot host like `milk.`).
+            let suffix = magic_dns_suffix(parsed.get("CurrentTailnet"))
+                .or_else(|| magic_dns_suffix(Some(&parsed)))
                 .map(str::to_string);
             let hostname = dns_name
                 .map(|name| {
@@ -109,6 +109,16 @@ fn node_name<'a>(self_field: Option<&'a Value>, field: &str) -> Option<&'a str> 
         .and_then(|value| value.get(field))
         .and_then(Value::as_str)
         .filter(|name| !trim_trailing_dots(name).is_empty())
+}
+
+/// The raw `MagicDNSSuffix` field of `object` when it carries a real domain:
+/// empty and dot-only strings trim to no suffix, so they read as absent and
+/// the next candidate (the deprecated top-level suffix) takes over.
+fn magic_dns_suffix(object: Option<&Value>) -> Option<&str> {
+    object
+        .and_then(|value| value.get("MagicDNSSuffix"))
+        .and_then(Value::as_str)
+        .filter(|suffix| !trim_trailing_dots(suffix).is_empty())
 }
 
 /// One-line doctor facts for `prime-agent doctor` (TS `tailscaleDoctorFacts`).

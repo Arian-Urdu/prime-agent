@@ -15,8 +15,12 @@
 //! while the leader is alive, then falls back to the platform tree kill
 //! ([`crate::platform::kill_process_group_or_pid`]). Every leader-exit stage
 //! relays the stop to the group like the reference
-//! ([`crate::platform::signal_process_group`]) so a launcher that exits first
-//! cannot strand its descendants.
+//! ([`crate::platform::signal_process_group`]) and then enforces it
+//! ([`crate::platform::kill_process_group`], after a bounded drain grace on
+//! the leader-exit arm) so a launcher that exits first cannot strand its
+//! descendants - not even ones that ignore SIGTERM, and not on Windows,
+//! where the group relay is a no-op and the enforced stop is the taskkill
+//! tree kill.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -395,12 +399,11 @@ impl RouterEnvironment for StdioRouterEnvironment {
                                 // It exited from the relayed SIGTERM:
                                 // descendants that ignored the stop still
                                 // get the enforced group kill (the
-                                // reference's post-SIGTERM arm).
+                                // reference's post-SIGTERM arm) - the group
+                                // SIGKILL on POSIX, the tree kill on
+                                // Windows, where the group relay is a no-op.
                                 if let Some(pid) = pid {
-                                    let _ = crate::platform::signal_process_group(
-                                        pid as i32,
-                                        Signal::Kill,
-                                    );
+                                    let _ = crate::platform::kill_process_group(pid as i32);
                                 }
                             }
                         }
@@ -410,11 +413,37 @@ impl RouterEnvironment for StdioRouterEnvironment {
                         // first (`sh -c`, a container client), or crashed
                         // before: its group can still hold descendants, so
                         // the stop is relayed to the group (the reference's
-                        // leader-exit arm). Without this, descendants outlive
-                        // the segment and `closed` keeps `Drop` from killing
-                        // them.
+                        // leader-exit arm). The relay is a request, not
+                        // enforcement: descendants that ignore SIGTERM
+                        // outlive it, and on Windows the relay is a no-op -
+                        // so after a bounded drain grace the enforced kill
+                        // below must land too, or the descendants outlive
+                        // the segment (`closed` keeps `Drop` from reaching
+                        // them).
                         if let Some(pid) = pid {
-                            let _ = crate::platform::signal_process_group(pid as i32, Signal::Term);
+                            let relayed =
+                                crate::platform::signal_process_group(pid as i32, Signal::Term);
+                            // The same shape as the SIGTERM wait above: a
+                            // descendant that honors the relay empties the
+                            // group and the poll exits early; one that
+                            // ignores it meets the enforced kill at the
+                            // deadline.
+                            let grace_ms = remaining_ms(started, budget, 0).min(1_000);
+                            let deadline = Instant::now() + Duration::from_millis(grace_ms);
+                            while relayed
+                                && crate::platform::process_group_exists(pid as i32)
+                                && Instant::now() < deadline
+                            {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                            if !relayed || crate::platform::process_group_exists(pid as i32) {
+                                // The enforced stop once the leader is
+                                // reaped: the group SIGKILL on POSIX (never
+                                // the recycled bare pid), the taskkill
+                                // tree kill on Windows (its relay was the
+                                // no-op above).
+                                let _ = crate::platform::kill_process_group(pid as i32);
+                            }
                         }
                     }
                 }

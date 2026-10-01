@@ -280,20 +280,41 @@ async fn wait_for_exit(pid: u32) {
     }
 }
 
-/// A launcher that answers the close request and exits first (`sh -c`, a
-/// container client) still relays the stop to the descendant it left in its
-/// group - the graceful wait succeeding must not strand it (cursor: adapter
-/// descendants leak after close).
+/// The launcher adapter shared by the descendant pins: a python process
+/// that spawns a `/bin/sh` grandchild whose TERM disposition is
+/// `trap_line` (which may reference the relay marker as `{marker}`),
+/// answers `init` with the grandchild's pid, and exits first on `close`,
+/// leaving the grandchild behind in its group. Returns the adapter's
+/// temp dir (the test must hold it: the markers live in it), the adapter
+/// command, the relay marker the grandchild writes when it honors the
+/// relayed stop, and the readiness marker it writes once its trap is
+/// installed.
 #[cfg(unix)]
-#[tokio::test]
-async fn a_launcher_that_answers_close_still_stops_its_descendants() {
-    let (_dir, command) = adapter(
+fn launcher_with_grandchild(
+    trap_line: &str,
+) -> (
+    tempfile::TempDir,
+    Vec<String>,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("relay-marker");
+    let ready_marker = dir.path().join("trap-ready");
+    let trap_line = trap_line.replace("{marker}", &marker.to_string_lossy());
+    // The readiness write sits after the trap: once `trap-ready` exists,
+    // a relayed SIGTERM can only ever exercise the trap, never the
+    // startup race where a `sh` still under its default TERM disposition
+    // dies before its script runs.
+    let ready = ready_marker.display();
+    let grandchild = format!("{trap_line}; printf ready > {ready}; while :; do sleep 0.1; done");
+    let script = format!(
         r#"
 import json
 import subprocess
 import sys
 
-grandchild = subprocess.Popen(["/bin/sh", "-c", "trap 'exit 0' TERM; while :; do sleep 0.1; done"])
+grandchild = subprocess.Popen(["/bin/sh", "-c", {grandchild:?}])
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -301,13 +322,50 @@ for line in sys.stdin:
     request = json.loads(line)
     kind = request.get("type")
     if kind == "init":
-        reply = {"id": request.get("id"), "ok": True, "environment": {"grandchild_pid": grandchild.pid}}
+        reply = {{"id": request.get("id"), "ok": True, "environment": {{"grandchild_pid": grandchild.pid}}}}
         print(json.dumps(reply), flush=True)
     elif kind == "close":
         # The launcher exits first, leaving its descendant behind.
         sys.exit(0)
-"#,
+"#
     );
+    let path = dir.path().join("adapter.py");
+    std::fs::write(&path, script).unwrap();
+    let command = vec![
+        "python3".to_string(),
+        "-u".to_string(),
+        path.to_string_lossy().to_string(),
+    ];
+    (dir, command, marker, ready_marker)
+}
+
+/// Wait (bounded) until the grandchild reports its TERM trap installed:
+/// only then does the close exercise the relay itself, not the startup
+/// race that would kill a `sh` mid-startup under its default TERM
+/// disposition.
+#[cfg(unix)]
+async fn wait_for_grandchild_trap(ready: &std::path::Path) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !ready.exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        ready.exists(),
+        "the grandchild never installed its TERM trap"
+    );
+}
+
+/// A launcher that answers the close request and exits first (`sh -c`, a
+/// container client) still relays the stop to the descendant it left in its
+/// group - the graceful wait succeeding must not strand it (cursor: adapter
+/// descendants leak after close). The grandchild records the relayed stop,
+/// so the relay stays pinned even though the enforced kill behind it would
+/// stop the descendant too.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_launcher_that_answers_close_still_stops_its_descendants() {
+    let (_dir, command, marker, ready) =
+        launcher_with_grandchild("trap 'printf relayed > {marker}; exit 0' TERM");
     let env = StdioRouterEnvironment::new(command, None, 5_000, None);
     let info = env.init().await.unwrap().expect("init environment info");
     let grandchild = info["grandchild_pid"].as_u64().expect("grandchild pid") as u32;
@@ -315,6 +373,7 @@ for line in sys.stdin:
         crate::platform::pid_exists(grandchild),
         "the grandchild starts alive"
     );
+    wait_for_grandchild_trap(&ready).await;
     env.close(RouterCloseOptions {
         budget_ms: Some(1_000),
     })
@@ -323,6 +382,44 @@ for line in sys.stdin:
     assert!(
         !crate::platform::pid_exists(grandchild),
         "the group relay stopped the launcher's descendant"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker).ok().as_deref(),
+        Some("relayed"),
+        "the stop reached the grandchild as the relayed SIGTERM, not the enforced kill"
+    );
+}
+
+/// A launcher that answers `close` and exits first cannot leave behind a
+/// descendant that ignores the relayed SIGTERM: the leader-exit arm relays
+/// the stop, drains a bounded grace, then enforces the group kill (cursor:
+/// close path leaks adapter descendants - the relay alone is not
+/// enforcement).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_launcher_that_answers_close_enforces_the_stop_on_sigterm_ignoring_descendants() {
+    let (_dir, command, _marker, ready) = launcher_with_grandchild("trap '' TERM");
+    let env = StdioRouterEnvironment::new(command, None, 5_000, None);
+    let info = env.init().await.unwrap().expect("init environment info");
+    let grandchild = info["grandchild_pid"].as_u64().expect("grandchild pid") as u32;
+    assert!(
+        crate::platform::pid_exists(grandchild),
+        "the grandchild starts alive"
+    );
+    wait_for_grandchild_trap(&ready).await;
+    let started = std::time::Instant::now();
+    env.close(RouterCloseOptions {
+        budget_ms: Some(2_000),
+    })
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the enforced stop stays inside its budget"
+    );
+    wait_for_exit(grandchild).await;
+    assert!(
+        !crate::platform::pid_exists(grandchild),
+        "the enforced group kill reached the SIGTERM-ignoring descendant"
     );
 }
 

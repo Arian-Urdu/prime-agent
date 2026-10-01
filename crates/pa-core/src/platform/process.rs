@@ -260,6 +260,54 @@ pub fn signal_process_group(_pid: i32, _signal: Signal) -> bool {
     false
 }
 
+/// Cheap `kill(-pid, 0)` group-membership probe: true while any process
+/// still holds the pgid led by `pid`, so teardown can tell a drained
+/// group from one that ignored its stop (TS `processGroupExists`; EPERM
+/// counts as existing - the group is there, just not signalable).
+/// Windows (and bare-metal) have no signalable groups, so no group ever
+/// exists to probe there and callers take their enforcement arm.
+#[cfg(unix)]
+#[must_use]
+pub fn process_group_exists(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 performs the permission and existence checks
+    // without sending anything.
+    if unsafe { libc::kill(-pid, 0) } == 0 {
+        return true;
+    }
+    // EPERM: the group has a member this process may not signal.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+#[must_use]
+pub fn process_group_exists(_pid: i32) -> bool {
+    false
+}
+
+/// Kill every member of the process group led by `pid`: the enforced stop
+/// for teardown after the leader has exited and been reaped (the close
+/// ladder's leader-exit arms). No bare-pid fallback - the reaped leader no
+/// longer anchors its pid, so a fallback could signal an innocent recycled
+/// pid; the group signal keeps the reference's inherent, bounded
+/// group-reuse TOCTOU and nothing wider. Windows has no signalable
+/// groups, so the hardened `taskkill /F /T` tree kill reaches the dead
+/// leader's descendants through the parent-child snapshot instead (the TS
+/// reference's own win32 answer for a stop that must reach a tree).
+#[cfg(unix)]
+#[must_use]
+pub fn kill_process_group(pid: i32) -> bool {
+    signal_process_group(pid, Signal::Kill)
+}
+
+#[cfg(not(unix))]
+#[must_use]
+pub fn kill_process_group(pid: i32) -> bool {
+    kill_process_group_or_pid(pid)
+}
+
 /// Cheap `kill(pid, 0)` existence probe; counts zombies as existing.
 #[cfg(unix)]
 #[must_use]
@@ -611,6 +659,10 @@ mod windows_tests {
         assert!(!kill_pid(-1, Signal::Kill));
         assert!(!kill_pid(0, Signal::Term));
         assert!(!kill_process_group_or_pid(-1));
+        assert!(!kill_process_group(-1));
+        assert!(!kill_process_group(0));
+        assert!(!process_group_exists(-1));
+        assert!(!process_group_exists(0));
     }
 }
 
@@ -634,6 +686,35 @@ mod exit_wait_tests {
         assert!(
             wait_for_exit(pid).await.is_ok(),
             "a reaped pid resolves at once"
+        );
+    }
+}
+
+/// The group probe the teardown ladders drain on (TS `processGroupExists`)
+/// and the enforced group-only kill they escalate to.
+#[cfg(all(test, unix))]
+mod process_group_tests {
+    use super::*;
+
+    #[test]
+    fn process_group_exists_while_a_member_runs_and_not_after_it_drains() {
+        let mut command = std::process::Command::new("sleep");
+        command.arg("600");
+        set_new_process_group(&mut command);
+        let mut child = command.spawn().expect("spawn sleep");
+        let pid = child.id() as i32;
+        assert!(process_group_exists(pid), "the group holds its live leader");
+        child.kill().expect("kill sleep");
+        child.wait().expect("reap sleep");
+        // The leader was the group's only member: reaped, nothing holds
+        // the pgid and the enforced kill proves no delivery.
+        assert!(
+            !process_group_exists(pid),
+            "a drained group names no members"
+        );
+        assert!(
+            !kill_process_group(pid),
+            "the enforced kill on a drained group is a proven no-op"
         );
     }
 }

@@ -478,8 +478,10 @@ impl Supervisor {
             // one fresh create and its only on-disk delta over the
             // spawn-time `Starting` record was a premature `Ready`
             // stamped while the create replay is still in flight; the
-            // durable identity (pid, socket, instance id) already sits in
-            // the spawn record, and the create-completion persist
+            // spawn record already carries the launch-time identity (pid,
+            // socket) — the registering worker's live instance id is a
+            // fresh uuid the worker mints at boot and refreshes only in
+            // memory — and the create-completion persist
             // (`launch_worker`'s post-create write) carries the `Ready`
             // state together with the session identity as the
             // metadata-survival barrier. TS has no boot-registration

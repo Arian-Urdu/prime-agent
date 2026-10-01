@@ -12,7 +12,7 @@ use super::{
     anyhow, create_command_payload, json, persist_worker, socket, util, Arc, Context,
     DaemonCommand, DaemonWorkerDescriptor, DaemonWorkerLifecycle, DurableDaemonCreateCommand,
     Duration, EngineModelSelection, Map, Ordering, Path, ResidentWorker, Result, RouteAdmission,
-    Supervisor, TypedCreateRejection, Value, LONG_ROUTE_TIMEOUT_MS, ROUTE_TIMEOUT_MS,
+    Supervisor, TempSync, TypedCreateRejection, Value, LONG_ROUTE_TIMEOUT_MS, ROUTE_TIMEOUT_MS,
 };
 use crate::lease::is_process_alive;
 use crate::protocol::{response_failure, response_success, DaemonResponse};
@@ -314,8 +314,13 @@ impl Supervisor {
         let deadline = worker_connect_deadline();
         // A failed launch never leaves its half-registered resident behind:
         // a later stale-id rebind (or resolve) must not select a worker
-        // that cannot route.
-        let child = match self.spawn_worker_process(&resident, deadline).await {
+        // that cannot route. The spawn record rides the unsynced TS
+        // `persistWorker` shape on this fresh create (the relaunch paths
+        // keep the synced persist).
+        let child = match self
+            .spawn_worker_process(&resident, deadline, TempSync::Unsynced)
+            .await
+        {
             Ok(child) => child,
             Err(error) => {
                 self.registry.remove(&worker_id).await;

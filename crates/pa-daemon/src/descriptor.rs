@@ -270,7 +270,35 @@ fn write_file_atomic_at(path: &Path, content: &str, sync: TempSync) -> Result<()
     let _ = pa_core::platform::perms::restrict_file(&temp);
     pa_core::platform::rename_onto(&temp, path)
         .with_context(|| format!("persist {}", path.display()))?;
+    #[cfg(test)]
+    atomic_write_probe::record(path, sync);
     Ok(())
+}
+
+/// Test-only served-path witness for the atomic writes: the durability
+/// class of a write is not observable in the persisted bytes (the
+/// temp-file sync differs, not the content), so the supervision oracles
+/// take the recorded classes here and assert the intended writer
+/// actually served a launch.
+#[cfg(test)]
+pub(crate) mod atomic_write_probe {
+    use super::{PathBuf, TempSync};
+    use std::sync::Mutex;
+
+    static RECORDED: Mutex<Vec<(PathBuf, TempSync)>> = Mutex::new(Vec::new());
+
+    /// Record one successful atomic write's path and durability class.
+    pub(crate) fn record(path: &std::path::Path, sync: TempSync) {
+        RECORDED
+            .lock()
+            .expect("atomic write probe")
+            .push((path.to_path_buf(), sync));
+    }
+
+    /// Drain the recorded writes.
+    pub(crate) fn take() -> Vec<(PathBuf, TempSync)> {
+        std::mem::take(&mut *RECORDED.lock().expect("atomic write probe"))
+    }
 }
 
 /// Persist the worker descriptor atomically with a fresh `updated_at`
@@ -287,10 +315,14 @@ pub fn persist_worker(path: &Path, descriptor: &WorkerDescriptor) -> Result<()> 
 /// Persist the spawn-time worker record in the TS `persistWorker` call
 /// shape: the same atomic rename and `updated_at` stamp, without the
 /// pre-rename fsync (TS's descriptor writes never request the fsync
-/// option). The spawn record is a pre-completion state: it must outlive
-/// a supervisor crash — the rename in the page cache does. The
-/// create-completion persist keeps the durable write as the
-/// metadata-survival barrier.
+/// option). This is the FRESH-CREATE shape only: the transient
+/// `Starting` record it replaces is the launch's own state, and the
+/// create-completion persist (`launch_worker`'s post-create write)
+/// re-establishes the durable write as the metadata-survival barrier.
+/// Every relaunch keeps the synced persist — it REPLACES an
+/// established, already-durable descriptor, and a torn unsynced
+/// replacement would lose the recovery journal pointer and the durable
+/// create command the next boot's revival replays.
 ///
 /// # Errors
 ///

@@ -437,3 +437,142 @@ async fn a_known_resident_registration_writes_nothing_to_disk() {
         "the live instance id refreshes in memory"
     );
 }
+
+/// The spawn-record durability witness: the probe records every atomic
+/// write's durability class (the fsync class is not observable in the
+/// persisted bytes), so the two oracles below drive the REAL launch
+/// paths and assert the intended writer actually served. The
+/// launch-budget seam (`PA_DAEMON_WORKER_CONNECT_TIMEOUT_MS`) keeps the
+/// probe failure immediate — no live worker socket ever serves here.
+async fn spawn_record_witness(tag: &str) -> (Arc<Supervisor>, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("pa-spawnrec-{tag}-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let agent_dir = dir.join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let supervisor = Arc::new(
+        Supervisor::new(SupervisorOptions {
+            socket_path: dir.join("daemon.sock"),
+            agent_dir,
+        })
+        .expect("supervisor"),
+    );
+    (supervisor, dir)
+}
+
+/// The Macroscope HIGH remedy, served-path asserted: a relaunch REPLACES
+/// an established, already-durable descriptor, so its spawn record must
+/// be the synced persist — a torn unsynced replacement would lose the
+/// descriptor's whole payload (the recovery journal pointer and the
+/// durable create command the next boot's revival replays). The relaunch
+/// fails here at the worker probe (no live worker), but the spawn
+/// record has already been written — exactly the window the durability
+/// choice governs. Pre-remedy this same path served the unsynced writer
+/// for every relaunch class (the finding).
+#[tokio::test]
+async fn a_relaunch_spawn_record_serves_the_durable_persist() {
+    std::env::set_var("PA_DAEMON_WORKER_CONNECT_TIMEOUT_MS", "1");
+    let (supervisor, dir) = spawn_record_witness("relaunch").await;
+    let descriptor_path = dir.join("w-relaunch.json");
+    let descriptor: DaemonWorkerDescriptor = serde_json::from_value(serde_json::json!({
+        "version": 2,
+        "workerId": "w-relaunch",
+        "pid": 4242,
+        "socketPath": "/tmp/w-relaunch.sock",
+        "recoveryJournalPath": "/tmp/w-relaunch.recovery.jsonl",
+        "supervisorSocketPath": "/tmp/none.sock",
+        "authenticationToken": "spawnrec-token",
+        "rootActiveSessionId": "w-relaunch",
+        "createdAt": "2026-10-01T00:00:00Z",
+        "updatedAt": "2026-10-01T00:00:00Z",
+        "lifecycle": "ready",
+        "createCommand": {},
+        "consecutiveFailures": 0,
+    }))
+    .expect("descriptor");
+    let resident = ResidentWorker::new(
+        "w-relaunch".to_string(),
+        descriptor,
+        descriptor_path.clone(),
+    );
+    supervisor.registry.insert(Arc::clone(&resident)).await;
+
+    let _ = crate::descriptor::atomic_write_probe::take();
+    let outcome = supervisor.relaunch_worker(&resident).await;
+    std::env::remove_var("PA_DAEMON_WORKER_CONNECT_TIMEOUT_MS");
+    assert!(
+        outcome.is_err(),
+        "no live worker: the relaunch fails at the probe, after the spawn record served"
+    );
+    let writes = crate::descriptor::atomic_write_probe::take();
+    let spawn_records: Vec<_> = writes
+        .iter()
+        .filter(|(path, _)| path == &descriptor_path)
+        .collect();
+    assert!(
+        !spawn_records.is_empty(),
+        "the relaunch wrote its spawn record"
+    );
+    assert!(
+        spawn_records
+            .iter()
+            .all(|(_, sync)| matches!(sync, TempSync::Synced)),
+        "the relaunch's spawn record is the synced persist: {spawn_records:?}"
+    );
+    // The record's content is the spawn-time `Starting` state either
+    // class writes; the durability class is the probe's business.
+    let persisted: DaemonWorkerDescriptor = serde_json::from_str(
+        &std::fs::read_to_string(&descriptor_path).expect("the spawn record is readable"),
+    )
+    .expect("parse the spawn record");
+    assert_eq!(persisted.lifecycle, DaemonWorkerLifecycle::Starting);
+    assert!(persisted.pid > 0, "the spawned pid rides the record");
+}
+
+/// The fresh-create cut, served-path asserted: the launch's spawn record
+/// keeps the unsynced TS `persistWorker` shape — the pre-rename fsync is
+/// exactly the write the fan-out cut removed, and serving the synced
+/// writer here would give the measured create-window win back. The
+/// launch fails at the probe (no live worker) and reclaims its
+/// half-launched descriptor, but the served write was already recorded.
+#[tokio::test]
+async fn a_fresh_create_spawn_record_keeps_the_unsynced_shape() {
+    std::env::set_var("PA_DAEMON_WORKER_CONNECT_TIMEOUT_MS", "1");
+    let (supervisor, dir) = spawn_record_witness("freshcreate").await;
+    let create = DaemonCommand::Create {
+        id: None,
+        session_path: Some(dir.join("s.jsonl").to_string_lossy().to_string()),
+        continue_recent: None,
+        no_session: None,
+        name: Some("faux".to_string()),
+        config: None,
+        telemetry_disabled: None,
+        runtime_metadata: None,
+        lifecycle: None,
+        env: None,
+        launch_env: None,
+        rest: Map::default(),
+    };
+
+    let _ = crate::descriptor::atomic_write_probe::take();
+    let outcome = supervisor.launch_worker(&create, None).await;
+    std::env::remove_var("PA_DAEMON_WORKER_CONNECT_TIMEOUT_MS");
+    assert!(
+        outcome.is_err(),
+        "no live worker: the fresh launch fails at the probe"
+    );
+    let writes = crate::descriptor::atomic_write_probe::take();
+    let spawn_records: Vec<_> = writes
+        .iter()
+        .filter(|(path, _)| path.starts_with(&supervisor.descriptor_dir))
+        .collect();
+    assert!(
+        !spawn_records.is_empty(),
+        "the fresh create wrote its spawn record"
+    );
+    assert!(
+        spawn_records
+            .iter()
+            .all(|(_, sync)| matches!(sync, TempSync::Unsynced)),
+        "the fresh create's spawn record stays the unsynced TS shape: {spawn_records:?}"
+    );
+}

@@ -14,7 +14,10 @@
 //! (`probe::resolve_tailscale_binary`): a `PATH` entry an attacker can plant in -
 //! a relative entry, which resolves to the current directory, or an entry
 //! naming the current directory itself - can never supply the binary that
-//! runs with the CLI's credentials and environment.
+//! runs with the CLI's credentials and environment, and the chosen candidate
+//! must be executable by this process (`access(2)` `X_OK`, not just any
+//! execute bit): a first entry usable only by an unrelated group yields to a
+//! later entry instead of stranding the CLI behind a permission-denied spawn.
 //!
 //! Submodules by responsibility: `probe` (detection and trusted-path
 //! resolution), `args` (argv parsing), `status` (the status command),

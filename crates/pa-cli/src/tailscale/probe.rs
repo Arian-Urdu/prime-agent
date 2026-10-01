@@ -5,7 +5,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use pa_core::platform::is_executable;
+use pa_core::platform::{is_executable, is_executable_by_process};
 use serde_json::Value;
 
 use super::{run_tailscale, trim_trailing_dots, TailscaleProbe, TAILSCALE_BINARY};
@@ -184,7 +184,11 @@ pub(super) fn trusted_tailscale_path() -> PathBuf {
 ///   not this command's to trust;
 /// - an entry that *is* the current directory is skipped the same way, so a
 ///   `./tailscale` planted in the working directory can never supply the
-///   binary that runs with the CLI's credentials and environment.
+///   binary that runs with the CLI's credentials and environment;
+/// - a candidate must be executable by this process (`access(2)` `X_OK`), not
+///   just carry an execute bit: a first entry executable only by an unrelated
+///   group yields to a later usable entry instead of failing to spawn with
+///   permission denied.
 pub(crate) fn resolve_tailscale_binary(
     path_env: &OsStr,
     cwd: &Path,
@@ -199,7 +203,11 @@ pub(crate) fn resolve_tailscale_binary(
             // The platform execute-bit probe, narrowed to regular files:
             // `pa_core`'s unix arm accepts any mode with an execute bit, and
             // a `PATH` entry holding a directory named like the program must
-            // not resolve.
-            candidate.is_file() && is_executable(candidate)
+            // not resolve. The any-bit probe alone would also accept a file
+            // this process cannot execute (its only execute bit belongs to an
+            // unrelated group): the spawn would die with permission denied
+            // and strand a usable CLI in a later entry, so the access check
+            // decides for this process and the search falls through.
+            candidate.is_file() && is_executable(candidate) && is_executable_by_process(candidate)
         })
 }

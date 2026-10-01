@@ -7,6 +7,8 @@
 use std::ffi::OsStr;
 use std::path::Path;
 
+use pa_core::platform::is_executable;
+
 use super::super::probe::resolve_tailscale_binary;
 use super::super::*;
 use super::*;
@@ -401,6 +403,41 @@ fn resolution_skips_a_non_executable_candidate() {
         Some(executable.path().join("tailscale"))
     );
 }
+
+/// The current process decides, not just the file's mode bits: a first
+/// entry whose `tailscale` carries an execute bit this process cannot use
+/// (the mode grants only an unrelated group) must not win the resolution -
+/// the spawn would fail with permission denied and strand a usable CLI in a
+/// later entry.
+#[test]
+fn resolution_falls_through_when_the_first_entry_is_not_executable_by_this_process() {
+    let unusable = tempfile::tempdir().expect("temp dir");
+    let candidate = unusable.path().join("tailscale");
+    write_executable(&candidate, "#!/bin/sh\nexit 0\n");
+    if !deny_execution_for_this_process(&candidate) {
+        eprintln!(
+            "this machine cannot construct an execute-denied candidate (root process or \
+             no ACL/sudo seam); skipping the fall-through pin"
+        );
+        return;
+    }
+    // The precondition, independent of the resolution under test: the mode
+    // still carries an execute bit (the any-bit probe accepts the
+    // candidate), which is what makes the first entry win the mode-only
+    // resolution this regression pins out.
+    assert!(
+        is_executable(&candidate),
+        "the denied candidate keeps its execute bit"
+    );
+    let usable = tempfile::tempdir().expect("temp dir");
+    write_executable(&usable.path().join("tailscale"), "#!/bin/sh\nexit 0\n");
+    let cwd = tempfile::tempdir().expect("temp dir");
+    let path = std::env::join_paths([unusable.path(), usable.path()]).expect("join paths");
+    assert_eq!(
+        resolve_tailscale_binary(path.as_os_str(), cwd.path(), "tailscale"),
+        Some(usable.path().join("tailscale"))
+    );
+}
 /// Windows installs `tailscale.exe`; the resolution must accept the
 /// platform's binary name (`tailscale.exe` on Windows, selected by
 /// [`tailscale_program_name`]).
@@ -490,6 +527,49 @@ fn the_public_commands_never_execute_a_tailscale_shadowing_the_cwd() {
         "the trusted CLI must receive the serve spawn: {:?}",
         real.argvs()
     );
+}
+
+/// Turn an executable file into one this process cannot execute while the
+/// mode keeps an execute bit (the reviewer's unrelated-group case). macOS:
+/// a deny-execute ACL on our own file. Other Unix: a root-owned mode-0o750
+/// candidate whose only execute bit applies to a group this process is not
+/// in, through passwordless sudo (the CI runner's configuration). Returns
+/// `false` when the machine cannot construct the denial - running as root
+/// makes it impossible, `access(2)` grants `X_OK` for any execute bit.
+fn deny_execution_for_this_process(path: &Path) -> bool {
+    let applied = if cfg!(target_os = "macos") {
+        std::process::Command::new("chmod")
+            .args(["+a", "everyone deny execute"])
+            .arg(path)
+            .status()
+            .is_ok_and(|status| status.success())
+    } else {
+        std::process::Command::new("sudo")
+            .args(["-n", "chown", "0:0"])
+            .arg(path)
+            .status()
+            .is_ok_and(|status| status.success())
+            && std::process::Command::new("sudo")
+                .args(["-n", "chmod", "0750"])
+                .arg(path)
+                .status()
+                .is_ok_and(|status| status.success())
+    };
+    // The verification is `sh`'s own access(2) probe, not the platform
+    // helper under test, so the pin cannot mask its own construction.
+    applied && !shell_can_execute(path)
+}
+
+/// `sh`'s `test -x` on `path`: an execute probe independent of the code
+/// under test.
+fn shell_can_execute(path: &Path) -> bool {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg("test -x \"$1\"")
+        .arg("sh")
+        .arg(path)
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// The process working directory on scope exit (including panics): a drop

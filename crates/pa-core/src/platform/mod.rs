@@ -16,7 +16,7 @@ pub use perms::{
 };
 pub use process::{
     kill_pid, kill_process_group_or_pid, pid_exists, set_new_process_group, set_no_window,
-    termination_signal, Signal,
+    signal_process_group, termination_signal, Signal,
 };
 // The rename-onto-destination primitive (bounded win32 destination-busy
 // retry, TS `renameOntoSync`) lives in pa-telemetry - the bottom crate every

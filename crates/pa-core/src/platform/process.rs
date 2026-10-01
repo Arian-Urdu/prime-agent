@@ -209,6 +209,38 @@ pub fn kill_process_group_or_pid(_pid: i32) -> bool {
     false
 }
 
+/// Relay a signal to the process group led by `pid` (the leader's own pid is
+/// its pgid): the reference ladder's stop for teardown paths whose direct
+/// child may already be reaped - a launcher (`sh -c`, a container client)
+/// can exit first and leave descendants alive in its group, so the group is
+/// signalled whether or not the leader is still around (TS
+/// `signalProcessGroupIfHeld`). Group-only, no bare-pid fallback: by the
+/// time teardown reaches here the leader is reaped, and a signal to its
+/// recycled pid would hit an innocent process - the group signal carries the
+/// reference's inherent, bounded pid-reuse TOCTOU and nothing wider.
+#[cfg(unix)]
+#[must_use]
+pub fn signal_process_group(pid: i32, signal: Signal) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let sig = match signal {
+        Signal::Term => libc::SIGTERM,
+        Signal::Kill => libc::SIGKILL,
+    };
+    unsafe { libc::kill(-pid, sig) == 0 }
+}
+
+/// Windows (and bare-metal) have no signalable process groups: the TS
+/// reference's `processGroupExists` is false on win32, so its leader-exit
+/// relays are no-ops there; tree teardown goes through
+/// [`kill_process_group_or_pid`] instead.
+#[cfg(not(unix))]
+#[must_use]
+pub fn signal_process_group(_pid: i32, _signal: Signal) -> bool {
+    false
+}
+
 /// Cheap `kill(pid, 0)` existence probe; counts zombies as existing.
 #[cfg(unix)]
 #[must_use]

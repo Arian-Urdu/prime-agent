@@ -269,3 +269,103 @@ for line in sys.stdin:
     })
     .await;
 }
+
+/// Poll until the pid is gone (or the deadline): the group relay reaches a
+/// descendant only after its own reaper lands.
+#[cfg(unix)]
+async fn wait_for_exit(pid: u32) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while crate::platform::pid_exists(pid) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A launcher that answers the close request and exits first (`sh -c`, a
+/// container client) still relays the stop to the descendant it left in its
+/// group - the graceful wait succeeding must not strand it (cursor: adapter
+/// descendants leak after close).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_launcher_that_answers_close_still_stops_its_descendants() {
+    let (_dir, command) = adapter(
+        r#"
+import json
+import subprocess
+import sys
+
+grandchild = subprocess.Popen(["/bin/sh", "-c", "trap 'exit 0' TERM; while :; do sleep 0.1; done"])
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    request = json.loads(line)
+    kind = request.get("type")
+    if kind == "init":
+        reply = {"id": request.get("id"), "ok": True, "environment": {"grandchild_pid": grandchild.pid}}
+        print(json.dumps(reply), flush=True)
+    elif kind == "close":
+        # The launcher exits first, leaving its descendant behind.
+        sys.exit(0)
+"#,
+    );
+    let env = StdioRouterEnvironment::new(command, None, 5_000, None);
+    let info = env.init().await.unwrap().expect("init environment info");
+    let grandchild = info["grandchild_pid"].as_u64().expect("grandchild pid") as u32;
+    assert!(
+        crate::platform::pid_exists(grandchild),
+        "the grandchild starts alive"
+    );
+    env.close(RouterCloseOptions {
+        budget_ms: Some(1_000),
+    })
+    .await;
+    wait_for_exit(grandchild).await;
+    assert!(
+        !crate::platform::pid_exists(grandchild),
+        "the group relay stopped the launcher's descendant"
+    );
+}
+
+/// A launcher that only dies from the relayed SIGTERM still enforces the stop
+/// on descendants that ignored it (the post-SIGTERM leader-exit arm).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_sigterm_killed_launcher_enforces_the_stop_on_its_descendants() {
+    let (_dir, command) = adapter(
+        r#"
+import json
+import subprocess
+import sys
+import time
+
+grandchild = subprocess.Popen(["/bin/sh", "-c", "trap '' TERM; while :; do sleep 0.1; done"])
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    request = json.loads(line)
+    if request.get("type") == "init":
+        reply = {"id": request.get("id"), "ok": True, "environment": {"grandchild_pid": grandchild.pid}}
+        print(json.dumps(reply), flush=True)
+# stdin is closed: keep the launcher alive until a signal stops it.
+while True:
+    time.sleep(0.1)
+"#,
+    );
+    let env = StdioRouterEnvironment::new(command, None, 5_000, None);
+    let info = env.init().await.unwrap().expect("init environment info");
+    let grandchild = info["grandchild_pid"].as_u64().expect("grandchild pid") as u32;
+    assert!(
+        crate::platform::pid_exists(grandchild),
+        "the grandchild starts alive"
+    );
+    env.close(RouterCloseOptions {
+        budget_ms: Some(2_000),
+    })
+    .await;
+    wait_for_exit(grandchild).await;
+    assert!(
+        !crate::platform::pid_exists(grandchild),
+        "the enforced group kill reached the SIGTERM-ignoring descendant"
+    );
+}

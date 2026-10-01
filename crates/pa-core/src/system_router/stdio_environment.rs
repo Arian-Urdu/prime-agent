@@ -11,9 +11,12 @@
 //! Port notes (divergences from the TS reference, both bounded):
 //! the early-exit error carries the stderr tail but not the process exit code
 //! (the tokio child handle stays owned by the environment and is reaped in
-//! `close`); cleanup sends SIGTERM to the direct child and falls back to the
-//! platform tree kill ([`crate::platform::kill_process_group_or_pid`]) instead
-//! of signalling the process group at every stage.
+//! `close`); cleanup sends SIGTERM to the direct child (not the whole group)
+//! while the leader is alive, then falls back to the platform tree kill
+//! ([`crate::platform::kill_process_group_or_pid`]). Every leader-exit stage
+//! relays the stop to the group like the reference
+//! ([`crate::platform::signal_process_group`]) so a launcher that exits first
+//! cannot strand its descendants.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -369,22 +372,49 @@ impl RouterEnvironment for StdioRouterEnvironment {
             let graceful_ms = remaining_ms(started, budget, sigterm_reserve).min(1_500);
             let pid = inner.pid;
             if let Some(child) = &mut inner.child {
-                if tokio::time::timeout(Duration::from_millis(graceful_ms), child.wait())
-                    .await
-                    .is_err()
-                {
-                    if let Some(pid) = pid {
-                        // SIGTERM first: a container-wrapped adapter forwards
-                        // it (a SIGKILL would hit only the wrapper client).
-                        let _ = kill_pid(pid as i32, Signal::Term);
-                    }
-                    let term_ms = remaining_ms(started, budget, 0).min(1_000);
-                    if tokio::time::timeout(Duration::from_millis(term_ms), child.wait())
-                        .await
-                        .is_err()
-                    {
+                match tokio::time::timeout(Duration::from_millis(graceful_ms), child.wait()).await {
+                    Err(_) => {
                         if let Some(pid) = pid {
-                            let _ = crate::platform::kill_process_group_or_pid(pid as i32);
+                            // SIGTERM first: a container-wrapped adapter
+                            // forwards it (a SIGKILL would hit only the
+                            // wrapper client).
+                            let _ = kill_pid(pid as i32, Signal::Term);
+                        }
+                        let term_ms = remaining_ms(started, budget, 0).min(1_000);
+                        match tokio::time::timeout(Duration::from_millis(term_ms), child.wait())
+                            .await
+                        {
+                            Err(_) => {
+                                // It ignored the SIGTERM too: the enforced
+                                // platform tree kill.
+                                if let Some(pid) = pid {
+                                    let _ = crate::platform::kill_process_group_or_pid(pid as i32);
+                                }
+                            }
+                            Ok(_) => {
+                                // It exited from the relayed SIGTERM:
+                                // descendants that ignored the stop still
+                                // get the enforced group kill (the
+                                // reference's post-SIGTERM arm).
+                                if let Some(pid) = pid {
+                                    let _ = crate::platform::signal_process_group(
+                                        pid as i32,
+                                        Signal::Kill,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        // The launcher answered the close request and exited
+                        // first (`sh -c`, a container client), or crashed
+                        // before: its group can still hold descendants, so
+                        // the stop is relayed to the group (the reference's
+                        // leader-exit arm). Without this, descendants outlive
+                        // the segment and `closed` keeps `Drop` from killing
+                        // them.
+                        if let Some(pid) = pid {
+                            let _ = crate::platform::signal_process_group(pid as i32, Signal::Term);
                         }
                     }
                 }

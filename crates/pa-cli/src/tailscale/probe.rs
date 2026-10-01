@@ -5,7 +5,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use pa_core::platform::is_executable;
+use pa_core::platform::{is_executable, is_executable_by_process};
 use serde_json::Value;
 
 use super::{run_tailscale, trim_trailing_dots, TailscaleProbe, TAILSCALE_BINARY};
@@ -56,32 +56,34 @@ pub(crate) async fn probe_tailscale(program: &OsStr) -> TailscaleProbe {
             let online = self_field
                 .and_then(|value| value.get("Online"))
                 .and_then(Value::as_bool);
-            let dns_name = self_field
-                .and_then(|value| value.get("DNSName"))
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    self_field
-                        .and_then(|value| value.get("HostName"))
-                        .and_then(Value::as_str)
-                });
+            // An empty or dot-only `DNSName` carries no name, so it yields to
+            // `HostName` instead of winning the choice and then trimming to
+            // no hostname (which serve would advertise as `.<suffix>`).
+            let dns_name =
+                node_name(self_field, "DNSName").or_else(|| node_name(self_field, "HostName"));
             // Top-level MagicDNSSuffix is deprecated upstream; prefer
-            // CurrentTailnet's.
-            let suffix = parsed
-                .get("CurrentTailnet")
-                .and_then(|value| value.get("MagicDNSSuffix"))
-                .and_then(Value::as_str)
-                .or_else(|| parsed.get("MagicDNSSuffix").and_then(Value::as_str))
+            // CurrentTailnet's. An empty or dot-only suffix carries no
+            // domain, so it reads as absent and yields to the next candidate
+            // instead of blocking it (serve would otherwise trim it to no
+            // suffix and advertise a trailing-dot host like `milk.`).
+            let suffix = magic_dns_suffix(parsed.get("CurrentTailnet"))
+                .or_else(|| magic_dns_suffix(Some(&parsed)))
                 .map(str::to_string);
-            let hostname = dns_name.filter(|name| !name.is_empty()).map(|name| {
-                let mut host = trim_trailing_dots(name).to_string();
-                if let Some(suffix) = &suffix {
-                    let suffix = trim_trailing_dots(suffix);
-                    if let Some(stripped) = host.strip_suffix(&format!(".{suffix}")) {
-                        host = stripped.to_string();
+            let hostname = dns_name
+                .map(|name| {
+                    let mut host = trim_trailing_dots(name).to_string();
+                    if let Some(suffix) = &suffix {
+                        let suffix = trim_trailing_dots(suffix);
+                        if let Some(stripped) = host.strip_suffix(&format!(".{suffix}")) {
+                            host = stripped.to_string();
+                        }
                     }
-                }
-                host
-            });
+                    host
+                })
+                // The hostname is either a real machine label or nothing: a
+                // name that trims or strips to empty must never surface as an
+                // empty host (serve would advertise it as `.<suffix>`).
+                .filter(|host| !host.is_empty());
             TailscaleProbe {
                 cli_path,
                 on_tailnet: online == Some(true) || backend == "Running",
@@ -97,6 +99,26 @@ pub(crate) async fn probe_tailscale(program: &OsStr) -> TailscaleProbe {
             ..TailscaleProbe::default()
         },
     }
+}
+
+/// The raw `Self.<field>` name when it carries a real hostname: empty and
+/// dot-only strings trim to no hostname, so they read as absent and the next
+/// candidate (e.g. `HostName`) takes over.
+fn node_name<'a>(self_field: Option<&'a Value>, field: &str) -> Option<&'a str> {
+    self_field
+        .and_then(|value| value.get(field))
+        .and_then(Value::as_str)
+        .filter(|name| !trim_trailing_dots(name).is_empty())
+}
+
+/// The raw `MagicDNSSuffix` field of `object` when it carries a real domain:
+/// empty and dot-only strings trim to no suffix, so they read as absent and
+/// the next candidate (the deprecated top-level suffix) takes over.
+fn magic_dns_suffix(object: Option<&Value>) -> Option<&str> {
+    object
+        .and_then(|value| value.get("MagicDNSSuffix"))
+        .and_then(Value::as_str)
+        .filter(|suffix| !trim_trailing_dots(suffix).is_empty())
 }
 
 /// One-line doctor facts for `prime-agent doctor` (TS `tailscaleDoctorFacts`).
@@ -162,7 +184,11 @@ pub(super) fn trusted_tailscale_path() -> PathBuf {
 ///   not this command's to trust;
 /// - an entry that *is* the current directory is skipped the same way, so a
 ///   `./tailscale` planted in the working directory can never supply the
-///   binary that runs with the CLI's credentials and environment.
+///   binary that runs with the CLI's credentials and environment;
+/// - a candidate must be executable by this process (`access(2)` `X_OK`), not
+///   just carry an execute bit: a first entry executable only by an unrelated
+///   group yields to a later usable entry instead of failing to spawn with
+///   permission denied.
 pub(crate) fn resolve_tailscale_binary(
     path_env: &OsStr,
     cwd: &Path,
@@ -177,7 +203,11 @@ pub(crate) fn resolve_tailscale_binary(
             // The platform execute-bit probe, narrowed to regular files:
             // `pa_core`'s unix arm accepts any mode with an execute bit, and
             // a `PATH` entry holding a directory named like the program must
-            // not resolve.
-            candidate.is_file() && is_executable(candidate)
+            // not resolve. The any-bit probe alone would also accept a file
+            // this process cannot execute (its only execute bit belongs to an
+            // unrelated group): the spawn would die with permission denied
+            // and strand a usable CLI in a later entry, so the access check
+            // decides for this process and the search falls through.
+            candidate.is_file() && is_executable(candidate) && is_executable_by_process(candidate)
         })
 }

@@ -19,6 +19,7 @@ mod hover_band;
 mod key_bindings;
 mod notices;
 mod render_pulse;
+mod reply;
 mod running_lines;
 mod saved_catalog;
 mod selection_churn;
@@ -43,6 +44,7 @@ fn mode_with_row(title: &str, model: &str) -> (AgentsViewMode, usize) {
         keybindings: crate::keybindings::KeybindingsManager::new(),
         show_hardware_cursor: false,
         incident_notice_state: None,
+        create_config: serde_json::json!({}),
     });
     let row = |title: &str| AgentsViewRow {
         section: Section::Idle,
@@ -152,6 +154,7 @@ fn mode_with_parent_and_child() -> AgentsViewMode {
         keybindings: crate::keybindings::KeybindingsManager::new(),
         show_hardware_cursor: false,
         incident_notice_state: None,
+        create_config: serde_json::json!({}),
     });
     mode.roster = vec![
         roster_entry("p", "idle", &parent_summary("p")),
@@ -180,6 +183,38 @@ fn mode_with_anchor(anchor: Option<&str>, roster: Vec<serde_json::Value>) -> Age
         keybindings: crate::keybindings::KeybindingsManager::new(),
         show_hardware_cursor: false,
         incident_notice_state: None,
+        create_config: serde_json::json!({}),
+    });
+    mode.roster = roster;
+    mode.rebuild_rows();
+    mode
+}
+
+/// A scoped view over the given roster (the family's shared fixture: the
+/// scope shape the subagents summary line's open action carries; the
+/// anchor names the session the agents-back handoff waits on).
+fn scoped_mode(anchor: Option<&str>, roster: Vec<serde_json::Value>) -> AgentsViewMode {
+    let mut mode = AgentsViewMode::new(AgentsViewOptions {
+        socket_path: PathBuf::from("/tmp/agents-view-test.sock"),
+        cwd: PathBuf::from("/tmp"),
+        session_dir: None,
+        theme: "prime".to_string(),
+        version: "0.0.0".to_string(),
+        anchor_session_id: anchor.map(str::to_string),
+        scope: Some(AgentsViewScope {
+            session_id: Some("p".to_string()),
+            active_session_id: Some("p-live".to_string()),
+            session_name: Some("p name".to_string()),
+        }),
+        query: None,
+        expanded_ancestors: Vec::new(),
+        selected_row_identity: None,
+        selected_key: None,
+        status_message: None,
+        keybindings: crate::keybindings::KeybindingsManager::new(),
+        show_hardware_cursor: false,
+        incident_notice_state: None,
+        create_config: serde_json::json!({}),
     });
     mode.roster = roster;
     mode.rebuild_rows();
@@ -210,6 +245,7 @@ fn mode_with_user_bindings(bindings: &[(&str, &str)]) -> AgentsViewMode {
         keybindings: crate::keybindings::KeybindingsManager::with_user_bindings(cfg),
         show_hardware_cursor: false,
         incident_notice_state: None,
+        create_config: serde_json::json!({}),
     });
     mode.roster = vec![
         roster_entry("p", "idle", &parent_summary("p")),
@@ -236,6 +272,7 @@ fn fresh_mode(roster: Vec<serde_json::Value>) -> AgentsViewMode {
         keybindings: crate::keybindings::KeybindingsManager::new(),
         show_hardware_cursor: false,
         incident_notice_state: None,
+        create_config: serde_json::json!({}),
     });
     mode.roster = roster;
     mode.rebuild_rows();
@@ -268,7 +305,7 @@ fn opening_a_remote_row_refuses_with_the_machine() {
     let mut mode = mode_with_remote_row();
     mode.selected = 1;
     mode.open_selected();
-    let status = mode.status.as_deref().expect("the open must refuse");
+    let status = mode.status_text().expect("the open must refuse");
     assert!(
         status.contains("Remote agent runs on milk.tailnet.ts.net"),
         "{status}"
@@ -287,7 +324,7 @@ fn renaming_a_remote_row_refuses_with_the_machine() {
     let mut mode = mode_with_remote_row();
     mode.selected = 1;
     mode.enter_rename_mode();
-    let status = mode.status.as_deref().expect("the rename must refuse");
+    let status = mode.status_text().expect("the rename must refuse");
     assert!(
         status.contains("Remote agent runs on milk.tailnet.ts.net"),
         "{status}"
@@ -302,7 +339,7 @@ fn deleting_a_remote_row_refuses_with_the_machine() {
     let mut mode = mode_with_remote_row();
     mode.selected = 1;
     assert!(mode.guard_remote_row("stop or delete"));
-    let status = mode.status.as_deref().expect("the delete must refuse");
+    let status = mode.status_text().expect("the delete must refuse");
     assert!(
         status.contains("Remote agent runs on milk.tailnet.ts.net"),
         "{status}"
@@ -310,5 +347,25 @@ fn deleting_a_remote_row_refuses_with_the_machine() {
     assert!(
         status.contains("stop or delete it on that machine"),
         "{status}"
+    );
+}
+
+/// The reply arm's guard refuses with the machine (TS #2516: replies
+/// steer or resume through the local daemon, so the composer cannot
+/// deliver for a tailnet peer's row).
+#[test]
+fn replying_to_a_remote_row_refuses_with_the_machine() {
+    let mut mode = mode_with_remote_row();
+    mode.selected = 1;
+    mode.toggle_reply();
+    let status = mode.status_text().expect("the reply must refuse");
+    assert!(
+        status.contains("Remote agent runs on milk.tailnet.ts.net"),
+        "{status}"
+    );
+    assert!(status.contains("reply to it on that machine"), "{status}");
+    assert!(
+        !matches!(mode.composer, super::Composer::Reply(_)),
+        "no reply composer may arm on a remote row"
     );
 }

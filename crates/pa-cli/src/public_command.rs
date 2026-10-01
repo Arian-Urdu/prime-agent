@@ -642,37 +642,36 @@ fn is_self_update_source(source: &str) -> bool {
     source == "self" || source == "pi" || source == APP_NAME
 }
 
-fn run_update(args: &[String]) -> PublicCommandResult {
-    // The migration path's own surface: the bare command is the
-    // installer takeover (the funnel), and `--check` reports the latest
-    // available build vs the running one without installing. The
-    // TS-parity staged-flow flags below keep their surface exactly as
-    // before (the managed releases/ layout world the battery's wire
-    // suites pin); an installer-based install reports it is not owned by
-    // the installer there, while the bare command works everywhere the
-    // installer does.
-    if args.is_empty() {
-        let options = crate::installer_update::UpdateOptions { check: false };
-        return handled_with_exit(crate::installer_update::run(&options));
+/// A `--check` invocation: `--check` (or `--version`) with at most one
+/// `--nightly` / `--stable`. `None` when the arguments are not a check.
+fn check_invocation(args: &[String]) -> Option<crate::installer_update::UpdateOptions> {
+    use pa_core::update::version::UpdateChannel;
+    let mut check = false;
+    let mut channel = None;
+    for arg in args {
+        match arg.as_str() {
+            "--check" | "--version" => check = true,
+            "--nightly" if channel.is_none() => channel = Some(UpdateChannel::Nightly),
+            "--stable" if channel.is_none() => channel = Some(UpdateChannel::Stable),
+            _ => return None,
+        }
     }
-    // `--check` alone (alias `--version`) reports without installing;
-    // mixed with anything else the staged parse below rejects it.
-    if args
-        .iter()
-        .all(|arg| matches!(arg.as_str(), "--check" | "--version"))
-    {
-        let options = crate::installer_update::UpdateOptions { check: true };
+    check.then_some(crate::installer_update::UpdateOptions {
+        check: true,
+        channel,
+    })
+}
+
+fn run_update(args: &[String]) -> PublicCommandResult {
+    // `--check` (alias `--version`) reports without installing, optionally
+    // for one channel flag; mixed with anything else the parse below
+    // rejects it.
+    if let Some(options) = check_invocation(args) {
         return handled_with_exit(crate::installer_update::run(&options));
     }
     let Some(options) = parse_update_options(args) else {
         return handled_failed();
     };
-    // TS package-manager-cli's update case: the persisted `updateChannel`
-    // setting (`/nightly off`) is the default the update follows
-    // (`options.channel ?? persistedChannel`), an explicit nightly switch
-    // warns and confirms, and a completed run persists the explicit
-    // switch (`commitChannel`) — one shared body with the `package update`
-    // self target (`crate::self_update`).
     let persisted_wire = std::env::current_dir()
         .ok()
         .and_then(|cwd| {
@@ -688,6 +687,17 @@ fn run_update(args: &[String]) -> PublicCommandResult {
         std::io::stdin().is_terminal(),
     ) {
         return handled_with_exit(abort_code);
+    }
+    // The installer funnel serves the bare update and the channel flags:
+    // the channel is the flag, else the saved `updateChannel` setting
+    // (`/nightly on|off`), else the installed one. `--rollback` and
+    // `--archive` stay on the managed-install flow.
+    if !options.rollback && options.archive.is_none() {
+        let update = crate::installer_update::UpdateOptions {
+            check: false,
+            channel: options.channel,
+        };
+        return handled_with_exit(crate::installer_update::run(&update));
     }
     handled_with_exit(crate::self_update::run(&options, persisted_wire.as_deref()))
 }
@@ -953,6 +963,29 @@ mod update_options_tests {
     }
 
     #[test]
+    fn check_combines_with_one_channel_flag() {
+        use pa_core::update::version::UpdateChannel;
+        let channel = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(std::string::ToString::to_string).collect();
+            check_invocation(&args).map(|options| options.channel)
+        };
+        assert_eq!(channel(&["--check"]), Some(None));
+        assert_eq!(
+            channel(&["--nightly", "--version"]),
+            Some(Some(UpdateChannel::Nightly))
+        );
+        assert_eq!(
+            channel(&["--check", "--stable"]),
+            Some(Some(UpdateChannel::Stable))
+        );
+        assert_eq!(channel(&[]), None);
+        assert_eq!(channel(&["--nightly"]), None);
+        assert_eq!(channel(&["--check", "--nightly", "--stable"]), None);
+        assert_eq!(channel(&["--check", "--force"]), None);
+        assert_eq!(channel(&["--check", "--rollback"]), None);
+    }
+
+    #[test]
     fn parses_the_ts_booleans() {
         let invocation = parse(&["--force"]).unwrap();
         assert!(invocation.force && !invocation.rollback);
@@ -1030,12 +1063,15 @@ mod tailscale_dispatch_tests {
     }
 
     #[test]
-    fn the_tailscale_help_matches_the_ts_spec() {
+    fn the_tailscale_help_marks_the_subcommand_optional() {
         let help = format_command_help(&["tailscale"]).expect("the tailscale spec");
+        // Bare `tailscale` and `tailscale --json` dispatch to status, so the
+        // top-level usage cannot document the subcommand as required.
         assert!(
-            help.contains("prime-agent tailscale <status|serve>"),
+            help.contains("prime-agent tailscale [status|serve]"),
             "{help}"
         );
+        assert!(!help.contains("<status|serve>"), "{help}");
         assert!(help.contains("status"), "{help}");
         assert!(help.contains("serve"), "{help}");
         let serve = format_command_help(&["tailscale", "serve"]).expect("the tailscale serve spec");

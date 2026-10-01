@@ -69,29 +69,6 @@ pub fn session_title(summary: &Value) -> String {
     "Untitled agent".to_string()
 }
 
-/// Whether a summary is a spawned subagent (TS `isSubagentSummary`): the
-/// runtime kind decides when present; summaries from daemons that predate
-/// it still carry subagent linkage and never surface as top-level agents.
-pub(crate) fn is_subagent_summary(summary: &Value) -> bool {
-    match summary.get("runtimeKind").and_then(Value::as_str) {
-        Some(kind) => kind == "subagent",
-        None => [
-            "rlmChildId",
-            "rlmParentNodeId",
-            "parentActiveSessionId",
-            "parentSessionId",
-            "parentSessionPath",
-        ]
-        .iter()
-        .any(|field| {
-            summary
-                .get(*field)
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty())
-        }),
-    }
-}
-
 /// A remote row publishes a peer's own session ids, so every id-derived
 /// key scopes them to their host (TS #2516 `identityScope`): a local
 /// session with the same ids keeps its own row, its own identity, and

@@ -447,8 +447,9 @@ impl Supervisor {
         }
         let supervisor = Arc::clone(self);
         let timer_resident = Arc::clone(resident);
+        let deadline = tokio::time::Instant::now() + OWNED_WORKER_DISCONNECT_GRACE;
         let task = tokio::spawn(async move {
-            tokio::time::sleep(OWNED_WORKER_DISCONNECT_GRACE).await;
+            tokio::time::sleep_until(deadline).await;
             // Clear this timer's own handle first, so a later arm can only
             // abort a sleeping timer, never a stop in progress. A newer arm's
             // handle in the slot means this timer was replaced (and aborted).

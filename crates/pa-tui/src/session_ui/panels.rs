@@ -166,7 +166,7 @@ impl SessionUi {
                 // all-zero dock, or one with only shells running, must stay
                 // reachable — TS `SubagentSummaryLine.isSelectable()` gated
                 // this on existing subagents, a sanctioned divergence). The
-                // grab lands on the row's first group; Left/Right walk the
+                // grab lands on the row's first group; Tab/Shift+Tab cycle the
                 // rest.
                 self.activity_group = crate::chrome::ActivityGroup::Subagents;
             }

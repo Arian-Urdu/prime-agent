@@ -92,6 +92,10 @@ impl MockSupervisor {
                 Err(_) => return,
             }
         };
+        // On macOS accepted sockets inherit O_NONBLOCK from the listener.
+        stream
+            .set_nonblocking(false)
+            .expect("blocking client socket");
         let mut writer = stream.try_clone().expect("clone mock socket");
         let mut reader = BufReader::new(stream);
 
@@ -263,7 +267,10 @@ fn canary_heartbeats() -> Value {
     })
 }
 
-fn options(socket: PathBuf) -> InteractiveOptions {
+fn options(
+    socket: PathBuf,
+    keybindings: pa_tui::keybindings::KeybindingsManager,
+) -> InteractiveOptions {
     InteractiveOptions {
         models: None,
         socket_path: socket,
@@ -292,7 +299,7 @@ fn options(socket: PathBuf) -> InteractiveOptions {
         provider_auth: None,
         update_commands: None,
         telemetry: None,
-        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
+        keybindings,
         session_rlm_depth: None,
         prompt_stash: std::sync::Arc::default(),
         session_has_children: false,
@@ -350,6 +357,20 @@ fn run_plan(
     heartbeats: Option<Value>,
     goal: Option<Value>,
 ) -> pa_tui::interactive::InteractiveOutcome {
+    run_plan_with_keybindings(
+        steps,
+        heartbeats,
+        goal,
+        pa_tui::keybindings::KeybindingsManager::new(),
+    )
+}
+
+fn run_plan_with_keybindings(
+    steps: Vec<HeadlessStep>,
+    heartbeats: Option<Value>,
+    goal: Option<Value>,
+    keybindings: pa_tui::keybindings::KeybindingsManager,
+) -> pa_tui::interactive::InteractiveOutcome {
     // The ambient TMUX variable adds a startup notice to the transcript;
     // scrub it so the run is the same inside tmux and out.
     std::env::remove_var("TMUX");
@@ -368,7 +389,10 @@ fn run_plan(
         height: 40,
     };
     let outcome = runtime
-        .block_on(run_interactive(options(socket), UiMode::Headless(plan)))
+        .block_on(run_interactive(
+            options(socket, keybindings),
+            UiMode::Headless(plan),
+        ))
         .expect("interactive run");
     handle.join().expect("mock supervisor finished");
     outcome
@@ -670,4 +694,34 @@ fn an_all_zero_dock_renders_and_opens_the_empty_scoped_agents_view() {
             session_name: Some("dock arrows session".to_string()),
         })
     );
+}
+
+/// Literal dock cycling wins even when a user remaps open/focus onto Tab.
+#[test]
+fn dock_tab_cycle_survives_remapped_open_binding() {
+    let mut bindings = pa_tui::keybindings::KeybindingsConfig::new();
+    bindings.insert("tui.select.confirm".to_string(), vec!["tab".to_string()]);
+    let keys = pa_tui::keybindings::KeybindingsManager::with_user_bindings(bindings);
+    let outcome = run_plan_with_keybindings(
+        vec![
+            HeadlessStep::WaitRender {
+                needle: "Pursuing goal (0s)".to_string(),
+                timeout_ms: 5_000,
+            },
+            HeadlessStep::Key(alt_a()),
+            HeadlessStep::Key(tab()),
+            HeadlessStep::Key(right()),
+            HeadlessStep::WaitRender {
+                needle: "No running or paused heartbeats".to_string(),
+                timeout_ms: 5_000,
+            },
+        ],
+        None,
+        Some(live_goal()),
+        keys,
+    );
+    assert!(outcome
+        .frames
+        .join("\n")
+        .contains("No running or paused heartbeats"));
 }

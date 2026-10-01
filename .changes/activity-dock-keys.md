@@ -1,0 +1,1 @@
+- The activity dock now cycles groups with Tab/Shift+Tab and opens the focused group with Enter or Right; its keys work from the prompt even when every group is empty.

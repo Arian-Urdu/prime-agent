@@ -1477,7 +1477,10 @@ const TUI_EVENTS: &[EventRule] = &[
         properties: &[
             (
                 "kind",
-                required(enum_rule(&["subagents", "heartbeats", "bash"], "subagents")),
+                required(enum_rule(
+                    &["subagents", "heartbeats", "bash", "goal"],
+                    "subagents",
+                )),
             ),
             (
                 "source",
@@ -1957,6 +1960,9 @@ mod tests {
         assert_eq!(properties.get("source"), Some(&json!("enter")));
         assert_eq!(properties.get("kind"), Some(&json!("heartbeats")));
         assert_eq!(adjusted, 1, "one enum fallback");
+        properties.set("kind", json!("goal"));
+        assert_eq!(sanitize("tui activity opened", &mut properties), 0);
+        assert_eq!(properties.get("kind"), Some(&json!("goal")));
     }
 
     #[test]

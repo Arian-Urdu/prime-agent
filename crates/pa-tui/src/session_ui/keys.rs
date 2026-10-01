@@ -547,6 +547,22 @@ impl SessionUi {
         // the editor handles it).
         if self.subagents_focused {
             let kb = view.editor.keybindings();
+            // Dock traversal is literal even if a configurable open binding
+            // claims Tab; otherwise that remap makes a group unreachable.
+            if id == "tab" || id == "shift+tab" {
+                // One press visits one rendered group, including empty ones.
+                let direction = if id == "shift+tab" {
+                    crate::chrome::ActivityDirection::Prev
+                } else {
+                    crate::chrome::ActivityDirection::Next
+                };
+                self.activity_group = self
+                    .activity_dock_state()
+                    .step(self.activity_group, direction);
+                self.update_subagent_summary(view);
+                self.dirty = true;
+                return Ok(());
+            }
             let open_source = if kb.matches(&id, "tui.select.confirm") {
                 Some("enter")
             } else if kb.matches(&id, "app.agents.open") {
@@ -558,25 +574,6 @@ impl SessionUi {
             };
             if let Some(source) = open_source {
                 self.open_dock_group_view(view, source);
-                return Ok(());
-            }
-            if id == "tab" || id == "shift+tab" {
-                // One press, one group: the step lands on the
-                // neighboring rendered group and wraps at the row's
-                // ends, so an empty group is still visited (the
-                // operator's 2026-09-26 muscle-memory directive — an
-                // empty group never skips) and N groups take N
-                // presses to cycle.
-                let direction = if id == "shift+tab" {
-                    crate::chrome::ActivityDirection::Prev
-                } else {
-                    crate::chrome::ActivityDirection::Next
-                };
-                self.activity_group = self
-                    .activity_dock_state()
-                    .step(self.activity_group, direction);
-                self.update_subagent_summary(view);
-                self.dirty = true;
                 return Ok(());
             }
             if kb.matches(&id, "tui.select.up")

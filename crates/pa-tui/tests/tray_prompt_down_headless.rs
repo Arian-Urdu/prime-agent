@@ -2,7 +2,7 @@
 //! row under the editor), the operator's 2026-10-01 consistency ruling:
 //! Down at the end of the prompt ALWAYS hands the focus to the dock — the
 //! all-zero dock and a dock with only shells running included —
-//! Left/Right walk its groups, Enter opens the focused group's view even
+//! Tab/Shift+Tab cycle its groups, Enter opens the focused group's view even
 //! when it is empty, and Up/Esc return to the prompt. Before the fix the
 //! Down only took the dock while subagents existed, so with zero
 //! subagents every group below the prompt was out of the arrows' reach.
@@ -77,6 +77,10 @@ impl MockSupervisor {
                 Err(_) => return,
             }
         };
+        // On macOS accepted sockets inherit O_NONBLOCK from the listener.
+        stream
+            .set_nonblocking(false)
+            .expect("blocking client socket");
         let mut writer = stream.try_clone().expect("clone mock socket");
         let mut reader = BufReader::new(stream);
 
@@ -251,9 +255,9 @@ fn up() -> KeyEvent {
     KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)
 }
 
-/// One right-arrow key event (the dock's next-section step).
-fn right() -> KeyEvent {
-    KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)
+/// One Tab press (the dock's next-section step).
+fn tab() -> KeyEvent {
+    KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
 }
 
 /// One plain Enter key event (the focused section's open).
@@ -323,7 +327,7 @@ fn prompt_down_enters_the_all_zero_dock_and_enter_opens_subagents() {
     );
 }
 
-/// Every empty group stays reachable from the prompt's Down: Right walks
+/// Every empty group stays reachable from the prompt's Down: Tab walks
 /// to the empty heartbeats and shells groups, and Enter opens each view's
 /// empty state.
 #[test]
@@ -334,7 +338,7 @@ fn prompt_down_reaches_every_empty_group() {
             timeout_ms: 5_000,
         },
         HeadlessStep::Key(down()),
-        HeadlessStep::Key(right()),
+        HeadlessStep::Key(tab()),
         HeadlessStep::Key(enter()),
         HeadlessStep::WaitRender {
             needle: "No running or paused heartbeats".to_string(),
@@ -342,7 +346,7 @@ fn prompt_down_reaches_every_empty_group() {
         },
         // The panel's exit lands back on its own dock item.
         HeadlessStep::Key(escape()),
-        HeadlessStep::Key(right()),
+        HeadlessStep::Key(tab()),
         HeadlessStep::Key(enter()),
         HeadlessStep::WaitRender {
             needle: "No background commands".to_string(),
@@ -362,7 +366,7 @@ fn prompt_down_reaches_every_empty_group() {
 }
 
 /// Bug 2: with a shell running and zero subagents, the prompt's Down
-/// enters the dock and two Right presses reach the shells group, whose
+/// enters the dock and two Tab presses reach the shells group, whose
 /// Enter opens the bash view listing the running shell.
 #[test]
 fn prompt_down_reaches_the_shells_group_with_zero_subagents() {
@@ -373,8 +377,8 @@ fn prompt_down_reaches_the_shells_group_with_zero_subagents() {
             timeout_ms: 5_000,
         },
         HeadlessStep::Key(down()),
-        HeadlessStep::Key(right()),
-        HeadlessStep::Key(right()),
+        HeadlessStep::Key(tab()),
+        HeadlessStep::Key(tab()),
         HeadlessStep::Key(enter()),
         HeadlessStep::WaitRender {
             needle: "render the frames".to_string(),
@@ -403,7 +407,7 @@ fn up_and_esc_return_from_the_dock_to_the_prompt() {
                 timeout_ms: 5_000,
             },
             HeadlessStep::Key(down()),
-            HeadlessStep::Key(right()),
+            HeadlessStep::Key(tab()),
             HeadlessStep::Key(back),
             HeadlessStep::Key(enter()),
             HeadlessStep::Type("back at the prompt".to_string()),

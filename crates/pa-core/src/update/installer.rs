@@ -42,7 +42,7 @@ pub const OFFICIAL_INSTALLER_URL: &str = "https://app.primeintellect.ai/prime-ag
 /// (`prime-agent update --rollback` and `--archive`) run this copy: they
 /// need no network, and the script matches the layout this build was
 /// installed with.
-pub const BUNDLED_INSTALLER: &str = include_str!("../../../../install-rust.sh");
+const BUNDLED_INSTALLER: &str = include_str!("../../../../install-rust.sh");
 
 /// The small-file budget for the script download (the script is a few KB;
 /// a hung fetch must not hang the update).
@@ -201,7 +201,7 @@ pub async fn run_installer_from(
     Ok(Installed { version })
 }
 
-/// Run the [`BUNDLED_INSTALLER`] with `args` (`--rollback`, or `--archive
+/// Run the bundled `install-rust.sh` with `args` (`--rollback`, or `--archive
 /// <path>`) against the install under `prefix`. On success the version is
 /// the one the published payload's install marker records.
 ///
@@ -228,7 +228,7 @@ pub async fn run_bundled_installer(
 /// installer's marker. `None` for any other binary (a managed release, a
 /// development build).
 #[must_use]
-pub fn installer_prefix_of(exe: &Path) -> Option<PathBuf> {
+fn installer_prefix_of(exe: &Path) -> Option<PathBuf> {
     let payload = exe.parent()?;
     let share = payload.parent()?;
     let owned = exe.file_name()? == "prime-agent"
@@ -239,7 +239,7 @@ pub fn installer_prefix_of(exe: &Path) -> Option<PathBuf> {
 }
 
 /// The install prefix of the running binary when the installer owns it
-/// (see [`installer_prefix_of`]).
+/// (`<prefix>/share/prime-agent/prime-agent` in a marked payload).
 #[must_use]
 pub fn running_installer_prefix() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;

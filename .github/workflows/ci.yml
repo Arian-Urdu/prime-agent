@@ -239,7 +239,7 @@ jobs:
           # partial hit and compile the rest. Slower hits, no correctness
           # issue.
           shared-key: test-shards
-      - name: Install uv (the kernel tests bootstrap the Python kernel venv with it)
+      - name: Install uv (the kernel venv bootstrap below uses it)
         run: |
           python3 -m pip install --user uv
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"

@@ -217,6 +217,180 @@ fn a_failing_installer_keeps_the_previous_install() {
     sandbox.assert_session_preserved();
 }
 
+/// A hermetic world for the real `install-rust.sh`: `HOME` and `TMPDIR`
+/// (the daemon sockets the installer probes) live in the sandbox, and
+/// `PATH` puts shims first — `uv` answers only `python find` (the
+/// installer's own Python), `npm` reports an empty global root — so the run
+/// never touches the network, the machine's daemons, or a global npm
+/// package.
+fn installer_env(command: &mut Command, sandbox: &Sandbox) {
+    let shims = sandbox.root.join("shims");
+    std::fs::create_dir_all(&shims).expect("shims dir");
+    let python = [
+        "/usr/bin/python3",
+        "/usr/local/bin/python3",
+        "/opt/homebrew/bin/python3",
+    ]
+    .into_iter()
+    .find(|path| Path::new(path).is_file())
+    .expect("a python3 for the installer's scripting steps");
+    let uv = shims.join("uv");
+    std::fs::write(
+        &uv,
+        format!("#!/bin/sh\n[ \"$1 $2\" = \"python find\" ] && echo {python} && exit 0\nexit 1\n"),
+    )
+    .expect("uv shim");
+    make_executable(&uv);
+    let npm = shims.join("npm");
+    std::fs::write(
+        &npm,
+        "#!/bin/sh\n[ \"$1\" = root ] && echo /nonexistent\nexit 0\n",
+    )
+    .expect("npm shim");
+    make_executable(&npm);
+    let tmp = sandbox.root.join("tmp");
+    std::fs::create_dir_all(&tmp).expect("tmp dir");
+    command
+        .env_clear()
+        .env("PATH", format!("{}:/usr/bin:/bin", shims.display()))
+        .env("HOME", sandbox.root.join("home"))
+        .env("TMPDIR", tmp)
+        .env(ENV_PREFIX, &sandbox.prefix)
+        .current_dir(&sandbox.root);
+}
+
+/// A release archive whose payload is a script answering `version`.
+fn fake_release(sandbox: &Sandbox, version: &str) -> PathBuf {
+    let payload = sandbox.root.join(format!("payload-{version}"));
+    std::fs::create_dir_all(&payload).expect("payload dir");
+    let binary = payload.join("prime-agent");
+    std::fs::write(&binary, format!("#!/bin/sh\necho {version}\n")).expect("payload binary");
+    make_executable(&binary);
+    let platform = pa_core::update::install::current_platform_alias();
+    let archive = sandbox
+        .root
+        .join(format!("prime-agent-{version}-{platform}.tar.gz"));
+    let status = Command::new("tar")
+        .arg("-czf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&payload)
+        .arg("prime-agent")
+        .status()
+        .expect("run tar");
+    assert!(status.success(), "tar the fake release");
+    archive
+}
+
+fn assert_ran(output: &std::process::Output, what: &str) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "{what} succeeds:\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    stdout
+}
+
+/// The version the live payload's install marker records.
+fn live_version(sandbox: &Sandbox) -> String {
+    let marker = std::fs::read_to_string(
+        sandbox
+            .prefix
+            .join("share/prime-agent/.prime-agent-install"),
+    )
+    .expect("the live payload's marker");
+    marker
+        .lines()
+        .nth(1)
+        .and_then(|line| line.strip_prefix("version "))
+        .expect("the marker's version line")
+        .to_string()
+}
+
+/// On an installer install, `update --archive` and `update --rollback` run
+/// the bundled installer: the archive goes live with the replaced payload
+/// kept, `--rollback` swaps the kept payload back (keeping the one it
+/// replaces), so a second `--rollback` undoes the first; the session store
+/// is untouched throughout.
+#[test]
+fn update_archive_and_rollback_swap_installer_payloads() {
+    let sandbox = Sandbox::new();
+    // This build, published as an installer payload.
+    let live = sandbox.prefix.join("share/prime-agent");
+    std::fs::create_dir_all(&live).expect("payload dir");
+    let binary = live.join("prime-agent");
+    std::fs::copy(env!("CARGO_BIN_EXE_prime-agent"), &binary).expect("copy this build");
+    std::fs::write(
+        live.join(".prime-agent-install"),
+        "install-rust.sh channel beta\nversion 9.9.9\n",
+    )
+    .expect("install marker");
+    let run_update = |args: &[&str]| {
+        let mut command = Command::new(&binary);
+        command.arg("update").args(args);
+        installer_env(&mut command, &sandbox);
+        command.output().expect("run the installed build")
+    };
+
+    let archive = fake_release(&sandbox, "1.0.0");
+    let stdout = assert_ran(
+        &run_update(&["--archive", archive.to_str().expect("utf-8 path")]),
+        "update --archive",
+    );
+    assert!(stdout.contains("installed 1.0.0"), "{stdout}");
+    assert_eq!(live_version(&sandbox), "1.0.0");
+
+    // The archive's payload cannot run `update`: roll back with the script
+    // itself (the bundled copy is this file).
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install-rust.sh");
+    let mut command = Command::new("/bin/sh");
+    command.arg(&script).arg("--rollback");
+    installer_env(&mut command, &sandbox);
+    assert_ran(
+        &command.output().expect("run the installer"),
+        "install-rust.sh --rollback",
+    );
+    assert_eq!(
+        live_version(&sandbox),
+        "9.9.9",
+        "the kept build is live again"
+    );
+
+    let stdout = assert_ran(&run_update(&["--rollback"]), "update --rollback");
+    assert!(stdout.contains("rolled back to 1.0.0"), "{stdout}");
+    assert_eq!(
+        live_version(&sandbox),
+        "1.0.0",
+        "a second rollback undoes the first"
+    );
+    sandbox.assert_session_preserved();
+}
+
+/// A fresh installer install has nothing to roll back: the run fails with
+/// the reason and the live payload stays.
+#[test]
+fn update_rollback_without_a_kept_version_changes_nothing() {
+    let sandbox = Sandbox::new();
+    let live = sandbox.prefix.join("share/prime-agent");
+    std::fs::create_dir_all(&live).expect("payload dir");
+    let binary = live.join("prime-agent");
+    std::fs::copy(env!("CARGO_BIN_EXE_prime-agent"), &binary).expect("copy this build");
+    std::fs::write(
+        live.join(".prime-agent-install"),
+        "install-rust.sh channel beta\nversion 9.9.9\n",
+    )
+    .expect("install marker");
+    let mut command = Command::new(&binary);
+    command.args(["update", "--rollback"]);
+    installer_env(&mut command, &sandbox);
+    let output = command.output().expect("run the installed build");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("nothing to roll back"), "{stderr}");
+    assert_eq!(live_version(&sandbox), "9.9.9");
+}
+
 fn make_executable(path: &Path) {
     use std::os::unix::fs::PermissionsExt as _;
     let mut permissions = std::fs::metadata(path).expect("metadata").permissions();

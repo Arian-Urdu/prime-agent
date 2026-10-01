@@ -1367,6 +1367,12 @@ on_exit() {
 }
 trap on_exit EXIT
 
+# The rollback source was chosen before the lock: another installer may have
+# swept it since. Re-check under the lock, before anything moves.
+if [ -n "$rollback_from" ] && [ ! -x "${rollback_from}/prime-agent" ]; then
+  die "the kept previous version ${rollback_from} was removed by another install while this one ran; nothing was changed"
+fi
+
 # Sweep rollback generations from PREVIOUS installs (both name eras) before
 # this run creates its own — exactly one .old generation survives each install.
 # A generation is swept only when BOTH hold: it carries this installer's

@@ -292,16 +292,29 @@ pub fn process_group_exists(_pid: i32) -> bool {
 /// ladder's leader-exit arms). No bare-pid fallback - the reaped leader no
 /// longer anchors its pid, so a fallback could signal an innocent recycled
 /// pid; the group signal keeps the reference's inherent, bounded
-/// group-reuse TOCTOU and nothing wider. Windows has no signalable
-/// groups, so the hardened `taskkill /F /T` tree kill reaches the dead
-/// leader's descendants through the parent-child snapshot instead (the TS
-/// reference's own win32 answer for a stop that must reach a tree).
+/// group-reuse TOCTOU and nothing wider (the group's live members hold the
+/// pgid at signal time). The caller must still own the leader's `Child`:
+/// on Windows the handle keeps the reaped leader's pid reserved against
+/// reuse and resolvable for the tree walk, exactly while a live member
+/// anchors the pgid on POSIX.
 #[cfg(unix)]
 #[must_use]
 pub fn kill_process_group(pid: i32) -> bool {
     signal_process_group(pid, Signal::Kill)
 }
 
+/// The same enforced stop on Windows: no signalable groups, so the
+/// hardened `taskkill /F /T` tree kill reaches the dead leader's
+/// descendants through the parent-child snapshot instead (the TS
+/// reference's own win32 answer for a stop that must reach a tree). The
+/// walk is link-based: a descendant keeps naming the exited leader as its
+/// parent, so the tree stays walkable after the reaped leader itself is
+/// gone from the snapshot - provided the caller still owns the leader's
+/// `Child` handle, which keeps the pid reserved (a Windows pid recycles
+/// only after its last handle closes), so the walk can neither miss the
+/// tree nor reach an unrelated recycled one. Best-effort by contract:
+/// false only means the stop is unproven, the answer callers treat
+/// conservatively.
 #[cfg(not(unix))]
 #[must_use]
 pub fn kill_process_group(pid: i32) -> bool {

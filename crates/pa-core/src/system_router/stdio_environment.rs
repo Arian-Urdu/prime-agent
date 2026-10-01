@@ -441,7 +441,11 @@ impl RouterEnvironment for StdioRouterEnvironment {
                                 // reaped: the group SIGKILL on POSIX (never
                                 // the recycled bare pid), the taskkill
                                 // tree kill on Windows (its relay was the
-                                // no-op above).
+                                // no-op above). It must run before
+                                // `inner.child = None` below: the Child
+                                // handle still anchors the reaped leader's
+                                // pid for the Windows walk (`kill_process_group`
+                                // documents the contract).
                                 let _ = crate::platform::kill_process_group(pid as i32);
                             }
                         }

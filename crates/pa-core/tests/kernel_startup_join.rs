@@ -100,12 +100,44 @@ async fn stop_during_boot_joins_startup() {
 }
 
 #[tokio::test]
+async fn panicking_progress_callback_does_not_poison_next_startup() {
+    let (_dir, provisioner, count) = failing_kernel();
+    let progress: pa_core::kernel::bootstrap::KernelBootstrapProgressHandler =
+        std::sync::Arc::new(|_| panic!("progress callback panic"));
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        provisioner.ensure(Some(progress), None),
+    )
+    .await
+    .expect("panicked startup settled")
+    .expect_err("panicked callback must not report success");
+    assert!(format!("{error:#}").contains("kernel startup task failed"));
+    let retry = tokio::time::timeout(Duration::from_secs(5), provisioner.ensure(None, None))
+        .await
+        .expect("next ensure started a new boot")
+        .expect_err("fixture interpreter fails after spawning");
+    assert!(format!("{retry:#}").contains("unexpected exit code=37"));
+    assert_eq!(
+        starts(&count),
+        2,
+        "the retry had one boot and one interpreter retry"
+    );
+}
+
+#[tokio::test]
 async fn dispose_during_boot_waits_and_releases_it() {
     let (_dir, provisioner, count) = failing_kernel();
     provisioner.prewarm();
     wait_for_start(&count).await;
     provisioner.dispose(None).await;
     let after = starts(&count);
+    // Pin the absolute count, not just stasis: exactly one interpreter spawn
+    // (the boot's first attempt) ran before dispose returned, and the
+    // dispose's abort keeps its retry from ever spawning.
+    assert_eq!(
+        after, 1,
+        "dispose returned only after the in-flight boot settled; its retry never spawned"
+    );
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(
         starts(&count),

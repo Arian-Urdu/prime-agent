@@ -23,9 +23,13 @@
 //! interpreter.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use pa_core::kernel::provisioner::{IpythonKernelProvisioner, IpythonKernelProvisionerOptions};
-use pa_core::kernel::shared::{ExecuteOptions, ExecuteStatus, KernelShutdownOptions};
+use pa_core::kernel::shared::{
+    host_handler, ExecuteOptions, ExecuteStatus, HostRequestHandlers, KernelShutdownOptions,
+};
 
 /// The kernel Python with prime-agent-runtime installed (see
 /// `kernel_snapshot_resume.rs`); skipped with a note when absent.
@@ -139,4 +143,107 @@ async fn stop_kernel_without_a_kernel_is_a_no_op_and_stays_revivable() {
         .await
         .unwrap();
     assert_eq!(result.status, ExecuteStatus::Ok);
+}
+
+/// A revival must not start or restore while its predecessor is still
+/// draining host work in `stop_kernel()`. The held request gives an exact
+/// ordering barrier rather than relying on timing of the snapshot flush.
+#[tokio::test]
+async fn revival_waits_for_in_flight_stop_before_booting() {
+    let Some(python) = kernel_python() else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().unwrap();
+    let artifacts = dir.path().join("artifacts");
+    std::fs::create_dir_all(&artifacts).unwrap();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+    let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+    let mut handlers = HostRequestHandlers::new();
+    handlers.register(
+        "rlm.find_models",
+        host_handler({
+            let entered_tx = Arc::clone(&entered_tx);
+            move |_| {
+                let entered_tx = Arc::clone(&entered_tx);
+                let mut release_rx = release_rx.clone();
+                async move {
+                    let entered = { entered_tx.lock().unwrap().take() };
+                    if let Some(tx) = entered {
+                        let _ = tx.send(());
+                        let _ = release_rx.wait_for(|released| *released).await;
+                    }
+                    Ok(serde_json::json!({"models": []}))
+                }
+            }
+        }),
+    );
+    let provisioner = IpythonKernelProvisioner::new(
+        dir.path(),
+        IpythonKernelProvisionerOptions {
+            python: Some(python),
+            snapshot_dir: Some(artifacts.clone()),
+            host_handlers: handlers,
+            ..Default::default()
+        },
+    );
+    let first = provisioner.ensure(None, None).await.unwrap();
+    let first_cell = tokio::spawn(async move {
+        first
+            .execute("await rlm.find_models('hold')", ExecuteOptions::default())
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), entered_rx)
+        .await
+        .expect("host request must enter before stop")
+        .expect("host request signal");
+    let stop = tokio::spawn({
+        let provisioner = provisioner.clone();
+        async move { provisioner.stop_kernel(None).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while provisioner.manager().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("stop claimed the prior manager");
+    let (progress_tx, progress_rx) = tokio::sync::oneshot::channel();
+    let progress_tx = Arc::new(Mutex::new(Some(progress_tx)));
+    let progress: pa_core::kernel::bootstrap::KernelBootstrapProgressHandler =
+        Arc::new(move |message| {
+            if message == "Starting Python kernel..." {
+                if let Some(tx) = progress_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+            }
+        });
+    let revival = tokio::spawn({
+        let provisioner = provisioner.clone();
+        async move { provisioner.ensure(Some(progress), None).await }
+    });
+    // Boot cannot emit its first progress stage while the old stop waits for
+    // the held host request: that stage follows the pending-stop gate.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), progress_rx)
+            .await
+            .is_err(),
+        "revival boot crossed the predecessor-stop gate"
+    );
+    let _ = release_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(15), stop)
+        .await
+        .expect("stop settled after releasing host work")
+        .unwrap();
+    let revived = tokio::time::timeout(Duration::from_secs(15), revival)
+        .await
+        .expect("revival settled after stop")
+        .unwrap()
+        .unwrap();
+    let result = revived
+        .execute("1 + 1", ExecuteOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(result.status, ExecuteStatus::Ok);
+    let _ = first_cell.await;
 }

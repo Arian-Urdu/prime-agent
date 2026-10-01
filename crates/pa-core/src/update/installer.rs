@@ -359,10 +359,10 @@ async fn execute_script(
             Err(UpdateFailure {
                 message: match status.code() {
                     Some(code) => format!(
-                        "the installer exited with code {code}; the previous install was kept"
+                        "the installer exited with code {code}; the current install was kept"
                     ),
                     None => {
-                        "the installer was terminated by a signal; the previous install was kept"
+                        "the installer was terminated by a signal; the current install was kept"
                             .to_string()
                     }
                 },

@@ -256,10 +256,6 @@ async fn a_settled_child_passivates_stays_listable_and_revives_by_prompt() {
         Arc::clone(&link),
         agent_dir.clone(),
         parent_active_session_id.clone(),
-        std::sync::Arc::new(pa_daemon::model_allowlist::ModelRefusalTelemetry::new(
-            agent_dir.clone(),
-            /*telemetry_disabled*/ true,
-        )),
     );
     children.set_identity(ParentIdentity {
         rlm_depth: 0,

@@ -1,4 +1,4 @@
-//! The model-resolution tests (catalog, allowlist, restore/switch/configure, the thinking clamp).
+//! The model-resolution tests (catalog, restore/switch/configure, the thinking clamp).
 use super::*;
 
 /// A models.json custom provider (name has no env-key mapping), with an
@@ -330,63 +330,6 @@ fn restore_test_engine(
         queued_steering_probe: None,
     })
     .expect("engine")
-}
-
-/// The daemon model allowlist enforcement at the startup chain
-/// (`resolve_registry_model`): a resolution outside settings
-/// `allowedModels` fails loudly with the typed refusal — the chain
-/// never lands a session on an off-list model (no silent fallback to
-/// the featured default) — and an allowing allowlist keeps the
-/// resolution.
-#[test]
-fn the_startup_chain_refuses_models_outside_the_allowlist() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let agent_dir = dir.path().join("agent");
-    write_custom_provider_models_json(&agent_dir, "http://127.0.0.1:9");
-    std::fs::write(
-        agent_dir.join("settings.json"),
-        serde_json::json!({ "allowedModels": ["anthropic/*"] }).to_string(),
-    )
-    .unwrap();
-    let engine = AgentSessionEngine::new(AgentEngineConfig {
-        cwd: dir.path().to_path_buf(),
-        agent_dir,
-        provider: None,
-        model: None,
-        api_key: None,
-        thinking: None,
-        session_dir: None,
-        session_file: None,
-        faux_script: None,
-        supervisor_link: None,
-        telemetry_disabled: Some(true),
-        cron_store: None,
-        queued_steering_probe: None,
-    })
-    .unwrap();
-    let error = engine
-        .resolve_registry_model()
-        .expect_err("off-allowlist model refused");
-    let refusal = error
-        .downcast_ref::<pa_core::models::ModelAllowlistRefusal>()
-        .expect("typed refusal");
-    assert_eq!(refusal.selector, "battery/mock-1");
-    assert!(
-        error
-            .to_string()
-            .contains("blocked by the daemon model allowlist"),
-        "{error}"
-    );
-
-    // An allowing allowlist opens the gate: the same engine resolves.
-    std::fs::write(
-        engine.config.agent_dir.join("settings.json"),
-        serde_json::json!({ "allowedModels": ["battery/*"] }).to_string(),
-    )
-    .unwrap();
-    let model = engine.resolve_registry_model().expect("resolved model");
-    assert_eq!(model.provider, "battery");
-    assert_eq!(model.id, "mock-1");
 }
 
 /// The create-config key override pins the KEY, never the headers: a
@@ -923,66 +866,11 @@ async fn a_replacement_re_clamps_the_thinking_level_against_the_restored_model()
     );
 }
 
-/// The engine's switch guard: `switch_model` refuses an off-allowlist
-/// candidate BEFORE the selection mutates, so a refused cycle or switch
-/// never poisons the live selection (every later resolution would fail
-/// at the same gate) — the session keeps resolving its current model.
-#[test]
-fn switch_model_never_poisons_the_selection_with_a_refused_candidate() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let agent_dir = dir.path().join("agent");
-    write_custom_provider_models_json(&agent_dir, "http://127.0.0.1:9");
-    std::fs::write(
-        agent_dir.join("settings.json"),
-        serde_json::json!({ "allowedModels": ["battery/mock-1"] }).to_string(),
-    )
-    .unwrap();
-    let engine = AgentSessionEngine::new(AgentEngineConfig {
-        cwd: dir.path().to_path_buf(),
-        agent_dir,
-        provider: None,
-        model: None,
-        api_key: None,
-        thinking: None,
-        session_dir: None,
-        session_file: None,
-        faux_script: None,
-        supervisor_link: None,
-        telemetry_disabled: Some(true),
-        cron_store: None,
-        queued_steering_probe: None,
-    })
-    .unwrap();
-    let model = engine.resolve_registry_model().expect("resolved model");
-    assert_eq!(model.id, "mock-1");
-    // The switched-to model does not match the allowlist: the switch is
-    // refused and the selection keeps the resolvable model.
-    let switched = engine.switch_model(EngineModelSelection {
-        provider: Some("battery".to_string()),
-        model: Some("mock-2".to_string()),
-        api_key: None,
-        thinking: None,
-    });
-    assert!(!switched, "off-allowlist switch refused");
-    let model = engine.resolve_registry_model().expect("still resolvable");
-    assert_eq!(model.id, "mock-1");
-    // The allowed model still switches through.
-    let switched = engine.switch_model(EngineModelSelection {
-        provider: Some("battery".to_string()),
-        model: Some("mock-1".to_string()),
-        api_key: None,
-        thinking: None,
-    });
-    assert!(switched, "allowed switch proceeds");
-    let model = engine.resolve_registry_model().expect("resolved model");
-    assert_eq!(model.id, "mock-1");
-}
-
 /// A live model switch propagates to the children registry's parent
 /// identity: an inherited `rlm.spawn` resolves the model the session
-/// NOW runs. The build-time stamp alone would go stale after a
-/// switch, so the allowlist gate would refuse a stale selector the
-/// parent no longer runs once the allowlist drops it.
+/// NOW runs. The build-time stamp alone would go stale after a switch,
+/// so an inherited spawn would keep resolving a selector the parent no
+/// longer runs.
 #[test]
 fn switch_model_propagates_the_new_model_to_the_child_identity() {
     let dir = tempfile::tempdir().unwrap();
@@ -1022,7 +910,7 @@ fn switch_model_propagates_the_new_model_to_the_child_identity() {
         api_key: None,
         thinking: None,
     });
-    assert!(switched, "the switch proceeds without an allowlist");
+    assert!(switched, "the switch proceeds");
     assert_eq!(
         children.parent_model().as_deref(),
         Some("battery/mock-1"),

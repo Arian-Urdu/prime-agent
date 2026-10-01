@@ -13,7 +13,6 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::agent_messaging::{LinkAgentMessageController, LinkAgentObserveController};
-use crate::model_allowlist::DaemonAllowlist;
 use crate::overflow_compaction::{OverflowArmRun, OverflowRecovery};
 use pa_agent::abort::AbortController;
 use pa_agent::types::StopReason;
@@ -448,9 +447,4 @@ pub struct AgentSessionEngine {
     /// run's duration, and [`SessionEngine::abort_auto_compaction`]
     /// aborts whatever run holds it.
     pub(crate) auto_compaction_abort: std::sync::Mutex<Option<std::sync::Arc<AbortController>>>,
-    /// The daemon model-allowlist refusal telemetry (`model refused`),
-    /// shared with the RLM children host so every enforcement seam in
-    /// this worker emits through one lazily-built client.
-    pub(crate) model_refusal_telemetry:
-        std::sync::Arc<crate::model_allowlist::ModelRefusalTelemetry>,
 }

@@ -231,38 +231,10 @@ impl AgentSessionEngine {
         pa_core::models::resolve_cli_model(Some(&provider), &model_id, registry.get_all()).model
     }
 
-    /// Emit the daemon model-allowlist refusal's adoption event (schema
-    /// v1 `model refused`) from any of this worker's enforcement seams.
-    /// The telemetry binds to the engine's live cwd, so a session that
-    /// moved directories reports through the current project scope.
-    pub(crate) fn note_model_refused(&self, surface: &str, selector: &str) {
-        self.model_refusal_telemetry
-            .note_refused(surface, selector, &self.cwd());
-    }
-
-    /// Resolve the model through the composed registry, then enforce the
-    /// settings `allowedModels` allowlist: a resolution outside the
-    /// allowlist fails loudly here (the silent-fallback guarantee — the
-    /// startup chain never lands a session on a model the daemon may not
-    /// resolve to), and the refusal emits `model refused`.
-    pub(super) fn resolve_registry_model(&self) -> anyhow::Result<Model> {
-        let model = self.resolve_registry_model_unchecked()?;
-        let selector = format!("{}/{}", model.provider, model.id);
-        let allowlist = crate::model_allowlist::load(&self.cwd(), &self.config.agent_dir);
-        if let Err(refusal) = crate::model_allowlist::assert_allowed(&allowlist, &selector) {
-            if let Some(refusal) = refusal.downcast_ref::<pa_core::models::ModelAllowlistRefusal>()
-            {
-                self.note_model_refused("session_start", &refusal.selector);
-            }
-            return Err(refusal);
-        }
-        Ok(model)
-    }
-
-    /// The registry resolution before the allowlist gate: the flagged-model
+    /// Resolve the model through the composed registry: the flagged-model
     /// arm (TS `resolveCliModel`) or the TS `createAgentSession` startup
     /// chain.
-    fn resolve_registry_model_unchecked(&self) -> anyhow::Result<Model> {
+    pub(super) fn resolve_registry_model(&self) -> anyhow::Result<Model> {
         let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
         let mut registry =
             pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"));

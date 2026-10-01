@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use pa_types::ai::Model;
 
 /// The routing context: the working directory and agent directory the
-/// settings (`auxiliaryModel`, `allowedModels`) and the model registry
+/// settings (`auxiliaryModel`) and the model registry
 /// (`models.json`, auth storage) resolve against. Embeddings wire one at
 /// session assembly; `None` at a call site keeps the session model
 /// (verification harnesses, in-memory sessions).
@@ -94,17 +94,6 @@ pub fn resolve_auxiliary_model(
     };
     if format!("{}/{}", session_model.provider, session_model.id).to_lowercase() == selector {
         return fallback();
-    }
-    // The daemon's `allowedModels` pin (rust-only guardrail, no TS
-    // equivalent) covers every model the product could run a pass on: a
-    // selector outside the pin falls back to the (allowlisted) session
-    // model instead of calling a forbidden model. A summarizer must
-    // never fail loudly over the guardrail.
-    if let Some(allowlist) = settings.get_allowed_models() {
-        if !crate::models::model_allowed(&selector, &allowlist) {
-            warn_fallback(&selector, purpose);
-            return fallback();
-        }
     }
     // The TS find runs over the authenticated, non-stale catalog
     // (`_authenticatedRlmModels`); the registry's searchable set is the
@@ -308,23 +297,5 @@ mod tests {
             Some(1_000),
         );
         assert_eq!(routed.model.id, "aux-model");
-    }
-
-    #[test]
-    fn selector_outside_the_allowlist_falls_back() {
-        let (_dir, context) = context_with_settings(&serde_json::json!({
-            "auxiliaryModel": "testaux/aux-model",
-            "allowedModels": ["faux/session-model"],
-        }));
-        let session = model("session-model", "faux", 8_000);
-        let routed = resolve_auxiliary_model(
-            &context,
-            "compaction summary",
-            &session,
-            Some("session-key"),
-            None,
-        );
-        assert_eq!(routed.model.id, "session-model");
-        assert_eq!(routed.api_key.as_deref(), Some("session-key"));
     }
 }

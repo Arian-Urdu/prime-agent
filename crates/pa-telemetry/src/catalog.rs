@@ -1259,35 +1259,6 @@ const DAEMON_EVENT: EventRule = EventRule {
     ],
 };
 
-/// `model refused` (v1): the settings allowlist guardrail.
-const MODEL_REFUSED: EventRule = EventRule {
-    name: "model refused",
-    since: 1,
-    properties: &[
-        (
-            "surface",
-            required(enum_rule(
-                &[
-                    "set_model",
-                    "cycle_model",
-                    "spawn",
-                    "create_session",
-                    "session_start",
-                ],
-                "session_start",
-            )),
-        ),
-        (
-            "provider_category",
-            optional(enum_rule(PROVIDER_CATEGORIES, "custom")),
-        ),
-        (
-            "model_category",
-            optional(enum_rule(MODEL_CATEGORIES, "custom")),
-        ),
-    ],
-};
-
 /// `mcp connector used` (v1): server name only.
 const MCP_CONNECTOR_USED: EventRule = EventRule {
     name: "mcp connector used",
@@ -1685,7 +1656,6 @@ pub fn catalog() -> Vec<&'static EventRule> {
         &SKILL_USED,
         &STARTUP,
         &DAEMON_EVENT,
-        &MODEL_REFUSED,
         &MCP_CONNECTOR_USED,
         &RLM_CHILD_USAGE,
         &TOOL_EXECUTED,

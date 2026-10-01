@@ -48,7 +48,6 @@ const KNOWN_FIELDS: &[&str] = &[
     "terminal",
     "images",
     "enabledModels",
-    "allowedModels",
     "treeFilterMode",
     "chatDetail",
     "thinkingBudgets",

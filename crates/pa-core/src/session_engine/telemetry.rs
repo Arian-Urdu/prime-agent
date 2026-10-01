@@ -35,17 +35,14 @@ use serde_json::Value;
 use super::auto_retry::AutoRetryEvent;
 use super::error_classify::classify_error_message;
 
-// The one-shot daemon/worker event trackers (the `daemon event` and
-// `model refused` one-shot surfaces the supervisor notes/adoption/sessions
-// and model-allowlist seams call once per lifecycle event) moved to the
-// child module at the same tree position (session_engine::telemetry::track);
-// every member keeps its pub level and the pub use re-exports keep every
-// external track_* path stable. ZERO bumps.
+// The one-shot daemon/worker event trackers (`daemon event`, schema v1):
+// the supervisor notes/adoption and sessions seams call each once per
+// lifecycle event. The re-exports keep every external track_* path stable.
 mod track;
 pub use track::{
     track_catalog_refresh, track_compaction_abort_declared, track_daemon_event,
-    track_deleted_child_usage_captured, track_model_refused, track_saved_sessions_usage,
-    track_sessions_archived, track_worker_adoption, track_worker_children_closed,
+    track_deleted_child_usage_captured, track_saved_sessions_usage, track_sessions_archived,
+    track_worker_adoption, track_worker_children_closed,
 };
 
 // The outcome/provider/model/error classification family (the TS

@@ -3,10 +3,7 @@
 //! serializers for stream events, tool results, and agent messages.
 use crate::engine::{session_wire_value, AssistantSnapshot};
 
-use super::{
-    json, json_round_trip, AgentSessionEngine, DaemonAllowlist, EngineEvent, TurnOnce, TurnPrompt,
-    Value,
-};
+use super::{json, json_round_trip, AgentSessionEngine, EngineEvent, TurnOnce, TurnPrompt, Value};
 
 impl AgentSessionEngine {
     /// The provider retry policy from settings (TS `providerRetryPolicy`).
@@ -26,13 +23,10 @@ impl AgentSessionEngine {
     }
 
     /// The failover chain for `model`: the other auth-configured providers
-    /// serving the same model id, in catalog order after the current one,
-    /// filtered by the daemon model allowlist — a failover must never land
-    /// a turn on a provider the operator pinned out (the same
-    /// `allowedModels` gate as every other resolution). Faux-script
-    /// sessions never fail over (their failures are deterministic test
-    /// fixtures, and a second provider would only reroute the scripted
-    /// queue).
+    /// serving the same model id, in catalog order after the current one.
+    /// Faux-script sessions never fail over (their failures are
+    /// deterministic test fixtures, and a second provider would only
+    /// reroute the scripted queue).
     pub(super) fn failover_candidates(
         &self,
         model: &pa_types::ai::Model,
@@ -46,22 +40,7 @@ impl AgentSessionEngine {
         registry.load_private_authorization_from_cache();
         let available: Vec<pa_types::ai::Model> =
             registry.get_available().into_iter().cloned().collect();
-        let candidates = pa_core::models::failover_candidates(model, &available);
-        match crate::model_allowlist::load(&self.cwd(), &self.config.agent_dir) {
-            DaemonAllowlist::Unrestricted => candidates,
-            DaemonAllowlist::Allowed(patterns) => candidates
-                .into_iter()
-                .filter(|candidate| {
-                    pa_core::models::model_allowed(
-                        &format!("{}/{}", candidate.provider, candidate.id),
-                        &patterns,
-                    )
-                })
-                .collect(),
-            // Fail closed on an unreadable policy: no failover candidate
-            // may bypass the configured allowlist.
-            DaemonAllowlist::Unreadable(_) => Vec::new(),
-        }
+        pa_core::models::failover_candidates(model, &available)
     }
 
     /// Run one turn, streaming assistant updates through `emit` as they

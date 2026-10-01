@@ -448,21 +448,6 @@ impl SessionEngine for AgentSessionEngine {
     }
 
     fn switch_model(&self, selection: EngineModelSelection) -> bool {
-        // The allowlist gate on the switch candidate, before the selection
-        // slot mutates: a refused model must not poison the live selection
-        // (every later resolution would fail at the same gate). The wire
-        // seams (`set_model`, `cycle_model`) check first and own the user
-        // message and refusal event; this is the engine's total guard for
-        // any other caller.
-        if let (Some(provider), Some(model)) =
-            (selection.provider.as_deref(), selection.model.as_deref())
-        {
-            let selector = format!("{provider}/{model}");
-            let allowlist = crate::model_allowlist::load(&self.cwd(), &self.config.agent_dir);
-            if crate::model_allowlist::assert_allowed(&allowlist, &selector).is_err() {
-                return false;
-            }
-        }
         self.configure_model(selection);
         let Ok(model) = self.resolve_model() else {
             return false;
@@ -501,9 +486,7 @@ impl SessionEngine for AgentSessionEngine {
         }
         // The children registry's inherited parent model follows the
         // switch (the build-time stamp alone would go stale): an inherited
-        // `rlm.spawn` resolves the model the session NOW runs, so the
-        // allowlist gate never refuses a stale selector the parent left
-        // behind.
+        // `rlm.spawn` resolves the model the session NOW runs.
         if let Some(children) = &self.children {
             children.set_model(format!("{}/{}", model.provider, model.id));
         }

@@ -117,23 +117,6 @@ impl AgentSessionEngine {
         let route = self
             .resolve_image_turn_route(carries_images)
             .map_err(|error| format!("{error:#}"))?;
-        let route = match route {
-            Some(resolved) => {
-                // The daemon's model allowlist is fail-closed on every model
-                // the session runs on (the switch, child-model, and failover
-                // paths all assert it): a routed image model excluded by
-                // `allowedModels` must not bypass it.
-                let selector = format!("{}/{}", resolved.model.provider, resolved.model.id);
-                let allowlist = crate::model_allowlist::load(&self.cwd(), &self.config.agent_dir);
-                if let Err(refusal) = crate::model_allowlist::assert_allowed(&allowlist, &selector)
-                {
-                    self.note_model_refused("image_route", &selector);
-                    return Err(format!("{refusal:#}"));
-                }
-                Some(resolved)
-            }
-            None => None,
-        };
         let armed = match route {
             Some(resolved) => {
                 let agent_model = json_round_trip(&resolved.model)

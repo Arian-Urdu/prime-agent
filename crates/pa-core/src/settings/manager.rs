@@ -33,12 +33,6 @@ pub struct SettingsManager {
     merged: Settings,
     runtime_overrides: Settings,
     errors: Vec<SettingsError>,
-    /// The raw global document (the parsed JSON before the lenient field
-    /// load). The daemon model allowlist distinguishes an ABSENT
-    /// `allowedModels` key (unrestricted) from a PRESENT-but-malformed one
-    /// (the security gate fails closed) — the typed `Settings` drops both
-    /// to `None`, so the raw value is the only witness.
-    global_raw: Option<serde_json::Value>,
     /// Load failures per scope; a scope whose file failed to parse is never
     /// written back (the TS `save` guard against clobbering bad settings).
     global_load_error: Option<String>,
@@ -49,9 +43,9 @@ impl SettingsManager {
     /// Load global + project settings from a storage backend.
     pub fn from_storage(storage: Arc<dyn SettingsStorage>) -> Self {
         let mut errors = Vec::new();
-        let (global, global_raw, global_load_error) =
+        let (global, global_load_error) =
             load_scope(storage.as_ref(), SettingsScope::Global, &mut errors);
-        let (project, _, project_load_error) =
+        let (project, project_load_error) =
             load_scope(storage.as_ref(), SettingsScope::Project, &mut errors);
         let merged = deep_merge(&global, &project);
         Self {
@@ -60,7 +54,6 @@ impl SettingsManager {
             project,
             merged,
             runtime_overrides: Settings::default(),
-            global_raw,
             errors,
             global_load_error,
             project_load_error,
@@ -105,14 +98,6 @@ impl SettingsManager {
         &self.global
     }
 
-    /// The raw global document (post-migration, pre-lenient-load value);
-    /// `None` when the scope has no document or it failed to parse (the
-    /// load error covers the latter).
-    #[must_use]
-    pub fn global_raw(&self) -> Option<&serde_json::Value> {
-        self.global_raw.as_ref()
-    }
-
     #[must_use]
     pub fn project_settings(&self) -> &Settings {
         &self.project
@@ -137,13 +122,12 @@ impl SettingsManager {
     /// are recorded as load errors on the manager instead.
     pub fn reload(&mut self) -> Result<()> {
         let mut errors = std::mem::take(&mut self.errors);
-        let (global, global_raw, global_load_error) =
+        let (global, global_load_error) =
             load_scope(self.storage.as_ref(), SettingsScope::Global, &mut errors);
-        let (project, _, project_load_error) =
+        let (project, project_load_error) =
             load_scope(self.storage.as_ref(), SettingsScope::Project, &mut errors);
         self.global = global;
         self.project = project;
-        self.global_raw = global_raw;
         self.global_load_error = global_load_error;
         self.project_load_error = project_load_error;
         self.errors = errors;
@@ -648,25 +632,6 @@ impl SettingsManager {
             .filter(|m| !m.is_empty())
     }
 
-    /// The daemon-level model allowlist (settings `allowedModels`): model
-    /// patterns the daemon may resolve to, enforced at every daemon
-    /// model resolution (`set_model`, RLM child-model resolution, the
-    /// worker startup chain) — a model outside the allowlist fails loudly,
-    /// never a fallback. Rust-only guardrail (no TS equivalent); `None` is
-    /// unrestricted. A daemon policy like `idleEvictionMinutes`: read from
-    /// the global scope only, so a project cannot weaken a box-level pin.
-    /// A list that trims to empty behaves as unset.
-    #[must_use]
-    pub fn get_allowed_models(&self) -> Option<Vec<String>> {
-        let patterns = self.global.allowed_models.as_ref()?;
-        let patterns: Vec<String> = patterns
-            .iter()
-            .map(|pattern| pattern.trim().to_string())
-            .filter(|pattern| !pattern.is_empty())
-            .collect();
-        (!patterns.is_empty()).then_some(patterns)
-    }
-
     /// TS `setDefaultServiceTier`: the persisted default a fresh session
     /// starts from; the stored string is the same vocabulary
     /// `get_default_service_tier` parses.
@@ -994,17 +959,14 @@ fn strings(array: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
-/// One loaded scope: the leniently-parsed settings, the migrated raw
-/// document (the value before the lenient field load — the only witness
-/// for a PRESENT-but-malformed known field, which the lenient load drops),
-/// and the load error (`Some` when the scope's document exists but could
-/// not be read or parsed).
-#[allow(clippy::type_complexity)]
+/// One loaded scope: the leniently-parsed settings and the load error
+/// (`Some` when the scope's document exists but could not be read or
+/// parsed).
 fn load_scope(
     storage: &dyn SettingsStorage,
     scope: SettingsScope,
     errors: &mut Vec<SettingsError>,
-) -> (Settings, Option<serde_json::Value>, Option<String>) {
+) -> (Settings, Option<String>) {
     let mut load_error: Option<String> = None;
     // The pure-read arm: a locked protocol read on any cache miss, the
     // process-cached copy on a hit (see `SettingsStorage::read`).
@@ -1016,11 +978,11 @@ fn load_scope(
                 scope,
                 message: message.clone(),
             });
-            return (Settings::default(), None, Some(message));
+            return (Settings::default(), Some(message));
         }
     };
     let Some(content) = content else {
-        return (Settings::default(), None, None);
+        return (Settings::default(), None);
     };
     let value: serde_json::Value = match serde_json::from_str(&content) {
         Ok(value) => value,
@@ -1034,7 +996,7 @@ fn load_scope(
             scope,
             message: message.clone(),
         });
-        return (Settings::default(), None, Some(message));
+        return (Settings::default(), Some(message));
     }
     // Migrate the raw document, then load leniently.
     let migrated = match value {
@@ -1044,7 +1006,7 @@ fn load_scope(
         }
         other => other,
     };
-    (from_value_lenient(&migrated), Some(migrated), None)
+    (from_value_lenient(&migrated), None)
 }
 
 #[cfg(test)]

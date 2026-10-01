@@ -10,8 +10,8 @@ pub(super) enum DirectRequestError {
 
 /// The daemon answered with `success: false` for one request: the daemon
 /// is alive and healthy — it refused THIS request ("Prompt cannot be
-/// empty", a queue/admission refusal, an unknown session selector, a
-/// model the allowlist refuses, ...). Rejections carry data about the
+/// empty", a queue/admission refusal, an unknown session selector,
+/// ...). Rejections carry data about the
 /// request, never about the connection: the interactive loop renders
 /// them inline and keeps running, while transport failures (dead
 /// socket, timeout, closed connection) stay fatal.

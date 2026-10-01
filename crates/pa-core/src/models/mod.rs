@@ -1,6 +1,5 @@
 //! Model subsystem: resolver and Prime Inference private models.
 
-pub use allowlist::{model_allowed, ModelAllowlistRefusal};
 pub use private_auth::{
     get_private_prime_inference_models, private_prime_authorization_fingerprint,
     read_private_prime_authorization_cache, write_private_prime_authorization_cache,
@@ -18,7 +17,6 @@ pub use catalog_chain::{
 /// through pa-core, so the trigger rides this re-export).
 pub use pa_models::RefreshTrigger;
 
-pub mod allowlist;
 pub(crate) mod catalog_chain;
 pub(crate) mod custom;
 pub mod image_model_routing;

@@ -32,7 +32,7 @@ actionlint:
 # GLIBC baseline gate (the continuous.yml/release.yml build-gnu jobs): a
 # GNU/Linux artifact must not require symbols above GLIBC_2.35, the Ubuntu
 # 22.04 release baseline. No-op on non-GNU hosts; the authoritative gate runs
-# in CI inside the ubuntu:22.04 build container. POSIX sh throughout: make
+# in CI on the Ubuntu 22.04 sandbox runners. POSIX sh throughout: make
 # runs recipes with /bin/sh, which is dash on Ubuntu (no [[ ]], no ==).
 glibc-gate:
 	@case "$(TARGET)" in *-linux-gnu) \

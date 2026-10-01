@@ -17,6 +17,11 @@ VERIFIER = HERE / "verify_decoders.py"
 CATALOG = HERE / "bundle_catalog.py"
 TARGETS = (("x86_64-unknown-linux-gnu", "linux-x64"),
            ("aarch64-unknown-linux-gnu", "linux-arm64"))
+# The fixture ELF must match the declared target: split_debug picks the
+# binutils tool by target, and the target-prefixed objcopy refuses a
+# foreign-arch image, so each target needs its own compiler.
+COMPILERS = {"x86_64-unknown-linux-gnu": "gcc",
+             "aarch64-unknown-linux-gnu": "aarch64-linux-gnu-gcc"}
 
 
 def run(*args: str, success: bool = True) -> subprocess.CompletedProcess:
@@ -28,6 +33,9 @@ def run(*args: str, success: bool = True) -> subprocess.CompletedProcess:
 
 class DecoderManifest(unittest.TestCase):
     def test_two_targets_reassemble_and_promote(self) -> None:
+        missing = [c for c in COMPILERS.values() if shutil.which(c) is None]
+        if missing:
+            self.skipTest(f"needs {', '.join(missing)} to build per-target fixtures")
         with tempfile.TemporaryDirectory(prefix="decoder-manifest-") as tmp:
             root = Path(tmp)
             repo = root / "repo"
@@ -42,17 +50,7 @@ class DecoderManifest(unittest.TestCase):
             dist = root / "dist"
             binary = root / "unstripped"
             for target, alias in TARGETS:
-                # The fixture ELF must match the declared target: split_debug
-                # picks the binutils tool by target, and the target-prefixed
-                # objcopy refuses a foreign-arch image (the cross-compile
-                # reality the release pipeline now exercises). The aarch64
-                # leg needs the cross gcc; without it the leg is skipped
-                # loudly rather than built with a lying fixture.
-                compiler = {"x86_64-unknown-linux-gnu": "gcc",
-                            "aarch64-unknown-linux-gnu": "aarch64-linux-gnu-gcc"}[target]
-                if shutil.which(compiler) is None:
-                    print(f"SKIP: {compiler} not installed; {target} fixture not built")
-                    continue
+                compiler = COMPILERS[target]
                 source = root / f"{alias}.c"
                 source.write_text(f"int main(void) {{ return {len(alias)}; }}\n")
                 run(compiler, "-g", "-Wl,--build-id", "-o", str(binary), str(source))

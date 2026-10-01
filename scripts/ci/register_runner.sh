@@ -15,8 +15,8 @@
 #                  Default: prime-runner-<sandbox hostname suffix>.
 #   RUNNER_LABELS  Comma-separated labels jobs target.
 #                  Default: prime-linux-x64.
-#   RUNNER_DIR     Default: /opt/gh-runner. Must NOT live under /root (the
-#                  runner user must reach it).
+#   RUNNER_DIR     Default: /opt/gh-runner. Must be a dedicated directory
+#                  under /opt (it is chowned recursively to the runner user).
 #   RUNNER_USER    Default: gh-runner.
 #
 # The runner tarball is pinned (version + sha256); the digest is reviewed
@@ -41,6 +41,10 @@ case "${RUNNER_URL}" in
   https://github.com/*) ;;
   *) log "RUNNER_URL must be an https://github.com/... URL"; exit 1 ;;
 esac
+case "${RUNNER_DIR}" in
+  /opt/*[!/]*) ;;
+  *) log "RUNNER_DIR must be a dedicated directory under /opt"; exit 1 ;;
+esac
 
 # The runner refuses to run as root, so the agent runs as a dedicated user
 # with no sudo grants: that user is the security boundary between job code
@@ -50,12 +54,25 @@ if ! id -u "${RUNNER_USER}" >/dev/null 2>&1; then
   passwd -l "${RUNNER_USER}" >/dev/null 2>&1 || true
 fi
 
+# Job steps run as the sudo-less runner user, so everything the build-gnu
+# jobs need is installed here, as root: the runner agent's deps, the native
+# build tools, and the aarch64 cross toolchain + qemu-user for the
+# prime-linux-arm64 leg (installed on every runner so any runner can take
+# either label).
 log "installing runner host prerequisites"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
 apt-get install -y -q --no-install-recommends \
   ca-certificates curl git jq libicu70 libkrb5-3 zlib1g \
-  build-essential python3 pkg-config binutils
+  build-essential python3 pkg-config binutils \
+  gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu libc6-arm64-cross \
+  qemu-user-static binfmt-support
+
+# The arm64 leg's livechecks run the aarch64 binary through qemu-user binfmt.
+log "enabling qemu-aarch64 binfmt"
+mountpoint -q /proc/sys/fs/binfmt_misc || mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc
+update-binfmts --enable qemu-aarch64
+[ -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ] || { log "qemu-aarch64 binfmt did not register"; exit 1; }
 
 mkdir -p "${RUNNER_DIR}"
 if [ -f "${RUNNER_DIR}/.runner" ]; then
@@ -101,7 +118,7 @@ done
 SUPERVISE
 chown "${RUNNER_USER}:${RUNNER_USER}" "${RUNNER_DIR}/runner-supervise.sh"
 chmod 700 "${RUNNER_DIR}/runner-supervise.sh"
-su -s /bin/bash "${RUNNER_USER}" -c "setsid nohup ${RUNNER_DIR}/runner-supervise.sh > /dev/null 2>&1 < /dev/null &"
+su -s /bin/bash "${RUNNER_USER}" -c "setsid nohup '${RUNNER_DIR}/runner-supervise.sh' > /dev/null 2>&1 < /dev/null &"
 
 log "runner provisioned: name=${RUNNER_NAME} labels=[${RUNNER_LABELS}] dir=${RUNNER_DIR}"
 log "verify: it should appear Idle in the GitHub runner list within a minute"

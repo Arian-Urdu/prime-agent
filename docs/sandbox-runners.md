@@ -39,8 +39,11 @@ rootfs.
 The warm-build contract: the runner VM persists `target/` (and the rustup
 toolchain) across builds. That is why the self-hosted legs carry no
 `Swatinem/rust-cache`: the disk is the cache, and a stale restored tarball
-over a warm target dir would only regress cargo fingerprints. A freshly
-provisioned runner pays one cold build; every build after that is warm.
+over a warm target dir would only regress cargo fingerprints. The jobs check
+out with `clean: false` (the default `git clean -ffdx` would delete
+`target/`), then clean everything except `target/` and delete the previous
+run's `dist/` and `catalog-assets/` outputs. A freshly provisioned runner
+pays one cold build; every build after that is warm.
 
 ## Labels and the two Linux legs
 
@@ -51,7 +54,8 @@ provisioned runner pays one cold build; every build after that is warm.
   host: the GNU `aarch64-linux-gnu` toolchain links against the Ubuntu
   22.04 cross sysroot (the same GLIBC 2.35 baseline), and every gate still
   runs:
-  - the GLIBC gate reads the arm64 ELF with `aarch64-linux-gnu-objdump`;
+  - the GLIBC gate reads the arm64 ELF with the host's multi-target
+    `objdump`;
   - the livechecks execute the produced arm64 binary on the x64 host under
     `qemu-user` binfmt (`QEMU_LD_PREFIX=/usr/aarch64-linux-gnu` points qemu
     at the cross sysroot's dynamic linker);
@@ -69,10 +73,15 @@ provision as root and:
 1. creates a locked, sudo-less `gh-runner` user — the agent refuses to run
    as root, and the user is the boundary between job code and the provision
    layer;
-2. downloads the pinned runner tarball (v2.337.0, sha256-verified);
-3. runs `config.sh --unattended` with a fresh registration token and the
+2. installs everything the jobs need, because job steps cannot use root:
+   the native build tools, the aarch64 cross toolchain, and qemu-user, and
+   enables the `qemu-aarch64` binfmt handler (every runner gets the full
+   set, so any runner can take either label). The workflow's first step
+   only checks that these are present;
+3. downloads the pinned runner tarball (v2.337.0, sha256-verified);
+4. runs `config.sh --unattended` with a fresh registration token and the
    runner's labels;
-4. starts the agent under a restart-on-exit supervision loop (sandboxes
+5. starts the agent under a restart-on-exit supervision loop (sandboxes
    have no systemd).
 
 The registration token is a one-hour credential minted per provision:
@@ -140,10 +149,11 @@ and queueing, not billing; the sandbox pair bills as always-on compute at
 the platform's published rates (CPU $0.02/vCPU-h, memory $0.0125/GiB-h,
 disk $0.0002/GiB-h). A 4 vCPU / 8 GiB / 30 GiB pair costs ≈ $0.19/h ≈
 $4.5/day ≈ $134/month per runner; a per-build ephemeral runner pays only
-for its ~3-8 minutes of build (fractions of a cent) but rebuilds cold every
-time. The persistent pair is the recommended default: the measured build on
-the sandbox fleet is ~70 s warm (minutes cold), versus 6-20 minutes per
-Linux leg on GitHub's 2-core runners — and the continuous concurrency
+for its ~5-7 minutes per leg (a few cents) but rebuilds cold every
+time. The persistent pair is the recommended default: the measured release
+build on a 4 vCPU runner is ~190-205 s warm and ~235-250 s cold (a ~4-6
+minute leg end to end), versus 6-20 minutes per Linux leg on GitHub's
+2-core runners — and the continuous concurrency
 group serializes runs, so every minute saved per leg drains the merge
 queue that much faster. The detailed measurements and the persistent-vs-
 ephemeral trade live in the fleet's report for this change.

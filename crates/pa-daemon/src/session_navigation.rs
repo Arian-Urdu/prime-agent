@@ -103,10 +103,10 @@ impl SessionNavigation {
         let _ =
             tokio::task::spawn_blocking(move || crate::session_store::read_session_info(&primed))
                 .await;
-        {
+        let previous = {
             let mut core = self.core.lock().unwrap();
-            core.store = Some(file);
-        }
+            core.store.replace(file)
+        };
         // The replacement session starts on the default push lane with
         // fresh counters (the TS replacement built a new AgentSession) —
         // and its watches die with the replaced session (TS #2356: the
@@ -114,6 +114,10 @@ impl SessionNavigation {
         // bleed into the new session's notices).
         self.agent_digest.reset_session_state();
         self.engine.clear_agent_watches();
+        // The old store's lease release flushes the window and info
+        // sidecars (megabytes for a large session): off the core lock
+        // and the runtime.
+        let _ = tokio::task::spawn_blocking(move || drop(previous)).await;
         self.engine.set_session_file(new_path.clone());
         // TS re-restores the moved-to session's saved model at its runtime
         // recreation (`createRuntime` -> `createAgentSession`): the
@@ -957,5 +961,68 @@ mod tests {
             }
             other => panic!("expected the typed missing-cwd error info, got {other:?}"),
         }
+    }
+
+    /// The replacement reset wiring through `replace_session` itself (the
+    /// direct-flow counterpart of the digest module's logic tests): the
+    /// lane state dies with the replaced session and the engine's agent
+    /// watches die with it. Mutating either call out silently carries the
+    /// retired session's digest lane and watch subscriptions into the
+    /// fresh session — the exact drift a wholesale conflict resolution
+    /// would reintroduce.
+    #[tokio::test]
+    async fn a_replacement_resets_the_digest_lane_and_clears_the_watches() {
+        let dir = std::env::temp_dir().join(format!("pa-nav-replace-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("live-session.jsonl");
+        let mut live_file = SessionFile::create("/tmp", None, 0);
+        live_file.set_path(live.clone());
+        live_file.rewrite().unwrap();
+        let core = Arc::new(std::sync::Mutex::new(SessionCore::test_core(
+            Some(live_file),
+            "/tmp".to_string(),
+        )));
+        let digest = Arc::new(crate::worker::AgentMessageDigest::new(
+            Arc::clone(&core),
+            Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
+        // The retired session's state: a digest pin, crossed counters, and
+        // an ingestion turn (the lane is live).
+        digest.configure_pin("digest").unwrap();
+        digest.record_arrival(crate::util::now_ms());
+        digest.note_model_turn(true);
+        let engine = Arc::new(crate::engine::ScriptedEngine::default());
+        let navigation = SessionNavigation::new(
+            Arc::clone(&engine) as Arc<dyn SessionEngine>,
+            Arc::clone(&core),
+            Arc::clone(&digest),
+        );
+        let mut fresh = SessionFile::create("/tmp", None, 0);
+        fresh.set_path(dir.join(session_file_name(fresh.session_id())));
+        fresh.rewrite().unwrap();
+        navigation.replace_session(fresh).await.unwrap();
+        // The replacement session starts on the default push lane with
+        // fresh counters: neither the retired session's pin nor its mode
+        // survived the swap.
+        {
+            let locked = core.lock().unwrap();
+            assert!(
+                !locked.agent_message_digest_mode,
+                "the replacement reset the lane mode"
+            );
+        }
+        assert_eq!(
+            digest.configure_pin("auto").unwrap()["digest"],
+            json!(false),
+            "the controller reads the reset lane"
+        );
+        // And its watches died with the replaced session (the scripted
+        // engine counts the clear; the real engine empties its registry).
+        assert_eq!(
+            engine.cleared_agent_watches_count(),
+            1,
+            "the replacement cleared the agent watches"
+        );
     }
 }

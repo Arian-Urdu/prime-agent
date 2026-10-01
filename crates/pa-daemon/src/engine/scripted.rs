@@ -43,6 +43,10 @@ pub struct ScriptedEngine {
     compaction: CompactionScript,
     branch_summary: CompactionScript,
     goal: Option<ScriptedGoal>,
+    /// How many times `clear_agent_watches` ran: the harness's observable
+    /// for the navigation replacement's "watchers die with the session"
+    /// wiring (verification only; the product never reads it).
+    cleared_agent_watches: std::sync::atomic::AtomicUsize,
 }
 
 /// A scripted thread goal (the post-compaction goal-continue fixture):
@@ -175,6 +179,7 @@ impl ScriptedEngine {
             compaction,
             branch_summary,
             goal,
+            cleared_agent_watches: std::sync::atomic::AtomicUsize::default(),
         })
     }
 
@@ -188,6 +193,14 @@ impl ScriptedEngine {
     pub fn from_file(path: &std::path::Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
         Self::from_value(&serde_json::from_str(&content)?)
+    }
+
+    /// How many `clear_agent_watches` calls ran (verification only; the
+    /// replacement-flow tests read it, the product never does).
+    #[cfg(test)]
+    pub(crate) fn cleared_agent_watches_count(&self) -> usize {
+        self.cleared_agent_watches
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn response_text(response: &Value) -> String {
@@ -229,6 +242,13 @@ impl SessionEngine for ScriptedEngine {
     /// id rides on the message rows only.
     fn model_metadata(&self) -> Option<Value> {
         None
+    }
+
+    /// Count `clear_agent_watches` calls for the replacement-flow tests
+    /// (the real engine empties its watch registry instead).
+    fn clear_agent_watches(&self) {
+        self.cleared_agent_watches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The scripted thread goal's state, or the empty state (no goal

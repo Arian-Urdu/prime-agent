@@ -167,6 +167,32 @@ async fn serve_never_advertises_an_empty_host_as_the_tailnet_url() {
 }
 
 #[tokio::test]
+async fn serve_never_invents_a_host_when_no_real_suffix_exists() {
+    // A missing MagicDNS suffix must skip the reachability line (like the
+    // missing-hostname case) instead of composing a made-up domain: a
+    // short `HostName` under `ts.net` is not this node's MagicDNS name, so
+    // `{hostname}.ts.net` would not reach the node.
+    let no_suffix = serde_json::json!({
+        "BackendState": "Running",
+        "Self": { "Online": true, "HostName": "milk" },
+    })
+    .to_string();
+    let shim = Shim::write(&no_suffix, &serve_status_for(3000));
+    let program = shim.path();
+    let mut buf = Vec::new();
+    assert_eq!(
+        run_serve_to(&mut buf, program.as_os_str(), 3000.0, true).await,
+        0
+    );
+    let text = String::from_utf8(buf).expect("utf8");
+    assert!(!text.contains("Now reachable"), "{text}");
+    assert!(!text.contains("milk.ts.net"), "{text}");
+    assert!(!text.contains("Public URL: https://milk"), "{text}");
+    // The funnel command still succeeds and prints its stop line.
+    assert!(text.contains("Stop with:"), "{text}");
+}
+
+#[tokio::test]
 async fn serve_uses_a_real_suffix_instead_of_advertising_a_trailing_dot_host() {
     // A present-but-empty CurrentTailnet.MagicDNSSuffix must yield to the
     // top-level one: an empty suffix used as present would trim to no

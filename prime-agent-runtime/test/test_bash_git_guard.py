@@ -181,13 +181,36 @@ class EvalPayloadDetectionTest(unittest.TestCase):
 class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self._prev_cwd = os.getcwd()
+        self._prev_env = dict(os.environ)
         os.environ.pop(BASH_DESTRUCTIVE_GIT_BYPASS_ENV, None)
         os.environ.pop("PRIME_AGENT_BASH_COMMAND_PREFIX", None)
+        # The launch-time bypass snapshot is a module attribute frozen at
+        # import; pin it to "unset" so a runner launched with the bypass
+        # set cannot disarm these refusals.
+        frozen_patch = mock.patch.object(
+            bash_module, "_BASH_DESTRUCTIVE_GIT_BYPASS_AT_START", False
+        )
+        frozen_patch.start()
+        self.addCleanup(frozen_patch.stop)
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         # Restore cwd before the temp dir disappears (cleanups run LIFO).
+        self.addCleanup(self._restore_env)
         self.addCleanup(os.chdir, self._prev_cwd)
         self.test_dir = temp.name
+        # Hermetic git config, like the sibling force-push suite: every real
+        # git this suite runs -- the commands bash() spawns and the guard's
+        # own probe -- inherits this process environment, so an empty HOME
+        # hides the runner's user config and GIT_CONFIG_NOSYSTEM the system
+        # one. Global aliases, hooks, or url.*.insteadOf rewrites from the
+        # runner must not reach the test repositories or the probes. (The
+        # `_run_git` repo setup already pins HOME=cwd per call.)
+        os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+        os.environ["HOME"] = str(self.test_dir)
+
+    def _restore_env(self):
+        os.environ.clear()
+        os.environ.update(self._prev_env)
 
     def _init_dirty_repo(self) -> None:
         _init_dirty_git_repo(self.test_dir)
@@ -309,17 +332,24 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(completed.returncode, 0)
                     self.assertEqual(Path(repo, "tracked.txt").read_text(), "committed\n")
 
-    async def test_frozen_bypass_not_leaked_into_child_environments(self):
-        # When the variable was absent at kernel start, kernel-spawned
-        # children must not inherit a mid-session write (a child kernel
-        # would freeze it as its own launch-time bypass).
-        with (
-            mock.patch.dict(os.environ, {BASH_DESTRUCTIVE_GIT_BYPASS_ENV: "1"}),
-            mock.patch.object(bash_module, "_BASH_DESTRUCTIVE_GIT_BYPASS_AT_START", True),
+    def test_child_env_strips_late_bypass(self):
+        # A mid-session os.environ write this kernel ignores must not reach
+        # a child kernel's environment (a child would freeze it as its own
+        # launch-time bypass); a kernel actually launched with the bypass
+        # still passes it through.
+        os.environ[BASH_DESTRUCTIVE_GIT_BYPASS_ENV] = "1"
+        self.addCleanup(os.environ.pop, BASH_DESTRUCTIVE_GIT_BYPASS_ENV, None)
+        # The launch-time snapshot is a module attribute frozen at import;
+        # pin it to "unset" so the late-write rule decides, not the parent
+        # process's launch environment (a runner launched with the bypass
+        # set would otherwise legitimately keep the value).
+        with mock.patch.object(
+            bash_module, "_BASH_DESTRUCTIVE_GIT_BYPASS_AT_START", False
         ):
-            child_env = bash_module._child_env()
-        # With the variable present at launch, children inherit it.
-        self.assertEqual(child_env.get(BASH_DESTRUCTIVE_GIT_BYPASS_ENV), "1")
+            self.assertNotIn(BASH_DESTRUCTIVE_GIT_BYPASS_ENV, bash_module._child_env())
+        # A value the kernel actually started with is the intentional state.
+        with mock.patch.object(bash_module, "_BASH_DESTRUCTIVE_GIT_BYPASS_AT_START", True):
+            self.assertIn(BASH_DESTRUCTIVE_GIT_BYPASS_ENV, bash_module._child_env())
 
     async def test_fails_open_outside_a_git_repository(self):
         os.chdir(self.test_dir)

@@ -239,12 +239,13 @@ impl Supervisor {
             "rlmMaxDepth",
             "parentSessionPath",
             "models",
+            // The scripted-parent verification seam: a dropped key leaves
+            // spawned children scriptless.
+            "childScript",
             "systemPrompt",
             "appendSystemPrompt",
             "skills",
             "promptTemplates",
-            "extensions",
-            "tools",
             "autonomous",
         ] {
             if let Some(value) = config_object.and_then(|config| config.get(key)) {
@@ -617,18 +618,22 @@ impl Supervisor {
     }
 
     /// The worker-driven idle passivation (TS's `idleEvictionMinutes`
-    /// tier, whole-worker): a parent-owned child worker whose park arm
-    /// proved the idle state and crossed the threshold asks for its own
-    /// graceful stop over the supervisor link. The supervisor verifies
-    /// the worker token, re-verifies the parent-owned descriptor (a root
-    /// worker can never ask its way out), and re-reads the setting — the
-    /// supervisor's own fresh-snapshot fence: a setting flipped to
-    /// `"off"` (or past the threshold) between the worker's ask and the
-    /// stop cancels the passivation. The stop itself is the existing
-    /// graceful path (`stop_worker`: durable tombstone, routed shutdown,
-    /// process-retirement wait, registry removal, roster passivation),
-    /// so a passivated child's row stays visible and family-addressable
-    /// and its next prompt wakes a fresh worker over the session file.
+    /// tier, whole-worker): an unowned worker whose park arm proved the
+    /// idle state and crossed the threshold asks for its own graceful
+    /// stop over the supervisor link — TS `canEvictWorker` reaches roots
+    /// and children alike. The supervisor verifies the worker token,
+    /// refuses a client-owned or noSession descriptor (TS
+    /// `hasOwnerClient`: the owner's disconnect cleanup owns that stop;
+    /// an in-memory session has no file to wake from), and re-reads the
+    /// setting — the supervisor's own fresh-snapshot fence: a setting
+    /// flipped to `"off"` (or past the threshold) between the worker's
+    /// ask and the stop cancels the passivation. The stop runs under the
+    /// eviction fence (TS `withEvictionFence`) and is the existing
+    /// graceful path (`stop_worker`: durable tombstone, routed
+    /// shutdown, process-retirement wait, registry removal, roster
+    /// passivation), so the passivated worker's row stays visible and
+    /// its next prompt (or an attach by durable id) wakes a fresh worker
+    /// over the session file.
     pub(crate) async fn handle_worker_idle_passivation(
         self: &Arc<Self>,
         command_id: &str,
@@ -644,25 +649,21 @@ impl Supervisor {
                 None,
             );
         };
-        // The parent-owned gate: only a child worker (rlmDepth > 0) may
-        // ask; a root worker's resident lease is client-owned policy.
-        let parent_owned = {
+        // Rust clients create noSession roots unowned (`lifecycle: None`);
+        // TS makes them client-owned, so its `hasOwnerClient` refuses them.
+        // An in-memory session has no file to wake from.
+        {
             let descriptor = resident.descriptor.lock().await;
-            descriptor
-                .create_command
-                .rest
-                .get("rlmDepth")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0)
-                > 0
-        };
-        if !parent_owned {
-            return response_failure(
-                Some(command_id),
-                type_name,
-                "Idle passivation is a child-worker policy; the root worker stays resident",
-                None,
-            );
+            if descriptor.owner_client_id.is_some()
+                || descriptor.create_command.no_session == Some(true)
+            {
+                return response_failure(
+                    Some(command_id),
+                    type_name,
+                    "Idle passivation is refused for a client-owned or in-memory (noSession) worker",
+                    None,
+                );
+            }
         }
         // The supervisor-side settings re-read (the fence): the same
         // `idleEvictionMinutes` surface the worker read.
@@ -683,7 +684,19 @@ impl Supervisor {
                 return response_success(Some(command_id), type_name, None);
             }
         }
-        match self.stop_worker(&resident).await {
+        // TS `withEvictionFence`: holding every in-flight route permit
+        // proves no routed request is still running on this worker (a
+        // drained `cron_add` or prompt would fail TS's fresh
+        // `canEvictWorker`), and refuses new client routes until the
+        // stop has retired the worker. A request in flight defers the
+        // passivation; the worker's next park re-asks.
+        let Ok(fence) = Arc::clone(&resident.inflight).try_acquire_many_owned(
+            u32::try_from(crate::backpressure::WORKER_INFLIGHT_CAPACITY)
+                .expect("in-flight capacity fits u32"),
+        ) else {
+            return response_success(Some(command_id), type_name, None);
+        };
+        match self.stop_worker_releasing(&resident, Some(fence)).await {
             Ok(()) => {
                 self.log_line(&format!(
                     "session worker {} passivated idle (idleEvictionMinutes={threshold})",
@@ -704,6 +717,16 @@ impl Supervisor {
         self: &Arc<Self>,
         resident: &Arc<ResidentWorker>,
     ) -> anyhow::Result<()> {
+        self.stop_worker_releasing(resident, None).await
+    }
+
+    /// The graceful stop; `fence` (the idle passivation's) is released
+    /// past the retire. Every other stop caller passes `None`.
+    async fn stop_worker_releasing(
+        self: &Arc<Self>,
+        resident: &Arc<ResidentWorker>,
+        fence: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> anyhow::Result<()> {
         // The stop's durable intent persists BEFORE the worker is told (TS
         // `stopWorkerUntracked(removeDescriptor)` ->
         // `persistWorkerStopTombstone`): a supervisor that dies mid-stop, or
@@ -720,6 +743,12 @@ impl Supervisor {
         // The stop is intentional: routes waiting out a replacement must
         // fail fast instead of parking on this worker.
         resident.note_retired();
+        // The fence releases past the retire (a tombstone-persist failure
+        // fails the stop before it, and the worker stays fully
+        // routable) and before the shutdown route, which needs a permit
+        // of its own. A client route that acquires a freed permit next
+        // sees the retire (the post-admission check in routing.rs).
+        drop(fence);
         match self
             .route_command_typed(
                 resident,
@@ -818,6 +847,13 @@ impl Supervisor {
             }
             _ => {
                 let _ = std::fs::remove_file(&resident.descriptor_path);
+                // The identity-pending side record dies with the
+                // descriptor it shadows (an orphaned pending would
+                // shadow the next identity over the same worker id). A
+                // removal failure here is as inert as the descriptor
+                // removal beside it — the retire already provably killed
+                // the worker, so no later boot applies a shadowed record.
+                let _ = crate::descriptor::clear_identity_pending(&resident.descriptor_path);
             }
         }
     }

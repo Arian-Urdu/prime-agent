@@ -475,7 +475,8 @@ class DestructiveGitGuardTest(unittest.IsolatedAsyncioTestCase):
         checked = 0
 
         async def check(command: str, refused: bool, prefix: str | None = None):
-            # its own repository, so one allowed command cannot hide the next
+            # Each case runs in its own repository, so one allowed command
+            # cannot hide the next case's missed refusal.
             nonlocal checked
             repo = str(self._tracked(f"alias-{checked}"))
             checked += 1

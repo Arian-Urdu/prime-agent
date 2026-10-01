@@ -347,3 +347,93 @@ async fn a_stale_epoch_never_overwrites_the_installed_channel() {
         .expect("the channel stays open");
     assert_eq!(frame.command_type, "get_state");
 }
+
+/// The create-path fan-out collapse's registration pin: a known-resident
+/// registration refreshes the resident's descriptor in memory and writes
+/// nothing to disk. Pre-cut, this path paid the third durable write of
+/// every fresh create — a premature `Ready` stamped while the create
+/// replay was still in flight, durably redundant with the
+/// create-completion persist (`launch_worker`'s post-create write, which
+/// keeps its fsync as the metadata-survival barrier). The spawn-time
+/// `Starting` record stays the on-disk state until that barrier lands.
+#[tokio::test]
+async fn a_known_resident_registration_writes_nothing_to_disk() {
+    let dir = std::env::temp_dir().join(format!("pa-regskip-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let agent_dir = dir.join("agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    let supervisor = Arc::new(
+        Supervisor::new(SupervisorOptions {
+            socket_path: dir.join("daemon.sock"),
+            agent_dir: agent_dir.clone(),
+        })
+        .expect("supervisor"),
+    );
+    let descriptor_path = dir.join("w-regskip.json");
+    let descriptor: DaemonWorkerDescriptor = serde_json::from_value(serde_json::json!({
+        "version": 2,
+        "workerId": "w-regskip",
+        "pid": 4242,
+        "socketPath": "/tmp/w-regskip.sock",
+        "recoveryJournalPath": "/tmp/none.jsonl",
+        "supervisorSocketPath": "/tmp/none.sock",
+        "authenticationToken": "reg-token",
+        "rootActiveSessionId": "w-regskip",
+        "createdAt": "2026-10-01T00:00:00Z",
+        "updatedAt": "2026-10-01T00:00:00Z",
+        "lifecycle": "starting",
+        "createCommand": {},
+        "consecutiveFailures": 0,
+    }))
+    .expect("descriptor");
+    // The spawn-time record, exactly as the launch writes it (the TS
+    // `persistWorker` call shape: the atomic rename, no fsync), from the
+    // same descriptor value the resident is about to own.
+    crate::descriptor::persist_worker_unsynced(&descriptor_path, &descriptor)
+        .expect("the spawn record lands");
+    let spawn_record = std::fs::read(&descriptor_path).expect("the spawn record is on disk");
+    let resident =
+        ResidentWorker::new("w-regskip".to_string(), descriptor, descriptor_path.clone());
+    supervisor.registry.insert(Arc::clone(&resident)).await;
+
+    let command = DaemonCommand::WorkerRegister {
+        id: None,
+        active_session_id: "w-regskip".to_string(),
+        session_id: None,
+        socket_path: "/tmp/w-regskip-live.sock".to_string(),
+        worker_instance_id: "inst-live".to_string(),
+        token: "reg-token".to_string(),
+        pid: 4242,
+        rest: Map::default(),
+    };
+    let response = supervisor
+        .handle_worker_register("r1", "worker_register", &command)
+        .await;
+    assert!(
+        response.success,
+        "the registration itself succeeds: {response:?}"
+    );
+
+    // DISK: byte-identical to the spawn record — the registration writes
+    // nothing; the create-completion persist owns the next durable state.
+    let after = std::fs::read(&descriptor_path).expect("the spawn record stays readable");
+    assert_eq!(
+        after, spawn_record,
+        "the registration must not write the descriptor"
+    );
+
+    // MEMORY: the resident's live identity still refreshes (the routing
+    // surfaces read it) — the registration is not a no-op, only its
+    // durable write is gone.
+    let descriptor = resident.descriptor.lock().await;
+    assert_eq!(descriptor.lifecycle, DaemonWorkerLifecycle::Ready);
+    assert_eq!(
+        descriptor.socket_path, "/tmp/w-regskip-live.sock",
+        "the live socket refreshes in memory"
+    );
+    assert_eq!(
+        descriptor.worker_instance_id.as_deref(),
+        Some("inst-live"),
+        "the live instance id refreshes in memory"
+    );
+}

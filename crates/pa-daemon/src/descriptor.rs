@@ -220,6 +220,31 @@ pub fn descriptor_dir(agent_dir: &Path, socket_path: &Path) -> PathBuf {
 /// the final rename onto `path` fails; the 0600 restriction is best
 /// effort and never fails the call.
 pub fn write_file_atomic(path: &Path, content: &str) -> Result<()> {
+    write_file_atomic_with(path, content, true)
+}
+
+/// Write a file atomically with 0600 permissions, without the pre-rename
+/// fsync — the TS `writeFileAtomicSync` default call shape: the fsync is
+/// opt-in there and the descriptor family's TS call sites never request
+/// it (`daemon-supervisor.ts` `persistWorker` passes `{ mode: 0o600 }`
+/// only). The pre-completion records this shape serves have to survive a
+/// supervisor crash, which the rename in the page cache already does; a
+/// power-crash loss dies with the worker and costs the launch its retry,
+/// the same window TS tolerates for the same writes. The
+/// create-completion persist keeps the durable write as the
+/// metadata-survival barrier.
+///
+/// # Errors
+///
+/// Returns an error when the parent directory cannot be created, or when
+/// creating, writing, or flushing the temp file fails, or when the final
+/// rename onto `path` fails; the 0600 restriction is best effort and
+/// never fails the call.
+pub fn write_file_atomic_unsynced(path: &Path, content: &str) -> Result<()> {
+    write_file_atomic_with(path, content, false)
+}
+
+fn write_file_atomic_with(path: &Path, content: &str, fsync: bool) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -230,7 +255,9 @@ pub fn write_file_atomic(path: &Path, content: &str) -> Result<()> {
         let mut writer = std::io::BufWriter::new(file);
         writer.write_all(content.as_bytes())?;
         writer.flush()?;
-        writer.get_ref().sync_all()?;
+        if fsync {
+            writer.get_ref().sync_all()?;
+        }
     }
     let _ = pa_core::platform::perms::restrict_file(&temp);
     pa_core::platform::rename_onto(&temp, path)
@@ -246,10 +273,35 @@ pub fn write_file_atomic(path: &Path, content: &str) -> Result<()> {
 /// Returns an error when the descriptor cannot be serialized or the
 /// atomic write to `path` fails.
 pub fn persist_worker(path: &Path, descriptor: &WorkerDescriptor) -> Result<()> {
+    persist_worker_with(path, descriptor, write_file_atomic)
+}
+
+/// Persist the spawn-time worker record in the TS `persistWorker` call
+/// shape: the same atomic rename and `updated_at` stamp, without the
+/// pre-rename fsync (TS's descriptor writes never request the fsync
+/// option). The spawn record is a pre-completion state: it must outlive
+/// a supervisor crash — the rename in the page cache does — while a
+/// power-crash loss dies with the worker and costs the create its
+/// retry. The create-completion persist keeps the durable write as the
+/// metadata-survival barrier.
+///
+/// # Errors
+///
+/// Returns an error when the descriptor cannot be serialized or the
+/// atomic write to `path` fails.
+pub fn persist_worker_unsynced(path: &Path, descriptor: &WorkerDescriptor) -> Result<()> {
+    persist_worker_with(path, descriptor, write_file_atomic_unsynced)
+}
+
+fn persist_worker_with(
+    path: &Path,
+    descriptor: &WorkerDescriptor,
+    write: fn(&Path, &str) -> Result<()>,
+) -> Result<()> {
     let mut descriptor = descriptor.clone();
     descriptor.updated_at = crate::util::now_iso();
     let content = serde_json::to_string_pretty(&descriptor)?;
-    write_file_atomic(path, &content)
+    write(path, &content)
 }
 
 /// The identity-pending side record (the descriptor store's own
@@ -392,6 +444,57 @@ mod tests {
         std::fs::write(&path, "stale").unwrap();
         write_file_atomic(&path, "next").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "next");
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().count() == 1,
+            "the temp file must not survive the rename"
+        );
+    }
+
+    #[test]
+    fn write_file_atomic_unsynced_replaces_an_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("descriptor.json");
+        std::fs::write(&path, "stale").unwrap();
+        write_file_atomic_unsynced(&path, "next").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "next");
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().count() == 1,
+            "the temp file must not survive the rename"
+        );
+    }
+
+    #[test]
+    fn persist_worker_unsynced_stamps_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.json");
+        let descriptor: WorkerDescriptor = serde_json::from_value(json!({
+            "version": 2,
+            "workerId": "wspawn",
+            "pid": 4242,
+            "socketPath": "/tmp/w.sock",
+            "recoveryJournalPath": "/tmp/w.recovery.jsonl",
+            "supervisorSocketPath": "/tmp/d.sock",
+            "authenticationToken": "tok",
+            "rootActiveSessionId": "wspawn",
+            "createdAt": "2026-10-01T00:00:00Z",
+            "updatedAt": "2026-10-01T00:00:00Z",
+            "lifecycle": "starting",
+            "createCommand": {},
+            "consecutiveFailures": 0,
+        }))
+        .expect("descriptor");
+        persist_worker_unsynced(&path, &descriptor).expect("persist");
+        let persisted: WorkerDescriptor =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).expect("parse");
+        // The spawn record carries the same content the durable persist
+        // would (the stamp included) — only the pre-rename fsync differs.
+        assert_eq!(persisted.worker_id, "wspawn");
+        assert_eq!(persisted.pid, 4242);
+        assert_eq!(persisted.lifecycle, WorkerLifecycle::Starting);
+        assert_ne!(
+            persisted.updated_at, descriptor.updated_at,
+            "the fresh updated_at stamp rides the spawn record"
+        );
         assert!(
             std::fs::read_dir(dir.path()).unwrap().count() == 1,
             "the temp file must not survive the rename"

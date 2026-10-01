@@ -3,11 +3,11 @@
 use super::routing::fail_unsent_request;
 use super::{
     anyhow, connect_transport, create_command_payload, json, mpsc, persist_worker,
-    probe_worker_socket, util, worker_connect_deadline, write_frame, Arc, Child, ClientRouting,
-    Command, Context, DaemonWorkerLifecycle, Duration, Ordering, PathBuf, PrivateFrameReader,
-    ResidentWorker, Result, RouteAdmission, Supervisor, TypedCreateRejection, Value, WorkerReply,
-    WorkerRequest, DEFAULT_PRIVATE_FRAME_LIMITS, LONG_ROUTE_TIMEOUT_MS, ROUTE_TIMEOUT_MS,
-    WORKER_AUTH_FLOOR_MS,
+    persist_worker_unsynced, probe_worker_socket, util, worker_connect_deadline, write_frame, Arc,
+    Child, ClientRouting, Command, Context, DaemonWorkerLifecycle, Duration, Ordering, PathBuf,
+    PrivateFrameReader, ResidentWorker, Result, RouteAdmission, Supervisor, TypedCreateRejection,
+    Value, WorkerReply, WorkerRequest, DEFAULT_PRIVATE_FRAME_LIMITS, LONG_ROUTE_TIMEOUT_MS,
+    ROUTE_TIMEOUT_MS, WORKER_AUTH_FLOOR_MS,
 };
 use crate::lease::is_process_alive;
 use crate::registry::WorkerRelay;
@@ -471,7 +471,16 @@ impl Supervisor {
             descriptor.pid = u64::from(child_pid);
             descriptor.process_start_id = crate::protocol::process_start_id(child_pid);
             descriptor.lifecycle = DaemonWorkerLifecycle::Starting;
-            let _ = persist_worker(&resident.descriptor_path, &descriptor);
+            // The spawn record is the TS `persistWorker` call shape: the
+            // atomic rename without the pre-rename fsync (TS's
+            // `writeFileAtomicSync` fsync is opt-in and the descriptor
+            // family never requests it). A pre-completion record only has
+            // to outlive a supervisor crash, which the rename in the page
+            // cache already does; a power-crash loss dies with the worker
+            // and costs the create its retry. The create-completion persist
+            // (`launch_worker`'s post-create write) keeps the durable
+            // fsync as the metadata-survival barrier.
+            let _ = persist_worker_unsynced(&resident.descriptor_path, &descriptor);
         }
 
         // Probe the worker socket until it accepts connections. A worker that

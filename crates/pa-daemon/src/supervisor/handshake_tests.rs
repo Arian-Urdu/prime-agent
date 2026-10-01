@@ -444,7 +444,7 @@ async fn a_known_resident_registration_writes_nothing_to_disk() {
 /// paths and assert the intended writer actually served. The
 /// launch-budget seam (`PA_DAEMON_WORKER_CONNECT_TIMEOUT_MS`) keeps the
 /// probe failure immediate — no live worker socket ever serves here.
-async fn spawn_record_witness(tag: &str) -> (Arc<Supervisor>, std::path::PathBuf) {
+fn spawn_record_witness(tag: &str) -> (Arc<Supervisor>, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!("pa-spawnrec-{tag}-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let agent_dir = dir.join("agent");
@@ -471,7 +471,7 @@ async fn spawn_record_witness(tag: &str) -> (Arc<Supervisor>, std::path::PathBuf
 #[tokio::test]
 async fn a_relaunch_spawn_record_serves_the_durable_persist() {
     std::env::set_var("PA_DAEMON_WORKER_CONNECT_TIMEOUT_MS", "1");
-    let (supervisor, dir) = spawn_record_witness("relaunch").await;
+    let (supervisor, dir) = spawn_record_witness("relaunch");
     let descriptor_path = dir.join("w-relaunch.json");
     let descriptor: DaemonWorkerDescriptor = serde_json::from_value(serde_json::json!({
         "version": 2,
@@ -537,7 +537,7 @@ async fn a_relaunch_spawn_record_serves_the_durable_persist() {
 #[tokio::test]
 async fn a_fresh_create_spawn_record_keeps_the_unsynced_shape() {
     std::env::set_var("PA_DAEMON_WORKER_CONNECT_TIMEOUT_MS", "1");
-    let (supervisor, dir) = spawn_record_witness("freshcreate").await;
+    let (supervisor, dir) = spawn_record_witness("freshcreate");
     let create = DaemonCommand::Create {
         id: None,
         session_path: Some(dir.join("s.jsonl").to_string_lossy().to_string()),

@@ -1337,6 +1337,22 @@ displaced_ts_root=""
 preserved_launcher=""
 migrated_old_layout=""
 migrated_old_layout=""
+# Defined before the EXIT trap is armed: on_exit calls it.
+restore_ts_root() {
+  if [ -n "$displaced_ts_root" ]; then
+    if [ -d "$share_dir" ]; then
+      # The half-installed Rust payload occupies the TS root's old path: it
+      # is disposable (a re-download restores it); the TS tree is not.
+      rm -rf "$share_dir"
+    fi
+    if mv "$displaced_ts_root" "$share_dir" 2>/dev/null; then
+      echo "note: the TypeScript install was restored to ${share_dir} — the install did not complete" >&2
+    else
+      echo "warning: could not restore the TypeScript install from ${displaced_ts_root}; restore it with: mv '${displaced_ts_root}' '${share_dir}'" >&2
+    fi
+    displaced_ts_root=""
+  fi
+}
 on_exit() {
   # Restores FIRST, lock release LAST: a second installer must not be able
   # to publish into share_dir while this one still restores state — the
@@ -1366,6 +1382,13 @@ on_exit() {
   rm -f "$lock_link"
 }
 trap on_exit EXIT
+
+# The rollback source was chosen before the lock: another installer may have
+# swept it since. Re-check under the lock, before the sweep and before
+# anything moves.
+if [ -n "$rollback_from" ] && [ ! -x "${rollback_from}/prime-agent" ]; then
+  die "the kept previous version ${rollback_from} was removed by another install while this one ran; nothing was changed"
+fi
 
 # Sweep rollback generations from PREVIOUS installs (both name eras) before
 # this run creates its own — exactly one .old generation survives each install.
@@ -1401,29 +1424,6 @@ done
 # the EXIT trap), so a half-finished install never leaves the machine with
 # no working prime-agent — the TS public symlink keeps resolving the whole
 # time and the TS tree returns to its original path if this install dies.
-restore_ts_root() {
-  if [ -n "$displaced_ts_root" ]; then
-    if [ -d "$share_dir" ]; then
-      # The half-installed Rust payload occupies the TS root's old path: it
-      # is disposable (a re-download restores it); the TS tree is not.
-      rm -rf "$share_dir"
-    fi
-    if mv "$displaced_ts_root" "$share_dir" 2>/dev/null; then
-      echo "note: the TypeScript install was restored to ${share_dir} — the install did not complete" >&2
-    else
-      echo "warning: could not restore the TypeScript install from ${displaced_ts_root}; restore it with: mv '${displaced_ts_root}' '${share_dir}'" >&2
-    fi
-    displaced_ts_root=""
-  fi
-}
-
-# The rollback source was chosen before the lock: another installer may have
-# swept it since. Re-check under the lock, before anything moves (after
-# restore_ts_root exists: the EXIT trap calls it, then releases the lock).
-if [ -n "$rollback_from" ] && [ ! -x "${rollback_from}/prime-agent" ]; then
-  die "the kept previous version ${rollback_from} was removed by another install while this one ran; nothing was changed"
-fi
-
 if [ -d "$share_dir" ] && ts_managed "$share_dir"; then
   preserved_to="$legacy_dir"
   if [ -e "$preserved_to" ]; then preserved_to="$(fresh_slot "$legacy_dir")"; fi

@@ -846,7 +846,7 @@ impl Supervisor {
                 // which pointed triage at the wrong seam).
                 if matches!(
                     error.to_string().as_str(),
-                    "Session worker timed out" | "Session worker dropped the request"
+                    "Session worker timed out" | "Daemon worker socket closed"
                 ) {
                     // Its captured stderr tail rides the failure (the same
                     // evidence the probe arm carries).

@@ -298,7 +298,7 @@ async fn a_closed_connection_fails_its_in_flight_request() {
         .await
         .expect("the route task lives")
         .expect_err("the dead worker never answers");
-    assert_eq!(error.to_string(), "Session worker dropped the request");
+    assert_eq!(error.to_string(), "Daemon worker socket closed");
 }
 
 /// The install guard's TOCTOU pin (the Macroscope HIGH finding on the

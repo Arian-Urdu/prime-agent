@@ -301,7 +301,11 @@ pub(crate) fn copy_to_clipboard(text: &str, sink: &mut OscSink) -> Result<CopyOu
 
 fn copy_with_env(text: &str, sink: &mut OscSink, env: &Env) -> Result<CopyOutcome, String> {
     let remote = is_remote_session(env);
-    let copied = if matches!(sink, OscSink::Buffer(_)) || remote {
+    // Remote tools target the wrong machine and can stall the input loop
+    // before terminal forwarding. Keep them for payloads too large for OSC 52.
+    let copied = if matches!(sink, OscSink::Buffer(_))
+        || (remote && crate::osc52::sequence(text).is_some())
+    {
         false
     } else {
         match std::env::consts::OS {

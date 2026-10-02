@@ -128,6 +128,55 @@ fn a_draft_object_before_the_decision_does_not_refuse_the_reply() {
 }
 
 #[test]
+fn two_distinct_valid_decisions_refuse_the_reply() {
+    // Both objects are valid choices; executing the first would silently
+    // discard the stated final answer.
+    let outcome = parse(
+        "Draft {\"action\": \"press\", \"params\": {\"button\": \"a\"}, \"confidence\": 0.9} \
+         Final {\"action\": \"look\", \"confidence\": 0.9}",
+    );
+    assert!(outcome.action.is_none());
+    assert!(outcome.params.is_empty());
+    assert!(outcome.confidence.is_none());
+    assert_eq!(
+        outcome.parse_error.as_deref(),
+        Some("reply contained more than one distinct decision")
+    );
+}
+
+#[test]
+fn identical_copies_of_one_decision_count_once() {
+    // The same object in the raw text twice (the greedy and balanced scans
+    // re-extract it) is one decision, not a conflict.
+    let repeated = parse(
+        "{\"action\": \"look\", \"confidence\": 0.7} {\"action\": \"look\", \"confidence\": 0.7}",
+    );
+    assert_eq!(repeated.action.as_deref(), Some("look"));
+
+    // The same decision inside and outside the fence still resolves to one.
+    let fenced = parse(
+        "see {\"action\": \"look\", \"confidence\": 0.7} or \
+         ```json\n{\"action\": \"look\", \"confidence\": 0.7}\n```",
+    );
+    assert_eq!(fenced.action.as_deref(), Some("look"));
+}
+
+#[test]
+fn a_conflicting_fenced_final_after_a_valid_raw_draft_refuses() {
+    // The fenced block holds the stated final answer; the raw draft holds a
+    // different valid choice. The reply is ambiguous either way.
+    let outcome = parse(
+        "Draft {\"action\": \"look\", \"confidence\": 0.6} final: \
+         ```json\n{\"action\": \"press\", \"params\": {\"button\": \"a\"}, \"confidence\": 0.9}\n```",
+    );
+    assert!(outcome.action.is_none());
+    assert_eq!(
+        outcome.parse_error.as_deref(),
+        Some("reply contained more than one distinct decision")
+    );
+}
+
+#[test]
 fn braces_inside_parameter_values_do_not_misread_the_object_boundary() {
     let mut actions = support::sample_action_space();
     actions.insert(

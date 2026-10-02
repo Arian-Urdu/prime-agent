@@ -119,9 +119,10 @@ fn text_of(message: &AssistantMessage) -> String {
 }
 
 /// Extract every JSON object in the reply, in reply order: the fenced block
-/// first, then the raw text. `parse_decision` accepts the first candidate that
-/// is a valid choice, so prose (or a discarded draft object) before the
-/// decision object cannot turn a well-formed reply into a parse refusal.
+/// first, then the raw text. `parse_decision` accepts the reply only when the
+/// candidates resolve to exactly one distinct valid choice, so prose (or a
+/// discarded draft object) around the decision object cannot turn a
+/// well-formed reply into a parse refusal.
 fn extract_json_object_candidates(raw: &str) -> Vec<Map<String, Value>> {
     let mut candidates = Vec::new();
     let fenced = fenced_block(raw);
@@ -222,7 +223,11 @@ fn push_object_candidate(candidates: &mut Vec<Map<String, Value>>, slice: &str) 
 }
 
 /// Parse a decision against the compiled action space. Free text never passes.
-/// The first JSON object that is a valid single choice wins.
+/// The reply must resolve to exactly ONE choice: prose (or a discarded draft
+/// object) around the decision object cannot turn a well-formed reply into a
+/// refusal, identical copies of one decision count once (the fenced and raw
+/// scans re-extract the same object), but two distinct valid choices are an
+/// ambiguous reply and refuse.
 #[must_use]
 #[allow(clippy::implicit_hasher)] // mirrors the TS Map<string, CompiledAction> seam
 pub fn parse_decision(
@@ -231,19 +236,36 @@ pub fn parse_decision(
 ) -> RouterDecisionOutcome {
     let candidates = extract_json_object_candidates(raw);
     let mut first_refusal: Option<RouterDecisionOutcome> = None;
+    let mut distinct: Vec<RouterDecisionOutcome> = Vec::new();
     for object in &candidates {
         let outcome = validate_decision_object(object, actions);
         if outcome.action.is_some() {
-            return outcome;
-        }
-        // The first candidate keeps the diagnostic about the earliest object.
-        if first_refusal.is_none() {
+            if !distinct.iter().any(|seen| same_decision(seen, &outcome)) {
+                distinct.push(outcome);
+            }
+        } else if first_refusal.is_none() {
+            // The first candidate keeps the diagnostic about the earliest object.
             first_refusal = Some(outcome);
         }
     }
-    first_refusal.unwrap_or_else(|| {
-        RouterDecisionOutcome::refused("reply was not a JSON object".to_string())
-    })
+    match distinct.len() {
+        0 => first_refusal.unwrap_or_else(|| {
+            RouterDecisionOutcome::refused("reply was not a JSON object".to_string())
+        }),
+        1 => distinct.pop().unwrap(),
+        _ => RouterDecisionOutcome::refused(
+            "reply contained more than one distinct decision".to_string(),
+        ),
+    }
+}
+
+/// Two valid outcomes are the same choice when the action, its params, and the
+/// confidence all match: identical copies (the fenced and raw scans find the
+/// same object twice) must not look like a conflict.
+fn same_decision(left: &RouterDecisionOutcome, right: &RouterDecisionOutcome) -> bool {
+    left.action == right.action
+        && left.params == right.params
+        && left.confidence == right.confidence
 }
 
 /// Validate one extracted decision object against the compiled action space.

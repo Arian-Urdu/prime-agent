@@ -134,10 +134,18 @@ class RunnerRegisterContract(unittest.TestCase):
 
 class SuOptionPermutation(unittest.TestCase):
     def test_leading_dash_value_cannot_become_su_option(self) -> None:
-        """Root-free proof of both directions: without --, a trailing
-        --help is consumed by su itself (the trap the provisioner must
-        never fall into); with --, it is passed through to the target
-        command instead of being parsed as su's option."""
+        """Root-free, prompt-free proof of both directions: without --, a
+        trailing --help is consumed by su itself (the trap the provisioner
+        must never fall into); with --, it is passed through to the target
+        command instead of being parsed as su's option.
+
+        Both invocations run detached from the controlling terminal
+        (start_new_session, the subprocess form of setsid): su reads the
+        password from /dev/tty, not stdin, so without the detach a
+        non-root PAM conversation would block the terminal waiting for
+        input. Detached, it fails fast instead - and as root no password
+        is asked at all, so the hardened direction runs printf directly.
+        """
         su = shutil.which("su")
         printf = shutil.which("printf") or "/usr/bin/printf"
         if su is None:
@@ -148,10 +156,11 @@ class SuOptionPermutation(unittest.TestCase):
         vulnerable = subprocess.run(
             [su, "-s", "/bin/bash", user, printf, "--help"],
             capture_output=True, text=True, timeout=30,
-            stdin=subprocess.DEVNULL)
+            stdin=subprocess.DEVNULL, start_new_session=True)
         # The help banner differs by su implementation (GNU prints
         # "Usage: su ...", util-linux "Usage:\n su ..."); "Usage" is the
-        # marker both share.
+        # marker both share. The --help is consumed before any
+        # authentication, so this direction never prompts.
         self.assertIn("Usage", vulnerable.stdout,
                       "su no longer permutes trailing options; re-check "
                       "the trap this test documents")
@@ -159,7 +168,7 @@ class SuOptionPermutation(unittest.TestCase):
         hardened = subprocess.run(
             [su, "-s", "/bin/bash", "--", user, printf, "--help"],
             capture_output=True, text=True, timeout=30,
-            stdin=subprocess.DEVNULL)
+            stdin=subprocess.DEVNULL, start_new_session=True)
         self.assertNotIn("Usage", hardened.stdout + hardened.stderr,
                          "a leading-dash value was consumed as su's own "
                          "option despite the -- terminator")

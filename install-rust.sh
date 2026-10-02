@@ -211,6 +211,10 @@ Environment:
                                  checks still run)
   PRIME_AGENT_RUST_PREFIX        install prefix (~/.local by default)
   PRIME_AGENT_RUST_VERBOSE       1 = the --verbose output mode
+  PRIME_AGENT_ROLLBACK_CHECK     1 = with --rollback, print the resolved
+                                 rollback source and exit without touching
+                                 the payload (the update command's
+                                 synchronous pre-flight)
 USAGE
 }
 
@@ -618,7 +622,14 @@ ts_takeover_undo=""
 migrated_note=""
 # The renderer always restores the cursor and line wrap when it stops; the
 # trap stops it on every exit path (an INT/TERM exits through it too).
-trap 'ui_stop' EXIT
+# The pre-flight's exits sit far from the run's own success-path sweep
+# below, and a refused check dies before the full trap is armed — so with
+# the knob set this run's every exit also cleans the staging.
+if [ "${PRIME_AGENT_ROLLBACK_CHECK:-}" = "1" ]; then
+  trap 'ui_stop; rm -rf "${dl:-}"' EXIT
+else
+  trap 'ui_stop' EXIT
+fi
 ui_interrupted() {
   if [ -n "$ui_step" ]; then step_fail "$ui_step" "interrupted"; fi
 }
@@ -1118,6 +1129,19 @@ if [ "$MODE" = rollback ]; then
   fi
   [ -n "$rollback_from" ] || die "nothing to roll back: no previous version is kept under ${PREFIX}/share
 (each update keeps the version it replaced; a fresh install has none)"
+  # THE ROLLBACK PRE-FLIGHT: with the knob set the resolved source is the
+  # whole answer — printed on stdout and the run stops here (no channel
+  # read, no staging, no lock, no payload touch; the install prologue's
+  # own temp staging still ran, so its sweep rides the exit too — the
+  # trap is not armed yet at this point), so a caller can ask
+  # synchronously whether a rollback CAN run before handing the real
+  # run off (the Windows update command's handoff: this process must
+  # exit for the publish to happen, so its exit code can only report the
+  # pre-flight's answer honestly).
+  if [ "${PRIME_AGENT_ROLLBACK_CHECK:-}" = "1" ]; then
+    printf '%s\n' "$rollback_from"
+    exit 0
+  fi
   CHANNEL="$(sed -n '1s/^install-rust.sh channel //p' "${rollback_from}/.prime-agent-install")"
   VERSION="$(sed -n '2s/^version //p' "${rollback_from}/.prime-agent-install")"
   say "rolling back to prime-agent ${VERSION} (${rollback_from})"

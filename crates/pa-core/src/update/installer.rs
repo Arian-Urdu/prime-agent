@@ -265,6 +265,22 @@ pub async fn run_bundled_installer(
         // spawn (std opens with FILE_SHARE_DELETE; a failure leaves nobody
         // reading and the removal is the same). The caller returns
         // immediately; the outcome rides the installer's own output.
+        // The rollback pre-flight (the exact-equivalence source): the
+        // generations record rides the script's OWN prefix spelling
+        // (cygpath + physical_path), so no native comparison can mirror
+        // its scan faithfully — the script itself answers, in its
+        // PRIME_AGENT_ROLLBACK_CHECK mode, synchronously. That mode
+        // stops before any staging, lock, or payload touch, so waiting for
+        // it never fights this process's locked image, and the refusal
+        // it prints is the one the handed-off run would die with — the
+        // caller exits with the real status, and only the publication
+        // itself stays async (the platform-inherent residue).
+        if args.first().copied() == Some(std::ffi::OsStr::new("--rollback")) {
+            if let Err(error) = rollback_source_exists(&script, prefix).await {
+                let _ = std::fs::remove_file(&script);
+                return Err(error);
+            }
+        }
         let file = std::fs::File::open(&script).map_err(|error| {
             let _ = std::fs::remove_file(&script);
             UpdateFailure {
@@ -344,46 +360,36 @@ pub fn caller_owns_payload(prefix: &Path) -> bool {
     }
 }
 
-/// The kept generation the script's `--rollback` publishes (its
-/// rollback-source read: the LAST usable line of the generations record
-/// — an existing `share/prime-agent.old.*` directory that still holds
-/// the payload binary and the install marker). `None` when nothing is
-/// kept, the state the script refuses with "nothing to roll back".
-/// The Windows handoff asks this BEFORE spawning, so that refusal (and
-/// the invalid `--archive` ones, via [`archive_refusal`]) still exits
-/// the caller with the real status instead of the handoff's async one —
-/// the publish itself is the only outcome that can no longer be
-/// reported synchronously on that platform.
-#[must_use]
-pub fn kept_rollback_generation(prefix: &Path) -> Option<PathBuf> {
-    let record =
-        std::fs::read_to_string(prefix.join("share/.prime-agent-install-generations")).ok()?;
-    let share = prefix.join("share");
-    let mut kept = None;
-    for recorded in record.lines().filter(|line| !line.is_empty()) {
-        let generation = std::path::Path::new(recorded);
-        if generation.parent() != Some(share.as_path()) {
-            continue;
-        }
-        let name = generation.file_name().and_then(|name| name.to_str());
-        if !name.is_some_and(|name| name.starts_with("prime-agent.old.")) {
-            continue;
-        }
-        if !payload_is_executable(&generation.join(PAYLOAD_BINARY)) {
-            continue;
-        }
-        let marker =
-            std::fs::read_to_string(generation.join(".prime-agent-install")).unwrap_or_default();
-        if !marker
-            .lines()
-            .next()
-            .is_some_and(|line| line.starts_with("install-rust.sh channel "))
-        {
-            continue;
-        }
-        kept = Some(generation.to_path_buf());
+/// The synchronous rollback pre-flight for the Windows handoff: run the
+/// bundled installer's own source scan (its `PRIME_AGENT_ROLLBACK_CHECK`
+/// mode — it stops before any staging, lock, or payload touch, so
+/// waiting never fights the locked image) and fail with the script's
+/// own refusal when nothing is kept.
+///
+/// # Errors
+/// Returns the pre-flight's captured refusal (its "nothing to roll
+/// back" tail) or the spawn failure.
+#[cfg(windows)]
+async fn rollback_source_exists(
+    script: &Path,
+    prefix: &Path,
+) -> std::result::Result<(), UpdateFailure> {
+    let shell = trusted_shell()?;
+    let mut command = installer_child(&shell, prefix, None);
+    command
+        .arg(script)
+        .arg("--rollback")
+        .env("PRIME_AGENT_ROLLBACK_CHECK", "1")
+        .stdin(std::process::Stdio::null());
+    let output = command.output().await.map_err(|error| UpdateFailure {
+        message: format!("could not run the installer: {error}"),
+    })?;
+    if output.status.success() {
+        return Ok(());
     }
-    kept
+    let refusal = output_tail(&output)
+        .unwrap_or_else(|| "the installer exited without a rollback source".to_string());
+    Err(UpdateFailure { message: refusal })
 }
 
 /// The refusal `install-rust.sh --archive` prints for a local release
@@ -445,9 +451,13 @@ pub fn archive_refusal(archive: &Path) -> Option<String> {
         if std::io::copy(&mut entry, &mut std::io::sink()).is_err() {
             return Some(format!("could not extract {}", archive.display()));
         }
-        let is_payload = entry
-            .path()
-            .is_ok_and(|path| path.as_os_str() == std::ffi::OsStr::new(PAYLOAD_BINARY));
+        // A regular FILE: the launcher execs the payload, so an
+        // executable DIRECTORY with the payload's name is not a payload
+        // (the script's bare `-x` would take it; the pre-check must not).
+        let is_payload = entry.header().entry_type().is_file()
+            && entry
+                .path()
+                .is_ok_and(|path| path.as_os_str() == std::ffi::OsStr::new(PAYLOAD_BINARY));
         #[cfg(unix)]
         let executable = entry.header().mode().unwrap_or(0) & 0o111 != 0;
         #[cfg(not(unix))]
@@ -469,22 +479,6 @@ pub fn archive_refusal(archive: &Path) -> Option<String> {
         return Some(format!("could not extract {}", archive.display()));
     }
     None
-}
-
-/// The payload binary's executability the script's rollback-source read
-/// requires (`-x ${generation}/${BINARY_NAME}`): the mode bits on unix,
-/// the file's presence on Windows (there `-x` reduces to the existing
-/// file).
-fn payload_is_executable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
-    }
-    #[cfg(not(unix))]
-    {
-        path.is_file()
-    }
 }
 
 /// The installed payload's version, read from the install marker's
@@ -906,57 +900,6 @@ mod tests {
         );
     }
 
-    /// The handoff's pre-validation mirrors the script's rollback-source
-    /// read: the LAST usable generations-record line wins, and a record
-    /// with no usable generation is the script's "nothing to roll back".
-    #[test]
-    fn kept_rollback_generation_reads_the_record_like_the_script() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let prefix = dir.path().join("prefix");
-        let share = prefix.join("share");
-        std::fs::create_dir_all(&share).unwrap();
-        assert_eq!(
-            kept_rollback_generation(&prefix),
-            None,
-            "no record: nothing kept"
-        );
-        let stale = share.join("prime-agent.old.100");
-        std::fs::create_dir_all(&stale).unwrap();
-        let usable = share.join("prime-agent.old.200");
-        let payload = usable.join(PAYLOAD_BINARY);
-        std::fs::create_dir_all(&usable).unwrap();
-        std::fs::write(&payload, b"payload").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mut permissions = std::fs::metadata(&payload).unwrap().permissions();
-            permissions.set_mode(permissions.mode() | 0o755);
-            std::fs::set_permissions(&payload, permissions).unwrap();
-        }
-        std::fs::write(
-            usable.join(".prime-agent-install"),
-            "install-rust.sh channel beta\nversion 0.9.9-beta.10\n",
-        )
-        .unwrap();
-        let record = share.join(".prime-agent-install-generations");
-        std::fs::write(
-            &record,
-            format!("{}\n{}\n", stale.display(), usable.display()),
-        )
-        .unwrap();
-        assert_eq!(
-            kept_rollback_generation(&prefix),
-            Some(usable),
-            "the last usable line wins"
-        );
-        std::fs::write(&record, format!("{}\n", stale.display())).unwrap();
-        assert_eq!(
-            kept_rollback_generation(&prefix),
-            None,
-            "no usable line: the refusal state"
-        );
-    }
-
     /// The handoff's archive pre-validation mirrors the script's
     /// `--archive` naming contract for this platform.
     #[test]
@@ -1048,6 +991,29 @@ mod tests {
         assert_eq!(
             archive_refusal(&truncated),
             Some(format!("could not extract {}", truncated.display()))
+        );
+        // An executable DIRECTORY with the payload's name is not a
+        // payload: the launcher execs a file.
+        let dir_payload = dir
+            .path()
+            .join(format!("prime-agent-9.9.9-e-{alias}.tar.gz"));
+        let file = std::fs::File::create(&dir_payload).unwrap();
+        let writer = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(writer);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_mode(0o755);
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, PAYLOAD_BINARY, std::io::empty())
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+        assert_eq!(
+            archive_refusal(&dir_payload),
+            Some(format!(
+                "the tarball did not contain an executable {PAYLOAD_BINARY} payload"
+            ))
         );
     }
 

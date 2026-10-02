@@ -1,0 +1,46 @@
+   --> crates/pa-core/src/platform/lock_dir.rs:132:38
+--
+   --> crates/pa-core/src/platform/lock_dir.rs:142:65
+--
+  --> crates/pa-core/src/session_engine/request_timing/payload.rs:85:5
+--
+   --> crates/pa-core/src/session_engine/request_timing/payload.rs:299:4
+--
+   --> crates/pa-core/src/session_engine/request_timing/payload.rs:342:4
+--
+   --> crates/pa-core/src/session_engine/request_timing/payload.rs:370:4
+--
+   --> crates/pa-core/src/session_engine/request_timing/payload.rs:422:4
+--
+   --> crates/pa-core/src/session_engine/request_timing/payload.rs:463:4
+--
+   --> crates/pa-core/src/auth/storage.rs:190:21
+--
+   --> crates/pa-core/src/models/private_auth.rs:174:21
+--
+   --> crates/pa-core/src/platform/lock_dir.rs:159:83
+--
+  --> crates/pa-core/src/platform/perms.rs:85:8
+--
+  --> crates/pa-core/src/platform/perms.rs:98:8
+--
+   --> crates/pa-core/src/platform/perms.rs:115:8
+--
+   --> crates/pa-core/src/platform/process.rs:141:1
+--
+   --> crates/pa-core/src/platform/process.rs:166:8
+--
+   --> crates/pa-core/src/platform/process.rs:205:8
+--
+   --> crates/pa-core/src/platform/process.rs:332:8
+--
+   --> crates/pa-core/src/platform/process.rs:505:8
+--
+   --> crates/pa-core/src/platform/process.rs:524:8
+--
+   --> crates/pa-core/src/session_engine/request_timing/payload.rs:140:17
+--
+   --> crates/pa-core/src/settings/storage.rs:185:21
+--
+   --> crates/pa-core/src/update/download.rs:594:1
+--

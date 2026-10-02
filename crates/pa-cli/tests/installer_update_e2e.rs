@@ -426,6 +426,77 @@ fn update_archive_and_rollback_swap_installer_payloads() {
     sandbox.assert_session_preserved();
 }
 
+/// The rollback pre-flight: the installer's check mode answers the
+/// rollback question synchronously — nothing kept is its own refusal,
+/// a kept generation prints the source and exits without touching the
+/// payload (the Windows update handoff runs this exact scan before it
+/// hands the real run off, so its exit code is honest for the
+/// deterministic refusals).
+#[test]
+fn rollback_check_answers_synchronously_without_touching_the_payload() {
+    let sandbox = Sandbox::new();
+    let live = sandbox.prefix.join("share/prime-agent");
+    std::fs::create_dir_all(&live).expect("payload dir");
+    let binary = live.join("prime-agent");
+    std::fs::copy(env!("CARGO_BIN_EXE_prime-agent"), &binary).expect("copy this build");
+    std::fs::write(
+        live.join(".prime-agent-install"),
+        "install-rust.sh channel beta\nversion 9.9.9\n",
+    )
+    .expect("install marker");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install-rust.sh");
+    let run_check = || {
+        let mut command = Command::new("/bin/sh");
+        command.arg(&script).arg("--rollback");
+        installer_env(&mut command, &sandbox);
+        command
+            .env("PRIME_AGENT_ROLLBACK_CHECK", "1")
+            .output()
+            .expect("run the installer's check mode")
+    };
+
+    let output = run_check();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("nothing to roll back"), "{stderr}");
+    assert_eq!(live_version(&sandbox), "9.9.9");
+
+    let archive = fake_release(&sandbox, "1.0.0");
+    let mut command = Command::new(&binary);
+    command
+        .arg("update")
+        .arg("--archive")
+        .arg(archive.to_str().expect("utf-8 path"));
+    installer_env(&mut command, &sandbox);
+    assert_ran(
+        &command.output().expect("run the installed build"),
+        "update --archive",
+    );
+    assert_eq!(live_version(&sandbox), "1.0.0");
+
+    let output = run_check();
+    assert!(output.status.success(), "the check finds the kept build");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let source = stdout.lines().last().unwrap_or_default().to_string();
+    let kept = source.strip_prefix(sandbox.prefix.display().to_string().as_str());
+    assert!(
+        kept.is_some_and(|rest| rest.starts_with("/share/prime-agent.old.")),
+        "the source names the kept generation: {source}"
+    );
+    assert_eq!(live_version(&sandbox), "1.0.0", "the check touched nothing");
+    let leftovers: Vec<String> = std::fs::read_dir(sandbox.root.join("tmp"))
+        .expect("tmp dir")
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.contains("prime-agent-download"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the check mode cleans its staging: {leftovers:?}"
+    );
+    sandbox.assert_session_preserved();
+}
+
 /// A fresh installer install has nothing to roll back: the run fails with
 /// the reason and the live payload stays.
 #[test]

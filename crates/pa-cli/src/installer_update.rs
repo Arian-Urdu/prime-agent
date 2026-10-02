@@ -154,29 +154,17 @@ pub fn run_local(prefix: &std::path::Path, archive: Option<&std::path::Path>) ->
     let handed_off = installer::caller_owns_payload(prefix);
     #[cfg(windows)]
     if handed_off {
-        // The refusals the script itself would print, delivered with the
-        // real exit status BEFORE any spawn: once handed off, the outcome
-        // can no longer be this process's exit code, so the common
-        // refusals (no kept generation, an unusable archive) must not
-        // ride the async one.
-        let refusal = if let Some(archive) = archive.as_deref() {
-            installer::archive_refusal(archive)
-        } else {
-            installer::kept_rollback_generation(prefix).is_none().then(|| {
-                format!(
-                    "nothing to roll back: no previous version is kept under {}\n(each update keeps the version it replaced; a fresh install has none)",
-                    prefix.join("share").display()
-                )
-            })
-        };
+        // The archive refusals the script itself would print, delivered
+        // with the real exit status BEFORE any spawn: once handed off,
+        // the outcome can no longer be this process's exit code, so the
+        // deterministic ones must not ride the async one (the rollback's
+        // own pre-flight runs inside the handoff, against the script's
+        // check mode).
+        let refusal = archive.as_deref().and_then(installer::archive_refusal);
         if let Some(refusal) = refusal {
             eprintln!("Error: {refusal}");
             return 1;
         }
-        println!(
-            "the {} continues in the background after this command exits — Windows only releases the payload once this process does",
-            if archive.is_some() { "archive install" } else { "rollback" }
-        );
     }
     match runtime.block_on(installer::run_bundled_installer(prefix, &args)) {
         Ok(installed) => {
@@ -185,7 +173,14 @@ pub fn run_local(prefix: &std::path::Path, archive: Option<&std::path::Path>) ->
                 // The handed-off child prints its own outcome to the
                 // inherited terminal after this process exits; this
                 // process never saw the landed version, so the "rolled
-                // back to" line would lie.
+                // back to" line would lie. The announcement rides here —
+                // the child is spawned by now, so a refused pre-flight
+                // (which returns Err below) never announced a background
+                // run that does not exist.
+                println!(
+                    "the {} continues in the background after this command exits — Windows only releases the payload once this process does",
+                    if archive.is_some() { "archive install" } else { "rollback" }
+                );
                 return 0;
             }
             let done = if archive.is_some() {

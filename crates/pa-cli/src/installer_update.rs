@@ -154,6 +154,25 @@ pub fn run_local(prefix: &std::path::Path, archive: Option<&std::path::Path>) ->
     let handed_off = installer::caller_owns_payload(prefix);
     #[cfg(windows)]
     if handed_off {
+        // The refusals the script itself would print, delivered with the
+        // real exit status BEFORE any spawn: once handed off, the outcome
+        // can no longer be this process's exit code, so the common
+        // refusals (no kept generation, an unusable archive) must not
+        // ride the async one.
+        let refusal = if let Some(archive) = archive.as_deref() {
+            installer::archive_refusal(archive)
+        } else {
+            installer::kept_rollback_generation(prefix).is_none().then(|| {
+                format!(
+                    "nothing to roll back: no previous version is kept under {}\n(each update keeps the version it replaced; a fresh install has none)",
+                    prefix.join("share").display()
+                )
+            })
+        };
+        if let Some(refusal) = refusal {
+            eprintln!("Error: {refusal}");
+            return 1;
+        }
         println!(
             "the {} continues in the background after this command exits — Windows only releases the payload once this process does",
             if archive.is_some() { "archive install" } else { "rollback" }

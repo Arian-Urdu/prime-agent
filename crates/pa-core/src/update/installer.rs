@@ -344,6 +344,149 @@ pub fn caller_owns_payload(prefix: &Path) -> bool {
     }
 }
 
+/// The kept generation the script's `--rollback` publishes (its
+/// rollback-source read: the LAST usable line of the generations record
+/// — an existing `share/prime-agent.old.*` directory that still holds
+/// the payload binary and the install marker). `None` when nothing is
+/// kept, the state the script refuses with "nothing to roll back".
+/// The Windows handoff asks this BEFORE spawning, so that refusal (and
+/// the invalid `--archive` ones, via [`archive_refusal`]) still exits
+/// the caller with the real status instead of the handoff's async one —
+/// the publish itself is the only outcome that can no longer be
+/// reported synchronously on that platform.
+#[must_use]
+pub fn kept_rollback_generation(prefix: &Path) -> Option<PathBuf> {
+    let record =
+        std::fs::read_to_string(prefix.join("share/.prime-agent-install-generations")).ok()?;
+    let share = prefix.join("share");
+    let mut kept = None;
+    for recorded in record.lines().filter(|line| !line.is_empty()) {
+        let generation = std::path::Path::new(recorded);
+        if generation.parent() != Some(share.as_path()) {
+            continue;
+        }
+        let name = generation.file_name().and_then(|name| name.to_str());
+        if !name.is_some_and(|name| name.starts_with("prime-agent.old.")) {
+            continue;
+        }
+        if !payload_is_executable(&generation.join(PAYLOAD_BINARY)) {
+            continue;
+        }
+        let marker =
+            std::fs::read_to_string(generation.join(".prime-agent-install")).unwrap_or_default();
+        if !marker
+            .lines()
+            .next()
+            .is_some_and(|line| line.starts_with("install-rust.sh channel "))
+        {
+            continue;
+        }
+        kept = Some(generation.to_path_buf());
+    }
+    kept
+}
+
+/// The refusal `install-rust.sh --archive` prints for a local release
+/// archive that cannot install (its name-validation and extraction
+/// blocks): `None` when the archive is usable — it exists, its name
+/// spells the channel's `prime-agent-<version>-<platform>.tar.gz`
+/// contract with a `[0-9A-Za-z.-]` version, and its whole gzip decodes
+/// to a tar carrying an executable payload binary. The Windows handoff
+/// asks this BEFORE spawning, so these refusals exit the caller with
+/// the real status (see [`kept_rollback_generation`]).
+#[must_use]
+pub fn archive_refusal(archive: &Path) -> Option<String> {
+    if !archive.is_file() {
+        return Some(format!(
+            "the release archive {} does not exist",
+            archive.display()
+        ));
+    }
+    let Some(name) = archive.file_name().and_then(|name| name.to_str()) else {
+        return Some("the release archive has no name".to_string());
+    };
+    let alias = crate::update::install::current_platform_alias();
+    let tail = format!("-{alias}.tar.gz");
+    let Some(version) = name
+        .strip_prefix("prime-agent-")
+        .and_then(|rest| rest.strip_suffix(&tail))
+    else {
+        return Some(format!(
+            "{name} is not a {alias} release archive (expected prime-agent-<version>-{alias}.tar.gz)"
+        ));
+    };
+    let invalid = version.is_empty()
+        || !version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'));
+    if invalid {
+        return Some(format!(
+            "invalid version in the archive name {name}: {version}"
+        ));
+    }
+    // The extraction the script runs (its `tar -xzf` + payload check),
+    // mirrored so the handoff's refusal stays synchronous: a corrupt or
+    // payloadless tarball is already on disk, so its refusal is
+    // deterministic, not a publish-time outcome. Consuming every entry
+    // forces the whole gzip through the decoder — a truncated stream
+    // dies here, where the script's tar would have died.
+    let Ok(file) = std::fs::File::open(archive).map(flate2::read::GzDecoder::new) else {
+        return Some(format!("could not extract {}", archive.display()));
+    };
+    let mut tarball = tar::Archive::new(file);
+    let Ok(entries) = tarball.entries() else {
+        return Some(format!("could not extract {}", archive.display()));
+    };
+    let mut payload = false;
+    for entry in entries {
+        let Ok(mut entry) = entry else {
+            return Some(format!("could not extract {}", archive.display()));
+        };
+        if std::io::copy(&mut entry, &mut std::io::sink()).is_err() {
+            return Some(format!("could not extract {}", archive.display()));
+        }
+        let is_payload = entry
+            .path()
+            .is_ok_and(|path| path.as_os_str() == std::ffi::OsStr::new(PAYLOAD_BINARY));
+        #[cfg(unix)]
+        let executable = entry.header().mode().unwrap_or(0) & 0o111 != 0;
+        #[cfg(not(unix))]
+        let executable = true;
+        if is_payload && executable {
+            payload = true;
+        }
+    }
+    if !payload {
+        return Some(format!(
+            "the tarball did not contain an executable {PAYLOAD_BINARY} payload"
+        ));
+    }
+    // The tar end marker does not prove the gzip footer: a stream cut
+    // inside its 8-byte trailer still ends the entries cleanly while a
+    // real `tar -xzf` dies on the incomplete decode — drain the rest of
+    // the decoder so the refusal matches the script's extraction.
+    if std::io::copy(&mut tarball.into_inner(), &mut std::io::sink()).is_err() {
+        return Some(format!("could not extract {}", archive.display()));
+    }
+    None
+}
+
+/// The payload binary's executability the script's rollback-source read
+/// requires (`-x ${generation}/${BINARY_NAME}`): the mode bits on unix,
+/// the file's presence on Windows (there `-x` reduces to the existing
+/// file).
+fn payload_is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
 /// The installed payload's version, read from the install marker's
 /// "version <v>" line.
 fn installed_version(prefix: &Path) -> Option<String> {
@@ -761,6 +904,166 @@ mod tests {
             !caller_owns_payload(&prefix),
             "a staged prefix never names this process's own image"
         );
+    }
+
+    /// The handoff's pre-validation mirrors the script's rollback-source
+    /// read: the LAST usable generations-record line wins, and a record
+    /// with no usable generation is the script's "nothing to roll back".
+    #[test]
+    fn kept_rollback_generation_reads_the_record_like_the_script() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let prefix = dir.path().join("prefix");
+        let share = prefix.join("share");
+        std::fs::create_dir_all(&share).unwrap();
+        assert_eq!(
+            kept_rollback_generation(&prefix),
+            None,
+            "no record: nothing kept"
+        );
+        let stale = share.join("prime-agent.old.100");
+        std::fs::create_dir_all(&stale).unwrap();
+        let usable = share.join("prime-agent.old.200");
+        let payload = usable.join(PAYLOAD_BINARY);
+        std::fs::create_dir_all(&usable).unwrap();
+        std::fs::write(&payload, b"payload").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = std::fs::metadata(&payload).unwrap().permissions();
+            permissions.set_mode(permissions.mode() | 0o755);
+            std::fs::set_permissions(&payload, permissions).unwrap();
+        }
+        std::fs::write(
+            usable.join(".prime-agent-install"),
+            "install-rust.sh channel beta\nversion 0.9.9-beta.10\n",
+        )
+        .unwrap();
+        let record = share.join(".prime-agent-install-generations");
+        std::fs::write(
+            &record,
+            format!("{}\n{}\n", stale.display(), usable.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            kept_rollback_generation(&prefix),
+            Some(usable),
+            "the last usable line wins"
+        );
+        std::fs::write(&record, format!("{}\n", stale.display())).unwrap();
+        assert_eq!(
+            kept_rollback_generation(&prefix),
+            None,
+            "no usable line: the refusal state"
+        );
+    }
+
+    /// The handoff's archive pre-validation mirrors the script's
+    /// `--archive` naming contract for this platform.
+    #[test]
+    fn archive_refusal_matches_the_script_naming_contract() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let alias = crate::update::install::current_platform_alias();
+        let good = dir
+            .path()
+            .join(format!("prime-agent-0.9.9-beta.10-{alias}.tar.gz"));
+        build_tar(&good, &[(PAYLOAD_BINARY, b"payload".as_slice(), 0o755)]);
+        assert_eq!(archive_refusal(&good), None);
+        let missing = dir
+            .path()
+            .join(format!("prime-agent-0.9.9-beta.11-{alias}.tar.gz"));
+        assert_eq!(
+            archive_refusal(&missing),
+            Some(format!(
+                "the release archive {} does not exist",
+                missing.display()
+            ))
+        );
+        let wrong_name = dir.path().join("payload.tgz");
+        std::fs::write(&wrong_name, b"archive").unwrap();
+        assert_eq!(
+            archive_refusal(&wrong_name),
+            Some(format!(
+                "payload.tgz is not a {alias} release archive (expected prime-agent-<version>-{alias}.tar.gz)"
+            ))
+        );
+        let wrong_version = dir
+            .path()
+            .join(format!("prime-agent-1.0.0 rc1-{alias}.tar.gz"));
+        std::fs::write(&wrong_version, b"archive").unwrap();
+        assert!(
+            archive_refusal(&wrong_version)
+                .is_some_and(|refusal| refusal.contains("invalid version")),
+            "a version outside [0-9A-Za-z.-] is refused"
+        );
+    }
+
+    /// A right-named archive still refuses synchronously when its
+    /// CONTENT cannot install (the handoff's pre-validation mirrors the
+    /// script's extraction): garbage bytes are the script's
+    /// `could not extract`, a valid tar without the payload entry is
+    /// its missing-payload refusal, and a real payload tarball passes.
+    #[test]
+    fn archive_refusal_checks_the_tarball_content() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let alias = crate::update::install::current_platform_alias();
+        let corrupt = dir.path().join(format!("prime-agent-9.9.9-{alias}.tar.gz"));
+        std::fs::write(&corrupt, b"this is not a tarball, just corrupt bytes").unwrap();
+        assert_eq!(
+            archive_refusal(&corrupt),
+            Some(format!("could not extract {}", corrupt.display()))
+        );
+        let empty = dir
+            .path()
+            .join(format!("prime-agent-9.9.9-b-{alias}.tar.gz"));
+        build_tar(&empty, &[]);
+        assert_eq!(
+            archive_refusal(&empty),
+            Some(format!(
+                "the tarball did not contain an executable {PAYLOAD_BINARY} payload"
+            ))
+        );
+        let payload = dir
+            .path()
+            .join(format!("prime-agent-9.9.9-c-{alias}.tar.gz"));
+        let mode = {
+            #[cfg(unix)]
+            {
+                0o755
+            }
+            #[cfg(not(unix))]
+            {
+                0o644
+            }
+        };
+        build_tar(&payload, &[(PAYLOAD_BINARY, b"payload".as_slice(), mode)]);
+        assert_eq!(archive_refusal(&payload), None);
+        // A stream cut inside the gzip footer: the tar entries ended
+        // cleanly, so only draining the decoder catches what
+        // `tar -xzf` would refuse.
+        let truncated = dir
+            .path()
+            .join(format!("prime-agent-9.9.9-d-{alias}.tar.gz"));
+        let bytes = std::fs::read(&payload).unwrap();
+        std::fs::write(&truncated, &bytes[..bytes.len() - 8]).unwrap();
+        assert_eq!(
+            archive_refusal(&truncated),
+            Some(format!("could not extract {}", truncated.display()))
+        );
+    }
+
+    /// Write `entries` (name, bytes, mode) as one gzipped tar archive.
+    fn build_tar(path: &Path, entries: &[(&str, &[u8], u32)]) {
+        let file = std::fs::File::create(path).unwrap();
+        let writer = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(writer);
+        for (name, bytes, mode) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(*mode);
+            header.set_cksum();
+            builder.append_data(&mut header, name, *bytes).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap();
     }
 
     /// Serve `body` over one plain HTTP request (the hermetic source the

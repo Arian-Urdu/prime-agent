@@ -366,8 +366,12 @@ impl IpythonKernelProvisioner {
                 let startup_progress = on_progress.clone();
                 let startup_memo = done_rx.clone();
                 tokio::spawn(async move {
-                    let boot =
-                        tokio::spawn(run_startup(inner.clone(), startup_progress, pending_stop));
+                    let boot = tokio::spawn(run_startup(
+                        inner.clone(),
+                        startup_progress,
+                        pending_stop,
+                        startup_memo.clone(),
+                    ));
                     let result = match boot.await {
                         Ok(result) => result,
                         Err(error) => {
@@ -640,7 +644,7 @@ impl IpythonKernelProvisioner {
             }
         }
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        let previous_stop = state.pending_stop.replace(stop_rx.clone());
+        let previous_stop = state.pending_stop.replace(stop_rx);
         // A gate armed with a directly-taken manager guards that manager's
         // shutdown, not a boot; only a gate armed for an in-flight boot is
         // joinable by the next stop of the same boot.
@@ -701,15 +705,27 @@ impl IpythonKernelProvisioner {
 fn emit_startup_progress(
     inner: &Arc<ProvisionerInner>,
     on_progress: Option<&KernelBootstrapProgressHandler>,
+    memo: &tokio::sync::watch::Receiver<Option<StartupResult>>,
     message: &str,
 ) {
     let mut state = inner
         .state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    state.last_startup_message = Some(message.to_string());
-    for listener in &state.startup_listeners {
-        listener(message);
+    // The shared stage belongs to the ACTIVE memo generation: a boot
+    // kill() invalidated must not overwrite the newer boot's replayed
+    // stage nor fire the newer generation's listeners with its own
+    // (the boot's own handler below is its caller's, not shared
+    // state, so it keeps firing).
+    if state
+        .startup
+        .as_ref()
+        .is_some_and(|armed| armed.same_channel(memo))
+    {
+        state.last_startup_message = Some(message.to_string());
+        for listener in &state.startup_listeners {
+            listener(message);
+        }
     }
     if let Some(on_progress) = on_progress {
         on_progress(message);
@@ -773,6 +789,7 @@ async fn run_startup(
     inner: Arc<ProvisionerInner>,
     on_progress: Option<KernelBootstrapProgressHandler>,
     pending_stop: Option<tokio::sync::watch::Receiver<bool>>,
+    memo: tokio::sync::watch::Receiver<Option<StartupResult>>,
 ) -> Result<(ReplKernelManager, u64), StartupFailure> {
     let started = std::time::Instant::now();
     let budget = std::time::Duration::from_millis(resolve_startup_budget_ms());
@@ -780,7 +797,7 @@ async fn run_startup(
     let mut attempt: u32 = 0;
     let outcome = loop {
         attempt += 1;
-        match start_kernel(&inner, on_progress.as_ref(), pending_stop.clone()).await {
+        match start_kernel(&inner, on_progress.as_ref(), pending_stop.clone(), &memo).await {
             Ok(manager) => break Ok(manager),
             Err(error) => {
                 if inner
@@ -800,6 +817,7 @@ async fn run_startup(
                 emit_startup_progress(
                     &inner,
                     on_progress.as_ref(),
+                    &memo,
                     &format!("Kernel start failed; retrying in {backoff_ms}ms…"),
                 );
                 tokio::select! {
@@ -830,6 +848,7 @@ async fn start_kernel(
     inner: &Arc<ProvisionerInner>,
     on_progress: Option<&KernelBootstrapProgressHandler>,
     pending_stop: Option<tokio::sync::watch::Receiver<bool>>,
+    memo: &tokio::sync::watch::Receiver<Option<StartupResult>>,
 ) -> anyhow::Result<ReplKernelManager> {
     let started = std::time::Instant::now();
     let cold = !inner
@@ -837,7 +856,7 @@ async fn start_kernel(
         .snapshot_dir
         .as_ref()
         .is_some_and(|dir| snapshot_path_in(dir).exists());
-    let result = start_kernel_impl(inner, on_progress, pending_stop).await;
+    let result = start_kernel_impl(inner, on_progress, pending_stop, memo).await;
     if let Some(report) = &inner.options.on_bootstrap_result {
         report(KernelBootstrapStats {
             cold,
@@ -856,6 +875,7 @@ async fn start_kernel_impl(
     inner: &Arc<ProvisionerInner>,
     on_progress: Option<&KernelBootstrapProgressHandler>,
     mut pending_stop: Option<tokio::sync::watch::Receiver<bool>>,
+    memo: &tokio::sync::watch::Receiver<Option<StartupResult>>,
 ) -> anyhow::Result<ReplKernelManager> {
     let options = &inner.options;
     let cwd = inner.cwd.clone();
@@ -873,6 +893,7 @@ async fn start_kernel_impl(
             emit_startup_progress(
                 inner,
                 on_progress,
+                memo,
                 "Waiting for the previous kernel to stop...",
             );
         }
@@ -921,7 +942,7 @@ async fn start_kernel_impl(
         stderr_log_path,
     });
 
-    emit_startup_progress(inner, on_progress, "Starting Python kernel...");
+    emit_startup_progress(inner, on_progress, memo, "Starting Python kernel...");
     // Only the process spawn + ready handshake contends for OS resources under
     // a fan-out, and it is bounded by start()'s own timeout — so the permit
     // covers only start(). Restore/bootstrap run per-kernel afterwards.
@@ -983,13 +1004,13 @@ async fn start_kernel_impl(
     let mut snapshot_existed = false;
     if let Some(dir) = &snapshot_dir {
         snapshot_existed = snapshot_path_in(dir).exists();
-        emit_startup_progress(inner, on_progress, "Restoring Python state...");
+        emit_startup_progress(inner, on_progress, memo, "Restoring Python state...");
         let restore = manager.restore_state().await;
         if snapshot_existed {
             pending_restore = Some(restore.unwrap_or_default());
         }
     }
-    emit_startup_progress(inner, on_progress, "Preparing Python runtime...");
+    emit_startup_progress(inner, on_progress, memo, "Preparing Python runtime...");
     // The bootstrap runs on the dispose signal (TS startKernel races every
     // boot stage against the dispose-linked abort): a dispose mid-bootstrap
     // settles the cell aborted, and the aborted-status arm below tears the

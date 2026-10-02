@@ -9,6 +9,10 @@
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
+// The whole target drives /bin/sh interpreter wrappers and unix-only
+// file permissions, so it stays off the windows cross-check (the same
+// gate the sibling kernel targets carry).
+#![cfg(unix)]
 
 //! Verifier integration tests for the revivable kernel stop (TS #2483's
 //! `stopKernel`): a snapshot-flushing stop that keeps the provisioner

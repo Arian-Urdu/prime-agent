@@ -9,6 +9,10 @@
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
+// The whole target drives /bin/sh interpreter wrappers and unix-only
+// file permissions, so it stays off the windows cross-check (the same
+// gate the sibling kernel targets carry).
+#![cfg(unix)]
 
 //! Verifier integration tests for the startup memo's generation contract
 //! and the provisioner's mid-boot lifecycle edges (all on the

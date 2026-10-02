@@ -489,6 +489,7 @@ impl IpythonKernelProvisioner {
                     {
                         state.startup = None;
                     }
+                    release_spent_stop_arm(&mut state, &startup_memo);
                 });
                 state.startup = Some(done_rx.clone());
                 done_rx
@@ -693,6 +694,11 @@ impl IpythonKernelProvisioner {
     pub fn kill(&self) {
         let manager = {
             let mut state = self.lock_state();
+            // The stop gate armed against the boot this kill invalidates
+            // is spent with it.
+            if let Some(armed_for) = state.startup.clone() {
+                release_spent_stop_arm(&mut state, &armed_for);
+            }
             state.startup = None;
             // The shared progress state belongs to the memo generation
             // kill() just invalidated: its own emits already skip shared
@@ -708,6 +714,78 @@ impl IpythonKernelProvisioner {
             manager.kill();
         }
     }
+}
+
+/// Release the stop gate armed for `memo`'s boot, if any. The arm's
+/// memo receiver is a strong handle to the settled result's manager, and
+/// a stale one keeps a parked-or-failed kernel alive past `stop_kernel()`,
+/// so a later failed shutdown's process would leak with it as the sole
+/// owner. Both spenders call this: the boot's settle and the `kill()` that
+/// invalidates the boot.
+fn release_spent_stop_arm(
+    state: &mut ProvisionerState,
+    memo: &tokio::sync::watch::Receiver<Option<StartupResult>>,
+) {
+    if state
+        .pending_stop_for_startup
+        .as_ref()
+        .is_some_and(|armed| armed.same_channel(memo))
+    {
+        state.pending_stop_for_startup = None;
+    }
+}
+
+/// The snapshot policy for a failed boot's teardown: the provisioner's
+/// dispose policy while the boot's memo generation is still armed, but
+/// NEVER a flush for a boot `kill()` invalidated — the replacement
+/// generation is already restoring from the same on-disk payload, and a
+/// failed doomed boot's teardown flushing over it would rewrite a healthy
+/// snapshot (and the kernel stderr log) out from under the new kernel.
+/// `dispose()` does not clear the memo, so a disposed boot keeps the
+/// dispose's own policy.
+///
+/// When the policy still flushes, this ALSO installs a pending-stop gate
+/// for the teardown's own flush — the decision and the gate share ONE
+/// lock scope, so a `kill()` landing between the decision and the flush
+/// still leaves the replacement boot gated on this teardown: it restores
+/// only after the flush settles (the same revival gate `stop_kernel`
+/// arms against its own flush). A stop actively armed for this boot
+/// already covers the flush (its task waits this boot's memo, which
+/// settles only after the teardown), so the gate stays untouched in
+/// that one case; any older, merely installed gate - including one long
+/// settled and left in place - covers nothing and is replaced. Hold the
+/// returned sender across the shutdown — the gate opens when the
+/// teardown scope drops it (a dead sender unblocks the waiters the same
+/// way a settled one does).
+#[must_use]
+fn hold_snapshot_flush_gate(
+    inner: &Arc<ProvisionerInner>,
+    memo: &tokio::sync::watch::Receiver<Option<StartupResult>>,
+) -> (bool, Option<tokio::sync::watch::Sender<bool>>) {
+    let mut state = inner
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let flush = state
+        .startup
+        .as_ref()
+        .is_some_and(|armed| armed.same_channel(memo))
+        && state.dispose_snapshot;
+    // A stop actively armed for THIS boot covers the teardown's flush
+    // through its own memo wait (the stop's task waits this boot's
+    // settle, which happens only after the teardown); a merely
+    // installed older gate - including one long settled and left in
+    // place - covers nothing, so this teardown's gate replaces it.
+    let covered_by_active_stop = state
+        .pending_stop_for_startup
+        .as_ref()
+        .is_some_and(|armed_for| armed_for.same_channel(memo));
+    if !flush || covered_by_active_stop {
+        return (flush, None);
+    }
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    state.pending_stop = Some(gate_rx);
+    (flush, Some(gate_tx))
 }
 
 /// The boot's memo is still the armed startup generation AND the
@@ -998,13 +1076,7 @@ async fn start_kernel_impl(
         // Never leak the kernel process if startup fails after spawn — and
         // never surface the failure before the teardown (final snapshot flush
         // included) finished.
-        let snapshot_policy = {
-            inner
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .dispose_snapshot
-        };
+        let (snapshot_policy, _teardown_gate) = hold_snapshot_flush_gate(inner, memo);
         let _ = manager
             .shutdown(KernelShutdownOptions {
                 snapshot: snapshot_policy,
@@ -1063,13 +1135,7 @@ async fn start_kernel_impl(
             // The cell completed, but the provisioner was disposed under it:
             // the same teardown as the aborted-status arm, with the honest
             // disposed-startup cause (TS startKernel's abort error).
-            let snapshot_policy = {
-                inner
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .dispose_snapshot
-            };
+            let (snapshot_policy, _teardown_gate) = hold_snapshot_flush_gate(inner, memo);
             let _ = manager
                 .shutdown(KernelShutdownOptions {
                     snapshot: snapshot_policy,
@@ -1126,13 +1192,7 @@ async fn start_kernel_impl(
                 .join("\n");
             // TS startKernel's catch shuts the failed boot down with the
             // dispose snapshot policy (default true), not `false`.
-            let snapshot_policy = {
-                inner
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .dispose_snapshot
-            };
+            let (snapshot_policy, _teardown_gate) = hold_snapshot_flush_gate(inner, memo);
             let _ = manager
                 .shutdown(KernelShutdownOptions {
                     snapshot: snapshot_policy,
@@ -1144,13 +1204,7 @@ async fn start_kernel_impl(
             ));
         }
         Err(error) => {
-            let snapshot_policy = {
-                inner
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .dispose_snapshot
-            };
+            let (snapshot_policy, _teardown_gate) = hold_snapshot_flush_gate(inner, memo);
             let _ = manager
                 .shutdown(KernelShutdownOptions {
                     snapshot: snapshot_policy,
@@ -1203,6 +1257,165 @@ pub fn provisioner_for_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_spent_stop_arm_releases_only_its_own_boot() {
+        let provisioner = IpythonKernelProvisioner::new(
+            PathBuf::from("/tmp"),
+            IpythonKernelProvisionerOptions::default(),
+        );
+        let (armed_tx, armed_rx) = tokio::sync::watch::channel(None::<StartupResult>);
+        let (other_tx, other_rx) = tokio::sync::watch::channel(None::<StartupResult>);
+        drop((armed_tx, other_tx));
+        {
+            let mut state = provisioner.lock_state();
+            state.pending_stop_for_startup = Some(armed_rx.clone());
+            release_spent_stop_arm(&mut state, &other_rx);
+            assert!(
+                state.pending_stop_for_startup.is_some(),
+                "an arm armed for a different boot is not spent by this boot's settle"
+            );
+            release_spent_stop_arm(&mut state, &armed_rx);
+            assert!(
+                state.pending_stop_for_startup.is_none(),
+                "the arm armed for this boot is spent by its settle"
+            );
+        }
+    }
+
+    #[test]
+    fn kill_releases_the_stop_arm_armed_for_the_killed_boot() {
+        let provisioner = IpythonKernelProvisioner::new(
+            PathBuf::from("/tmp"),
+            IpythonKernelProvisionerOptions::default(),
+        );
+        let (memo_tx, memo_rx) = tokio::sync::watch::channel(None::<StartupResult>);
+        drop(memo_tx);
+        {
+            let mut state = provisioner.lock_state();
+            state.startup = Some(memo_rx.clone());
+            state.pending_stop_for_startup = Some(memo_rx);
+        }
+        provisioner.kill();
+        let state = provisioner.lock_state();
+        assert!(state.startup.is_none(), "kill() invalidates the memo");
+        assert!(
+            state.pending_stop_for_startup.is_none(),
+            "kill() releases the stop arm armed for the boot it invalidates"
+        );
+    }
+
+    #[test]
+    fn a_doomed_boot_teardown_never_flushes_a_snapshot() {
+        let provisioner = IpythonKernelProvisioner::new(
+            PathBuf::from("/tmp"),
+            IpythonKernelProvisionerOptions::default(),
+        );
+        let (memo_tx, memo_rx) = tokio::sync::watch::channel(None::<StartupResult>);
+        drop(memo_tx);
+        // A live boot's failed teardown keeps the dispose policy (true by
+        // default) and installs the revival gate for its own flush: a
+        // replacement boot that arms after this decision restores only
+        // after the flush settles.
+        {
+            let mut state = provisioner.lock_state();
+            state.startup = Some(memo_rx.clone());
+        }
+        let (flushes, gate) = hold_snapshot_flush_gate(&provisioner.inner, &memo_rx);
+        assert!(flushes);
+        assert!(
+            provisioner.lock_state().pending_stop.is_some(),
+            "a flushing teardown gates the revival on its own flush"
+        );
+        assert!(!provisioner
+            .lock_state()
+            .pending_stop
+            .as_ref()
+            .is_some_and(|g| *g.borrow()));
+        drop(gate);
+        // A boot kill() invalidated must never flush: the replacement
+        // generation is already restoring the same on-disk payload.
+        provisioner.kill();
+        {
+            let mut state = provisioner.lock_state();
+            state.pending_stop = None;
+        }
+        let (flushes, gate) = hold_snapshot_flush_gate(&provisioner.inner, &memo_rx);
+        assert!(!flushes);
+        assert!(gate.is_none());
+        assert!(
+            provisioner.lock_state().pending_stop.is_none(),
+            "a doomed teardown installs no gate"
+        );
+        // A disposed boot keeps the dispose's own policy (dispose does not
+        // clear the memo) and gates the same way.
+        let (disposed_tx, disposed_rx) = tokio::sync::watch::channel(None::<StartupResult>);
+        drop(disposed_tx);
+        {
+            let mut state = provisioner.lock_state();
+            state.startup = Some(disposed_rx.clone());
+            state.disposed = true;
+        }
+        let (flushes, gate) = hold_snapshot_flush_gate(&provisioner.inner, &disposed_rx);
+        assert!(flushes);
+        assert!(gate.is_some());
+        drop(gate);
+        {
+            let mut state = provisioner.lock_state();
+            state.dispose_snapshot = false;
+        }
+        let (flushes, gate) = hold_snapshot_flush_gate(&provisioner.inner, &disposed_rx);
+        assert!(!flushes);
+        assert!(gate.is_none());
+        // A stop actively armed for THIS boot covers the flush through its
+        // own memo wait (it settles only after this teardown): the
+        // teardown leaves that stop's gate untouched.
+        let (armed_tx, armed_rx) = tokio::sync::watch::channel(false);
+        {
+            let mut state = provisioner.lock_state();
+            state.dispose_snapshot = true;
+            state.pending_stop = Some(armed_rx.clone());
+            state.pending_stop_for_startup = Some(disposed_rx.clone());
+        }
+        let (flushes, gate) = hold_snapshot_flush_gate(&provisioner.inner, &disposed_rx);
+        assert!(flushes);
+        assert!(
+            gate.is_none(),
+            "an active stop armed for this boot covers the teardown flush"
+        );
+        assert!(
+            provisioner
+                .lock_state()
+                .pending_stop
+                .as_ref()
+                .is_some_and(|g| g.same_channel(&armed_rx)),
+            "the active stop's gate survives the teardown decision"
+        );
+        drop(armed_tx);
+        // A merely installed, long-settled older gate covers nothing:
+        // the teardown gate replaces it, or a kill() racing the teardown
+        // would leave the replacement boot restoring against this
+        // teardown's flush.
+        {
+            let mut state = provisioner.lock_state();
+            state.pending_stop_for_startup = None;
+        }
+        let (flushes, gate) = hold_snapshot_flush_gate(&provisioner.inner, &disposed_rx);
+        assert!(flushes);
+        assert!(
+            gate.is_some(),
+            "a stale settled gate must not suppress the teardown gate"
+        );
+        assert!(
+            !provisioner
+                .lock_state()
+                .pending_stop
+                .as_ref()
+                .is_some_and(|g| g.same_channel(&armed_rx)),
+            "the stale gate is replaced"
+        );
+        drop(gate);
+    }
 
     #[test]
     fn boot_concurrency_defaults_and_override() {

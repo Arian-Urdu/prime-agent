@@ -56,21 +56,23 @@ pub struct RouterSegmentOptions {
 /// `default_cwd`), because `current_dir` on a raw relative path resolves
 /// against the host process cwd and the two differ in a daemon worker
 /// switched onto another session: the adapter would run in the wrong
-/// place (#3184 review). A declared cwd stays raw when the session
-/// declares no working directory: there is nothing to resolve against, so
-/// it keeps the host-process semantics of the TS `spawn` default.
+/// place (#3184 review). An empty declared cwd is omitted, not a path
+/// (the TS segment seam's truthiness spread, `cwd ? { cwd } : {}`):
+/// models often emit `""` for optional fields, and `current_dir` on an
+/// empty path fails the spawn, so the run falls back to the session
+/// working directory (#3184 review). A declared cwd stays raw when the
+/// session declares no working directory: there is nothing to resolve
+/// against, so it keeps the host-process semantics of the TS `spawn`
+/// default.
 fn resolve_adapter_cwd(declared: Option<&str>, session: Option<&str>) -> Option<String> {
+    let declared = declared.filter(|declared| !declared.is_empty());
     match (declared, session) {
-        (Some(declared), Some(session))
-            if !declared.is_empty() && !Path::new(declared).is_absolute() =>
-        {
-            Some(
-                Path::new(session)
-                    .join(declared)
-                    .to_string_lossy()
-                    .into_owned(),
-            )
-        }
+        (Some(declared), Some(session)) if !Path::new(declared).is_absolute() => Some(
+            Path::new(session)
+                .join(declared)
+                .to_string_lossy()
+                .into_owned(),
+        ),
         (Some(declared), _) => Some(declared.to_string()),
         (None, session) => session.map(str::to_string),
     }

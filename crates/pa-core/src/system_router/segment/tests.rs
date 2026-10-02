@@ -250,6 +250,47 @@ async fn a_relative_adapter_cwd_joins_the_session_working_directory() {
     assert_eq!(actual, expected);
 }
 
+/// An empty declared adapter cwd (`""`) is treated as omitted, not as a
+/// path: models often emit `""` for optional fields, and the TS reference
+/// drops it at the segment seam (`spec.environment.stdio.cwd ? { cwd }
+/// : {}`), so the run falls back to the session working directory instead
+/// of failing the spawn (`Command::current_dir` on an empty path errors,
+/// #3184 review).
+#[tokio::test]
+async fn an_empty_adapter_cwd_is_treated_as_omitted() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("adapter-cwd.txt");
+    let command = format!("pwd > {} ; exit 0", marker.display());
+    let payload = json!({
+        "goal": "reach the overworld",
+        "timeoutMs": 2_000,
+        "actions": { "look": { "description": "Look." } },
+        "environment": {
+            "stdio": { "command": ["sh", "-c", command], "cwd": "" }
+        }
+    });
+    let spec = parse_system_router_run_spec(&payload).unwrap();
+    let options = RouterSegmentOptions {
+        model: action_model(),
+        api_key: Some("test-key".to_string()),
+        headers: None,
+        session_id: None,
+        policy: crate::session_engine::provider_retry::DEFAULT_PROVIDER_RETRY_POLICY,
+        env: None,
+        decide: Some(support::scripted_decide(vec![])),
+        default_cwd: Some(dir.path().to_string_lossy().into_owned()),
+        signal: None,
+    };
+    // The adapter cannot speak the protocol, so the segment fails after the
+    // shell wrote its cwd.
+    let _ = run_router_segment(&spec, options).await;
+    let written = std::fs::read_to_string(&marker)
+        .expect("the empty declared cwd fell back to the session working directory");
+    let expected = std::fs::canonicalize(dir.path()).unwrap();
+    let actual = std::fs::canonicalize(written.trim()).unwrap();
+    assert_eq!(actual, expected);
+}
+
 /// An absolute declared adapter cwd wins as-is: the session working
 /// directory is only the anchor for relative paths and the undeclared
 /// default, never an override.

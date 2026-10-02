@@ -631,20 +631,30 @@ migrated_note=""
 # below, and a refused check dies before the full trap is armed — so with
 # either check knob set this run's every exit also cleans the staging.
 if [ "${PRIME_AGENT_ROLLBACK_CHECK:-}" = "1" ] || [ "${PRIME_AGENT_ARCHIVE_CHECK:-}" = "1" ]; then
-  # The stage rides too: an abort during the archive check's extraction
-  # must leave no staged tree under the prefix. `stage` is INITIALIZED
-  # here — a caller-exported `stage` in this run's environment would
-  # otherwise be the trap's target (an inherited "$HOME" would be
-  # rm-rf'd); the empty init keeps the trap pointed only at what THIS
-  # script later assigns (a rollback check assigns nothing — the sweep
-  # is a no-op).
-  stage=""
+  # The stage rides too (an abort during the archive check's extraction
+  # must leave no staged tree under the prefix); `stage` is initialized
+  # before the traps, so the sweep targets only what THIS script assigns.
   trap 'ui_stop; rm -rf "${dl:-}" "${stage:-}"' EXIT
 else
   trap 'ui_stop; rm -rf "$dl"' EXIT
 fi
+stage=""
 ui_interrupted() {
+  # The failed-step line prints FIRST: it writes the renderer's files
+  # under the download staging, and removing that mid-write would fail
+  # the UI's own teardown. Then the interrupted install leaves nothing
+  # behind it would not own — the download staging always, and the
+  # extraction stage when THIS run created it (a rollback's stage is the
+  # KEPT generation itself, never this run's trash to delete; the guard
+  # matches the cleanup trap's). `stage` is INITIALIZED to empty above —
+  # before any trap can fire — so a caller-exported `stage` in this run's
+  # environment is never the removal's target.
   if [ -n "$ui_step" ]; then step_fail "$ui_step" "interrupted"; fi
+  ui_stop
+  rm -rf "$dl"
+  if [ -z "${rollback_from:-}" ] && [ -n "${stage:-}" ]; then
+    rm -rf "$stage"
+  fi
 }
 trap 'ui_interrupted; exit 130' INT
 trap 'ui_interrupted; exit 143' HUP TERM
@@ -2036,6 +2046,7 @@ else
 probe_out="$dl/.version-probe.out"
 probe_done="$dl/.version-probe.done"
 probe_pid_file="$dl/.version-probe.pid"
+probe_status="$dl/.version-probe.status"
 rm -f "$probe_out" "$probe_done" "$probe_pid_file"
 # The runner: the payload is ITS child (a sibling's `wait` cannot reap
 # another shell's child), and `kill -0` keeps succeeding on a ZOMBIE, so
@@ -2046,7 +2057,13 @@ rm -f "$probe_out" "$probe_done" "$probe_pid_file"
 (
   "${stage}/${BINARY_NAME}" --version >"$probe_out" 2>/dev/null &
   printf '%s\n' "$!" >"$probe_pid_file"
-  wait || true
+  # The probe's OWN status rides a file (set -e would take the wait's
+  # nonzero as an abort): the version line AND a successful exit are the
+  # answer — a payload that prints the right version then fails its own
+  # --version invocation is not a working launcher.
+  probe_status_val=0
+  wait "$!" || probe_status_val=$?
+  printf '%s\n' "$probe_status_val" >"$probe_status"
   printf 'done\n' >"$probe_done"
 ) &
 probe_runner=$!
@@ -2079,7 +2096,7 @@ done
 # wait's status aborts the installer under set -e.
 wait "$probe_runner" 2>/dev/null || true
 if [ -n "$probe_timed_out" ]; then
-  rm -f "$probe_out" "$probe_done" "$probe_pid_file"
+  rm -f "$probe_out" "$probe_done" "$probe_pid_file" "$probe_status"
   # The stage goes too: this die predates the full cleanup trap's arming
   # (the mismatch refusal below sweeps its own stage the same way), so a
   # hung payload on a normal install leaves no staging tree behind.
@@ -2087,7 +2104,12 @@ if [ -n "$probe_timed_out" ]; then
   die "the archive names ${VERSION} but its payload did not answer --version within 10s; refusing an unresponsive payload"
 fi
 reported_version="$(head -n 1 "$probe_out" 2>/dev/null)"
-rm -f "$probe_out" "$probe_done" "$probe_pid_file"
+probe_exit_status="$(cat "$probe_status" 2>/dev/null || true)"
+rm -f "$probe_out" "$probe_done" "$probe_pid_file" "$probe_status"
+if [ "$probe_exit_status" != "0" ]; then
+  rm -rf "$stage"
+  die "the archive names ${VERSION} but its payload's --version invocation failed (exit ${probe_exit_status}); refusing an unusable launcher"
+fi
 # The continuous-build stamp rides the reported version, not the name
 # (assemble_artifacts.py stages a package.json reporting
 # <version>-continuous.<sha> while the archive name keeps the bare

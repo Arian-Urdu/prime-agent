@@ -2010,20 +2010,29 @@ if [ ! -x "${stage}/${BINARY_NAME}" ]; then
   rm -rf "$stage"
   die "the tarball did not contain an executable ${BINARY_NAME} payload"
 fi
-# The archive's name is the version contract: the marker records it and the
-# rollback later reports it, so the payload's own --version must agree — a
-# mis-named archive would publish a marker that lies about its payload
-# (the version pin and the channel tarballs carry the matching build by
-# construction, so this refuses only the operator's mis-naming). The probe
-# is BOUNDED by a portable watchdog — NOT the `timeout` command: on
-# Windows `timeout` on PATH is timeout.exe, which waits instead of running
-# a command and would refuse every probe, and macOS ships no GNU timeout
-# at all. A payload whose --version blocks is killed at the bound and
-# reports nothing (the refusal below, not a hang).
+# --ARCHIVE ONLY: the archive's name is the version contract (the marker
+# records it and the rollback later reports it), so the payload's own
+# --version must agree — a mis-named archive would publish a marker that
+# lies about its payload. The CHANNEL install is out of scope by design:
+# its tarball already passed the manifest's sha256 gate (the row's exact
+# checksum for this exact version), so the channel's integrity needs no
+# second opinion — and a probe there would add a new failure mode (a
+# cold-start binary slower than the bound) the pre-existing flow never
+# had. The probe is BOUNDED by a portable watchdog — NOT the `timeout`
+# command: on Windows `timeout` on PATH is timeout.exe, which waits
+# instead of running a command and would refuse every probe, and macOS
+# ships no GNU timeout at all. A payload whose --version blocks is
+# killed at the bound and reports nothing (the refusal below, not a
+# hang).
 # The probe's files ride the run's OWN download staging, never the
 # payload-writable stage: an extracted archive could forge a done marker
 # where the loop looks and hang past the bound (the trailing wait would
 # block on the hanging payload forever).
+if [ "$MODE" != "archive" ]; then
+  # The channel install publishes without the name probe (see the block
+  # comment above); the stage continues to the marker write.
+  :
+else
 probe_out="$dl/.version-probe.out"
 probe_done="$dl/.version-probe.done"
 probe_pid_file="$dl/.version-probe.pid"
@@ -2101,6 +2110,7 @@ case "$reported_version" in
     die "the archive names ${VERSION} but its payload reports ${reported_version:-nothing}; rename the archive or publish it under its real version"
     ;;
 esac
+fi
 # THE ARCHIVE PRE-FLIGHT (the rollback pre-flight's sibling): with the knob
 # set, the validated stage is the whole answer — every extraction check
 # (the tar, the payload, the version) passed — so the run stops here, the

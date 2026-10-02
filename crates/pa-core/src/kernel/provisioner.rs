@@ -195,7 +195,14 @@ enum StopArm {
         manager: Option<ReplKernelManager>,
         startup: Option<tokio::sync::watch::Receiver<Option<StartupResult>>>,
         stop_tx: tokio::sync::watch::Sender<bool>,
-        stop_rx: tokio::sync::watch::Receiver<bool>,
+        /// The gate this arm superseded. The stop task waits it before
+        /// opening its own, so a revival gated on this stop's gate can
+        /// never cross before the superseded stop's final snapshot flush
+        /// settles; and because every task waits only a gate OLDER than
+        /// its own arm, the waits cannot form a cycle (the
+        /// wait-the-installed-gate shape admitted both the missed
+        /// supersede window and a three-task deadlock).
+        previous_stop: Option<tokio::sync::watch::Receiver<bool>>,
     },
 }
 
@@ -385,14 +392,22 @@ impl IpythonKernelProvisioner {
                             .state
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        state.startup_listeners.clear();
-                        state.last_startup_message = None;
+                        let mine = state
+                            .startup
+                            .as_ref()
+                            .is_some_and(|memo| memo.same_channel(&startup_memo));
+                        // The listener state belongs to the ACTIVE memo
+                        // generation: a doomed boot settling against a
+                        // newer memo must not wipe the newer boot's
+                        // progress listeners or its replayed stage. With
+                        // no memo armed at all the entries are stale
+                        // (their waiters already hold results) - clear.
+                        if mine || state.startup.is_none() {
+                            state.startup_listeners.clear();
+                            state.last_startup_message = None;
+                        }
                         match result {
                             Ok((manager, duration_ms)) => {
-                                let mine = state
-                                    .startup
-                                    .as_ref()
-                                    .is_some_and(|memo| memo.same_channel(&startup_memo));
                                 if state.disposed {
                                     Settle::TearDownForDispose {
                                         manager,
@@ -552,7 +567,8 @@ impl IpythonKernelProvisioner {
                 manager,
                 startup,
                 stop_tx,
-                stop_rx,
+                previous_stop,
+                ..
             } => {
                 let inner = Arc::clone(&self.inner);
                 let stop = tokio::spawn(async move {
@@ -576,24 +592,18 @@ impl IpythonKernelProvisioner {
                                 drain_host_requests: true,
                             })
                             .await;
-                    } else {
-                        // Lost the manager take (a concurrent direct stop
-                        // already owns the kernel): the shutdown this gate
-                        // promises is the winner's. Wait for the currently
-                        // armed gate before opening ours, so a revival
-                        // joined to OUR gate still cannot cross before
-                        // the winner's flush settles.
-                        let installed = inner
-                            .state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .pending_stop
-                            .clone();
-                        if let Some(mut gate) = installed {
-                            if !gate.same_channel(&stop_rx) {
-                                let _ = gate.wait_for(|done| *done).await;
-                            }
-                        }
+                    }
+                    // Chained gate (the #3257 shape, kept under the join):
+                    // open ours only after the gate THIS arm superseded
+                    // settles - never the currently-installed one. A
+                    // revival gated on ours then cannot cross before the
+                    // superseded stop's final snapshot flush, whether this
+                    // task shut its own kernel down or lost the manager
+                    // take to the stop that gate belongs to; and because
+                    // each task waits only a strictly older gate, the
+                    // waits cannot form a cycle.
+                    if let Some(mut previous) = previous_stop {
+                        let _ = previous.wait_for(|done| *done).await;
                     }
                     let _ = stop_tx.send(true);
                 });
@@ -630,7 +640,7 @@ impl IpythonKernelProvisioner {
             }
         }
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        state.pending_stop = Some(stop_rx.clone());
+        let previous_stop = state.pending_stop.replace(stop_rx.clone());
         // A gate armed with a directly-taken manager guards that manager's
         // shutdown, not a boot; only a gate armed for an in-flight boot is
         // joinable by the next stop of the same boot.
@@ -643,7 +653,7 @@ impl IpythonKernelProvisioner {
             manager,
             startup,
             stop_tx,
-            stop_rx,
+            previous_stop,
         }
     }
 

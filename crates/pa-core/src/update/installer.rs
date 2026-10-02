@@ -236,7 +236,10 @@ pub async fn run_installer_from(
 
 /// Run the bundled `install-rust.sh` with `args` (`--rollback`, or `--archive
 /// <path>`) against the install under `prefix`. On success the version is
-/// the one the published payload's install marker records.
+/// the one the published payload's install marker records — except on the
+/// Windows payload handoff, where the caller IS the locked payload: the
+/// child is spawned detached and no version is read (the installer's own
+/// streamed output carries the outcome).
 ///
 /// # Errors
 /// Returns the failure message when the script cannot be written or run,
@@ -248,6 +251,42 @@ pub async fn run_bundled_installer(
     let script = write_script(BUNDLED_INSTALLER.as_bytes()).map_err(|error| UpdateFailure {
         message: format!("could not write the bundled installer: {error:#}"),
     })?;
+    #[cfg(windows)]
+    if caller_owns_payload(prefix) {
+        // THE HANDOFF (Windows rename rule): this process's image sits inside
+        // <prefix>/share/prime-agent and Windows refuses to rename a directory
+        // that contains a running image, so the script's publish step can only
+        // succeed after this process exits. The child is spawned without
+        // waiting and inherits the terminal, so the installer's own steps and
+        // error messages still print there. The script rides the child's stdin
+        // (`bash -s --`, the curl|sh one-liner's own invocation form), so the
+        // temp file's name is removed the moment the child holds its handle —
+        // nothing of this run outlives the process, not even on a failed
+        // spawn (std opens with FILE_SHARE_DELETE; a failure leaves nobody
+        // reading and the removal is the same). The caller returns
+        // immediately; the outcome rides the installer's own output.
+        let file = std::fs::File::open(&script).map_err(|error| {
+            let _ = std::fs::remove_file(&script);
+            UpdateFailure {
+                message: format!("could not run the installer: {error}"),
+            }
+        })?;
+        let mut command = installer_child(prefix, None).map_err(|error| {
+            let _ = std::fs::remove_file(&script);
+            error
+        })?;
+        command
+            .arg("-s")
+            .arg("--")
+            .args(args)
+            .stdin(std::process::Stdio::from(file));
+        let spawned = command.spawn();
+        let _ = std::fs::remove_file(&script);
+        spawned.map_err(|error| UpdateFailure {
+            message: format!("could not run the installer: {error}"),
+        })?;
+        return Ok(Installed { version: None });
+    }
     let result = execute_script(&script, args, prefix, None, InstallerOutput::Inherit).await;
     let _ = std::fs::remove_file(&script);
     result?;
@@ -282,6 +321,27 @@ pub fn running_installer_prefix() -> Option<PathBuf> {
     #[cfg(not(windows))]
     let exe = exe.canonicalize().ok()?;
     installer_prefix_of(&exe)
+}
+
+/// True when this process's own image is the payload binary of `prefix`
+/// (`<prefix>/share/prime-agent/prime-agent.exe` with the install marker):
+/// the Windows rename rule — a running image locks its directory, so an
+/// installer child can only publish this payload after this process exits.
+/// On unix a rename never fights a running image, so the answer is false.
+#[must_use]
+pub fn caller_owns_payload(prefix: &Path) -> bool {
+    #[cfg(not(windows))]
+    {
+        let _ = prefix;
+        false
+    }
+    #[cfg(windows)]
+    {
+        // The same helper the CLI read its prefix from: both sides then
+        // spell the path identically (canonicalizing here would answer
+        // the \\?\ verbatim form the prefix never equals).
+        running_installer_prefix().is_some_and(|self_prefix| self_prefix == prefix)
+    }
 }
 
 /// The installed payload's version, read from the install marker's
@@ -358,26 +418,25 @@ fn write_script(bytes: &[u8]) -> Result<PathBuf> {
     Ok(script)
 }
 
-/// Exec the downloaded script (`/bin/sh`, the same interpreter the
-/// curl|sh one-liner uses, at the trusted absolute path so a poisoned
-/// `PATH` cannot substitute the interpreter that runs the installer with
-/// the inherited environment) and wait for it. The install prefix rides
-/// the child's environment as the installer's own knob, so the script
-/// publishes exactly where the probe looks — every other
+/// Build the installer's child command: the trusted interpreter and the
+/// installer's env knobs (the script and its args are the caller's —
+/// [`execute_script`] passes them as the child's arguments, and the
+/// Windows handoff rides the script over the child's stdin), so both
+/// wait modes ([`execute_script`]) and the handoff spawn this same
+/// command. The trusted absolute interpreter (`/bin/sh`, the same
+/// interpreter the curl|sh one-liner uses, at the trusted absolute path
+/// so a poisoned `PATH` cannot substitute the interpreter that runs the
+/// installer with the inherited environment), with the install prefix
+/// riding the child's environment as the installer's own knob, so the
+/// script publishes exactly where the probe looks — every other
 /// `PRIME_AGENT_RUST_*` knob passes through untouched.
-/// The script's own die messages already streamed with
-/// [`InstallerOutput::Inherit`]; with [`InstallerOutput::Capture`] the
-/// tail becomes the failure message.
 ///
 /// # Errors
-/// Returns the failure when the script cannot start or exits nonzero.
-async fn execute_script(
-    script: &Path,
-    args: &[&std::ffi::OsStr],
+/// Returns the failure when the trusted interpreter cannot be resolved.
+fn installer_child(
     prefix: &Path,
     channel: Option<&'static str>,
-    output: InstallerOutput,
-) -> std::result::Result<(), UpdateFailure> {
+) -> std::result::Result<tokio::process::Command, UpdateFailure> {
     // The interpreter: the trusted absolute /bin/sh on unix (never
     // PATH-resolved, so a poisoned PATH cannot substitute the interpreter
     // that runs the installer with the inherited credentials); on Windows
@@ -409,13 +468,33 @@ async fn execute_script(
     #[cfg(not(windows))]
     let shell = "/bin/sh";
     let mut command = tokio::process::Command::new(shell);
-    command.arg(script).args(args).env(ENV_PREFIX, prefix);
+    command.env(ENV_PREFIX, prefix);
     // The requested channel wins; otherwise the update stays on the channel
     // the install marker records (the fetched script's own default is the
     // stable render, so a beta install would silently switch channels).
     if let Some(channel) = channel.or_else(|| installed_channel(prefix)) {
         command.env(ENV_RELEASE_CHANNEL, channel);
     }
+    Ok(command)
+}
+
+/// Exec the script and wait for it: [`installer_child`]'s command plus
+/// the script and its args as the child's arguments. The script's own
+/// die messages already streamed with [`InstallerOutput::Inherit`];
+/// with [`InstallerOutput::Capture`] the tail becomes the failure
+/// message.
+///
+/// # Errors
+/// Returns the failure when the script cannot start or exits nonzero.
+async fn execute_script(
+    script: &Path,
+    args: &[&std::ffi::OsStr],
+    prefix: &Path,
+    channel: Option<&'static str>,
+    output: InstallerOutput,
+) -> std::result::Result<(), UpdateFailure> {
+    let mut command = installer_child(prefix, channel)?;
+    command.arg(script).args(args);
     match output {
         InstallerOutput::Inherit => {
             let status = command.status().await.map_err(|error| UpdateFailure {
@@ -631,6 +710,51 @@ mod tests {
         assert_eq!(
             installer_prefix_of(&prefix.join("releases/0.9.8/prime-agent")),
             None
+        );
+    }
+
+    /// The handoff gate never opens on unix: a rename never fights a
+    /// running image, so the local operations always wait for the
+    /// installer — even a fully staged, marker-bearing payload prefix
+    /// stays closed (the platform alone decides).
+    #[test]
+    #[cfg(not(windows))]
+    fn caller_owns_payload_stays_false_for_a_staged_prefix_on_unix() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let prefix = dir.path().join("prefix");
+        let payload = prefix.join("share/prime-agent");
+        std::fs::create_dir_all(&payload).unwrap();
+        std::fs::write(
+            payload.join(".prime-agent-install"),
+            "install-rust.sh channel beta\nversion 0.9.9-beta.10\n",
+        )
+        .unwrap();
+        assert!(
+            !caller_owns_payload(&prefix),
+            "unix renames never fight a running image"
+        );
+    }
+
+    /// The handoff gate opens only when the marker-bearing payload path
+    /// IS this process's own image: the test binary never runs from a
+    /// payload dir, so even a fully staged prefix stays closed on
+    /// Windows — the true arm needs a real self-installed run (the e2e
+    /// covers the wait path).
+    #[test]
+    #[cfg(windows)]
+    fn caller_owns_payload_needs_the_running_image_on_windows() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let prefix = dir.path().join("prefix");
+        let payload = prefix.join("share/prime-agent");
+        std::fs::create_dir_all(&payload).unwrap();
+        std::fs::write(
+            payload.join(".prime-agent-install"),
+            "install-rust.sh channel beta\nversion 0.9.9-beta.10\n",
+        )
+        .unwrap();
+        assert!(
+            !caller_owns_payload(&prefix),
+            "a staged prefix never names this process's own image"
         );
     }
 

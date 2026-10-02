@@ -150,8 +150,25 @@ pub fn run_local(prefix: &std::path::Path, archive: Option<&std::path::Path>) ->
         eprintln!("Error: could not start the update runtime.");
         return 1;
     };
+    #[cfg(windows)]
+    let handed_off = installer::caller_owns_payload(prefix);
+    #[cfg(windows)]
+    if handed_off {
+        println!(
+            "the {} continues in the background after this command exits — Windows only releases the payload once this process does",
+            if archive.is_some() { "archive install" } else { "rollback" }
+        );
+    }
     match runtime.block_on(installer::run_bundled_installer(prefix, &args)) {
         Ok(installed) => {
+            #[cfg(windows)]
+            if handed_off {
+                // The handed-off child prints its own outcome to the
+                // inherited terminal after this process exits; this
+                // process never saw the landed version, so the "rolled
+                // back to" line would lie.
+                return 0;
+            }
             let done = if archive.is_some() {
                 "installed"
             } else {

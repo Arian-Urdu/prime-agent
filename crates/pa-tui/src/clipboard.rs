@@ -300,7 +300,8 @@ pub(crate) fn copy_to_clipboard(text: &str, sink: &mut OscSink) -> Result<CopyOu
 }
 
 fn copy_with_env(text: &str, sink: &mut OscSink, env: &Env) -> Result<CopyOutcome, String> {
-    let copied = if matches!(sink, OscSink::Buffer(_)) {
+    let remote = is_remote_session(env);
+    let copied = if matches!(sink, OscSink::Buffer(_)) || remote {
         false
     } else {
         match std::env::consts::OS {
@@ -309,8 +310,7 @@ fn copy_with_env(text: &str, sink: &mut OscSink, env: &Env) -> Result<CopyOutcom
             _ => copy_on_linux(text, env),
         }
     };
-    let remote = is_remote_session(env);
-    if copied && !remote {
+    if copied {
         return Ok(CopyOutcome::Confirmed);
     }
     if matches!(sink, OscSink::Stdout) && std::env::var_os("TMUX").is_some() {
@@ -384,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_session_emits_osc52_even_after_a_tool_copy() {
+    fn a_remote_session_emits_osc52_without_local_tools() {
         let mut sink = OscSink::Buffer(Vec::new());
         let env = Env::scripted([
             ("SSH_CONNECTION", Some("1.2.3.4")),

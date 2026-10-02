@@ -14,6 +14,7 @@ mod abort_idle_race;
 mod broadcast;
 mod burst;
 mod feed;
+mod interleave;
 mod park;
 mod queue;
 
@@ -58,6 +59,7 @@ fn burst_runner(engine: Arc<dyn SessionEngine>) -> TurnRunner {
         agent_message_digest_pin: crate::worker::digest::DigestLanePin::Auto,
         active_action: None,
         running_tool_calls: std::collections::HashSet::new(),
+        running_admission_ids: std::collections::HashSet::new(),
     }));
     TurnRunner {
         core,

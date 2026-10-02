@@ -14,6 +14,8 @@ mod abort_idle_race;
 mod broadcast;
 mod burst;
 mod feed;
+// The stop-ask probe binds a tokio UnixListener.
+#[cfg(unix)]
 mod interleave;
 mod park;
 mod queue;

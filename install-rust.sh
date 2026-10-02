@@ -631,8 +631,13 @@ migrated_note=""
 # either check knob set this run's every exit also cleans the staging.
 if [ "${PRIME_AGENT_ROLLBACK_CHECK:-}" = "1" ] || [ "${PRIME_AGENT_ARCHIVE_CHECK:-}" = "1" ]; then
   # The stage rides too: an abort during the archive check's extraction
-  # must leave no staged tree under the prefix (a rollback check has no
-  # stage yet, and the unset expansion is a no-op).
+  # must leave no staged tree under the prefix. `stage` is INITIALIZED
+  # here — a caller-exported `stage` in this run's environment would
+  # otherwise be the trap's target (an inherited "$HOME" would be
+  # rm-rf'd); the empty init keeps the trap pointed only at what THIS
+  # script later assigns (a rollback check assigns nothing — the sweep
+  # is a no-op).
+  stage=""
   trap 'ui_stop; rm -rf "${dl:-}" "${stage:-}"' EXIT
 else
   trap 'ui_stop' EXIT

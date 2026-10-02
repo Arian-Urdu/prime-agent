@@ -640,7 +640,7 @@ impl IpythonKernelProvisioner {
             }
         }
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        let previous_stop = state.pending_stop.replace(stop_rx.clone());
+        let previous_stop = state.pending_stop.replace(stop_rx);
         // A gate armed with a directly-taken manager guards that manager's
         // shutdown, not a boot; only a gate armed for an in-flight boot is
         // joinable by the next stop of the same boot.

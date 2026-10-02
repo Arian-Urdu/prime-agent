@@ -2020,9 +2020,13 @@ fi
 # a command and would refuse every probe, and macOS ships no GNU timeout
 # at all. A payload whose --version blocks is killed at the bound and
 # reports nothing (the refusal below, not a hang).
-probe_out="${stage}/.version-probe.out"
-probe_done="${stage}/.version-probe.done"
-probe_pid_file="${stage}/.version-probe.pid"
+# The probe's files ride the run's OWN download staging, never the
+# payload-writable stage: an extracted archive could forge a done marker
+# where the loop looks and hang past the bound (the trailing wait would
+# block on the hanging payload forever).
+probe_out="$dl/.version-probe.out"
+probe_done="$dl/.version-probe.done"
+probe_pid_file="$dl/.version-probe.pid"
 rm -f "$probe_out" "$probe_done" "$probe_pid_file"
 # The runner: the payload is ITS child (a sibling's `wait` cannot reap
 # another shell's child), and `kill -0` keeps succeeding on a ZOMBIE, so
@@ -2075,10 +2079,28 @@ if [ -n "$probe_timed_out" ]; then
 fi
 reported_version="$(head -n 1 "$probe_out" 2>/dev/null)"
 rm -f "$probe_out" "$probe_done" "$probe_pid_file"
-if [ "$reported_version" != "$VERSION" ]; then
-  rm -rf "$stage"
-  die "the archive names ${VERSION} but its payload reports ${reported_version:-nothing}; rename the archive or publish it under its real version"
-fi
+# The continuous-build stamp rides the reported version, not the name
+# (assemble_artifacts.py stages a package.json reporting
+# <version>-continuous.<sha> while the archive name keeps the bare
+# <version> so rolling releases overwrite assets): the exact name or its
+# documented continuous stamp both publish honestly.
+case "$reported_version" in
+  "$VERSION") ;;
+  "$VERSION-continuous."*)
+    # The stamp is exactly a 40-hex commit SHA (assemble_artifacts.py's
+    # --sha contract): a wrong-length or non-hex tail is a malformed
+    # stamp, not the built commit.
+    stamp="${reported_version#"$VERSION"-continuous.}"
+    if ! printf '%s\n' "$stamp" | grep -qE '^[0-9a-f]{40}$'; then
+      rm -rf "$stage"
+      die "the archive names ${VERSION} but its payload reports ${reported_version}; rename the archive or publish it under its real version"
+    fi
+    ;;
+  *)
+    rm -rf "$stage"
+    die "the archive names ${VERSION} but its payload reports ${reported_version:-nothing}; rename the archive or publish it under its real version"
+    ;;
+esac
 # THE ARCHIVE PRE-FLIGHT (the rollback pre-flight's sibling): with the knob
 # set, the validated stage is the whole answer — every extraction check
 # (the tar, the payload, the version) passed — so the run stops here, the

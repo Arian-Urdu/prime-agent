@@ -497,6 +497,58 @@ fn rollback_check_answers_synchronously_without_touching_the_payload() {
     sandbox.assert_session_preserved();
 }
 
+/// A mis-named archive is refused before the publish: the payload's own
+/// `--version` is the ground truth for the marker the install records
+/// (and the rollback later reports), so a name/payload mismatch would
+/// publish a lie.
+#[test]
+fn update_archive_refuses_a_misnamed_payload_version() {
+    let sandbox = Sandbox::new();
+    let live = sandbox.prefix.join("share/prime-agent");
+    std::fs::create_dir_all(&live).expect("payload dir");
+    let binary = live.join("prime-agent");
+    std::fs::copy(env!("CARGO_BIN_EXE_prime-agent"), &binary).expect("copy this build");
+    std::fs::write(
+        live.join(".prime-agent-install"),
+        "install-rust.sh channel beta\nversion 9.9.9\n",
+    )
+    .expect("install marker");
+    let platform = pa_core::update::install::current_platform_alias();
+    let payload_dir = sandbox.root.join("payload-misnamed");
+    std::fs::create_dir_all(&payload_dir).expect("payload dir");
+    let payload = payload_dir.join("prime-agent");
+    std::fs::write(&payload, "#!/bin/sh\necho 0.9.7\n").expect("payload binary");
+    make_executable(&payload);
+    let archive = sandbox
+        .root
+        .join(format!("prime-agent-9.9.9-{platform}.tar.gz"));
+    let status = Command::new("tar")
+        .arg("-czf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&payload_dir)
+        .arg("prime-agent")
+        .status()
+        .expect("run tar");
+    assert!(status.success(), "tar the misnamed release");
+
+    let mut command = Command::new(&binary);
+    command
+        .arg("update")
+        .arg("--archive")
+        .arg(archive.to_str().expect("utf-8 path"));
+    installer_env(&mut command, &sandbox);
+    let output = command.output().expect("run the installed build");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("the archive names 9.9.9 but its payload reports 0.9.7"),
+        "{stderr}"
+    );
+    assert_eq!(live_version(&sandbox), "9.9.9", "nothing was published");
+    sandbox.assert_session_preserved();
+}
+
 /// A fresh installer install has nothing to roll back: the run fails with
 /// the reason and the live payload stays.
 #[test]

@@ -443,14 +443,11 @@ pub fn archive_refusal(archive: &Path) -> Option<String> {
     let Ok(entries) = tarball.entries() else {
         return Some(format!("could not extract {}", archive.display()));
     };
-    let mut payload = false;
+    let mut payload_bytes = None;
     for entry in entries {
         let Ok(mut entry) = entry else {
             return Some(format!("could not extract {}", archive.display()));
         };
-        if std::io::copy(&mut entry, &mut std::io::sink()).is_err() {
-            return Some(format!("could not extract {}", archive.display()));
-        }
         // A regular FILE: the launcher execs the payload, so an
         // executable DIRECTORY with the payload's name is not a payload
         // (the script's bare `-x` would take it; the pre-check must not).
@@ -463,10 +460,18 @@ pub fn archive_refusal(archive: &Path) -> Option<String> {
         #[cfg(not(unix))]
         let executable = true;
         if is_payload && executable {
-            payload = true;
+            // Consuming the entry is the full-gzip decode either way; the
+            // payload's bytes ride along for the version pre-flight.
+            let mut bytes = Vec::new();
+            if std::io::copy(&mut entry, &mut bytes).is_err() {
+                return Some(format!("could not extract {}", archive.display()));
+            }
+            payload_bytes = Some(bytes);
+        } else if std::io::copy(&mut entry, &mut std::io::sink()).is_err() {
+            return Some(format!("could not extract {}", archive.display()));
         }
     }
-    if !payload {
+    if payload_bytes.is_none() {
         return Some(format!(
             "the tarball did not contain an executable {PAYLOAD_BINARY} payload"
         ));
@@ -478,7 +483,70 @@ pub fn archive_refusal(archive: &Path) -> Option<String> {
     if std::io::copy(&mut tarball.into_inner(), &mut std::io::sink()).is_err() {
         return Some(format!("could not extract {}", archive.display()));
     }
+    // The script refuses a mis-named archive at publish time (the name is
+    // the version the marker records and the rollback reports); on the
+    // Windows handoff that refusal happens in a child this process can no
+    // longer wait for, so the same check runs here, against a temp copy
+    // outside the prefix. The unix wait path lets the child's own refusal
+    // carry the exit status.
+    #[cfg(windows)]
+    if let Some(refusal) =
+        payload_version_refusal(payload_bytes.as_deref().unwrap_or_default(), version)
+    {
+        return Some(refusal);
+    }
     None
+}
+
+/// The payload's own `--version` answer for the archive pre-flight: the
+/// binary runs once from a temp copy (never the prefix) and its first
+/// stdout line must equal the archive's name version, exactly the
+/// script's pre-publish check. `None` = the name and the payload agree.
+/// Windows-only at the call site (the unix wait path lets the child's
+/// own refusal carry the status); the unit test drives it everywhere.
+#[cfg(any(windows, test))]
+#[must_use]
+fn payload_version_refusal(payload: &[u8], expected: &str) -> Option<String> {
+    let temp = std::env::temp_dir().join(format!(
+        "prime-agent-archive-check-{}{}",
+        uuid::Uuid::now_v7().simple(),
+        std::env::consts::EXE_SUFFIX
+    ));
+    let run = (|| {
+        std::fs::write(&temp, payload)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = std::fs::metadata(&temp)?.permissions();
+            permissions.set_mode(permissions.mode() | 0o755);
+            std::fs::set_permissions(&temp, permissions)?;
+        }
+        std::process::Command::new(&temp)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+    })();
+    let _ = std::fs::remove_file(&temp);
+    // The script's own comparison is `head -n 1` inside a command
+    // substitution: the trailing NEWLINE goes, trailing spaces and CR
+    // stay — so the pre-flight must not trim either, or it would pass a
+    // payload the handed-off child then refuses.
+    let reported = run
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .map(|stdout| match stdout.split_once('\n') {
+            Some((first_line, _)) => first_line.to_string(),
+            None => stdout,
+        })
+        .unwrap_or_default();
+    (reported != expected).then(|| {
+        format!(
+            "the archive names {expected} but its payload reports {}; rename the archive or publish it under its real version",
+            if reported.is_empty() { "nothing" } else { &reported }
+        )
+    })
 }
 
 /// The installed payload's version, read from the install marker's
@@ -938,6 +1006,32 @@ mod tests {
                 .is_some_and(|refusal| refusal.contains("invalid version")),
             "a version outside [0-9A-Za-z.-] is refused"
         );
+    }
+
+    /// The version pre-flight runs the payload once from a temp copy: a
+    /// payload answering its archive's name passes, a mismatch gets the
+    /// script's own refusal, and a silent payload is "nothing".
+    #[test]
+    fn payload_version_refusal_runs_the_payload_once() {
+        let answering = b"#!/bin/sh\necho 9.9.9\n";
+        assert_eq!(payload_version_refusal(answering, "9.9.9"), None);
+        let refusal = payload_version_refusal(answering, "0.9.7").unwrap();
+        assert!(
+            refusal.contains("the archive names 0.9.7 but its payload reports 9.9.9"),
+            "{refusal}"
+        );
+        let silent = b"#!/bin/sh\nexit 0\n";
+        let refusal = payload_version_refusal(silent, "9.9.9").unwrap();
+        assert!(refusal.contains("reports nothing"), "{refusal}");
+        // The script strips only the newline: a trailing space or CR is
+        // part of the report, so both refuse (the pre-flight and the
+        // child must agree byte for byte).
+        let spaced = b"#!/bin/sh\necho '9.9.9 '\n";
+        let refusal = payload_version_refusal(spaced, "9.9.9").unwrap();
+        assert!(refusal.contains("reports 9.9.9 ;"), "{refusal}");
+        let carriage = b"#!/bin/sh\nprintf '9.9.9\r\n'\n";
+        let refusal = payload_version_refusal(carriage, "9.9.9").unwrap();
+        assert!(refusal.contains("reports 9.9.9\u{d};"), "{refusal}");
     }
 
     /// A right-named archive still refuses synchronously when its

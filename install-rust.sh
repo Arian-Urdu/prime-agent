@@ -1987,6 +1987,16 @@ if [ ! -x "${stage}/${BINARY_NAME}" ]; then
   rm -rf "$stage"
   die "the tarball did not contain an executable ${BINARY_NAME} payload"
 fi
+# The archive's name is the version contract: the marker records it and the
+# rollback later reports it, so the payload's own --version must agree — a
+# mis-named archive would publish a marker that lies about its payload
+# (the version pin and the channel tarballs carry the matching build by
+# construction, so this refuses only the operator's mis-naming).
+reported_version="$("${stage}/${BINARY_NAME}" --version 2>/dev/null | head -n 1)"
+if [ "$reported_version" != "$VERSION" ]; then
+  rm -rf "$stage"
+  die "the archive names ${VERSION} but its payload reports ${reported_version:-nothing}; rename the archive or publish it under its real version"
+fi
 # The ownership marker: the share tree this script publishes carries it, so
 # later installs recognize the tree as theirs BY MARKER, not by shape — an
 # unrelated directory that happens to contain a `prime-agent` entry is never

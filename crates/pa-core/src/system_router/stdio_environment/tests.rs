@@ -120,6 +120,55 @@ async fn an_adapter_that_exits_early_fails_the_pending_request() {
     .await;
 }
 
+/// End of stream flushes the buffered tail: an adapter can write its final
+/// reply without the trailing newline and exit, and that reply must reach
+/// its pending request instead of dying with the early exit (cursor: EOF
+/// drops last adapter reply).
+#[tokio::test]
+async fn a_final_reply_without_a_trailing_newline_lands() {
+    let (_dir, command) = adapter(
+        r#"
+import json
+import sys
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    request = json.loads(line)
+    kind = request.get("type")
+    if kind == "close":
+        break
+    reply = {"id": request.get("id"), "ok": True}
+    if kind == "init":
+        reply["environment"] = {"actions": {"wait": {"description": "Wait one tick."}}}
+    # The final reply is written without its trailing newline, then the
+    # adapter exits: the reader must complete it at end of stream.
+    sys.stdout.write(json.dumps(reply))
+    sys.stdout.flush()
+    sys.exit(0)
+"#,
+    );
+    let env = StdioRouterEnvironment::new(command, None, 5_000, None);
+    let info = env.init().await.unwrap().expect("init environment info");
+    assert!(info.get("actions").is_some());
+    // The adapter is gone, so later requests still fail as the early exit:
+    // the flush delivered the final reply, it did not swallow the exit.
+    let error = env
+        .reset("reach the overworld")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("exited early"),
+        "unexpected post-exit error: {error}"
+    );
+    env.close(RouterCloseOptions {
+        budget_ms: Some(500),
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_silent_adapter_times_out_per_request() {
     let env = StdioRouterEnvironment::new(

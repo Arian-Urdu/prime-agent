@@ -8,7 +8,7 @@
 //! One JSON object per line on stdin, one per line on stdout. Adapters may be
 //! any program that speaks it.
 //!
-//! Port notes (divergences from the TS reference, both bounded):
+//! Port notes (divergences from the TS reference, each bounded):
 //! the early-exit error carries the stderr tail but not the process exit code
 //! (the tokio child handle stays owned by the environment and is reaped in
 //! `close`); cleanup sends SIGTERM to the direct child (not the whole group)
@@ -20,7 +20,9 @@
 //! the leader-exit arm) so a launcher that exits first cannot strand its
 //! descendants - not even ones that ignore SIGTERM, and not on Windows,
 //! where the group relay is a no-op and the enforced stop is the taskkill
-//! tree kill.
+//! tree kill. The reader completes the buffered tail as a final line at end
+//! of stream, where the TS data handler can drop a reply the adapter wrote
+//! without its trailing newline (cursor: EOF drops last adapter reply).
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -557,40 +559,50 @@ async fn read_loop(mut stdout: ChildStdout, shared: Arc<Shared>) {
     let mut decoder = LineBuffer::default();
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
-        match stdout.read(&mut buffer).await {
-            Ok(0) | Err(_) => break,
-            Ok(read) => match decoder.feed(&buffer[..read]) {
-                Ok(lines) => {
-                    for line in lines {
-                        if line.len() > MAX_REPLY_LINE_CHARS {
-                            // A terminated oversized line is the same protocol
-                            // violation as an unterminated one.
-                            let overflow = format!(
-                                "environment adapter wrote a reply line over {MAX_REPLY_LINE_CHARS} chars"
-                            );
-                            shared.append_tail(&format!("\n{overflow}"));
-                            shared.fail_all(&overflow);
-                            return;
-                        }
-                        dispatch_line(&line, &shared);
+        let (chunk, at_end) = match stdout.read(&mut buffer).await {
+            // End of stream terminates the buffered tail like a newline would
+            // (readline semantics): an adapter can write its final reply and
+            // exit without the trailing newline, and a line the adapter fully
+            // wrote must reach its pending request before the exit is handled
+            // - the TS reference guarantees every reply line is dispatched
+            // before its close handler runs.
+            Ok(0) | Err(_) => (b"\n".as_slice(), true),
+            Ok(read) => (&buffer[..read], false),
+        };
+        match decoder.feed(chunk) {
+            Ok(lines) => {
+                for line in lines {
+                    if line.len() > MAX_REPLY_LINE_CHARS {
+                        // A terminated oversized line is the same protocol
+                        // violation as an unterminated one.
+                        let overflow = format!(
+                            "environment adapter wrote a reply line over {MAX_REPLY_LINE_CHARS} chars"
+                        );
+                        shared.append_tail(&format!("\n{overflow}"));
+                        shared.fail_all(&overflow);
+                        return;
                     }
+                    dispatch_line(&line, &shared);
                 }
-                Err(LineError::Overflow) => {
-                    let overflow = format!(
-                        "environment adapter wrote an unterminated reply line over {MAX_REPLY_LINE_CHARS} chars"
-                    );
-                    shared.append_tail(&format!("\n{overflow}"));
-                    shared.fail_all(&overflow);
-                    return;
-                }
-                Err(LineError::Utf8) => {
-                    let invalid = "environment adapter wrote a reply line that is not valid UTF-8"
-                        .to_string();
-                    shared.append_tail(&format!("\n{invalid}"));
-                    shared.fail_all(&invalid);
-                    return;
-                }
-            },
+            }
+            Err(LineError::Overflow) => {
+                let overflow = format!(
+                    "environment adapter wrote an unterminated reply line over {MAX_REPLY_LINE_CHARS} chars"
+                );
+                shared.append_tail(&format!("\n{overflow}"));
+                shared.fail_all(&overflow);
+                return;
+            }
+            Err(LineError::Utf8) => {
+                let invalid =
+                    "environment adapter wrote a reply line that is not valid UTF-8".to_string();
+                shared.append_tail(&format!("\n{invalid}"));
+                shared.fail_all(&invalid);
+                return;
+            }
+        }
+        if at_end {
+            break;
         }
     }
     if shared.closed.load(Ordering::Relaxed) {

@@ -582,6 +582,104 @@ fn update_rollback_without_a_kept_version_changes_nothing() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("do not apply to --rollback"), "{stderr}");
     assert_eq!(live_version(&sandbox), "9.9.9");
+
+    // The CLI's --force is the nightly-switch confirmation skip; the
+    // local operations refuse it instead of silently dropping it.
+    let mut command = Command::new(&binary);
+    command.args(["update", "--rollback", "--force"]);
+    installer_env(&mut command, &sandbox);
+    let output = command.output().expect("run the installed build");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--force does not apply"), "{stderr}");
+    assert!(stderr.contains("shutdown --force"), "{stderr}");
+    assert_eq!(live_version(&sandbox), "9.9.9");
+}
+
+/// The archive pre-flight: the installer's check mode answers the
+/// archive question synchronously — a mis-named archive is its own
+/// refusal, a good one validates and exits without publishing (the
+/// Windows update handoff runs this exact validation before it hands
+/// the real run off, so its exit code is honest for the deterministic
+/// refusals).
+#[test]
+fn archive_check_answers_synchronously_without_publishing() {
+    let sandbox = Sandbox::new();
+    let live = sandbox.prefix.join("share/prime-agent");
+    std::fs::create_dir_all(&live).expect("payload dir");
+    let binary = live.join("prime-agent");
+    std::fs::copy(env!("CARGO_BIN_EXE_prime-agent"), &binary).expect("copy this build");
+    std::fs::write(
+        live.join(".prime-agent-install"),
+        "install-rust.sh channel beta\nversion 9.9.9\n",
+    )
+    .expect("install marker");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install-rust.sh");
+    let run_check = |archive: &std::path::Path| {
+        let mut command = Command::new("/bin/sh");
+        command.arg(&script).arg("--archive").arg(archive);
+        installer_env(&mut command, &sandbox);
+        command
+            .env("PRIME_AGENT_ARCHIVE_CHECK", "1")
+            .output()
+            .expect("run the installer's check mode")
+    };
+
+    // A mis-named archive: the payload answers 0.9.7 under a 9.9.9 name.
+    let misnamed = fake_release_payload(&sandbox, "9.9.9", "0.9.7");
+    let output = run_check(&misnamed);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("the archive names 9.9.9 but its payload reports 0.9.7"),
+        "{stderr}"
+    );
+    assert_eq!(live_version(&sandbox), "9.9.9");
+    let leftovers: Vec<String> = std::fs::read_dir(sandbox.prefix.join("share"))
+        .expect("share dir")
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.contains("prime-agent.stage"))
+        .collect();
+    assert!(leftovers.is_empty(), "no stage dir survives: {leftovers:?}");
+
+    // A good archive: the check validates and exits without publishing.
+    let good = fake_release(&sandbox, "9.9.9");
+    let output = run_check(&good);
+    assert!(
+        output.status.success(),
+        "the check accepts the good archive"
+    );
+    assert_eq!(
+        live_version(&sandbox),
+        "9.9.9",
+        "the check published nothing"
+    );
+    sandbox.assert_session_preserved();
+}
+
+/// A release archive whose payload answers `reported` under the archive
+/// name `named` (the mis-naming fixture for the check-mode test).
+fn fake_release_payload(sandbox: &Sandbox, named: &str, reported: &str) -> PathBuf {
+    let payload = sandbox.root.join(format!("payload-mismatch-{named}"));
+    std::fs::create_dir_all(&payload).expect("payload dir");
+    let binary = payload.join("prime-agent");
+    std::fs::write(&binary, format!("#!/bin/sh\necho {reported}\n")).expect("payload binary");
+    make_executable(&binary);
+    let platform = pa_core::update::install::current_platform_alias();
+    let archive = sandbox
+        .root
+        .join(format!("prime-agent-{named}-{platform}.tar.gz"));
+    let status = Command::new("tar")
+        .arg("-czf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&payload)
+        .arg("prime-agent")
+        .status()
+        .expect("run tar");
+    assert!(status.success(), "tar the mismatched release");
+    archive
 }
 
 fn make_executable(path: &Path) {

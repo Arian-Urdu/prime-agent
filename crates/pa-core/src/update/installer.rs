@@ -265,21 +265,24 @@ pub async fn run_bundled_installer(
         // spawn (std opens with FILE_SHARE_DELETE; a failure leaves nobody
         // reading and the removal is the same). The caller returns
         // immediately; the outcome rides the installer's own output.
-        // The rollback pre-flight (the exact-equivalence source): the
-        // generations record rides the script's OWN prefix spelling
-        // (cygpath + physical_path), so no native comparison can mirror
-        // its scan faithfully — the script itself answers, in its
-        // PRIME_AGENT_ROLLBACK_CHECK mode, synchronously. That mode
-        // stops before any staging, lock, or payload touch, so waiting for
-        // it never fights this process's locked image, and the refusal
-        // it prints is the one the handed-off run would die with — the
-        // caller exits with the real status, and only the publication
-        // itself stays async (the platform-inherent residue).
-        if args.first().copied() == Some(std::ffi::OsStr::new("--rollback")) {
-            if let Err(error) = rollback_source_exists(&script, prefix).await {
-                let _ = std::fs::remove_file(&script);
-                return Err(error);
-            }
+        // The local-mode pre-flight (the exact-equivalence source): the
+        // rollback's generations record rides the script's OWN prefix
+        // spelling (cygpath + physical_path), and the archive's checks
+        // (name, tar, payload, the version the packaged package.json
+        // reports) are the script's staged run's own — no native mirror
+        // can answer either faithfully, so the script itself answers, in
+        // its PRIME_AGENT_ROLLBACK_CHECK / PRIME_AGENT_ARCHIVE_CHECK
+        // modes, synchronously. Neither mode claims the lock or renames
+        // the live tree (the rollback check only reads; the archive
+        // check's extraction rides a temporary stage swept on its own
+        // exit), so waiting never fights this process's locked image,
+        // and the refusal they print is the one the handed-off run
+        // would die with — the caller exits with the real status, and
+        // only the publication itself stays async (the platform-
+        // inherent residue).
+        if let Err(error) = local_mode_preflight(&script, prefix, args).await {
+            let _ = std::fs::remove_file(&script);
+            return Err(error);
         }
         let file = std::fs::File::open(&script).map_err(|error| {
             let _ = std::fs::remove_file(&script);
@@ -360,193 +363,45 @@ pub fn caller_owns_payload(prefix: &Path) -> bool {
     }
 }
 
-/// The synchronous rollback pre-flight for the Windows handoff: run the
-/// bundled installer's own source scan (its `PRIME_AGENT_ROLLBACK_CHECK`
-/// mode — it stops before any staging, lock, or payload touch, so
-/// waiting never fights the locked image) and fail with the script's
-/// own refusal when nothing is kept.
+/// The synchronous local-mode pre-flight for the Windows handoff: run the
+/// bundled installer ITSELF in its check mode — `PRIME_AGENT_ROLLBACK_CHECK`
+/// or `PRIME_AGENT_ARCHIVE_CHECK` by the requested mode — and fail with the
+/// script's own refusal when the operation cannot run. Neither mode ever
+/// claims the publication lock or renames the live tree — the rollback
+/// check only reads, and the archive check's extraction lives in a
+/// temporary stage swept on its own exit — so waiting never fights the
+/// locked image; and the answer is the script's OWN scan, the exact
+/// equivalence the caller's exit code needs (once handed off, the
+/// outcome can no longer be this process's exit status).
 ///
 /// # Errors
-/// Returns the pre-flight's captured refusal (its "nothing to roll
-/// back" tail) or the spawn failure.
+/// Returns the pre-flight's captured refusal tail or the spawn failure.
 #[cfg(windows)]
-async fn rollback_source_exists(
+async fn local_mode_preflight(
     script: &Path,
     prefix: &Path,
+    args: &[&std::ffi::OsStr],
 ) -> std::result::Result<(), UpdateFailure> {
     let shell = trusted_shell()?;
     let mut command = installer_child(&shell, prefix, None);
     command
         .arg(script)
-        .arg("--rollback")
-        .env("PRIME_AGENT_ROLLBACK_CHECK", "1")
+        .args(args)
         .stdin(std::process::Stdio::null());
+    if args.first().copied() == Some(std::ffi::OsStr::new("--rollback")) {
+        command.env("PRIME_AGENT_ROLLBACK_CHECK", "1");
+    } else {
+        command.env("PRIME_AGENT_ARCHIVE_CHECK", "1");
+    }
     let output = command.output().await.map_err(|error| UpdateFailure {
         message: format!("could not run the installer: {error}"),
     })?;
     if output.status.success() {
         return Ok(());
     }
-    let refusal = output_tail(&output)
-        .unwrap_or_else(|| "the installer exited without a rollback source".to_string());
+    let refusal =
+        output_tail(&output).unwrap_or_else(|| "the installer refused the request".to_string());
     Err(UpdateFailure { message: refusal })
-}
-
-/// The refusal `install-rust.sh --archive` prints for a local release
-/// archive that cannot install (its name-validation and extraction
-/// blocks): `None` when the archive is usable — it exists, its name
-/// spells the channel's `prime-agent-<version>-<platform>.tar.gz`
-/// contract with a `[0-9A-Za-z.-]` version, and its whole gzip decodes
-/// to a tar carrying an executable payload binary. The Windows handoff
-/// asks this BEFORE spawning, so these refusals exit the caller with
-/// the real status (see [`kept_rollback_generation`]).
-#[must_use]
-pub fn archive_refusal(archive: &Path) -> Option<String> {
-    if !archive.is_file() {
-        return Some(format!(
-            "the release archive {} does not exist",
-            archive.display()
-        ));
-    }
-    let Some(name) = archive.file_name().and_then(|name| name.to_str()) else {
-        return Some("the release archive has no name".to_string());
-    };
-    let alias = crate::update::install::current_platform_alias();
-    let tail = format!("-{alias}.tar.gz");
-    let Some(version) = name
-        .strip_prefix("prime-agent-")
-        .and_then(|rest| rest.strip_suffix(&tail))
-    else {
-        return Some(format!(
-            "{name} is not a {alias} release archive (expected prime-agent-<version>-{alias}.tar.gz)"
-        ));
-    };
-    let invalid = version.is_empty()
-        || !version
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'));
-    if invalid {
-        return Some(format!(
-            "invalid version in the archive name {name}: {version}"
-        ));
-    }
-    // The extraction the script runs (its `tar -xzf` + payload check),
-    // mirrored so the handoff's refusal stays synchronous: a corrupt or
-    // payloadless tarball is already on disk, so its refusal is
-    // deterministic, not a publish-time outcome. Consuming every entry
-    // forces the whole gzip through the decoder — a truncated stream
-    // dies here, where the script's tar would have died.
-    let Ok(file) = std::fs::File::open(archive).map(flate2::read::GzDecoder::new) else {
-        return Some(format!("could not extract {}", archive.display()));
-    };
-    let mut tarball = tar::Archive::new(file);
-    let Ok(entries) = tarball.entries() else {
-        return Some(format!("could not extract {}", archive.display()));
-    };
-    let mut payload_bytes = None;
-    for entry in entries {
-        let Ok(mut entry) = entry else {
-            return Some(format!("could not extract {}", archive.display()));
-        };
-        // A regular FILE: the launcher execs the payload, so an
-        // executable DIRECTORY with the payload's name is not a payload
-        // (the script's bare `-x` would take it; the pre-check must not).
-        let is_payload = entry.header().entry_type().is_file()
-            && entry
-                .path()
-                .is_ok_and(|path| path.as_os_str() == std::ffi::OsStr::new(PAYLOAD_BINARY));
-        #[cfg(unix)]
-        let executable = entry.header().mode().unwrap_or(0) & 0o111 != 0;
-        #[cfg(not(unix))]
-        let executable = true;
-        if is_payload && executable {
-            // Consuming the entry is the full-gzip decode either way; the
-            // payload's bytes ride along for the version pre-flight.
-            let mut bytes = Vec::new();
-            if std::io::copy(&mut entry, &mut bytes).is_err() {
-                return Some(format!("could not extract {}", archive.display()));
-            }
-            payload_bytes = Some(bytes);
-        } else if std::io::copy(&mut entry, &mut std::io::sink()).is_err() {
-            return Some(format!("could not extract {}", archive.display()));
-        }
-    }
-    if payload_bytes.is_none() {
-        return Some(format!(
-            "the tarball did not contain an executable {PAYLOAD_BINARY} payload"
-        ));
-    }
-    // The tar end marker does not prove the gzip footer: a stream cut
-    // inside its 8-byte trailer still ends the entries cleanly while a
-    // real `tar -xzf` dies on the incomplete decode — drain the rest of
-    // the decoder so the refusal matches the script's extraction.
-    if std::io::copy(&mut tarball.into_inner(), &mut std::io::sink()).is_err() {
-        return Some(format!("could not extract {}", archive.display()));
-    }
-    // The script refuses a mis-named archive at publish time (the name is
-    // the version the marker records and the rollback reports); on the
-    // Windows handoff that refusal happens in a child this process can no
-    // longer wait for, so the same check runs here, against a temp copy
-    // outside the prefix. The unix wait path lets the child's own refusal
-    // carry the exit status.
-    #[cfg(windows)]
-    if let Some(refusal) =
-        payload_version_refusal(payload_bytes.as_deref().unwrap_or_default(), version)
-    {
-        return Some(refusal);
-    }
-    None
-}
-
-/// The payload's own `--version` answer for the archive pre-flight: the
-/// binary runs once from a temp copy (never the prefix) and its first
-/// stdout line must equal the archive's name version, exactly the
-/// script's pre-publish check. `None` = the name and the payload agree.
-/// Windows-only at the call site (the unix wait path lets the child's
-/// own refusal carry the status); the unit test drives it everywhere.
-#[cfg(any(windows, test))]
-#[must_use]
-fn payload_version_refusal(payload: &[u8], expected: &str) -> Option<String> {
-    let temp = std::env::temp_dir().join(format!(
-        "prime-agent-archive-check-{}{}",
-        uuid::Uuid::now_v7().simple(),
-        std::env::consts::EXE_SUFFIX
-    ));
-    let run = (|| {
-        std::fs::write(&temp, payload)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mut permissions = std::fs::metadata(&temp)?.permissions();
-            permissions.set_mode(permissions.mode() | 0o755);
-            std::fs::set_permissions(&temp, permissions)?;
-        }
-        std::process::Command::new(&temp)
-            .arg("--version")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-    })();
-    let _ = std::fs::remove_file(&temp);
-    // The script's own comparison is `head -n 1` inside a command
-    // substitution: the trailing NEWLINE goes, trailing spaces and CR
-    // stay — so the pre-flight must not trim either, or it would pass a
-    // payload the handed-off child then refuses.
-    let reported = run
-        .ok()
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .map(|stdout| match stdout.split_once('\n') {
-            Some((first_line, _)) => first_line.to_string(),
-            None => stdout,
-        })
-        .unwrap_or_default();
-    (reported != expected).then(|| {
-        format!(
-            "the archive names {expected} but its payload reports {}; rename the archive or publish it under its real version",
-            if reported.is_empty() { "nothing" } else { &reported }
-        )
-    })
 }
 
 /// The installed payload's version, read from the install marker's
@@ -966,164 +821,6 @@ mod tests {
             !caller_owns_payload(&prefix),
             "a staged prefix never names this process's own image"
         );
-    }
-
-    /// The handoff's archive pre-validation mirrors the script's
-    /// `--archive` naming contract for this platform.
-    #[test]
-    fn archive_refusal_matches_the_script_naming_contract() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let alias = crate::update::install::current_platform_alias();
-        let good = dir
-            .path()
-            .join(format!("prime-agent-0.9.9-beta.10-{alias}.tar.gz"));
-        build_tar(&good, &[(PAYLOAD_BINARY, b"payload".as_slice(), 0o755)]);
-        assert_eq!(archive_refusal(&good), None);
-        let missing = dir
-            .path()
-            .join(format!("prime-agent-0.9.9-beta.11-{alias}.tar.gz"));
-        assert_eq!(
-            archive_refusal(&missing),
-            Some(format!(
-                "the release archive {} does not exist",
-                missing.display()
-            ))
-        );
-        let wrong_name = dir.path().join("payload.tgz");
-        std::fs::write(&wrong_name, b"archive").unwrap();
-        assert_eq!(
-            archive_refusal(&wrong_name),
-            Some(format!(
-                "payload.tgz is not a {alias} release archive (expected prime-agent-<version>-{alias}.tar.gz)"
-            ))
-        );
-        let wrong_version = dir
-            .path()
-            .join(format!("prime-agent-1.0.0 rc1-{alias}.tar.gz"));
-        std::fs::write(&wrong_version, b"archive").unwrap();
-        assert!(
-            archive_refusal(&wrong_version)
-                .is_some_and(|refusal| refusal.contains("invalid version")),
-            "a version outside [0-9A-Za-z.-] is refused"
-        );
-    }
-
-    /// The version pre-flight runs the payload once from a temp copy: a
-    /// payload answering its archive's name passes, a mismatch gets the
-    /// script's own refusal, and a silent payload is "nothing".
-    #[test]
-    fn payload_version_refusal_runs_the_payload_once() {
-        let answering = b"#!/bin/sh\necho 9.9.9\n";
-        assert_eq!(payload_version_refusal(answering, "9.9.9"), None);
-        let refusal = payload_version_refusal(answering, "0.9.7").unwrap();
-        assert!(
-            refusal.contains("the archive names 0.9.7 but its payload reports 9.9.9"),
-            "{refusal}"
-        );
-        let silent = b"#!/bin/sh\nexit 0\n";
-        let refusal = payload_version_refusal(silent, "9.9.9").unwrap();
-        assert!(refusal.contains("reports nothing"), "{refusal}");
-        // The script strips only the newline: a trailing space or CR is
-        // part of the report, so both refuse (the pre-flight and the
-        // child must agree byte for byte).
-        let spaced = b"#!/bin/sh\necho '9.9.9 '\n";
-        let refusal = payload_version_refusal(spaced, "9.9.9").unwrap();
-        assert!(refusal.contains("reports 9.9.9 ;"), "{refusal}");
-        let carriage = b"#!/bin/sh\nprintf '9.9.9\r\n'\n";
-        let refusal = payload_version_refusal(carriage, "9.9.9").unwrap();
-        assert!(refusal.contains("reports 9.9.9\u{d};"), "{refusal}");
-    }
-
-    /// A right-named archive still refuses synchronously when its
-    /// CONTENT cannot install (the handoff's pre-validation mirrors the
-    /// script's extraction): garbage bytes are the script's
-    /// `could not extract`, a valid tar without the payload entry is
-    /// its missing-payload refusal, and a real payload tarball passes.
-    #[test]
-    fn archive_refusal_checks_the_tarball_content() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let alias = crate::update::install::current_platform_alias();
-        let corrupt = dir.path().join(format!("prime-agent-9.9.9-{alias}.tar.gz"));
-        std::fs::write(&corrupt, b"this is not a tarball, just corrupt bytes").unwrap();
-        assert_eq!(
-            archive_refusal(&corrupt),
-            Some(format!("could not extract {}", corrupt.display()))
-        );
-        let empty = dir
-            .path()
-            .join(format!("prime-agent-9.9.9-b-{alias}.tar.gz"));
-        build_tar(&empty, &[]);
-        assert_eq!(
-            archive_refusal(&empty),
-            Some(format!(
-                "the tarball did not contain an executable {PAYLOAD_BINARY} payload"
-            ))
-        );
-        let payload = dir
-            .path()
-            .join(format!("prime-agent-9.9.9-c-{alias}.tar.gz"));
-        let mode = {
-            #[cfg(unix)]
-            {
-                0o755
-            }
-            #[cfg(not(unix))]
-            {
-                0o644
-            }
-        };
-        build_tar(&payload, &[(PAYLOAD_BINARY, b"payload".as_slice(), mode)]);
-        assert_eq!(archive_refusal(&payload), None);
-        // A stream cut inside the gzip footer: the tar entries ended
-        // cleanly, so only draining the decoder catches what
-        // `tar -xzf` would refuse.
-        let truncated = dir
-            .path()
-            .join(format!("prime-agent-9.9.9-d-{alias}.tar.gz"));
-        let bytes = std::fs::read(&payload).unwrap();
-        std::fs::write(&truncated, &bytes[..bytes.len() - 8]).unwrap();
-        assert_eq!(
-            archive_refusal(&truncated),
-            Some(format!("could not extract {}", truncated.display()))
-        );
-        // An executable DIRECTORY with the payload's name is not a
-        // payload: the launcher execs a file.
-        let dir_payload = dir
-            .path()
-            .join(format!("prime-agent-9.9.9-e-{alias}.tar.gz"));
-        let file = std::fs::File::create(&dir_payload).unwrap();
-        let writer = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-        let mut builder = tar::Builder::new(writer);
-        let mut header = tar::Header::new_gnu();
-        header.set_size(0);
-        header.set_mode(0o755);
-        header.set_entry_type(tar::EntryType::Directory);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, PAYLOAD_BINARY, std::io::empty())
-            .unwrap();
-        builder.into_inner().unwrap().finish().unwrap();
-        assert_eq!(
-            archive_refusal(&dir_payload),
-            Some(format!(
-                "the tarball did not contain an executable {PAYLOAD_BINARY} payload"
-            ))
-        );
-    }
-
-    /// Write `entries` (name, bytes, mode) as one gzipped tar archive.
-    fn build_tar(path: &Path, entries: &[(&str, &[u8], u32)]) {
-        let file = std::fs::File::create(path).unwrap();
-        let writer = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-        let mut builder = tar::Builder::new(writer);
-        for (name, bytes, mode) in entries {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(bytes.len() as u64);
-            header.set_mode(*mode);
-            header.set_cksum();
-            builder.append_data(&mut header, name, *bytes).unwrap();
-        }
-        builder.into_inner().unwrap().finish().unwrap();
     }
 
     /// Serve `body` over one plain HTTP request (the hermetic source the

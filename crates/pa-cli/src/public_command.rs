@@ -660,6 +660,18 @@ fn run_update(args: &[String]) -> PublicCommandResult {
                     )),
                 );
             }
+            // The CLI's --force is the nightly-switch confirmation skip;
+            // the installer's own forced daemon stop is a different flag
+            // the funnel never forwards either — so the local modes refuse
+            // it instead of silently dropping it.
+            if options.force {
+                return fail(
+                    "--force does not apply to --rollback or --archive.",
+                    Some(format!(
+                        "To stop busy daemons first, run \"{APP_NAME} shutdown --force\" and re-run."
+                    )),
+                );
+            }
             return handled_with_exit(crate::installer_update::run_local(
                 &prefix,
                 options.archive.as_deref(),

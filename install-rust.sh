@@ -215,6 +215,10 @@ Environment:
                                  rollback source and exit without touching
                                  the payload (the update command's
                                  synchronous pre-flight)
+  PRIME_AGENT_ARCHIVE_CHECK      1 = with --archive, validate the archive
+                                 (its name, tar, payload, and version) and
+                                 exit without publishing (the same
+                                 pre-flight for the archive route)
 USAGE
 }
 
@@ -622,10 +626,10 @@ ts_takeover_undo=""
 migrated_note=""
 # The renderer always restores the cursor and line wrap when it stops; the
 # trap stops it on every exit path (an INT/TERM exits through it too).
-# The pre-flight's exits sit far from the run's own success-path sweep
+# The pre-flights' exits sit far from the run's own success-path sweep
 # below, and a refused check dies before the full trap is armed — so with
-# the knob set this run's every exit also cleans the staging.
-if [ "${PRIME_AGENT_ROLLBACK_CHECK:-}" = "1" ]; then
+# either check knob set this run's every exit also cleans the staging.
+if [ "${PRIME_AGENT_ROLLBACK_CHECK:-}" = "1" ] || [ "${PRIME_AGENT_ARCHIVE_CHECK:-}" = "1" ]; then
   trap 'ui_stop; rm -rf "${dl:-}"' EXIT
 else
   trap 'ui_stop' EXIT
@@ -1991,11 +1995,31 @@ fi
 # rollback later reports it, so the payload's own --version must agree — a
 # mis-named archive would publish a marker that lies about its payload
 # (the version pin and the channel tarballs carry the matching build by
-# construction, so this refuses only the operator's mis-naming).
-reported_version="$("${stage}/${BINARY_NAME}" --version 2>/dev/null | head -n 1)"
+# construction, so this refuses only the operator's mis-naming). The probe
+# is BOUNDED where the platform has GNU timeout (Linux, Git Bash): a
+# payload whose --version blocks must not hang the install (macOS has no
+# timeout command; there the probe rides unbounded, the same contract as
+# the daemon-stop probes).
+if command -v timeout >/dev/null 2>&1; then
+  reported_version="$(timeout 10 "${stage}/${BINARY_NAME}" --version 2>/dev/null | head -n 1)"
+else
+  reported_version="$("${stage}/${BINARY_NAME}" --version 2>/dev/null | head -n 1)"
+fi
 if [ "$reported_version" != "$VERSION" ]; then
   rm -rf "$stage"
   die "the archive names ${VERSION} but its payload reports ${reported_version:-nothing}; rename the archive or publish it under its real version"
+fi
+# THE ARCHIVE PRE-FLIGHT (the rollback pre-flight's sibling): with the knob
+# set, the validated stage is the whole answer — every extraction check
+# (the tar, the payload, the version) passed — so the run stops here, the
+# stage never becomes anything the caller owns, and a caller can ask
+# synchronously whether an archive CAN install before handing the real run
+# off (the Windows update handoff: this process must exit for the publish
+# to happen, so its exit code can only report the pre-flight's answer
+# honestly).
+if [ "${PRIME_AGENT_ARCHIVE_CHECK:-}" = "1" ]; then
+  rm -rf "$stage"
+  exit 0
 fi
 # The ownership marker: the share tree this script publishes carries it, so
 # later installs recognize the tree as theirs BY MARKER, not by shape — an
@@ -2631,7 +2655,8 @@ say "launcher:  ${launcher}"
 say "payload:   ${share_dir}"
 if [ -d "$old" ] && grep -qxF -- "$old" "$generations_record" 2>/dev/null; then
   say "rollback:  ${old} (the previous payload, one generation; swept on the next install)"
-  say "           restore it with: prime-agent update --rollback"
+  say "           restore it with: prime-agent update --rollback (the live"
+  say "            build must carry the update rollback; an older payload may not)"
 elif [ -d "$old" ]; then
   say "rollback:  ${old} (the migrated pre-takeover tree; kept — remove it by hand"
   say "            once you no longer need the rollback)"

@@ -152,20 +152,6 @@ pub fn run_local(prefix: &std::path::Path, archive: Option<&std::path::Path>) ->
     };
     #[cfg(windows)]
     let handed_off = installer::caller_owns_payload(prefix);
-    #[cfg(windows)]
-    if handed_off {
-        // The archive refusals the script itself would print, delivered
-        // with the real exit status BEFORE any spawn: once handed off,
-        // the outcome can no longer be this process's exit code, so the
-        // deterministic ones must not ride the async one (the rollback's
-        // own pre-flight runs inside the handoff, against the script's
-        // check mode).
-        let refusal = archive.as_deref().and_then(installer::archive_refusal);
-        if let Some(refusal) = refusal {
-            eprintln!("Error: {refusal}");
-            return 1;
-        }
-    }
     match runtime.block_on(installer::run_bundled_installer(prefix, &args)) {
         Ok(installed) => {
             #[cfg(windows)]

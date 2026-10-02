@@ -859,6 +859,13 @@ async fn start_kernel_impl(
     // supersedes the previous). `ready_gate` stays the cross-provisioner
     // /reload arm.
     if let Some(stop_gate) = &mut pending_stop {
+        if !*stop_gate.borrow() {
+            emit_startup_progress(
+                inner,
+                on_progress,
+                "Waiting for the previous kernel to stop...",
+            );
+        }
         let _ = stop_gate.wait_for(|done| *done).await;
     }
     // Wait for a previous provisioner (e.g. on /reload) to finish disposing —

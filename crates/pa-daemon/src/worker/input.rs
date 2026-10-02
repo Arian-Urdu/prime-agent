@@ -371,6 +371,10 @@ impl Worker {
                     DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
                 )
             {
+                // A rejected delivery records no arrival: the queue-cap
+                // retries must not pin the controller's pending-pressure
+                // EMA above the recovery half-threshold (an auto session
+                // would stay flipped to digest while every send fails).
                 drop(core);
                 return response_failure(None, "worker_deliver_message", &error.to_string(), None);
             }
@@ -440,6 +444,12 @@ impl Worker {
             let snapshot = Self::snapshot_locked(&core);
             (id, queued, snapshot, target)
         };
+        // The push lane's ACCEPTED arrival records here — after the
+        // queue-cap admission above — and outside the core lock (the
+        // controller's evaluate takes counters-then-core; taking the
+        // counters mutex while holding the core lock would invert that
+        // order).
+        self.agent_digest.record_arrival(crate::util::now_ms());
         // The delivery checkpoint (busy=true): the queued agent message is
         // admitted live work — a restart must revive the worker to
         // deliver it (agent-to-agent messages have no client that

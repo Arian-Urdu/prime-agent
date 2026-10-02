@@ -482,7 +482,13 @@ impl AgentMessageDigest {
     }
 
     /// Record one accepted inbound agent message (both lanes, TS
-    /// `MessagingStats`' arrivals definition: every accepted arrival).
+    /// `MessagingStats`' arrivals definition: every accepted arrival —
+    /// never a rejected one, so retries against a full queue or inbox do
+    /// not pin the pending-pressure EMA above the recovery
+    /// half-threshold). The digest lane records at its durable append
+    /// ([`Self::route_inbound_message`]); the push lane records at the
+    /// delivery path's enqueue (the caller's queue cap is the push
+    /// lane's admission).
     pub(crate) fn record_arrival(&self, now_ms: u64) {
         self.counters
             .lock()
@@ -607,10 +613,15 @@ impl AgentMessageDigest {
     }
 
     /// The full pre-delivery routing for one inbound agent message (PR C):
-    /// record the arrival, run the daemon-side lane decision, and — on the
-    /// digest lane — store the payload durably and ensure the one-per-batch
-    /// notice. Returns `None` for the push lane (the caller runs the
-    /// existing delivery unchanged).
+    /// run the daemon-side lane decision and — on the digest lane — store
+    /// the payload durably and ensure the one-per-batch notice. The
+    /// arrival records only at acceptance: on the digest lane after the
+    /// durable append succeeds (a failed append or the unread-entry cap
+    /// refusal below answers the delivery failure instead), and on the
+    /// push lane at the delivery path's enqueue. Returns `None` for the
+    /// push lane (the caller runs the existing delivery unchanged; the
+    /// caller's queue cap is the push lane's admission, so a rejected
+    /// delivery never records).
     pub(crate) fn route_inbound_message(
         &self,
         message_id: &str,
@@ -619,7 +630,6 @@ impl AgentMessageDigest {
         from_relationship: Option<&str>,
     ) -> anyhow::Result<Option<Value>> {
         let now_ms = crate::util::now_ms();
-        self.record_arrival(now_ms);
         let sender_is_parent = {
             let core = self
                 .core
@@ -640,6 +650,9 @@ impl AgentMessageDigest {
         }
         let (target, digest_at) =
             self.append_inbox_message(message_id, message, sender, from_relationship)?;
+        // Accepted: the entry reached the durable store (the arrivals
+        // ring counts it — never the rejected attempts above).
+        self.record_arrival(now_ms);
         self.ensure_digest_notice();
         Ok(Some(json!({
             "target": target,
@@ -904,45 +917,30 @@ impl AgentMessageDigest {
     /// whole batch; later arrivals wait for the recipient to pull them
     /// with `rlm.inbox.read()` in that turn. Quiet (queue-invisible,
     /// injected) on the follow-up lane; an idle session wakes on it.
+    ///
+    /// The unread snapshot, the one-live-notice check, and the enqueue
+    /// share ONE inbox+core hold: a concurrent `read_inbox` (which holds
+    /// the inbox lock across its whole body, including the fully-read
+    /// withdrawal) cannot slip between the check and the enqueue, so a
+    /// notice never lands for an inbox the read already emptied — the
+    /// stale wake the two-section form allowed.
     fn ensure_digest_notice(&self) {
-        let content = {
-            let mut inbox = self
-                .inbox
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let core = self
-                .core
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(store) = core.store.as_ref() {
-                inbox.load_from(store);
-            }
-            let unread: Vec<&InboxRecord> =
-                inbox.records.iter().filter(|record| !record.read).collect();
-            if unread.is_empty() {
-                return;
-            }
-            let senders: Vec<String> = {
-                let mut senders = Vec::new();
-                for record in &unread {
-                    let sender = record
-                        .data
-                        .from
-                        .session_name
-                        .clone()
-                        .unwrap_or_else(|| record.data.from.active_session_id.clone());
-                    if !senders.contains(&sender) {
-                        senders.push(sender);
-                    }
-                }
-                senders
-            };
-            digest_notice_content(unread.len(), &senders)
-        };
+        let mut inbox = self
+            .inbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut core = self
             .core
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(store) = core.store.as_ref() {
+            inbox.load_from(store);
+        }
+        let unread: Vec<&InboxRecord> =
+            inbox.records.iter().filter(|record| !record.read).collect();
+        if unread.is_empty() {
+            return;
+        }
         if core.shutdown_requested {
             return;
         }
@@ -955,6 +953,22 @@ impl AgentMessageDigest {
         if notice_pending {
             return;
         }
+        let senders: Vec<String> = {
+            let mut senders = Vec::new();
+            for record in &unread {
+                let sender = record
+                    .data
+                    .from
+                    .session_name
+                    .clone()
+                    .unwrap_or_else(|| record.data.from.active_session_id.clone());
+                if !senders.contains(&sender) {
+                    senders.push(sender);
+                }
+            }
+            senders
+        };
+        let content = digest_notice_content(unread.len(), &senders);
         let row = json!({
             "role": "custom",
             "customType": AGENT_MESSAGE_DIGEST_NOTICE_CUSTOM_TYPE,
@@ -979,6 +993,7 @@ impl AgentMessageDigest {
             policy: TurnPolicy::Injected,
             forced_batch: false,
         });
+        drop(inbox);
         drop(core);
         super::checkpoint_queue_recovery(
             &self.recovery,
@@ -989,7 +1004,6 @@ impl AgentMessageDigest {
         );
         self.work_notify.notify_one();
     }
-
     /// TS `_cancelPendingDigestNotices`: withdraw every undelivered digest
     /// notice once the inbox is fully read (a read-before-delivery cancels
     /// the pending wake).
@@ -1416,5 +1430,75 @@ mod tests {
         assert_eq!(snapshot["total"], json!(1));
         assert_eq!(snapshot["unread"], json!(0));
         assert_eq!(snapshot["entries"][0]["read"], json!(true));
+    }
+
+    /// The arrivals ring counts ACCEPTED arrivals only (TS
+    /// `MessagingStats`' arrivals definition): the digest lane records
+    /// at its durable append, the push lane records at the delivery
+    /// path's enqueue (the caller's queue cap is that lane's admission),
+    /// and a rejected delivery records nothing — retries against a full
+    /// inbox or queue must not pin the controller's pending-pressure EMA
+    /// above the recovery half-threshold while every send fails.
+    #[test]
+    fn route_records_arrivals_only_for_accepted_deliveries() {
+        let ring = |digest: &AgentMessageDigest| {
+            digest
+                .counters
+                .lock()
+                .unwrap()
+                .arrivals_last_5m(crate::util::now_ms())
+        };
+        let sender = json!({ "activeSessionId": "sender", "sessionName": "sender" });
+        let digest_over = |store: Option<crate::session_store::SessionFile>| {
+            AgentMessageDigest::new(
+                std::sync::Arc::new(std::sync::Mutex::new(super::super::SessionCore::test_core(
+                    store,
+                    "/tmp".to_string(),
+                ))),
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+                std::sync::Arc::new(tokio::sync::Notify::new()),
+            )
+        };
+
+        // Accepted digest-lane delivery: exactly one arrival.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut store = crate::session_store::SessionFile::create("/tmp", None, 0);
+        store.set_path(dir.path().join("session.jsonl"));
+        store.rewrite().unwrap();
+        let digest = digest_over(Some(store));
+        digest.configure_pin("digest").unwrap();
+        digest
+            .route_inbound_message("agentmsg_ok", "accepted", &sender, Some("sibling"))
+            .expect("digest receipt");
+        assert_eq!(
+            ring(&digest),
+            1,
+            "the accepted delivery recorded no arrival"
+        );
+
+        // Rejected digest-lane delivery (the durable append fails): none.
+        let mut broken = crate::session_store::SessionFile::create("/tmp", None, 0);
+        broken.set_path(dir.path().to_path_buf()); // a directory: every append fails
+        let digest = digest_over(Some(broken));
+        digest.configure_pin("digest").unwrap();
+        digest
+            .route_inbound_message("agentmsg_reject", "rejected", &sender, Some("sibling"))
+            .expect_err("the broken store answered success");
+        assert_eq!(
+            ring(&digest),
+            0,
+            "the rejected delivery counted as an arrival"
+        );
+
+        // Push-lane route: the arrival belongs to the delivery path's
+        // enqueue (the caller's queue cap is the push admission), so the
+        // route itself records nothing.
+        let digest = digest_over(None);
+        digest.configure_pin("push").unwrap();
+        let routed = digest
+            .route_inbound_message("agentmsg_push", "pushed", &sender, Some("sibling"))
+            .expect("route failed");
+        assert!(routed.is_none(), "a push-pinned route digested");
+        assert_eq!(ring(&digest), 0, "the push route pre-recorded an arrival");
     }
 }

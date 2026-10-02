@@ -68,7 +68,9 @@ pub trait SessionEngine: Send + Sync {
 
     /// Clear every agent-watch subscription (swarm PR E's "watchers die
     /// with the session" at a session replacement): the reused engine must
-    /// not carry the replaced session's subscriptions into the new one.
+    /// not carry the replaced session's subscriptions into the new one,
+    /// and a poll pass already in flight dies with the replaced session
+    /// (implementations invalidate stale passes, not just the registry).
     /// Engines without a watch registry do nothing.
     fn clear_agent_watches(&self) {}
 

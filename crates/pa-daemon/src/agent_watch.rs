@@ -26,8 +26,6 @@ pub const AGENT_WATCH_NOTICE_CUSTOM_TYPE: &str = "agent_watch_notice";
 #[derive(Debug, Clone)]
 pub struct AgentWatchSubscription {
     pub id: String,
-    /// The direct child id (RLM child id) this watch resolves to.
-    pub child_id: String,
     /// The child's live active session id — the supervisor-routable key the
     /// poller queries (`get_state` routes by `activeSessionId`, never by
     /// the RLM child id).
@@ -83,6 +81,10 @@ pub struct AgentWatchState<'a> {
 #[derive(Debug, Default)]
 pub struct AgentWatchRegistry {
     subscriptions: std::collections::HashMap<String, AgentWatchSubscription>,
+    /// The registration sequence (the TS `Map` keeps insertion order; a
+    /// bare `HashMap` does not), so `list` and `poll` visit the
+    /// subscriptions in the order they registered.
+    order: Vec<String>,
     total_registered: usize,
 }
 
@@ -95,7 +97,9 @@ impl AgentWatchRegistry {
         self.total_registered < AGENT_WATCH_MAX_TOTAL
     }
 
-    /// Register a direct child.
+    /// Register a direct child (the watch `id` embeds the RLM child id —
+    /// `watch-agent-{child_id}` — at the engine's registration path; the
+    /// subscription itself keys on the routable active session id).
     ///
     /// # Errors
     ///
@@ -104,7 +108,6 @@ impl AgentWatchRegistry {
     pub fn register(
         &mut self,
         id: &str,
-        child_id: &str,
         active_session_id: &str,
         child_name: &str,
         initial: AgentWatchSnapshot,
@@ -120,7 +123,6 @@ impl AgentWatchRegistry {
         }
         let subscription = AgentWatchSubscription {
             id: id.to_string(),
-            child_id: child_id.to_string(),
             active_session_id: active_session_id.to_string(),
             child_name: child_name.to_string(),
             last_seen_messages: initial.message_count,
@@ -128,30 +130,31 @@ impl AgentWatchRegistry {
         };
         self.subscriptions
             .insert(id.to_string(), subscription.clone());
+        self.order.push(id.to_string());
         self.total_registered += 1;
         Ok(subscription)
     }
 
     /// Cancel one subscription (re-registration re-baselines by cancelling
-    /// first, exactly like TS `registerAgentWatch`).
+    /// first, exactly like TS `registerAgentWatch`: the replacement
+    /// re-registers at the END of the sequence, the TS `Map` delete+set).
     pub fn cancel(&mut self, id: &str) -> bool {
-        self.subscriptions.remove(id).is_some()
+        if self.subscriptions.remove(id).is_some() {
+            self.order.retain(|registered| registered != id);
+            true
+        } else {
+            false
+        }
     }
 
     /// The active subscriptions in registration order.
     #[must_use]
     pub fn list(&self) -> Vec<AgentWatchSubscription> {
-        self.subscriptions.values().cloned().collect()
-    }
-
-    #[must_use]
-    pub fn get(&self, id: &str) -> Option<&AgentWatchSubscription> {
-        self.subscriptions.get(id)
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.subscriptions.len()
+        self.order
+            .iter()
+            .filter_map(|id| self.subscriptions.get(id))
+            .cloned()
+            .collect()
     }
 
     #[must_use]
@@ -162,7 +165,10 @@ impl AgentWatchRegistry {
     /// Poll every subscription; emits one event per child with changes.
     /// A vanished child (no snapshot) is skipped: the baseline holds.
     pub fn poll(&mut self, state: &mut AgentWatchState<'_>) {
-        for subscription in self.subscriptions.values_mut() {
+        for id in &self.order {
+            let Some(subscription) = self.subscriptions.get_mut(id) else {
+                continue;
+            };
             // The snapshot provider is keyed by the child's ACTIVE SESSION
             // ID — the supervisor-routable form the poller queries
             // (`get_state` routes by `activeSessionId`).
@@ -242,7 +248,6 @@ mod tests {
         registry
             .register(
                 "w1",
-                "child-1",
                 "active-1",
                 "c1",
                 AgentWatchSnapshot {
@@ -286,7 +291,12 @@ mod tests {
             on_event: &mut |event| seen.push(format_agent_watch_notice(&event)),
         });
         assert!(seen.is_empty());
-        assert_eq!(registry.get("w1").unwrap().last_seen_messages, 7);
+        let baseline = registry
+            .list()
+            .into_iter()
+            .find(|watch| watch.id == "w1")
+            .expect("the watch survived");
+        assert_eq!(baseline.last_seen_messages, 7);
 
         assert!(registry.cancel("w1"));
         assert!(!registry.cancel("w1"));
@@ -299,7 +309,6 @@ mod tests {
             registry
                 .register(
                     &format!("w-{index}"),
-                    &format!("child-{index}"),
                     &format!("active-{index}"),
                     "c",
                     AgentWatchSnapshot {
@@ -312,7 +321,6 @@ mod tests {
         let error = registry
             .register(
                 "w-over",
-                "child-over",
                 "active-over",
                 "c",
                 AgentWatchSnapshot {
@@ -330,7 +338,6 @@ mod tests {
         registry
             .register(
                 "w1",
-                "child-1",
                 "active-1",
                 "c1",
                 AgentWatchSnapshot {
@@ -376,6 +383,72 @@ mod tests {
         assert!(notice.ends_with("..."));
     }
 
+    /// `list` is documented as registration order (the TS `Map` keeps
+    /// insertion order); `poll` visits the same sequence.
+    #[test]
+    fn list_and_poll_follow_the_registration_order() {
+        let mut registry = AgentWatchRegistry::default();
+        let initial = AgentWatchSnapshot {
+            message_count: 0,
+            status: "idle".to_string(),
+        };
+        // Register in a deliberately non-sorted sequence.
+        for id in ["w-7", "w-3", "w-9", "w-1", "w-5", "w-2", "w-8", "w-6"] {
+            registry
+                .register(id, &format!("active-{id}"), id, initial.clone())
+                .unwrap();
+        }
+        let ids: Vec<String> = registry
+            .list()
+            .iter()
+            .map(|watch| watch.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            ["w-7", "w-3", "w-9", "w-1", "w-5", "w-2", "w-8", "w-6"],
+            "list order"
+        );
+
+        // A cancel removes its slot; a re-registration (cancel + register)
+        // re-baselines at the END of the sequence, the TS delete+set.
+        assert!(registry.cancel("w-1"));
+        registry
+            .register("w-1", "active-w-1", "w-1", initial)
+            .unwrap();
+        let ids: Vec<String> = registry
+            .list()
+            .iter()
+            .map(|watch| watch.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            ["w-7", "w-3", "w-9", "w-5", "w-2", "w-8", "w-6", "w-1"],
+            "list order after the re-registration"
+        );
+
+        // Poll emits in the same registration order.
+        let grown = |child: &str| {
+            if child.starts_with("active-w-") {
+                Some(AgentWatchSnapshot {
+                    message_count: 4,
+                    status: "idle".to_string(),
+                })
+            } else {
+                None
+            }
+        };
+        let mut seen: Vec<String> = Vec::new();
+        registry.poll(&mut AgentWatchState {
+            message_count: &grown,
+            on_event: &mut |event| seen.push(event.subscription_id),
+        });
+        assert_eq!(
+            seen,
+            ["w-7", "w-3", "w-9", "w-5", "w-2", "w-8", "w-6", "w-1"],
+            "poll order"
+        );
+    }
+
     #[test]
     fn duplicate_registration_is_refused() {
         let mut registry = AgentWatchRegistry::default();
@@ -384,10 +457,10 @@ mod tests {
             status: "idle".to_string(),
         };
         registry
-            .register("w1", "child-1", "active-1", "c1", initial.clone())
+            .register("w1", "active-1", "c1", initial.clone())
             .unwrap();
         let error = registry
-            .register("w1", "child-1", "active-1", "c1", initial)
+            .register("w1", "active-1", "c1", initial)
             .unwrap_err();
         assert!(error.to_string().contains("already exists"), "{error}");
     }

@@ -51,11 +51,47 @@ pub type WatchNoticeSink = Arc<dyn Fn(&str, &str) + Send + Sync>;
 /// The watch registration's engine-side state (swarm PR E): the
 /// subscription registry plus the one-shared-poll arming flag. The poller
 /// task exits when the registry empties or the session closes, and the
-/// next registration re-arms it.
+/// next registration re-arms it. The generation invalidates in-flight
+/// poll passes at a session replacement (see
+/// [`Self::poll_if_current`]).
 #[derive(Debug, Default)]
 pub(crate) struct AgentWatchHostState {
     pub registry: AgentWatchRegistry,
     pub poller_armed: std::sync::atomic::AtomicBool,
+    /// Bumped by every registry reset (a session replacement's
+    /// [`AgentSessionEngine::clear_agent_watches`]): a poll pass that
+    /// snapshotted its subscriptions under an older generation must drop
+    /// its results — the retired session's snapshot inputs must not
+    /// poll the replacement session's registry or deliver its notices.
+    pub generation: u64,
+}
+
+impl AgentWatchHostState {
+    /// One poll pass's registry step: poll only while the state still
+    /// carries the generation the pass snapshotted its subscriptions
+    /// under (a session replacement clears the registry and bumps the
+    /// generation between the poller's subscription snapshot and this
+    /// step — the child snapshot queries in between are the race
+    /// window). A stale pass answers `false` and its caller drops the
+    /// events.
+    pub(crate) fn poll_if_current(
+        &mut self,
+        generation: u64,
+        snapshots: &HashMap<String, AgentWatchSnapshot>,
+        events: &mut Vec<String>,
+    ) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        self.registry
+            .poll(&mut crate::agent_watch::AgentWatchState {
+                message_count: &|child_id: &str| snapshots.get(child_id).cloned(),
+                on_event: &mut |event| {
+                    events.push(crate::agent_watch::format_agent_watch_notice(&event));
+                },
+            });
+        true
+    }
 }
 
 impl AgentSessionEngine {
@@ -247,7 +283,6 @@ impl AgentSessionEngine {
                     // limit rejects the replacement.
                     engine.register_agent_watch(
                         &id,
-                        &child_id,
                         &active_session_id,
                         &child_name,
                         initial.clone(),
@@ -310,10 +345,15 @@ impl AgentSessionEngine {
     /// Clear every watch subscription (the "watchers die with the session"
     /// rule at a session replacement: the reused engine must not carry the
     /// replaced session's subscriptions into the new one). The shared
-    /// poller exits on its next tick (the empty registry disarms it).
+    /// poller exits on its next tick (the empty registry disarms it), and
+    /// the generation bump kills any pass already in flight: its
+    /// subscription snapshot belongs to the retired session, so it must
+    /// not poll the replacement's registry or deliver its notices into
+    /// the replacement's inbox.
     pub fn clear_agent_watches(&self) {
         let mut state = self.watch_host_state();
         state.registry = AgentWatchRegistry::default();
+        state.generation += 1;
     }
 
     /// The watch host state accessor (register/poll paths hold the lock
@@ -375,7 +415,6 @@ impl AgentSessionEngine {
     fn register_agent_watch(
         &self,
         id: &str,
-        child_id: &str,
         active_session_id: &str,
         child_name: &str,
         initial: AgentWatchSnapshot,
@@ -387,7 +426,7 @@ impl AgentSessionEngine {
         state.registry.cancel(id);
         state
             .registry
-            .register(id, child_id, active_session_id, child_name, initial)
+            .register(id, active_session_id, child_name, initial)
             .map(|_| ())
     }
 
@@ -425,8 +464,11 @@ impl AgentSessionEngine {
                     return;
                 }
                 // One poll cycle: snapshot every subscribed child, then
-                // one registry pass turns the deltas into range events.
-                let subscriptions = {
+                // one registry pass turns the deltas into range events. The
+                // generation rides the snapshot: a session replacement's
+                // clear (between this snapshot and the registry pass)
+                // invalidates the pass.
+                let (subscriptions, generation) = {
                     let state = engine.watch_host_state();
                     if state.registry.is_empty() {
                         // Quiet by default: the poller dies with the last
@@ -436,7 +478,7 @@ impl AgentSessionEngine {
                             .store(false, std::sync::atomic::Ordering::SeqCst);
                         return;
                     }
-                    state.registry.list()
+                    (state.registry.list(), state.generation)
                 };
                 // Snapshot the children CONCURRENTLY (an unavailable child
                 // gets its own bounded timeout instead of stalling the
@@ -463,14 +505,13 @@ impl AgentSessionEngine {
                 let mut events: Vec<String> = Vec::new();
                 {
                     let mut state = engine.watch_host_state();
-                    state
-                        .registry
-                        .poll(&mut crate::agent_watch::AgentWatchState {
-                            message_count: &|child_id: &str| snapshots.get(child_id).cloned(),
-                            on_event: &mut |event| {
-                                events.push(crate::agent_watch::format_agent_watch_notice(&event));
-                            },
-                        });
+                    if !state.poll_if_current(generation, &snapshots, &mut events) {
+                        // The pass snapshotted the retired session's
+                        // registry: drop its results instead of polling
+                        // the replacement's registry with the stale child
+                        // snapshots. The next tick re-snapshots fresh.
+                        continue;
+                    }
                 }
                 for content in events {
                     sink("agent", &content);

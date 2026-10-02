@@ -340,6 +340,88 @@ async fn controller_flips_armed_sessions_but_never_push_pinned_ones() {
     assert_eq!(worker.agent_digest.inbox_snapshot()["total"], json!(0));
 }
 
+/// The push lane's arrival pressure feeds the controller only through
+/// ACCEPTED deliveries: a burst of parked push deliveries (each accepted at
+/// its enqueue) crosses the pending-EMA trigger and flips an auto-armed
+/// session, while retries against a FULL queue record nothing — a rejected
+/// attempt must never pin the lane on digest (the pre-fix recording flipped
+/// the lane mid-retry, so later attempts digested into the already-full
+/// session instead of answering the capacity error). The parked runner
+/// keeps every trigger input at the pending ring (no turns run, so the
+/// ingestion shares stay unmeasured).
+#[tokio::test]
+async fn accepted_push_pressure_flips_an_auto_session_rejections_never_pin_it() {
+    // Accepted pressure flips: every delivered message parks as live work
+    // and records its arrival at the enqueue.
+    let worker = created_worker().await;
+    park_runner(&worker).await;
+    worker.agent_digest.configure_pin("auto").unwrap();
+    let mut flipped = false;
+    for index in 0..20 {
+        let receipt = deliver(&worker, &format!("pressure {index}")).await;
+        if receipt["deliveryStatus"] == "digest" {
+            flipped = true;
+            break;
+        }
+        assert_eq!(
+            receipt["deliveryStatus"], "delivered",
+            "attempt {index}: {receipt:?}"
+        );
+    }
+    assert!(flipped, "the accepted arrivals never flipped the lane");
+
+    // Rejected pressure does not: a full queue refuses every further
+    // delivery, and the refusals must not record arrivals — the lane
+    // never flips, so every attempt keeps answering the queue-capacity
+    // error.
+    let worker = created_worker().await;
+    park_runner(&worker).await;
+    {
+        let mut core = worker.core.lock().unwrap();
+        for _ in 0..DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION {
+            core.follow_up.push_back(QueuedItem {
+                priority: QueuePriority::Human,
+                preview: None,
+                message: "occupied".to_string(),
+                custom_message: None,
+                agent_message: None,
+                queue_key: None,
+                admission_id: None,
+                images: Vec::new(),
+                done: None,
+                queue_visible: true,
+                policy: TurnPolicy::Injected,
+                forced_batch: false,
+            });
+        }
+    }
+    worker.agent_digest.configure_pin("auto").unwrap();
+    for index in 0..12 {
+        let response = worker
+            .dispatch(
+                "worker_deliver_message",
+                &json!({
+                    "targetActiveSessionId": worker.config.active_session_id,
+                    "message": format!("retry {index}"),
+                    "sender": sibling_sender(),
+                }),
+            )
+            .await;
+        assert!(
+            !response.success,
+            "the capped attempt {index} admitted: {response:?}"
+        );
+        assert!(
+            response
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unfinished"),
+            "attempt {index} left the queue-capacity error: {response:?}"
+        );
+    }
+}
+
 /// Watch notices on the push lane: the quiet `agent_watch_notice` row rides
 /// the steering lane (queue-if-busy, resume-if-idle), never the inbox.
 #[tokio::test]

@@ -224,3 +224,82 @@ async fn watch_agent_without_children_answers_the_ts_errors() {
         .unwrap();
     assert_eq!(listing, json!({ "watches": [] }));
 }
+
+/// The session replacement invalidates an in-flight poll pass: a pass that
+/// snapshotted its subscriptions before the replacement clear must not
+/// poll the replacement session's registry with the retired session's
+/// child snapshots (baseline corruption) nor deliver its notices into
+/// the replacement's inbox.
+#[test]
+fn an_in_flight_poll_pass_dies_with_the_replaced_session() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = std::sync::Arc::new(bare_engine(dir.path()));
+    let idle = crate::agent_watch::AgentWatchSnapshot {
+        message_count: 0,
+        status: "idle".to_string(),
+    };
+    // The retired session's watch.
+    {
+        let mut state = engine.watch_host_state();
+        state
+            .registry
+            .register("watch-agent-old", "active-1", "c1", idle.clone())
+            .unwrap();
+    }
+    // The in-flight pass snapshots the subscriptions (and their
+    // generation) before the child snapshot queries run.
+    let generation = engine.watch_host_state().generation;
+    // ...the session replacement clears the watches mid-poll...
+    engine.clear_agent_watches();
+    // ...and the replacement session registers a fresh watch for the
+    // SAME child.
+    {
+        let mut state = engine.watch_host_state();
+        state
+            .registry
+            .register("watch-agent-new", "active-1", "c2", idle)
+            .unwrap();
+    }
+    // The stale pass's snapshot map (built from the OLD subscription)
+    // must not poll the replacement's registry.
+    let mut snapshots = std::collections::HashMap::new();
+    snapshots.insert(
+        "active-1".to_string(),
+        crate::agent_watch::AgentWatchSnapshot {
+            message_count: 5,
+            status: "idle".to_string(),
+        },
+    );
+    let mut events: Vec<String> = Vec::new();
+    let polled = engine
+        .watch_host_state()
+        .poll_if_current(generation, &snapshots, &mut events);
+    assert!(!polled, "the stale pass polled the replacement's registry");
+    assert!(events.is_empty(), "the stale pass delivered: {events:?}");
+    // The replacement's baseline is untouched.
+    let baseline = engine
+        .watch_host_state()
+        .registry
+        .list()
+        .into_iter()
+        .find(|watch| watch.id == "watch-agent-new")
+        .expect("the replacement's watch");
+    assert_eq!(baseline.last_seen_messages, 0);
+    // A pass under the CURRENT generation still polls: the replacement's
+    // watch emits from its own baseline.
+    let generation = engine.watch_host_state().generation;
+    let mut events: Vec<String> = Vec::new();
+    let polled = engine
+        .watch_host_state()
+        .poll_if_current(generation, &snapshots, &mut events);
+    assert!(polled, "a current-generation pass did not poll");
+    assert_eq!(events.len(), 1, "{events:?}");
+    let baseline = engine
+        .watch_host_state()
+        .registry
+        .list()
+        .into_iter()
+        .find(|watch| watch.id == "watch-agent-new")
+        .expect("the replacement's watch");
+    assert_eq!(baseline.last_seen_messages, 5);
+}

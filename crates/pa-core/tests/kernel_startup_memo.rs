@@ -574,3 +574,97 @@ async fn doomed_settle_keeps_the_newer_boot_listener_state() {
         "the doomed boot and the newer boot, nothing else"
     );
 }
+
+/// A kernel interpreter wrapper whose FIRST invocation records the spawn
+/// and fails fast (exit 1 before any handshake), while every later
+/// invocation records the spawn and execs the real kernel Python: a
+/// boot's first attempt fails retryably, and only a live generation's
+/// retry may consume the second.
+fn flaky_first_kernel(
+    dir: &std::path::Path,
+    python: &std::path::Path,
+    count: &std::path::Path,
+    flip: &std::path::Path,
+    marker: &std::path::Path,
+) -> PathBuf {
+    let wrapper = dir.join("flaky-first-python");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nprintf x >> '{}'\nif [ -f '{}' ]; then exec '{}' \"$@\"; fi\ntouch '{}' '{}'\nexit 1\n",
+            count.display(),
+            flip.display(),
+            python.display(),
+            flip.display(),
+            marker.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    wrapper
+}
+
+/// A boot `kill()` invalidated must not RETRY: each attempt spawns an
+/// interpreter and runs restore/bootstrap, and the doomed attempt's
+/// settle only kills its kernel - the absolute spawn count pins that the
+/// killed generation never consumed its retry after the backoff.
+#[tokio::test]
+async fn kill_during_the_retry_backoff_pins_the_spawn_count() {
+    let Some(python) = kernel_python() else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().unwrap();
+    let count = dir.path().join("starts");
+    std::fs::write(&count, "").unwrap();
+    let flip = dir.path().join("flipped");
+    let marker = dir.path().join("first-failed");
+    let wrapped = flaky_first_kernel(dir.path(), &python, &count, &flip, &marker);
+    let provisioner = IpythonKernelProvisioner::new(
+        dir.path(),
+        IpythonKernelProvisionerOptions {
+            python: Some(wrapped),
+            ..Default::default()
+        },
+    );
+    // Boot A's first attempt records its spawn and fails retryably.
+    let doomed = tokio::spawn({
+        let provisioner = provisioner.clone();
+        async move { provisioner.ensure(None, None).await }
+    });
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !marker.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first attempt failed fast");
+    // The kill invalidates A's generation while A is still inside its
+    // retry decision (the backoff window) - before it could retry.
+    provisioner.kill();
+    // Boot B (the newer generation) boots on the stable arm.
+    let newer = tokio::spawn({
+        let provisioner = provisioner.clone();
+        async move { provisioner.ensure(None, None).await }
+    });
+    let manager = tokio::time::timeout(Duration::from_secs(30), newer)
+        .await
+        .expect("the newer boot settled")
+        .unwrap()
+        .unwrap();
+    // The doomed boot settles as a failure WITHOUT consuming its retry.
+    let settled = tokio::time::timeout(Duration::from_secs(30), doomed)
+        .await
+        .expect("the doomed boot settled")
+        .unwrap();
+    assert!(settled.is_err(), "a killed boot settles as a failure");
+    let result = manager
+        .execute("1 + 1", ExecuteOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(result.status, ExecuteStatus::Ok);
+    assert_eq!(
+        starts(&count),
+        2,
+        "the failed attempt and the newer boot, nothing else"
+    );
+}

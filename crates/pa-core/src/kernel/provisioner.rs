@@ -710,6 +710,26 @@ impl IpythonKernelProvisioner {
     }
 }
 
+/// The boot's memo is still the armed startup generation AND the
+/// provisioner is not disposed: a failed attempt may retry, and a
+/// restore may surface. `kill()` (or a newer boot's defunct-clear)
+/// invalidating the memo makes a further attempt stale work whose
+/// kernel the settle would only have to kill.
+fn boot_generation_is_live(
+    inner: &Arc<ProvisionerInner>,
+    memo: &tokio::sync::watch::Receiver<Option<StartupResult>>,
+) -> bool {
+    let state = inner
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    !state.disposed
+        && state
+            .startup
+            .as_ref()
+            .is_some_and(|armed| armed.same_channel(memo))
+}
+
 fn emit_startup_progress(
     inner: &Arc<ProvisionerInner>,
     on_progress: Option<&KernelBootstrapProgressHandler>,
@@ -808,11 +828,12 @@ async fn run_startup(
         match start_kernel(&inner, on_progress.as_ref(), pending_stop.clone(), &memo).await {
             Ok(manager) => break Ok(manager),
             Err(error) => {
-                if inner
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .disposed
+                // A boot whose memo generation kill() (or a newer boot's
+                // defunct-clear) invalidated must not retry: each attempt
+                // spawns an interpreter and runs restore/bootstrap, and a
+                // stale attempt's restore would surface notifications and
+                // state a fresher generation never asked for.
+                if !boot_generation_is_live(&inner, &memo)
                     || !startup_failure_is_retryable(&error)
                     || remaining_retries == 0
                     || started.elapsed() >= budget
@@ -831,6 +852,11 @@ async fn run_startup(
                 tokio::select! {
                     () = tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)) => {}
                     () = inner.dispose_signal.cancelled() => break Err(error),
+                }
+                // Re-check after the backoff: kill() can invalidate the
+                // generation while this task sleeps it out.
+                if !boot_generation_is_live(&inner, &memo) {
+                    break Err(error);
                 }
             }
         }
@@ -1119,16 +1145,31 @@ async fn start_kernel_impl(
     }
 
     // Only tell the model what was revived once the kernel is actually usable —
-    // a notice claiming restored state must never outlive a failed bootstrap.
+    // a notice claiming restored state must never outlive a failed bootstrap,
+    // and only a LIVE generation may surface it: a boot kill() invalidated
+    // restores its snapshot only for the settle to kill its kernel, so its
+    // restore must not fire the notification nor pollute last_restore for
+    // the fresher generation. The liveness check, the write, AND the
+    // callback share ONE lock scope (this provisioner invokes its
+    // callbacks under the state lock - the startup-progress listeners
+    // already do - and they must not re-enter the provisioner), so a
+    // kill() can no longer slip between the check and the notice.
     if let Some(restore) = pending_restore {
-        if let Some(on_restore) = &inner.options.on_restore {
-            on_restore(&restore);
-        }
-        inner
+        let mut state = inner
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .last_restore = Some(restore);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.disposed
+            && state
+                .startup
+                .as_ref()
+                .is_some_and(|armed| armed.same_channel(memo))
+        {
+            state.last_restore = Some(restore.clone());
+            if let Some(on_restore) = &inner.options.on_restore {
+                on_restore(&restore);
+            }
+        }
     }
     Ok(manager)
 }

@@ -668,3 +668,106 @@ async fn kill_during_the_retry_backoff_pins_the_spawn_count() {
         "the failed attempt and the newer boot, nothing else"
     );
 }
+
+/// A boot `kill()` invalidated must not report unavailable skills: the
+/// callback shares the restore notice's mailbox, so a discarded kernel's
+/// broken-import rows must not reach the next turn - while the LIVE
+/// boot's report still must (the same bootstrap's broken import, the
+/// same callback, exactly one report).
+#[tokio::test]
+async fn doomed_boot_does_not_report_unavailable_skills() {
+    let Some(python) = kernel_python() else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().unwrap();
+    let count = dir.path().join("starts");
+    std::fs::write(&count, "").unwrap();
+    let gates = dir.path().join("gates");
+    std::fs::create_dir_all(&gates).unwrap();
+    let _release_gates = ReleaseGates(gates.clone());
+    let wrapped = counting_gated_kernel(dir.path(), &python, &count, &gates);
+    let reported: Arc<Mutex<Vec<pa_core::kernel::bootstrap::UnavailablePythonSkills>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let on_unavailable_skills = {
+        let reported = Arc::clone(&reported);
+        Arc::new(
+            move |errors: &pa_core::kernel::bootstrap::UnavailablePythonSkills| {
+                reported.lock().unwrap().push(errors.clone());
+            },
+        ) as pa_core::kernel::provisioner::UnavailableSkillsCallback
+    };
+    let provisioner = IpythonKernelProvisioner::new(
+        dir.path(),
+        IpythonKernelProvisionerOptions {
+            python: Some(wrapped),
+            python_skills: vec![pa_core::kernel::bootstrap::KernelPythonSkill {
+                name: "doomed-broken-skill".to_string(),
+                import_name: "doomed_broken_skill".to_string(),
+                package_path: PathBuf::from("/nonexistent/skill"),
+                pyproject_path: PathBuf::from("/nonexistent/skill/pyproject.toml"),
+            }],
+            on_unavailable_skills: Some(on_unavailable_skills),
+            ..Default::default()
+        },
+    );
+    // Boot A spawns its interpreter held at gate0.
+    let doomed = tokio::spawn({
+        let provisioner = provisioner.clone();
+        async move { provisioner.ensure(None, None).await }
+    });
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while starts(&count) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the fixture interpreter spawned");
+    // The kill invalidates A's generation while A is still settling.
+    provisioner.kill();
+    // Boot B arms fresh and spawns its own interpreter held at gate1.
+    let newer = tokio::spawn({
+        let provisioner = provisioner.clone();
+        async move { provisioner.ensure(None, None).await }
+    });
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while starts(&count) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the newer boot's interpreter spawned");
+    // Release A: its bootstrap still parses its broken skill for a DEAD
+    // generation - its report must not reach the mailbox.
+    std::fs::write(gates.join("gate0"), "").unwrap();
+    let settled = tokio::time::timeout(Duration::from_secs(30), doomed)
+        .await
+        .expect("the doomed boot settled")
+        .unwrap();
+    assert!(settled.is_err(), "a killed boot settles as a failure");
+    // Release B: the LIVE generation's report is the only one.
+    std::fs::write(gates.join("gate1"), "").unwrap();
+    let manager = tokio::time::timeout(Duration::from_secs(30), newer)
+        .await
+        .expect("the newer boot settled")
+        .unwrap()
+        .unwrap();
+    let result = manager
+        .execute("1 + 1", ExecuteOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(result.status, ExecuteStatus::Ok);
+    let reported = reported.lock().unwrap().clone();
+    assert_eq!(
+        reported.len(),
+        1,
+        "only the live generation reports unavailable skills: {reported:?}"
+    );
+    assert_eq!(
+        reported[0],
+        vec![(
+            "doomed_broken_skill".to_string(),
+            "No module named 'doomed_broken_skill'".to_string(),
+        )],
+        "the live boot's broken-import report"
+    );
+}

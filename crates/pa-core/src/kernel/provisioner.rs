@@ -1088,12 +1088,29 @@ async fn start_kernel_impl(
             }
             // Broken skill imports stay importable-looking placeholders;
             // report them so the model learns before its first call, not
-            // from the placeholder's error (TS startKernel).
+            // from the placeholder's error (TS startKernel) - but only a
+            // LIVE generation may report: the callback shares the restore
+            // notice's mailbox, and a boot kill() invalidated must not
+            // append stale skills-unavailable rows the next turn shows the
+            // model. Same contract as the restore gate below: the
+            // generation check and the callback share ONE lock scope, and
+            // the callbacks must not re-enter the provisioner.
             let unavailable = parse_unavailable_python_skills(&bootstrap.stdout);
-            if let (Some(on_unavailable_skills), Some(errors)) =
-                (&inner.options.on_unavailable_skills, unavailable)
-            {
-                on_unavailable_skills(&errors);
+            if let Some(errors) = unavailable {
+                let state = inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !state.disposed
+                    && state
+                        .startup
+                        .as_ref()
+                        .is_some_and(|armed| armed.same_channel(memo))
+                {
+                    if let Some(on_unavailable_skills) = &inner.options.on_unavailable_skills {
+                        on_unavailable_skills(&errors);
+                    }
+                }
             }
         }
         Ok(bootstrap) => {

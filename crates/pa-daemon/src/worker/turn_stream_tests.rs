@@ -14,6 +14,7 @@ mod abort_idle_race;
 mod broadcast;
 mod burst;
 mod feed;
+mod interleave;
 mod park;
 mod queue;
 
@@ -76,6 +77,7 @@ fn burst_runner(engine: Arc<dyn SessionEngine>) -> TurnRunner {
             )),
             worker_token: String::new(),
         },
+        herdr: std::sync::Arc::new(std::sync::Mutex::new(crate::herdr::HerdrReporter::default())),
     }
 }
 

@@ -529,6 +529,12 @@ fn installer_child(
 ) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(shell);
     command.env(ENV_PREFIX, prefix);
+    // The check knobs are the PRE-FLIGHT's alone: a user shell carrying
+    // either would make the real run validate and exit without
+    // publishing, so the shared builder strips both (the pre-flight sets
+    // its own back after this).
+    command.env_remove("PRIME_AGENT_ROLLBACK_CHECK");
+    command.env_remove("PRIME_AGENT_ARCHIVE_CHECK");
     // The requested channel wins; otherwise the update stays on the channel
     // the install marker records (the fetched script's own default is the
     // stable render, so a beta install would silently switch channels).

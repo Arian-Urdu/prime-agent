@@ -630,7 +630,10 @@ migrated_note=""
 # below, and a refused check dies before the full trap is armed — so with
 # either check knob set this run's every exit also cleans the staging.
 if [ "${PRIME_AGENT_ROLLBACK_CHECK:-}" = "1" ] || [ "${PRIME_AGENT_ARCHIVE_CHECK:-}" = "1" ]; then
-  trap 'ui_stop; rm -rf "${dl:-}"' EXIT
+  # The stage rides too: an abort during the archive check's extraction
+  # must leave no staged tree under the prefix (a rollback check has no
+  # stage yet, and the unset expansion is a no-op).
+  trap 'ui_stop; rm -rf "${dl:-}" "${stage:-}"' EXIT
 else
   trap 'ui_stop' EXIT
 fi
@@ -1996,15 +1999,30 @@ fi
 # mis-named archive would publish a marker that lies about its payload
 # (the version pin and the channel tarballs carry the matching build by
 # construction, so this refuses only the operator's mis-naming). The probe
-# is BOUNDED where the platform has GNU timeout (Linux, Git Bash): a
-# payload whose --version blocks must not hang the install (macOS has no
-# timeout command; there the probe rides unbounded, the same contract as
-# the daemon-stop probes).
-if command -v timeout >/dev/null 2>&1; then
-  reported_version="$(timeout 10 "${stage}/${BINARY_NAME}" --version 2>/dev/null | head -n 1)"
-else
-  reported_version="$("${stage}/${BINARY_NAME}" --version 2>/dev/null | head -n 1)"
-fi
+# is BOUNDED by a portable watchdog — NOT the `timeout` command: on
+# Windows `timeout` on PATH is timeout.exe, which waits instead of running
+# a command and would refuse every probe, and macOS ships no GNU timeout
+# at all. A payload whose --version blocks is killed at the bound and
+# reports nothing (the refusal below, not a hang).
+probe_out="${stage}/.version-probe.out"
+rm -f "$probe_out"
+"${stage}/${BINARY_NAME}" --version >"$probe_out" 2>/dev/null &
+probe_pid=$!
+probe_waited=0
+while kill -0 "$probe_pid" 2>/dev/null; do
+  probe_waited=$((probe_waited + 1))
+  if [ "$probe_waited" -gt 10 ]; then
+    kill "$probe_pid" 2>/dev/null
+    break
+  fi
+  sleep 1
+done
+# A nonzero-exiting payload still answers --version (its first line is
+# already captured): the wait reaps it without its exit status aborting
+# the installer under set -e.
+wait "$probe_pid" 2>/dev/null || true
+reported_version="$(head -n 1 "$probe_out" 2>/dev/null)"
+rm -f "$probe_out"
 if [ "$reported_version" != "$VERSION" ]; then
   rm -rf "$stage"
   die "the archive names ${VERSION} but its payload reports ${reported_version:-nothing}; rename the archive or publish it under its real version"

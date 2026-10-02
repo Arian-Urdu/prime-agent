@@ -448,6 +448,17 @@ fn update_rollback_without_a_kept_version_changes_nothing() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("nothing to roll back"), "{stderr}");
     assert_eq!(live_version(&sandbox), "9.9.9");
+
+    // A channel flag has nothing to switch in a local operation: refused
+    // before any prompt or install.
+    let mut command = Command::new(&binary);
+    command.args(["update", "--rollback", "--nightly"]);
+    installer_env(&mut command, &sandbox);
+    let output = command.output().expect("run the installed build");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("do not apply to --rollback"), "{stderr}");
+    assert_eq!(live_version(&sandbox), "9.9.9");
 }
 
 fn make_executable(path: &Path) {

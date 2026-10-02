@@ -640,6 +640,32 @@ fn run_update(args: &[String]) -> PublicCommandResult {
     let Some(options) = parse_update_options(args) else {
         return handled_failed();
     };
+    // `--rollback` and `--archive` on an installer install run the bundled
+    // installer; any other binary stays on the managed-install flow.
+    if options.rollback || options.archive.is_some() {
+        if let Some(prefix) = pa_core::update::installer::running_installer_prefix() {
+            if options.source.is_some() {
+                return fail(
+                    "--source only applies to managed installs.",
+                    Some(
+                        "An installer install keeps updating from its release channel.".to_string(),
+                    ),
+                );
+            }
+            if options.channel.is_some() {
+                return fail(
+                    "--nightly and --stable do not apply to --rollback or --archive.",
+                    Some(format!(
+                        "Switch channels with \"{APP_NAME} update --nightly\" or \"--stable\"."
+                    )),
+                );
+            }
+            return handled_with_exit(crate::installer_update::run_local(
+                &prefix,
+                options.archive.as_deref(),
+            ));
+        }
+    }
     let persisted_wire = std::env::current_dir()
         .ok()
         .and_then(|cwd| {
@@ -665,20 +691,6 @@ fn run_update(args: &[String]) -> PublicCommandResult {
             channel: options.channel,
         };
         return handled_with_exit(crate::installer_update::run(&update));
-    }
-    // `--rollback` and `--archive` on an installer install run the bundled
-    // installer; any other binary stays on the managed-install flow.
-    if let Some(prefix) = pa_core::update::installer::running_installer_prefix() {
-        if options.source.is_some() {
-            return fail(
-                "--source only applies to managed installs.",
-                Some("An installer install keeps updating from its release channel.".to_string()),
-            );
-        }
-        return handled_with_exit(crate::installer_update::run_local(
-            &prefix,
-            options.archive.as_deref(),
-        ));
     }
     if options.archive.is_some() && options.source.is_none() {
         return fail(

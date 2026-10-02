@@ -1953,9 +1953,16 @@ else
 step_start "Installing"
 stage="$(mktemp -d "${PREFIX}/share/prime-agent.stage.XXXXXX")"
 guard_preserved "$stage"
-tar -xzf "$asset" -C "$stage"
-[ -x "${stage}/${BINARY_NAME}" ] \
-  || die "the tarball did not contain an executable ${BINARY_NAME} payload"
+# A bad tarball (a malformed --archive is the realistic one) leaves no
+# stage behind: the cleanup trap is not armed yet.
+if ! tar -xzf "$asset" -C "$stage"; then
+  rm -rf "$stage"
+  die "could not extract ${asset}"
+fi
+if [ ! -x "${stage}/${BINARY_NAME}" ]; then
+  rm -rf "$stage"
+  die "the tarball did not contain an executable ${BINARY_NAME} payload"
+fi
 # The ownership marker: the share tree this script publishes carries it, so
 # later installs recognize the tree as theirs BY MARKER, not by shape — an
 # unrelated directory that happens to contain a `prime-agent` entry is never

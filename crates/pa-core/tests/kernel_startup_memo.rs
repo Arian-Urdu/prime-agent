@@ -444,6 +444,25 @@ async fn doomed_settle_keeps_the_newer_boot_listener_state() {
     })
     .await
     .expect("the fixture interpreter spawned");
+    // A joiner of the doomed generation attaches its progress handler
+    // first (replaying A's current stage) and parks on A's memo.
+    let a_stages: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let a_progress: pa_core::kernel::bootstrap::KernelBootstrapProgressHandler = {
+        let a_stages = a_stages.clone();
+        Arc::new(move |message| a_stages.lock().unwrap().push(message.to_string()))
+    };
+    let a_joiner = tokio::spawn({
+        let provisioner = provisioner.clone();
+        let a_progress = a_progress.clone();
+        async move { provisioner.ensure(Some(a_progress), None).await }
+    });
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while a_stages.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the doomed generation's joiner replayed A's stage");
     // The kill invalidates A's memo generation while A is still settling.
     provisioner.kill();
     // Boot B (the newer generation) registers a live progress listener
@@ -452,12 +471,16 @@ async fn doomed_settle_keeps_the_newer_boot_listener_state() {
     // gate1.
     let (stage_tx, stage_rx) = tokio::sync::oneshot::channel();
     let stage_tx = Arc::new(Mutex::new(Some(stage_tx)));
-    let progress_b: pa_core::kernel::bootstrap::KernelBootstrapProgressHandler =
+    let b_stages: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let progress_b: pa_core::kernel::bootstrap::KernelBootstrapProgressHandler = {
+        let b_stages = b_stages.clone();
         Arc::new(move |message| {
+            b_stages.lock().unwrap().push(message.to_string());
             if let Some(tx) = stage_tx.lock().unwrap().take() {
                 let _ = tx.send(message.to_string());
             }
-        });
+        })
+    };
     let newer = tokio::spawn({
         let provisioner = provisioner.clone();
         let progress_b = progress_b.clone();
@@ -500,6 +523,32 @@ async fn doomed_settle_keeps_the_newer_boot_listener_state() {
         .expect("a late joiner must replay the active boot's stage")
         .expect("replay signal");
     assert_eq!(replayed, "Starting Python kernel...");
+    // The killed generation's shared progress state died with the kill:
+    // its joiner heard nothing after the kill (its one entry is the
+    // pre-kill replay), and the newer boot's handler heard exactly its
+    // own first stage - no stale replay of the killed boot's stage in
+    // between.
+    assert_eq!(
+        *a_stages.lock().unwrap(),
+        vec!["Starting Python kernel...".to_string()],
+        "the killed generation's listener must not hear the newer boot"
+    );
+    assert_eq!(
+        *b_stages.lock().unwrap(),
+        vec![
+            "Starting Python kernel...".to_string(),
+            "Starting Python kernel...".to_string(),
+        ],
+        "the arming caller hears its own stage twice (fan-out + boot-local, the pre-existing main shape) and never the killed boot's stale replay first"
+    );
+    let a_settled = tokio::time::timeout(Duration::from_secs(30), a_joiner)
+        .await
+        .expect("the doomed generation's joiner settled")
+        .unwrap();
+    assert!(
+        a_settled.is_err(),
+        "a joiner of a killed boot must settle as a failure"
+    );
     // Release the newer boot: it settles, serves, and the absolute spawn
     // count stays pinned - the doomed boot and the newer one, nothing
     // else.

@@ -694,6 +694,14 @@ impl IpythonKernelProvisioner {
         let manager = {
             let mut state = self.lock_state();
             state.startup = None;
+            // The shared progress state belongs to the memo generation
+            // kill() just invalidated: its own emits already skip shared
+            // writes, and the next ensure() must neither replay the
+            // killed boot's stale stage to a fresh handler nor fan the
+            // newer boot's stages out to the killed generation's
+            // listeners.
+            state.startup_listeners.clear();
+            state.last_startup_message = None;
             state.manager.take()
         };
         if let Some(manager) = manager {

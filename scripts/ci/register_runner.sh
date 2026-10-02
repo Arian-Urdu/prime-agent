@@ -15,9 +15,13 @@
 #                  other repository can run jobs on the runner. An org URL
 #                  is only safe with a runner group limited to this repo.
 #   RUNNER_NAME    Runner name shown in the repo runner list.
-#                  Default: prime-runner-<sandbox hostname suffix>.
+#                  Default: prime-runner-<full sandbox hostname> (the full
+#                  hostname keeps names unique; --replace must not be able
+#                  to reach a different live runner).
 #   RUNNER_LABELS  Comma-separated labels jobs target.
-#                  Default: prime-linux-x64.
+#                  Default: prime-linux-x64. Registered with
+#                  --no-default-labels, so runs-on: self-hosted jobs do
+#                  NOT land on these runners.
 #   RUNNER_DIR     Default: /opt/gh-runner. Must be a dedicated directory
 #                  under /opt (it is chowned recursively to the runner user).
 #   RUNNER_USER    Default: gh-runner.
@@ -27,7 +31,10 @@
 set -euo pipefail
 
 RUNNER_URL="${RUNNER_URL:-https://github.com/PrimeIntellect-ai/prime-agent}"
-RUNNER_NAME="${RUNNER_NAME:-prime-runner-$(hostname | tail -c 5)}"
+# The full hostname keeps names unique across the fleet: a short suffix
+# could collide between two live runners, and --replace would then take
+# the name over from a runner that is still serving jobs.
+RUNNER_NAME="${RUNNER_NAME:-prime-runner-$(hostname)}"
 RUNNER_LABELS="${RUNNER_LABELS:-prime-linux-x64}"
 RUNNER_DIR="${RUNNER_DIR:-/opt/gh-runner}"
 RUNNER_USER="${RUNNER_USER:-gh-runner}"
@@ -113,6 +120,7 @@ exec ./config.sh --unattended \
   --token "$2" \
   --name "$3" \
   --labels "$4" \
+  --no-default-labels \
   --replace
 REGISTER
 chown "${RUNNER_USER}:${RUNNER_USER}" "${RUNNER_DIR}/runner-register.sh"

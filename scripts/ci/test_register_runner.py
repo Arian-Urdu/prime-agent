@@ -99,7 +99,7 @@ class RunnerRegisterContract(unittest.TestCase):
                 [chunk.decode() for chunk in recorded.split(b"\0") if chunk],
                 ["--unattended", "--url", HOSTILE_URL, "--token",
                  HOSTILE_TOKEN, "--name", HOSTILE_NAME, "--labels",
-                 HOSTILE_LABELS, "--replace"],
+                 HOSTILE_LABELS, "--no-default-labels", "--replace"],
                 "config.sh argv is not byte-exact: a value was mangled "
                 "or executed as shell source")
             self.assertEqual(

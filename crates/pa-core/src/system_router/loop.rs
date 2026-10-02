@@ -11,7 +11,13 @@
 //! aborts via `AbortController` and detached handlers. Rust futures cancel on
 //! drop, so every await point here is a `select!` over the work, the segment
 //! deadline, and the external abort signal; the observable results (terminal
-//! reasons, summaries, counters, trace) match the TS loop.
+//! reasons, summaries, counters, trace) match the TS loop. One boundary
+//! differs on purpose: a terminal observation that wins the biased race in
+//! the same poll the deadline fires lands as `done`. The TS loop's post-race
+//! clock check drops it, but that window is nearly unreachable behind
+//! `Promise.race`, while the biased `select!` makes it the designed path for
+//! finished work — and losing the environment's final state would tell
+//! System 2 a finished episode timed out.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -265,16 +271,10 @@ async fn run_loop(
             }
             Race::Done(Ok(observation)) => observation,
         };
-        if Instant::now() >= deadline {
-            return Ok(state.finish(
-                RouterRunStatus::Incomplete,
-                "timeout",
-                format!(
-                    "Stopped at step {step}: the segment timeout of {}ms elapsed while observing.",
-                    options.timeout_ms
-                ),
-            ));
-        }
+        // A terminal observation that won the biased race lands before the
+        // deadline ends the segment: the environment already delivered its
+        // final state, and dropping it would tell System 2 a finished
+        // episode timed out and may be restarted.
         if observation.terminal {
             return Ok(state.finish(
                 RouterRunStatus::Done,
@@ -282,6 +282,18 @@ async fn run_loop(
                 format!(
                     "Environment reported terminal state at step {step} after {} executed action(s).",
                     state.executed
+                ),
+            ));
+        }
+        // The leftover budget still guards the decision dispatch: a drained
+        // segment must not start a new side effect.
+        if Instant::now() >= deadline {
+            return Ok(state.finish(
+                RouterRunStatus::Incomplete,
+                "timeout",
+                format!(
+                    "Stopped at step {step}: the segment timeout of {}ms elapsed while observing.",
+                    options.timeout_ms
                 ),
             ));
         }

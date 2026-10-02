@@ -17,6 +17,9 @@ pub struct ScriptedEnvironment {
     resets: Mutex<VecDeque<Result<(), String>>>,
     observations: Mutex<VecDeque<Result<RouterObservation, String>>>,
     executions: Mutex<VecDeque<Result<RouterExecution, String>>>,
+    /// Every `observe` reply waits this many milliseconds first: the
+    /// deadline-window batteries race a reply against the segment budget.
+    observe_delay_ms: Mutex<u64>,
     /// Every `reset`/`observe`/`execute` call, in order, as
     /// `"reset"`/`"observe"`/`"execute:<action>"`.
     pub calls: Arc<Mutex<Vec<String>>>,
@@ -35,6 +38,7 @@ impl ScriptedEnvironment {
             resets: Mutex::new(VecDeque::from(vec![Ok(())])),
             observations: Mutex::new(observations.into_iter().map(Ok).collect()),
             executions: Mutex::new(VecDeque::new()),
+            observe_delay_ms: Mutex::new(0),
             calls: Arc::new(Mutex::new(Vec::new())),
             closes: Arc::new(Mutex::new(0)),
             init_actions: Mutex::new(None),
@@ -56,6 +60,14 @@ impl ScriptedEnvironment {
         Arc::clone(self)
     }
 
+    /// Delay every `observe` reply by `delay_ms` (the deadline-window
+    /// batteries complete the reply in the same poll the budget fires).
+    #[must_use]
+    pub fn with_observe_delay_ms(self: &Arc<Self>, delay_ms: u64) -> Arc<Self> {
+        *self.observe_delay_ms.lock().unwrap() = delay_ms;
+        Arc::clone(self)
+    }
+
     /// The same observation forever (the repeated-state case).
     #[must_use]
     pub fn with_observation(observation: RouterObservation) -> Arc<Self> {
@@ -63,6 +75,7 @@ impl ScriptedEnvironment {
             resets: Mutex::new(VecDeque::from(vec![Ok(())])),
             observations: Mutex::new(VecDeque::from(vec![Ok(observation)])),
             executions: Mutex::new(VecDeque::new()),
+            observe_delay_ms: Mutex::new(0),
             calls: Arc::new(Mutex::new(Vec::new())),
             closes: Arc::new(Mutex::new(0)),
             init_actions: Mutex::new(None),
@@ -129,6 +142,10 @@ impl RouterEnvironment for ScriptedEnvironment {
     > {
         Box::pin(async move {
             self.calls.lock().unwrap().push("observe".to_string());
+            let delay_ms = *self.observe_delay_ms.lock().unwrap();
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
             let mut observations = self.observations.lock().unwrap();
             let next = match observations.len() {
                 // The last queued observation repeats: the loop's repeated-state

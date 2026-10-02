@@ -79,6 +79,44 @@ async fn a_terminal_observation_ends_the_segment_done() {
     assert!(env.calls.lock().unwrap().contains(&"reset".to_string()));
 }
 
+/// A terminal observation that completes in the same poll the segment
+/// deadline fires wins the biased race; its terminal state must land as
+/// `done`, not be dropped as a timeout for a finished episode.
+#[tokio::test(start_paused = true)]
+async fn a_terminal_observation_at_the_deadline_lands() {
+    let mut terminal = support::observation("the ending credits roll");
+    terminal.terminal = true;
+    let env = support::ScriptedEnvironment::new(vec![terminal]).with_observe_delay_ms(50);
+    let mut options = options(Arc::clone(&env), support::scripted_decide(vec![]));
+    options.timeout_ms = 50;
+    let result = run_system_router_loop(options).await.unwrap();
+    assert_eq!(result.status, RouterRunStatus::Done);
+    assert_eq!(result.reason, "environment_terminal");
+    assert_eq!(result.steps, 0);
+    assert_eq!(result.executed, 0);
+    assert_eq!(
+        result.summary,
+        "Environment reported terminal state at step 0 after 0 executed action(s)."
+    );
+}
+
+/// The leftover-budget check still fires for a non-terminal observation that
+/// wins the biased race: a drained segment must not dispatch a decision.
+#[tokio::test(start_paused = true)]
+async fn a_non_terminal_observation_at_the_deadline_times_out() {
+    let env = support::ScriptedEnvironment::new(vec![support::observation("slow")])
+        .with_observe_delay_ms(50);
+    // An empty decision script: a dispatched decision would fail the run as
+    // a decision_model_error instead of the timeout this test pins.
+    let mut options = options(Arc::clone(&env), support::scripted_decide(vec![]));
+    options.timeout_ms = 50;
+    let result = run_system_router_loop(options).await.unwrap();
+    assert_eq!(result.status, RouterRunStatus::Incomplete);
+    assert_eq!(result.reason, "timeout");
+    assert_eq!(result.steps, 0);
+    assert!(result.summary.contains("elapsed while observing"));
+}
+
 #[tokio::test]
 async fn a_terminal_execution_ends_the_segment_done() {
     let env = support::ScriptedEnvironment::with_observation(support::observation("boss room"))

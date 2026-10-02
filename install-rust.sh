@@ -2055,6 +2055,11 @@ rm -f "$probe_out" "$probe_done" "$probe_pid_file"
 # marker; the loop below polls the MARKER (a fast probe costs one tick,
 # not the whole bound).
 (
+  # The probe must read the STAGED tree's own package.json: a caller's
+  # PI_PACKAGE_DIR would point the packaged-version lookup at another
+  # tree and the probe would then refuse a good archive or pass a
+  # mismatched one.
+  unset PI_PACKAGE_DIR || true
   # The probe's own writes are bounded (64 blocks = 32 KB, ample for a
   # version line): a payload that continuously emits would otherwise fill
   # the filesystem for the whole watchdog window, and the limit kills it

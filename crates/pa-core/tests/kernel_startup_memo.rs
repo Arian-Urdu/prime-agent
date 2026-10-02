@@ -32,7 +32,7 @@
 //! machines without a live install so the suite stays hermetic elsewhere.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pa_core::kernel::provisioner::{IpythonKernelProvisioner, IpythonKernelProvisionerOptions};
@@ -362,5 +362,166 @@ async fn kill_during_the_re_armed_boot_leaves_no_resident_kernel() {
         starts(&count),
         2,
         "the doomed re-armed boot and the fresh boot, nothing else"
+    );
+}
+
+/// A kernel interpreter wrapper that counts spawns into `count` AND holds
+/// the n-th interpreter (0-based, from the count file) until the fixture
+/// creates `gates/gate<n>`, so a test controls exactly when each boot's
+/// handshake may complete - a file barrier, never a timing assumption.
+fn counting_gated_kernel(
+    dir: &std::path::Path,
+    python: &std::path::Path,
+    count: &std::path::Path,
+    gates: &std::path::Path,
+) -> PathBuf {
+    let wrapper = dir.join("counting-gated-python");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nn=$(wc -c < '{}')\nprintf x >> '{}'\nwhile [ ! -f '{}'/gate$n ]; do sleep 0.05; done\nexec '{}' \"$@\"\n",
+            count.display(),
+            count.display(),
+            gates.display(),
+            python.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    wrapper
+}
+
+/// Opens the fixture's gate0/gate1 files on any drop (a failing assert
+/// included): a counting wrapper still polling its gate when the test
+/// ends must not outlive the test as an orphan - released, it execs the
+/// interpreter, whose stdin pipe is gone, and exits.
+struct ReleaseGates(std::path::PathBuf);
+impl Drop for ReleaseGates {
+    fn drop(&mut self) {
+        let _ = std::fs::write(self.0.join("gate0"), "");
+        let _ = std::fs::write(self.0.join("gate1"), "");
+    }
+}
+
+/// A doomed boot settling against a NEWER memo generation must not wipe
+/// the newer boot's progress state: the settle's listener teardown and
+/// the replayed-stage reset belong to the ACTIVE generation only. The
+/// observable is the joiner replay - a late `ensure()` joiner of the
+/// newer boot replays that boot's last stage to its fresh progress
+/// handler; after the doomed settle the replay must still fire.
+#[tokio::test]
+async fn doomed_settle_keeps_the_newer_boot_listener_state() {
+    let Some(python) = kernel_python() else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().unwrap();
+    let count = dir.path().join("starts");
+    // The wrapper reads its ordinal from the count file BEFORE appending,
+    // so the file must exist (empty) before the first spawn.
+    std::fs::write(&count, "").unwrap();
+    let gates = dir.path().join("gates");
+    std::fs::create_dir_all(&gates).unwrap();
+    let _release_gates = ReleaseGates(gates.clone());
+    let wrapped = counting_gated_kernel(dir.path(), &python, &count, &gates);
+    let provisioner = IpythonKernelProvisioner::new(
+        dir.path(),
+        IpythonKernelProvisionerOptions {
+            python: Some(wrapped),
+            ..Default::default()
+        },
+    );
+    // Boot A spawns its interpreter held at gate0 (its handshake cannot
+    // complete until the fixture opens the gate, so its settle timing is
+    // under the test's control, never a timing race).
+    let doomed = tokio::spawn({
+        let provisioner = provisioner.clone();
+        async move { provisioner.ensure(None, None).await }
+    });
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while starts(&count) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the fixture interpreter spawned");
+    // The kill invalidates A's memo generation while A is still settling.
+    provisioner.kill();
+    // Boot B (the newer generation) registers a live progress listener
+    // and reaches its first stage - which precedes its own interpreter
+    // spawn, so the stage is observable while B's handshake is held at
+    // gate1.
+    let (stage_tx, stage_rx) = tokio::sync::oneshot::channel();
+    let stage_tx = Arc::new(Mutex::new(Some(stage_tx)));
+    let progress_b: pa_core::kernel::bootstrap::KernelBootstrapProgressHandler =
+        Arc::new(move |message| {
+            if let Some(tx) = stage_tx.lock().unwrap().take() {
+                let _ = tx.send(message.to_string());
+            }
+        });
+    let newer = tokio::spawn({
+        let provisioner = provisioner.clone();
+        let progress_b = progress_b.clone();
+        async move { provisioner.ensure(Some(progress_b), None).await }
+    });
+    let first_stage = tokio::time::timeout(Duration::from_secs(30), stage_rx)
+        .await
+        .expect("the newer boot reached its first stage")
+        .expect("stage signal");
+    assert_eq!(first_stage, "Starting Python kernel...");
+    // NOW the doomed boot settles (gate0 opens its handshake): whatever
+    // it does to the shared progress state, the newer generation's
+    // listener and replay stage must survive it.
+    std::fs::write(gates.join("gate0"), "").unwrap();
+    let settled = tokio::time::timeout(Duration::from_secs(30), doomed)
+        .await
+        .expect("the doomed boot settled")
+        .unwrap();
+    assert!(
+        settled.is_err(),
+        "a boot doomed by kill() must settle as a failure"
+    );
+    // A late joiner of the NEWER boot replays its current stage to a
+    // fresh handler: the doomed settle must not have wiped it.
+    let (replay_tx, replay_rx) = tokio::sync::oneshot::channel();
+    let replay_tx = Arc::new(Mutex::new(Some(replay_tx)));
+    let progress_c: pa_core::kernel::bootstrap::KernelBootstrapProgressHandler =
+        Arc::new(move |message| {
+            if let Some(tx) = replay_tx.lock().unwrap().take() {
+                let _ = tx.send(message.to_string());
+            }
+        });
+    let joiner = tokio::spawn({
+        let provisioner = provisioner.clone();
+        let progress_c = progress_c.clone();
+        async move { provisioner.ensure(Some(progress_c), None).await }
+    });
+    let replayed = tokio::time::timeout(Duration::from_secs(5), replay_rx)
+        .await
+        .expect("a late joiner must replay the active boot's stage")
+        .expect("replay signal");
+    assert_eq!(replayed, "Starting Python kernel...");
+    // Release the newer boot: it settles, serves, and the absolute spawn
+    // count stays pinned - the doomed boot and the newer one, nothing
+    // else.
+    std::fs::write(gates.join("gate1"), "").unwrap();
+    let manager = tokio::time::timeout(Duration::from_secs(30), newer)
+        .await
+        .expect("the newer boot settled")
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), joiner)
+        .await
+        .expect("the joiner settled")
+        .unwrap()
+        .unwrap();
+    let result = manager
+        .execute("1 + 1", ExecuteOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(result.status, ExecuteStatus::Ok);
+    assert_eq!(
+        starts(&count),
+        2,
+        "the doomed boot and the newer boot, nothing else"
     );
 }

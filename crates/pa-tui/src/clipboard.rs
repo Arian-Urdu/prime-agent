@@ -1,11 +1,8 @@
-//! Terminal clipboard writes (TS `utils/clipboard.ts` `copyToClipboard`):
-//! the platform clipboard tools first (they hold selection ownership), then
-//! the OSC 52 escape for remote sessions or when no tool copied. The OSC 52
-//! payload cap and the final error text are TS-verbatim; the TS native
-//! `clipboard-rs` addon (skipped on Linux by TS itself) has no Rust
-//! counterpart, so the tool chain plus OSC 52 is the full port.
+//! Terminal clipboard requests. Local clipboard tools confirm delivery;
+//! tmux buffer forwarding and OSC 52 cannot confirm receipt by the user's
+//! terminal. All user-facing copy paths share this chain and its size cap.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -32,21 +29,14 @@ impl OscSink {
 }
 
 /// tmux with `external` or `off` discards application-origin OSC 52.
-/// An outer tmux or the terminal may still reject a write when this returns
-/// false, so this detects a known block rather than proving delivery.
+/// A tmux-owned buffer can still be forwarded with `external` when an
+/// attached client advertises the Ms clipboard capability.
 pub(crate) fn tmux_blocks_osc52() -> bool {
     if std::env::var_os("TMUX").is_none() {
         return false;
     }
-    let Ok(output) = Command::new("tmux")
-        .args(["show", "-s", "set-clipboard"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-    else {
-        return false;
-    };
-    output.status.success() && tmux_clipboard_setting_blocks(&output.stdout)
+    tmux_output(&["show", "-s", "set-clipboard"])
+        .is_some_and(|output| tmux_clipboard_setting_blocks(output.as_bytes()))
 }
 
 fn tmux_clipboard_setting_blocks(output: &[u8]) -> bool {
@@ -57,7 +47,86 @@ fn tmux_clipboard_setting_blocks(output: &[u8]) -> bool {
 }
 
 pub(crate) const TMUX_CLIPBOARD_BLOCKED: &str =
-    "tmux blocks app clipboard writes. Run 'tmux set -s set-clipboard on' at each tmux hop.";
+    "tmux cannot forward this copy to a clipboard. Check its attached client's Ms capability and each outer tmux hop.";
+pub(crate) const TMUX_CLIPBOARD_REQUESTED: &str =
+    "Clipboard sent via tmux; paste in the local terminal to verify delivery";
+
+fn tmux_output(args: &[&str]) -> Option<String> {
+    let mut child = Command::new("tmux")
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + HELPER_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let mut output = String::new();
+                child.stdout.take()?.read_to_string(&mut output).ok()?;
+                return Some(output);
+            }
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(PIPE_POLL),
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Ask tmux to originate the clipboard write. `external` allows tmux's own
+/// writes, unlike the application OSC 52 path. No terminal protocol confirms
+/// that an outer tmux or terminal actually received the request.
+pub(crate) fn copy_via_tmux(text: &str) -> bool {
+    let Ok(pane) = std::env::var("TMUX_PANE") else {
+        return false;
+    };
+    if tmux_output(&["show-options", "-gv", "set-clipboard"])
+        .is_none_or(|value| value.trim() == "off")
+    {
+        return false;
+    }
+    let Some(session) = tmux_output(&["display-message", "-p", "-t", &pane, "#{session_id}"])
+    else {
+        return false;
+    };
+    let Some(clients) = tmux_output(&[
+        "list-clients",
+        "-t",
+        session.trim(),
+        "-F",
+        "#{client_activity} #{client_name}",
+    ]) else {
+        return false;
+    };
+    let Some((_, client)) = clients
+        .lines()
+        .filter_map(|line| {
+            let (activity, client) = line.split_once(' ')?;
+            Some((activity.parse::<u64>().ok()?, client))
+        })
+        .max_by_key(|(activity, _)| *activity)
+    else {
+        return false;
+    };
+    let Some(terminal) = tmux_output(&["show-messages", "-T", "-t", client]) else {
+        return false;
+    };
+    if !terminal.lines().any(|line| {
+        line.split_once("Ms: (string) ")
+            .is_some_and(|(_, capability)| !capability.trim().is_empty())
+    }) {
+        return false;
+    }
+    pipe_to("tmux", &["load-buffer", "-w", "-t", client, "-"], text)
+}
 
 /// TS `isRemoteSession`: any SSH or mosh transport means the local tools
 /// would target the wrong machine, so OSC 52 carries the copy home.
@@ -217,37 +286,48 @@ fn copy_to_x11(text: &str) -> bool {
         || pipe_to("xsel", &["--clipboard", "--input"], text)
 }
 
-/// Copy `text` to the user's clipboard (TS `copyToClipboard`): platform
-/// tools, then OSC 52 for remote sessions or when no tool copied. Errors
-/// resolve with the TS wording.
-pub(crate) fn copy_to_clipboard(text: &str, sink: &mut OscSink) -> Result<(), String> {
+/// Copy text using a local platform tool or request delivery via the terminal.
+/// A terminal request has no acknowledgement from the local clipboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CopyOutcome {
+    Confirmed,
+    Requested,
+}
+
+pub(crate) fn copy_to_clipboard(text: &str, sink: &mut OscSink) -> Result<CopyOutcome, String> {
     copy_with_env(text, sink, &Env::process())
 }
 
-fn copy_with_env(text: &str, sink: &mut OscSink, env: &Env) -> Result<(), String> {
-    let mut copied = false;
-    if !copied {
-        copied = match std::env::consts::OS {
+fn copy_with_env(text: &str, sink: &mut OscSink, env: &Env) -> Result<CopyOutcome, String> {
+    let copied = if matches!(sink, OscSink::Buffer(_)) {
+        false
+    } else {
+        match std::env::consts::OS {
             "macos" => pipe_to("pbcopy", &[], text),
             "windows" => pipe_to("clip", &[], text),
             _ => copy_on_linux(text, env),
-        };
-    }
+        }
+    };
     let remote = is_remote_session(env);
     if copied && !remote {
-        return Ok(());
+        return Ok(CopyOutcome::Confirmed);
     }
-    if remote || !copied {
-        if matches!(sink, OscSink::Stdout) && tmux_blocks_osc52() {
+    if matches!(sink, OscSink::Stdout) && std::env::var_os("TMUX").is_some() {
+        // The containing tmux originates this copy even with its default
+        // `set-clipboard external`; raw application OSC 52 is rejected there.
+        if crate::osc52::sequence(text).is_some() && copy_via_tmux(text) {
+            return Ok(CopyOutcome::Requested);
+        }
+        if tmux_blocks_osc52() {
             return Err(TMUX_CLIPBOARD_BLOCKED.to_string());
         }
-        if let Some(sequence) = crate::osc52::sequence(text) {
-            sink.write_sequence(&sequence);
-            copied = true;
-        }
+    }
+    if let Some(sequence) = crate::osc52::sequence(text) {
+        sink.write_sequence(&sequence);
+        return Ok(CopyOutcome::Requested);
     }
     if copied {
-        Ok(())
+        Ok(CopyOutcome::Confirmed)
     } else {
         Err("Failed to copy to clipboard".to_string())
     }

@@ -70,7 +70,9 @@ Prime Agent combines a persistent Python control environment with durable harnes
 
 ## Clipboard over SSH and tmux
 
-Prime Agent copies terminal selections with OSC 52. SSH carries the sequence, but each tmux layer must accept clipboard writes from applications. If a selection reports that tmux blocks clipboard writes, run `tmux set -s set-clipboard on` in every tmux server between Prime Agent and your local terminal (including a login-node tmux session). To keep this setting, add `set -s set-clipboard on` to each server's `~/.tmux.conf` and reload it. Your local terminal must also support OSC 52 and allow clipboard writes; macOS Terminal.app does not support OSC 52, while iTerm2 requires its “Applications in terminal may access clipboard” setting. A successful write to the terminal does not prove the local clipboard changed. When mouse reporting takes over dragging, hold Shift while selecting in most terminals (Option in iTerm2) to make a native selection for Cmd-C.
+Prime Agent uses the local clipboard tool (such as `pbcopy`) when available. In tmux it asks the attached tmux client to forward a clipboard buffer if that client advertises the `Ms` capability. This works with tmux's default `set-clipboard external`, unlike application-origin OSC 52. Without tmux, remote copies request delivery using OSC 52. Terminal requests cannot confirm that your local clipboard changed, so Prime Agent reports them as unconfirmed.
+
+Nested tmux servers and terminals may still block delivery. An outer tmux with `set-clipboard external` can reject the inner server's OSC 52. In that case, run `tmux set -s set-clipboard on` on the outer server, or use native terminal selection (Shift-drag in most terminals; Option-drag in iTerm2) followed by Cmd-C. macOS Terminal.app does not support OSC 52; iTerm2 requires its “Applications in terminal may access clipboard” setting.
 
 ## Getting Started
 

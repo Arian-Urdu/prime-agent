@@ -477,7 +477,7 @@ impl SessionUi {
                 self.toast("Copied last agent message to clipboard", view);
             }
             Ok(crate::clipboard::CopyOutcome::Requested) => {
-                self.toast(crate::clipboard::TMUX_CLIPBOARD_REQUESTED, view);
+                self.toast(crate::clipboard::CLIPBOARD_REQUESTED, view);
             }
             Err(message) => self.error_row(&message, view),
         }

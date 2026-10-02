@@ -14,16 +14,17 @@ pub(crate) enum OscSink {
 }
 
 impl OscSink {
-    fn write_sequence(&mut self, sequence: &str) {
+    fn write_sequence(&mut self, sequence: &str) -> std::io::Result<()> {
         match self {
             OscSink::Stdout => {
                 let mut out = std::io::stdout();
-                // The sequence is zero-width; a write failure (closed pipe)
-                // must not fail the copy attempt chain.
-                let _ = out.write_all(sequence.as_bytes());
-                let _ = out.flush();
+                out.write_all(sequence.as_bytes())?;
+                out.flush()
             }
-            OscSink::Buffer(buffer) => buffer.extend_from_slice(sequence.as_bytes()),
+            OscSink::Buffer(buffer) => {
+                buffer.extend_from_slice(sequence.as_bytes());
+                Ok(())
+            }
         }
     }
 }
@@ -48,8 +49,8 @@ fn tmux_clipboard_setting_blocks(output: &[u8]) -> bool {
 
 pub(crate) const TMUX_CLIPBOARD_BLOCKED: &str =
     "tmux cannot forward this copy to a clipboard. Check its attached client's Ms capability and each outer tmux hop.";
-pub(crate) const TMUX_CLIPBOARD_REQUESTED: &str =
-    "Clipboard sent via tmux; paste in the local terminal to verify delivery";
+pub(crate) const CLIPBOARD_REQUESTED: &str =
+    "Clipboard request sent; paste in the local terminal to verify delivery";
 
 fn tmux_output(args: &[&str]) -> Option<String> {
     let mut child = Command::new("tmux")
@@ -323,7 +324,8 @@ fn copy_with_env(text: &str, sink: &mut OscSink, env: &Env) -> Result<CopyOutcom
         }
     }
     if let Some(sequence) = crate::osc52::sequence(text) {
-        sink.write_sequence(&sequence);
+        sink.write_sequence(&sequence)
+            .map_err(|error| format!("Failed to write clipboard request: {error}"))?;
         return Ok(CopyOutcome::Requested);
     }
     if copied {
@@ -368,7 +370,10 @@ mod tests {
     #[test]
     fn a_small_text_without_tools_emits_osc52() {
         let mut sink = OscSink::Buffer(Vec::new());
-        copy_with_env("parity text", &mut sink, &plain_env()).expect("copy succeeds via OSC 52");
+        assert_eq!(
+            copy_with_env("parity text", &mut sink, &plain_env()),
+            Ok(CopyOutcome::Requested)
+        );
         match sink {
             OscSink::Buffer(buffer) => {
                 let bytes = String::from_utf8(buffer).expect("utf8");

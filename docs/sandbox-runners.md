@@ -134,9 +134,14 @@ executes workflow code on your infra. This design answers each half:
   the agent → the runner appears *Idle* in the GitHub runner list within a
   minute. Repeat per label (`prime-linux-x64`, `prime-linux-arm64`).
 - **Keep-alive / rotation**: the sandbox lifetime cap forces a weekly
-  recreate; the driver deletes the old VM (which deregisters the runner on
-  its next failed poll) and provisions a fresh one with a fresh token. The
-  first build after each rotation is cold.
+  recreate; the driver deletes the old VM and provisions a fresh one with a
+  fresh token. Deleting the VM does not deregister the runner: the dead
+  registration stays listed *Offline* until it is removed (manually, or by
+  GitHub after >14 days disconnected). The runner name is hostname-derived,
+  so the fresh VM can receive the same name as the lingering entry;
+  `register_runner.sh` passes `--replace`, and the fresh registration takes
+  the name over if that happens instead of failing. The first build after
+  each rotation is cold.
 - **Teardown**: delete the VM; remove the dead runner entry
   (`gh api -X DELETE repos/PrimeIntellect-ai/prime-agent/actions/runners/<id>`)
   at the next convenience.

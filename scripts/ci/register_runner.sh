@@ -91,13 +91,20 @@ chown -R "${RUNNER_USER}:${RUNNER_USER}" "${RUNNER_DIR}"
 # config.sh validates the token against GitHub and writes the registration
 # state; the token only ever crosses as an argv to config.sh (never logged,
 # never echoed by this script). A bad/expired token fails here, leaving no
-# partial registration.
+# partial registration. --replace takes the name over from a stale
+# registration: the sandbox lifetime cap rotates VMs weekly and the name is
+# hostname-derived, and GitHub keeps listing the old entry as Offline after
+# the VM is gone (a deleted VM cannot deregister itself; the entry lingers
+# until removed manually or after >14 days disconnected). Without
+# --replace that leftover name fails provisioning of the fresh VM and
+# leaves prime-linux-* jobs queued.
 log "registering '${RUNNER_NAME}' with labels [${RUNNER_LABELS}] at ${RUNNER_URL}"
 su -s /bin/bash "${RUNNER_USER}" -c "cd '${RUNNER_DIR}' && ./config.sh --unattended \
   --url '${RUNNER_URL}' \
   --token '${RUNNER_TOKEN}' \
   --name '${RUNNER_NAME}' \
-  --labels '${RUNNER_LABELS}'"
+  --labels '${RUNNER_LABELS}' \
+  --replace"
 # su keeps the caller's environment: drop the token so the supervisor, the
 # agent, and every job it runs never see it.
 unset RUNNER_TOKEN

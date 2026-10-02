@@ -276,6 +276,10 @@ impl SessionUi {
             self.toast("Copied selection to clipboard", view);
             return;
         }
+        if crate::clipboard::tmux_blocks_osc52() {
+            self.error_row(crate::clipboard::TMUX_CLIPBOARD_BLOCKED, view);
+            return;
+        }
         let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
         let mut out = std::io::stdout();
         match out.write_all(format!("\x1b]52;c;{encoded}\x07").as_bytes()) {
@@ -1136,6 +1140,10 @@ impl SessionUi {
                     // chain and its captured OSC sink stays verifiable.
                     if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
                         use std::io::Write;
+                        if crate::clipboard::tmux_blocks_osc52() {
+                            self.error_row(crate::clipboard::TMUX_CLIPBOARD_BLOCKED, view);
+                            return Ok(());
+                        }
                         // The sequence goes through `osc52::sequence`, so
                         // the encoded-payload cap applies to this path
                         // like every other OSC 52 write: an oversized

@@ -68,6 +68,10 @@ Prime Agent combines a persistent Python control environment with durable harnes
 - **Agents communicate directly:** running agents can exchange messages and orchestrate one another without routing everything through the user.
 - **Long tasks keep moving:** automatic compaction, persistent goals, heartbeats, schedules, autonomous mode, and retained subagents preserve progress across turns and terminal sessions.
 
+## Clipboard over SSH and tmux
+
+Prime Agent copies terminal selections with OSC 52. SSH carries the sequence, but each tmux layer must accept clipboard writes from applications. If a selection reports that tmux blocks clipboard writes, run `tmux set -s set-clipboard on` in every tmux server between Prime Agent and your local terminal (including a login-node tmux session). To keep this setting, add `set -s set-clipboard on` to each server's `~/.tmux.conf` and reload it. Your local terminal must also support OSC 52 and allow clipboard writes; macOS Terminal.app does not support OSC 52, while iTerm2 requires its “Applications in terminal may access clipboard” setting. A successful write to the terminal does not prove the local clipboard changed. When mouse reporting takes over dragging, hold Shift while selecting in most terminals (Option in iTerm2) to make a native selection for Cmd-C.
+
 ## Getting Started
 
 Start Prime Agent from the repository or directory you want it to work in:

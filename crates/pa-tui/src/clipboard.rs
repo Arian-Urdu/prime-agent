@@ -31,6 +31,34 @@ impl OscSink {
     }
 }
 
+/// tmux with `external` or `off` discards application-origin OSC 52.
+/// An outer tmux or the terminal may still reject a write when this returns
+/// false, so this detects a known block rather than proving delivery.
+pub(crate) fn tmux_blocks_osc52() -> bool {
+    if std::env::var_os("TMUX").is_none() {
+        return false;
+    }
+    let Ok(output) = Command::new("tmux")
+        .args(["show", "-s", "set-clipboard"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    output.status.success() && tmux_clipboard_setting_blocks(&output.stdout)
+}
+
+fn tmux_clipboard_setting_blocks(output: &[u8]) -> bool {
+    matches!(
+        String::from_utf8_lossy(output).trim(),
+        "set-clipboard external" | "set-clipboard off"
+    )
+}
+
+pub(crate) const TMUX_CLIPBOARD_BLOCKED: &str =
+    "tmux blocks app clipboard writes. Run 'tmux set -s set-clipboard on' at each tmux hop.";
+
 /// TS `isRemoteSession`: any SSH or mosh transport means the local tools
 /// would target the wrong machine, so OSC 52 carries the copy home.
 fn is_remote_session(env: &Env) -> bool {
@@ -210,6 +238,9 @@ fn copy_with_env(text: &str, sink: &mut OscSink, env: &Env) -> Result<(), String
         return Ok(());
     }
     if remote || !copied {
+        if matches!(sink, OscSink::Stdout) && tmux_blocks_osc52() {
+            return Err(TMUX_CLIPBOARD_BLOCKED.to_string());
+        }
         if let Some(sequence) = crate::osc52::sequence(text) {
             sink.write_sequence(&sequence);
             copied = true;
@@ -225,6 +256,13 @@ fn copy_with_env(text: &str, sink: &mut OscSink, env: &Env) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tmux_application_clipboard_policy() {
+        assert!(tmux_clipboard_setting_blocks(b"set-clipboard external\n"));
+        assert!(tmux_clipboard_setting_blocks(b"set-clipboard off\n"));
+        assert!(!tmux_clipboard_setting_blocks(b"set-clipboard on\n"));
+    }
 
     fn plain_env() -> Env {
         Env::scripted([

@@ -388,7 +388,7 @@ fn normalize(text: &str, sandbox_roots: &[&Path]) -> String {
     // (package dir); compare the shape, not the installation location.
     text = normalize_docs_paths(&text);
     // Rust-first commands the TS product has not adopted yet (the `prompt`
-    // dump, roadmap item 3, and the tailscale detection core): strip their
+    // dump, the telemetry switch, and the tailscale detection core): strip their
     // help rows and re-align the `Commands:` list, so the rest of the command
     // surface still compares equal. When the TS product adopts a command, drop
     // it from `RUST_FIRST_COMMANDS`.
@@ -400,7 +400,7 @@ fn normalize(text: &str, sandbox_roots: &[&Path]) -> String {
 }
 
 /// The command names only the Rust binary lists today.
-const RUST_FIRST_COMMANDS: &[&str] = &["prompt", "tailscale"];
+const RUST_FIRST_COMMANDS: &[&str] = &["prompt", "telemetry", "tailscale"];
 
 /// Normalize a `Commands:` help block: drop the Rust-first rows and re-align
 /// each remaining row's name/summary gap. A Rust-first command whose name is

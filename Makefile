@@ -187,4 +187,12 @@ shard-gates:
 	python3 scripts/test_ci_test_shard.py
 	python3 scripts/test_ci_pr_crates.py
 
-.PHONY: check deny windows-cross actionlint glibc-gate release-dry-run continuous-dry-run audit-build package catalog-assets catalog-assets-fixture catalog-assets-gates fold-gates restamp-gates shard-gates
+# The sandbox-runner provisioning contract battery (scripts/ci/
+# register_runner.sh): the security case is first - the registration values
+# reach config.sh as argv and the supervisor script path reaches su as
+# argv, never as interpolated shell source, and the -- on both su
+# invocations keeps a leading-dash value from becoming su's own option.
+runner-gates:
+	python3 scripts/ci/test_register_runner.py
+
+.PHONY: check deny windows-cross actionlint glibc-gate release-dry-run continuous-dry-run audit-build package catalog-assets catalog-assets-fixture catalog-assets-gates fold-gates restamp-gates shard-gates runner-gates

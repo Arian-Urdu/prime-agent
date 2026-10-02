@@ -4,7 +4,9 @@
 # drops to the dedicated runner user for everything that touches GitHub.
 #
 # Environment (the sandbox SDK injects secrets as env vars; the registration
-# token is a one-hour credential and MUST NOT be logged or passed by argv):
+# token is a one-hour credential and MUST NOT be logged or written to disk;
+# it does cross as argv to the register script and config.sh, so it is
+# briefly visible to root and the runner user via ps):
 #   RUNNER_TOKEN   REQUIRED. A fresh registration token (minted per
 #                  provision; see docs/sandbox-runners.md for both mint
 #                  routes). Missing => hard fail, no partial state.
@@ -89,22 +91,39 @@ rm -f "/tmp/${RUNNER_TARBALL}"
 chown -R "${RUNNER_USER}:${RUNNER_USER}" "${RUNNER_DIR}"
 
 # config.sh validates the token against GitHub and writes the registration
-# state; the token only ever crosses as an argv to config.sh (never logged,
-# never echoed by this script). A bad/expired token fails here, leaving no
-# partial registration. --replace takes the name over from a stale
-# registration: the sandbox lifetime cap rotates VMs weekly and the name is
-# hostname-derived, and GitHub keeps listing the old entry as Offline after
-# the VM is gone (a deleted VM cannot deregister itself; the entry lingers
-# until removed manually or after >14 days disconnected). Without
-# --replace that leftover name fails provisioning of the fresh VM and
-# leaves prime-linux-* jobs queued.
+# state; the token only ever crosses as an argv (never logged, never echoed
+# by this script). The registration runs from a fixed script file that
+# takes the values as positional parameters (the runner-supervise.sh
+# pattern: no nested quoting through a su -c shell string), so a quote in
+# any value is data, never shell syntax. A bad/expired token fails in
+# config.sh, leaving no partial registration. --replace takes the name over
+# from a stale registration: the sandbox lifetime cap rotates VMs weekly
+# and the name is hostname-derived, and GitHub keeps listing the old entry
+# as Offline after the VM is gone (a deleted VM cannot deregister itself;
+# the entry lingers until removed manually or after >14 days disconnected).
+# Without --replace that leftover name fails provisioning of the fresh VM
+# and leaves prime-linux-* jobs queued.
 log "registering '${RUNNER_NAME}' with labels [${RUNNER_LABELS}] at ${RUNNER_URL}"
-su -s /bin/bash "${RUNNER_USER}" -c "cd '${RUNNER_DIR}' && ./config.sh --unattended \
-  --url '${RUNNER_URL}' \
-  --token '${RUNNER_TOKEN}' \
-  --name '${RUNNER_NAME}' \
-  --labels '${RUNNER_LABELS}' \
-  --replace"
+cat > "${RUNNER_DIR}/runner-register.sh" <<'REGISTER'
+#!/bin/bash
+set -euo pipefail
+cd "$(dirname "$0")"
+exec ./config.sh --unattended \
+  --url "$1" \
+  --token "$2" \
+  --name "$3" \
+  --labels "$4" \
+  --replace
+REGISTER
+chown "${RUNNER_USER}:${RUNNER_USER}" "${RUNNER_DIR}/runner-register.sh"
+chmod 700 "${RUNNER_DIR}/runner-register.sh"
+# The -- terminator is load-bearing: su parses options among trailing args
+# (getopt permutation), so a value like -c in RUNNER_NAME/LABELS - or in
+# RUNNER_USER itself - would be consumed by su itself; -- before any value
+# ends option parsing, and everything after it is passed to the script as
+# plain argv.
+su -s /bin/bash -- "${RUNNER_USER}" "${RUNNER_DIR}/runner-register.sh" \
+  "${RUNNER_URL}" "${RUNNER_TOKEN}" "${RUNNER_NAME}" "${RUNNER_LABELS}"
 # su keeps the caller's environment: drop the token so the supervisor, the
 # agent, and every job it runs never see it.
 unset RUNNER_TOKEN
@@ -129,7 +148,14 @@ done
 SUPERVISE
 chown "${RUNNER_USER}:${RUNNER_USER}" "${RUNNER_DIR}/runner-supervise.sh"
 chmod 700 "${RUNNER_DIR}/runner-supervise.sh"
-su -s /bin/bash "${RUNNER_USER}" -c "setsid nohup '${RUNNER_DIR}/runner-supervise.sh' > /dev/null 2>&1 < /dev/null &"
+# The detachment lives outside any shell string: su runs the fixed script
+# as its bash operand (the -- again ends su's option parsing before any
+# value), setsid/nohup background it as a new session, and no value is
+# ever shell source. The supervise loop never exits, so the backgrounded
+# su tree stays alive for the sandbox's life - same lifetime contract as
+# the previous inline-setsid form.
+setsid nohup su -s /bin/bash -- "${RUNNER_USER}" "${RUNNER_DIR}/runner-supervise.sh" \
+  > /dev/null 2>&1 < /dev/null &
 
 log "runner provisioned: name=${RUNNER_NAME} labels=[${RUNNER_LABELS}] dir=${RUNNER_DIR}"
 log "verify: it should appear Idle in the GitHub runner list within a minute"

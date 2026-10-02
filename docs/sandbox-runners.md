@@ -96,8 +96,10 @@ that is limited to `prime-agent`.
 
 The token is passed to the fleet driver as a sandbox *secret* (encrypted at
 rest, materialized as an env var inside the VM, never logged, never in an
-API response), reaches `register_runner.sh` as `$RUNNER_TOKEN`, and only
-ever crosses as an argv to `config.sh`.
+API response), reaches `register_runner.sh` as `$RUNNER_TOKEN`, and crosses
+as argv (briefly visible via `ps` to root and the runner user during
+registration) - to the register script and `config.sh`, and never as an
+interpolated shell string.
 
 The sandbox-SDK half (create the VM, inject the secret, upload and run the
 script, keep the VM alive, delete it at teardown or on the 7-day sandbox

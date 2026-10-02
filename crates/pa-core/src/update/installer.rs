@@ -271,10 +271,10 @@ pub async fn run_bundled_installer(
                 message: format!("could not run the installer: {error}"),
             }
         })?;
-        let mut command = installer_child(prefix, None).map_err(|error| {
+        let shell = trusted_shell().inspect_err(|_| {
             let _ = std::fs::remove_file(&script);
-            error
         })?;
+        let mut command = installer_child(&shell, prefix, None);
         command
             .arg("-s")
             .arg("--")
@@ -418,55 +418,55 @@ fn write_script(bytes: &[u8]) -> Result<PathBuf> {
     Ok(script)
 }
 
-/// Build the installer's child command: the trusted interpreter and the
-/// installer's env knobs (the script and its args are the caller's —
-/// [`execute_script`] passes them as the child's arguments, and the
-/// Windows handoff rides the script over the child's stdin), so both
-/// wait modes ([`execute_script`]) and the handoff spawn this same
-/// command. The trusted absolute interpreter (`/bin/sh`, the same
-/// interpreter the curl|sh one-liner uses, at the trusted absolute path
+/// The trusted interpreter for the installer child (the `curl|sh`
+/// one-liner's own): the absolute /bin/sh on unix — never PATH-resolved,
 /// so a poisoned `PATH` cannot substitute the interpreter that runs the
-/// installer with the inherited environment), with the install prefix
-/// riding the child's environment as the installer's own knob, so the
-/// script publishes exactly where the probe looks — every other
-/// `PRIME_AGENT_RUST_*` knob passes through untouched.
+/// installer with the inherited credentials.
+#[cfg(not(windows))]
+fn trusted_shell() -> PathBuf {
+    PathBuf::from("/bin/sh")
+}
+
+/// On Windows the kernel shell resolver's TRUSTED Git Bash roots -
+/// hardcoded install-dir literals, never PATH and never `where bash.exe`
+/// (the `get_shell_config` fallback that serves the kernel shell would
+/// let a repo-controlled `PATH` place the interpreter that receives the
+/// inherited `GITHUB_TOKEN`; the funnel must not use it).
 ///
 /// # Errors
-/// Returns the failure when the trusted interpreter cannot be resolved.
+/// Returns the failure when no trusted Git Bash root exists.
+#[cfg(windows)]
+fn trusted_shell() -> std::result::Result<std::path::PathBuf, UpdateFailure> {
+    crate::platform::shell::resolve_kernel_bash_shell(None)
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| UpdateFailure {
+            // No shellPath guidance here: the funnel, like its unix side
+            // (the hardcoded /bin/sh), resolves only the trusted roots -
+            // the settings key serves the kernel shell, not this privileged
+            // execution (the promise would lie).
+            message: "could not run the installer: no Git Bash found at \
+                  the trusted install roots \
+                  (C:\\Program Files\\Git\\bin\\bash.exe); install \
+                  Git for Windows (https://git-scm.com/download/win) \
+                  to update from this machine"
+                .to_string(),
+        })
+}
+
+/// Build the installer's child command: [`trusted_shell`]'s interpreter
+/// with the installer's env knobs (the script and its args are the
+/// caller's — [`execute_script`] passes them as the child's arguments,
+/// and the Windows handoff rides the script over the child's stdin), so
+/// both wait modes ([`execute_script`]) and the handoff spawn this same
+/// command: the install prefix riding the child's environment as the
+/// installer's own knob, so the script publishes exactly where the probe
+/// looks — every other `PRIME_AGENT_RUST_*` knob passes through
+/// untouched.
 fn installer_child(
+    shell: &Path,
     prefix: &Path,
     channel: Option<&'static str>,
-) -> std::result::Result<tokio::process::Command, UpdateFailure> {
-    // The interpreter: the trusted absolute /bin/sh on unix (never
-    // PATH-resolved, so a poisoned PATH cannot substitute the interpreter
-    // that runs the installer with the inherited credentials); on Windows
-    // the kernel shell resolver's TRUSTED Git Bash roots - hardcoded
-    // install-dir literals, never PATH and never `where bash.exe` (the
-    // get_shell_config fallback that serves the kernel shell would let a
-    // repo-controlled PATH place the interpreter that receives the
-    // inherited GITHUB_TOKEN; the funnel must not use it).
-    #[cfg(windows)]
-    let shell = {
-        match crate::platform::shell::resolve_kernel_bash_shell(None) {
-            Some(path) => path,
-            None => {
-                return Err(UpdateFailure {
-                    // No shellPath guidance here: the funnel, like its unix
-                    // side (the hardcoded /bin/sh), resolves only the trusted
-                    // roots - the settings key serves the kernel shell, not
-                    // this privileged execution (the promise would lie).
-                    message: "could not run the installer: no Git Bash found at \
-                              the trusted install roots \
-                              (C:\\Program Files\\Git\\bin\\bash.exe); install \
-                              Git for Windows (https://git-scm.com/download/win) \
-                              to update from this machine"
-                        .to_string(),
-                });
-            }
-        }
-    };
-    #[cfg(not(windows))]
-    let shell = "/bin/sh";
+) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(shell);
     command.env(ENV_PREFIX, prefix);
     // The requested channel wins; otherwise the update stays on the channel
@@ -475,11 +475,12 @@ fn installer_child(
     if let Some(channel) = channel.or_else(|| installed_channel(prefix)) {
         command.env(ENV_RELEASE_CHANNEL, channel);
     }
-    Ok(command)
+    command
 }
 
-/// Exec the script and wait for it: [`installer_child`]'s command plus
-/// the script and its args as the child's arguments. The script's own
+/// Exec the script and wait for it: [`trusted_shell`]'s interpreter
+/// under [`installer_child`]'s env wiring, plus the script and its args
+/// as the child's arguments. The script's own
 /// die messages already streamed with [`InstallerOutput::Inherit`];
 /// with [`InstallerOutput::Capture`] the tail becomes the failure
 /// message.
@@ -493,7 +494,11 @@ async fn execute_script(
     channel: Option<&'static str>,
     output: InstallerOutput,
 ) -> std::result::Result<(), UpdateFailure> {
-    let mut command = installer_child(prefix, channel)?;
+    #[cfg(windows)]
+    let shell = trusted_shell()?;
+    #[cfg(not(windows))]
+    let shell = trusted_shell();
+    let mut command = installer_child(&shell, prefix, channel);
     command.arg(script).args(args);
     match output {
         InstallerOutput::Inherit => {

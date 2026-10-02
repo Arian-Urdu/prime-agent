@@ -170,17 +170,29 @@ impl Client {
             .set_read_timeout(Some(Duration::from_millis(100)))
             .expect("set timeout");
         loop {
-            line.clear();
             match self.reader.read_line(&mut line) {
                 Ok(0) => panic!("supervisor closed the connection"),
-                Ok(_) if line.trim().is_empty() => {}
+                // A large supervisor frame can straddle the 100ms read
+                // windows: the buffer keeps a partial frame's bytes across
+                // the poll timeouts and resets only after a complete line
+                // is consumed — the same fragmentation fix the driver's
+                // own client carries.
+                Ok(_) if line.trim().is_empty() => line.clear(),
                 Ok(_) => return serde_json::from_str(line.trim()).expect("parse line"),
-                Err(error) => {
+                // Only the poll timeout (WouldBlock on Unix, TimedOut on
+                // Windows) means "no line yet"; any other read error is
+                // persistent and fails the read instead of busy-looping
+                // to the deadline.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
                     assert!(
                         Instant::now() < deadline,
                         "timed out waiting for supervisor line: {error}"
                     );
                 }
+                Err(error) => panic!("supervisor socket error: {error}"),
             }
         }
     }
@@ -509,4 +521,48 @@ fn swarm_eval_smoke_scores_a_real_one_child_swarm() {
     let report = render_markdown_report(&[row], &config);
     assert!(report.contains("| 1 | 1 |"), "{report}");
     assert!(report.contains("## Verdict"), "{report}");
+}
+
+/// The e2e client's `read_line` must keep a frame's partial bytes across a
+/// read timeout: a supervisor line can straddle the client's 100ms read
+/// window, and dropping the first chunk fails the frame's parse (the same
+/// flake class the driver's own client already fixed). No supervisor
+/// needed — the client runs against a scripted socket.
+#[test]
+fn e2e_client_survives_fragmented_supervisor_frames() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("frag.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind socket");
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let mut writer = stream.try_clone().expect("clone stream");
+        let mut reader = BufReader::new(stream);
+        let _ = writeln!(writer, r#"{{"type":"daemon_hello"}}"#);
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+        // The response arrives in two pieces with a gap wider than the
+        // client's 100ms read window.
+        let response = r#"{"id":"frag-1","type":"response","success":true,"data":{"text":"ok"}}"#;
+        writer
+            .write_all(&response.as_bytes()[..20])
+            .expect("first chunk");
+        writer.flush().expect("flush chunk");
+        std::thread::sleep(Duration::from_millis(300));
+        writer.write_all(&response.as_bytes()[20..]).expect("rest");
+        writer
+            .write_all(
+                b"
+",
+            )
+            .expect("newline");
+        writer.flush().expect("flush rest");
+    });
+    let (mut client, hello) = Client::connect(&socket);
+    assert_eq!(hello["type"], "daemon_hello");
+    client.send_command(
+        "frag-1",
+        &json!({ "type": "get_last_assistant_text", "activeSessionId": "s" }),
+    );
+    let response = client.read_response("frag-1");
+    assert_eq!(response["data"]["text"], "ok", "{response}");
 }

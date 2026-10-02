@@ -210,23 +210,41 @@ fn extract_flag(argv: &[String], flag: &str) -> (Option<String>, bool, Vec<Strin
     (value, given, rest)
 }
 
-/// The per-run scratch root: the process id plus the start time keeps two
-/// harness processes launched in the same millisecond from sharing trial
-/// directories and `swarm-eval-{size}-{trial}` daemon session names.
-fn runs_root_path() -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "swarm-eval-{}-{}",
+/// The per-run tag: the process id plus the start time. It keeps two
+/// harness processes launched in the same millisecond apart in every
+/// per-run identity — the scratch root and the daemon session names,
+/// which embed the same tag so a create is never refused over another
+/// run's name.
+fn run_tag() -> String {
+    format!(
+        "{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis()
-    ))
+    )
+}
+
+/// The per-run scratch root, uniquified by [`run_tag`].
+fn runs_root_path(tag: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("swarm-eval-{tag}"))
+}
+
+/// The daemon session name for one trial. The embedded run tag keeps the
+/// name unique across harness processes: a leftover live session from a
+/// crashed run (or a concurrent eval on the same daemon) no longer
+/// refuses the create — a refusal that used to skip the orphan reconcile
+/// and leave the blocking session spending tokens — and the orphan
+/// reconcile can address an otherwise-unidentifiable orphan by name.
+fn session_name(run_tag: &str, size: usize, trial: usize) -> String {
+    format!("swarm-eval-{run_tag}-{size}-{trial}")
 }
 
 fn run(socket: &Path, config: &SwarmEvalConfig) -> Result<(), String> {
     let mut client = Client::connect(socket)?;
-    let runs_root = runs_root_path();
+    let tag = run_tag();
+    let runs_root = runs_root_path(&tag);
     fs::create_dir_all(&runs_root).map_err(|error| format!("create runs root: {error}"))?;
 
     let mut results: Vec<SwarmEvalTrialResult> = Vec::new();
@@ -237,7 +255,7 @@ fn run(socket: &Path, config: &SwarmEvalConfig) -> Result<(), String> {
                 config.trials, config.model
             );
             let started = Instant::now();
-            match run_trial(&mut client, socket, config, size, trial, &runs_root) {
+            match run_trial(&mut client, socket, config, size, trial, &runs_root, &tag) {
                 Ok(result) => results.push(result),
                 Err(message) => {
                     eprintln!("trial failed: {message}");
@@ -288,6 +306,7 @@ fn run_trial(
     size: usize,
     trial: usize,
     runs_root: &Path,
+    run_tag: &str,
 ) -> Result<SwarmEvalTrialResult, String> {
     let started = Instant::now();
     let (provider, model_id) = config
@@ -324,12 +343,13 @@ fn run_trial(
     // hands the session id to the shared cleanup below; a refused create
     // (the daemon answered) is authoritative — nothing was created; a
     // lost create response (timeout or transport reset) is ambiguous —
-    // the daemon may already have created `swarm-eval-{size}-{trial}`,
-    // and with no id returned it would outlive the run as a live orphan.
+    // the daemon may already have created the trial's session, and with
+    // no id returned it would outlive the run as a live orphan.
+    let name = session_name(run_tag, size, trial);
     let create_result = client.command(
         &json!({
             "type": "create",
-            "name": format!("swarm-eval-{size}-{trial}"),
+            "name": name,
             "config": {
                 "cwd": trial_root.to_string_lossy(),
                 "sessionDir": sessions_dir.to_string_lossy(),
@@ -351,7 +371,7 @@ fn run_trial(
             // Reconcile the trial's own sessions dir over a fresh
             // connection and kill whatever the daemon reports there
             // before reporting the failure.
-            let reconcile = reconcile_orphaned_create(client, socket, &sessions_dir);
+            let reconcile = reconcile_orphaned_create(client, socket, &sessions_dir, &name);
             let _ = fs::remove_dir_all(&trial_root);
             return Err(match reconcile {
                 Ok(0) => format!("create failed: {error}; reconcile found no orphaned session"),
@@ -390,7 +410,7 @@ fn run_trial(
     // trial directory removed whether the trial scored or errored, so a
     // failed prompt, poll, or stats request can never leave a live
     // orchestrator issuing real model requests after the trial ends.
-    let cleanup = kill_session(client, socket, &session_id);
+    let cleanup = kill_session(client, socket, &session_id).map(|_| ());
     let _ = fs::remove_dir_all(&trial_root);
     match (outcome, cleanup) {
         (outcome, Ok(())) => outcome,
@@ -412,13 +432,24 @@ fn run_trial(
 /// under the trial's own sessions dir — with no id ever returned, it would
 /// outlive the run. The reconcile lists that dir over a fresh connection
 /// and kills every session the daemon reports under it. Matching by the
-/// trial's unique sessions dir (not by the session name, which repeats
-/// across runs with the same sweep coordinates) keeps a concurrent
-/// harness process's live session out of the kill set.
+/// trial's unique sessions dir keeps a concurrent harness process's or a
+/// user's live session out of the kill set.
+///
+/// The list's path filter cannot see every orphan, though: a resident whose
+/// `get_state` fails is summarized as a recovering row with neither a
+/// `sessionFile` nor an `activeSessionId` (and a create still in flight
+/// may not have written its session file at all), so the row filter would
+/// skip the exact live session this pass exists to kill. The daemon
+/// resolves a kill by the resident's name label too, and the trial's
+/// session name embeds this run's process-unique tag, so a kill addressed
+/// to the name reaches the orphan — and only this run's orphan. An
+/// envelope saying the session is unknown means the create never landed
+/// (or the path pass already killed it): settled, not an error.
 fn reconcile_orphaned_create(
     client: &mut Client,
     socket: &Path,
     sessions_dir: &Path,
+    session_name: &str,
 ) -> Result<usize, String> {
     let mut retry = Client::connect(socket)
         .map_err(|connect_error| format!("reconnect failed: {connect_error}"))?;
@@ -458,6 +489,17 @@ fn reconcile_orphaned_create(
         kill_session(client, socket, orphan_id)?;
         killed += 1;
     }
+    // The name-addressed kill of last resort: it reaches the orphan the
+    // row filter above cannot see (see the doc comment). Only a success
+    // envelope counts as a kill — an unknown-session answer means there
+    // was nothing left to kill.
+    if kill_session(client, socket, session_name)?
+        .get("success")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        killed += 1;
+    }
     Ok(killed)
 }
 
@@ -467,24 +509,31 @@ fn reconcile_orphaned_create(
 /// connection before the failure propagates into the trial. A response
 /// envelope (even `success: false`, e.g. an unknown session) is the
 /// daemon's authoritative answer and settles the cleanup.
-fn kill_session(client: &mut Client, socket: &Path, session_id: &str) -> Result<(), String> {
+fn kill_session(client: &mut Client, socket: &Path, session_id: &str) -> Result<Value, String> {
     let command = json!({ "type": "kill", "activeSessionId": session_id });
-    if let Err(first_error) = client.command(&command, Duration::from_secs(30)) {
-        let mut retry = Client::connect(socket)
-            .map_err(|connect_error| format!("{first_error}; reconnect: {connect_error}"))?;
-        let retry_result = retry.command(&command, Duration::from_secs(30));
-        // The fresh connection heals the shared client for the sweep's
-        // later trials.
-        *client = retry;
-        retry_result.map_err(|retry_error| {
-            format!("cleanup kill failed on both connections ({first_error}; {retry_error})")
-        })?;
-    }
-    Ok(())
+    let response = match client.command(&command, Duration::from_secs(30)) {
+        Ok(response) => response,
+        Err(first_error) => {
+            let mut retry = Client::connect(socket)
+                .map_err(|connect_error| format!("{first_error}; reconnect: {connect_error}"))?;
+            let retry_result = retry.command(&command, Duration::from_secs(30));
+            // The fresh connection heals the shared client for the sweep's
+            // later trials.
+            *client = retry;
+            retry_result.map_err(|retry_error| {
+                format!("cleanup kill failed on both connections ({first_error}; {retry_error})")
+            })?
+        }
+    };
+    Ok(response)
 }
 
 /// The post-create trial body: prompt, poll, verify, and score. Cleanup is
 /// owned by [`run_trial`], which kills the session on every outcome.
+// Lint exception, kept narrow (AGENTS.md lint discipline): the body
+// needs the trial's whole addressable state — client, config, sweep
+// coordinates, session id, secrets, prompt, and start — and a context
+// struct would only reshuffle the same seven values between call sites.
 #[allow(clippy::too_many_arguments)]
 fn drive_trial(
     client: &mut Client,
@@ -619,7 +668,7 @@ mod tests {
     use pa_types::platform::transport::BlockingTransportStream;
     use serde_json::{json, Value};
 
-    use super::{run, run_trial, runs_root_path, socket_from_args, Client};
+    use super::{run, run_tag, run_trial, runs_root_path, session_name, socket_from_args, Client};
 
     /// A scripted daemon socket: greets the client, then answers each
     /// command by its `type` from `script`, recording every command in
@@ -1034,9 +1083,9 @@ mod tests {
     #[test]
     fn the_runs_root_is_process_unique() {
         // Two harness processes launched in the same millisecond must not
-        // share a scratch root: their trial directories and daemon session
-        // names would collide.
-        let name = runs_root_path()
+        // share a scratch root: their trial directories would collide.
+        let tag = run_tag();
+        let name = runs_root_path(&tag)
             .file_name()
             .expect("a name")
             .to_string_lossy()
@@ -1044,6 +1093,34 @@ mod tests {
         assert!(
             name.starts_with(&format!("swarm-eval-{}-", std::process::id())),
             "{name}"
+        );
+    }
+
+    #[test]
+    fn session_names_carry_the_process_unique_run_tag() {
+        // The daemon refuses a create whose name a live session already
+        // holds: without the run tag in the name, a leftover live session
+        // from a crashed run (or a concurrent eval on the same daemon)
+        // blocks the new trial's create — a refusal that skips the orphan
+        // reconcile entirely.
+        let tag = run_tag();
+        let name = session_name(&tag, 2, 1);
+        assert_eq!(name, format!("swarm-eval-{tag}-2-1"), "{name}");
+        assert!(
+            name.starts_with(&format!("swarm-eval-{}-", std::process::id())),
+            "the name embeds this process's id: {name}"
+        );
+        // Two harness processes carry different tags (pid, start time), so
+        // the same sweep coordinates never contend for one daemon name.
+        assert_ne!(
+            session_name("11-111", 2, 1),
+            session_name("22-222", 2, 1),
+            "same sweep coordinates, different runs"
+        );
+        assert_ne!(
+            session_name(&tag, 2, 1),
+            session_name(&tag, 2, 2),
+            "different trials in one run stay distinct"
         );
     }
 
@@ -1098,7 +1175,7 @@ mod tests {
         let config = test_config(out_dir.path(), 2, 15.0);
         let runs_root = dir.path().join("runs");
         let mut client = Client::connect(&socket).expect("connect");
-        let error = run_trial(&mut client, &socket, &config, 2, 1, &runs_root)
+        let error = run_trial(&mut client, &socket, &config, 2, 1, &runs_root, "77-880")
             .expect_err("the trial fails on the reset socket");
         // The kill reached the daemon over the retry connection.
         let command = rx
@@ -1117,6 +1194,12 @@ mod tests {
     }
 
     #[test]
+    // Lint exception, kept narrow (AGENTS.md lint discipline): the
+    // inline scripted daemon is this test's fixture — the two-connection
+    // create/list/kill sequence the assertions address line by line —
+    // and a helper would only move the fixture behind a boundary the
+    // assertions cannot follow.
+    #[allow(clippy::too_many_lines)]
     fn an_ambiguous_create_orphan_is_reconciled_and_killed() {
         // The create response can be lost to a reset while the daemon still
         // created the session; with no id returned the orphan would outlive
@@ -1128,6 +1211,7 @@ mod tests {
         let listener = UnixListener::bind(&socket).expect("bind");
         let (list_tx, list_rx) = channel();
         let (kill_tx, kill_rx) = channel();
+        let (name_kill_tx, name_kill_rx) = channel();
         // The trial's own sessions dir, so the scripted list can place the
         // orphan under it (the reconcile only kills rows whose session file
         // lives there) beside a decoy from another dir that must survive.
@@ -1191,12 +1275,30 @@ mod tests {
                     "success": true
                 })
             );
+            // The name-addressed kill follows the path pass: the live
+            // orphan is already gone, so the daemon answers unknown
+            // session — settled, and not counted again.
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read name kill");
+            let envelope: Value = serde_json::from_str(line.trim()).expect("name kill envelope");
+            let _ = name_kill_tx.send(envelope.get("command").cloned().unwrap_or(Value::Null));
+            let _ = writeln!(
+                writer,
+                "{}",
+                json!({
+                    "id": envelope.get("id").cloned().unwrap_or(Value::Null),
+                    "type": "response",
+                    "success": false,
+                    "error": "Unknown active session"
+                })
+            );
         });
         let out_dir = tempfile::TempDir::new().expect("out dir");
         let config = test_config(out_dir.path(), 2, 15.0);
         let runs_root = dir.path().join("runs");
         let mut client = Client::connect(&socket).expect("connect");
-        let error = run_trial(&mut client, &socket, &config, 2, 1, &runs_root)
+        let tag = "77-880";
+        let error = run_trial(&mut client, &socket, &config, 2, 1, &runs_root, tag)
             .expect_err("the lost create response fails the trial");
         // The reconcile listed the trial's own sessions dir...
         let list_command = list_rx
@@ -1220,6 +1322,18 @@ mod tests {
             kill_command["activeSessionId"], "s-orphan",
             "{kill_command}"
         );
+        // The pass then retried the trial's own session name — the
+        // unidentifiable-orphan fallback — and the daemon's unknown answer
+        // settles it without counting a second kill.
+        let name_kill_command = name_kill_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the name kill ran");
+        assert_eq!(name_kill_command["type"], "kill", "{name_kill_command}");
+        assert_eq!(
+            name_kill_command["activeSessionId"],
+            session_name(tag, 2, 1),
+            "{name_kill_command}"
+        );
         // Only the trial's own orphan: the unrelated resident the list
         // also reported must survive the reconcile.
         assert!(
@@ -1233,6 +1347,108 @@ mod tests {
     }
 
     #[test]
+    fn an_unidentifiable_orphan_is_killed_by_name() {
+        // A resident whose `get_state` fails is listed as a recovering row
+        // with neither a `sessionFile` nor an `activeSessionId` — the path
+        // filter of the reconcile skips it, and the live session keeps
+        // spending tokens after the trial dir is deleted. The daemon
+        // resolves a kill by the resident's name label, so the reconcile's
+        // name-addressed kill must reach the orphan under this trial's
+        // process-unique session name.
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let socket = dir.path().join("recovering.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let (list_tx, list_rx) = channel();
+        let (kill_tx, kill_rx) = channel();
+        thread::spawn(move || {
+            // Connection 1: hello, read the create, drop (the response is
+            // lost).
+            let (stream, _) = listener.accept().expect("accept 1");
+            let mut writer = stream.try_clone().expect("clone 1");
+            let mut reader = BufReader::new(stream);
+            let _ = writeln!(writer, r#"{{"type":"daemon_hello"}}"#);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read create");
+            drop(writer);
+            drop(reader);
+            // Connection 2 (the reconcile): the list reports only the
+            // recovering row — no `sessionFile`, no `activeSessionId`,
+            // exactly the daemon's offline summary shape — so nothing in
+            // the list is path-addressable.
+            let (stream, _) = listener.accept().expect("accept 2");
+            let mut writer = stream.try_clone().expect("clone 2");
+            let mut reader = BufReader::new(stream);
+            let _ = writeln!(writer, r#"{{"type":"daemon_hello"}}"#);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read list");
+            let envelope: Value = serde_json::from_str(line.trim()).expect("list envelope");
+            let _ = list_tx.send(envelope.get("command").cloned().unwrap_or(Value::Null));
+            let _ = writeln!(
+                writer,
+                "{}",
+                json!({
+                    "id": envelope.get("id").cloned().unwrap_or(Value::Null),
+                    "type": "response",
+                    "success": true,
+                    "data": { "sessions": [
+                        // The recovering orphan: the daemon's offline
+                        // summary for a resident whose `get_state` fails.
+                        { "id": "w-orphan", "lifecycle": "recovering",
+                          "isSessionActive": false, "sessionId": "" },
+                        // Another daemon's user session in the same shape:
+                        // unidentifiable rows are never path-killed, and
+                        // the name kill must not reach it either.
+                        { "id": "w-user", "lifecycle": "recovering",
+                          "isSessionActive": false, "sessionId": "" }
+                    ] }
+                })
+            );
+            // The name kill resolves the recovering orphan by its name
+            // label and succeeds.
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read name kill");
+            let envelope: Value = serde_json::from_str(line.trim()).expect("name kill envelope");
+            let _ = kill_tx.send(envelope.get("command").cloned().unwrap_or(Value::Null));
+            let _ = writeln!(
+                writer,
+                "{}",
+                json!({
+                    "id": envelope.get("id").cloned().unwrap_or(Value::Null),
+                    "type": "response",
+                    "success": true
+                })
+            );
+        });
+        let out_dir = tempfile::TempDir::new().expect("out dir");
+        let config = test_config(out_dir.path(), 2, 15.0);
+        let runs_root = dir.path().join("runs");
+        let mut client = Client::connect(&socket).expect("connect");
+        let tag = "77-880";
+        let error = run_trial(&mut client, &socket, &config, 2, 1, &runs_root, tag)
+            .expect_err("the lost create response fails the trial");
+        let list_command = list_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the reconcile list ran");
+        assert_eq!(list_command["type"], "list", "{list_command}");
+        // No row was path-addressable, so the kill that arrives is the
+        // name-addressed one — the trial's own session name, not the
+        // recovering rows' worker ids.
+        let kill_command = kill_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the name kill ran");
+        assert_eq!(kill_command["type"], "kill", "{kill_command}");
+        assert_eq!(
+            kill_command["activeSessionId"],
+            session_name(tag, 2, 1),
+            "{kill_command}"
+        );
+        assert!(kill_rx.recv_timeout(Duration::from_secs(1)).is_err());
+        assert!(error.contains("create failed"), "{error}");
+        assert!(error.contains("reconcile killed 1"), "{error}");
+        assert!(!runs_root.join("size-2-trial-1").exists());
+    }
+
+    #[test]
     fn a_refused_create_skips_the_reconcile() {
         // A refused create (the daemon answered success: false) is
         // authoritative: nothing was created, so no reconcile pass runs.
@@ -1241,8 +1457,16 @@ mod tests {
         let config = test_config(out_dir.path(), 2, 15.0);
         let runs_root = out_dir.path().join("runs");
         let mut client = Client::connect(&daemon.socket).expect("connect");
-        let error = run_trial(&mut client, &daemon.socket, &config, 2, 1, &runs_root)
-            .expect_err("the refused create fails the trial");
+        let error = run_trial(
+            &mut client,
+            &daemon.socket,
+            &config,
+            2,
+            1,
+            &runs_root,
+            "77-880",
+        )
+        .expect_err("the refused create fails the trial");
         assert!(error.contains("command failed"), "{error}");
         assert!(!error.contains("reconcile"), "{error}");
         // Drain every command the driver sent: no list may appear. The
@@ -1294,8 +1518,16 @@ mod tests {
         };
         let runs_root = out_dir.path().join("runs");
         let mut client = Client::connect(&daemon.socket).expect("connect");
-        let error = run_trial(&mut client, &daemon.socket, &config, 2, 1, &runs_root)
-            .expect_err("the overflowing seed must fail the trial");
+        let error = run_trial(
+            &mut client,
+            &daemon.socket,
+            &config,
+            2,
+            1,
+            &runs_root,
+            "77-880",
+        )
+        .expect_err("the overflowing seed must fail the trial");
         assert!(
             error.contains("overflows the derived trial seed"),
             "{error}"

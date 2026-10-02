@@ -1981,7 +1981,11 @@ fi
 if [ -e "$legacy_lock" ] || [ -L "$legacy_lock" ]; then
   held_by="$(readlink "$legacy_lock" 2>/dev/null || true)"
   if [ -n "$held_by" ] && kill -0 "$held_by" 2>/dev/null; then
-    die "an older prime-agent-rust installer (pid ${held_by}) is publishing to ${PREFIX}; retry when it finishes"
+    # The lock refusals below die with the stage already built, before the EXIT
+    # trap that would sweep it: a fresh install's stage is this run's own scratch,
+    # so it never outlives the refused install — a rollback's stage is the kept
+    # generation itself, never this run's trash to delete.
+    { [ -z "${rollback_from:-}" ] && rm -rf "$stage"; die "an older prime-agent-rust installer (pid ${held_by}) is publishing to ${PREFIX}; retry when it finishes"; }
   fi
   rm -f "$legacy_lock"
 fi
@@ -2010,20 +2014,20 @@ if [ "$WINDOWS" = "yes" ]; then
     if [ -n "$held_by" ] \
        && MSYS2_ARG_CONV_EXCL='*' tasklist.exe /FI "PID eq ${held_by}" /NH 2>/dev/null \
           | grep -qw "$held_by"; then
-      die "another prime-agent installer (Windows pid ${held_by}) is publishing to ${PREFIX}; retry when it finishes"
+      { [ -z "${rollback_from:-}" ] && rm -rf "$stage"; die "another prime-agent installer (Windows pid ${held_by}) is publishing to ${PREFIX}; retry when it finishes"; }
     fi
-    die "a publication lock (Windows pid ${held_by:-unknown}) is held at ${lock_dir}. If no prime-agent installer (install-rust.sh or install.ps1) is running, it is stale (a crashed install); remove it and retry:
-  rm -rf \"${lock_dir}\""
+    { [ -z "${rollback_from:-}" ] && rm -rf "$stage"; die "a publication lock (Windows pid ${held_by:-unknown}) is held at ${lock_dir}. If no prime-agent installer (install-rust.sh or install.ps1) is running, it is stale (a crashed install); remove it and retry:
+  rm -rf \"${lock_dir}\""; }
   done
   printf '%s\n' "$(cat "/proc/$$/winpid" 2>/dev/null || echo $$)" > "$lock_dir/pid"
 else
   until ln -s $$ "$lock_link" 2>/dev/null; do
     held_by="$(readlink "$lock_link" 2>/dev/null || true)"
     if [ -n "$held_by" ] && kill -0 "$held_by" 2>/dev/null; then
-      die "another install-rust.sh (pid ${held_by}) is publishing to ${PREFIX}; retry when it finishes"
+      { [ -z "${rollback_from:-}" ] && rm -rf "$stage"; die "another install-rust.sh (pid ${held_by}) is publishing to ${PREFIX}; retry when it finishes"; }
     fi
-    die "a previous install-rust.sh (pid ${held_by:-unknown}) left a stale publication lock (a crashed install; its cleanup trap cannot have run). Remove it and retry:
-  rm -f \"${lock_link}\""
+    { [ -z "${rollback_from:-}" ] && rm -rf "$stage"; die "a previous install-rust.sh (pid ${held_by:-unknown}) left a stale publication lock (a crashed install; its cleanup trap cannot have run). Remove it and retry:
+  rm -f \"${lock_link}\""; }
   done
 fi
 
@@ -2089,6 +2093,14 @@ on_exit() {
   # restore would delete that fresh payload (cross-installer data loss).
   [ -n "$launcher_tmp" ] && rm -f "$launcher_tmp" 2>/dev/null || true
   [ -n "${cmd_tmp:-}" ] && rm -f "$cmd_tmp" 2>/dev/null || true
+  # The extraction stage is disposable on every failed path: a successful
+  # publish renamed the stage into ${share_dir}, so the stale path no longer
+  # exists and the removal is a no-op there; a rollback publishes the kept
+  # generation itself (stage == rollback_from), which is never this run's
+  # trash to delete.
+  if [ -z "${rollback_from:-}" ] && [ -n "${stage:-}" ]; then
+    rm -rf "$stage" 2>/dev/null || true
+  fi
   # The user's unowned command file goes home if the Rust launcher never
   # went live (the same restore discipline as the displaced TS tree): a
   # failed launcher write must not leave the machine without ANY

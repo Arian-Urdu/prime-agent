@@ -2010,24 +2010,60 @@ fi
 # at all. A payload whose --version blocks is killed at the bound and
 # reports nothing (the refusal below, not a hang).
 probe_out="${stage}/.version-probe.out"
-rm -f "$probe_out"
-"${stage}/${BINARY_NAME}" --version >"$probe_out" 2>/dev/null &
-probe_pid=$!
+probe_done="${stage}/.version-probe.done"
+probe_pid_file="${stage}/.version-probe.pid"
+rm -f "$probe_out" "$probe_done" "$probe_pid_file"
+# The runner: the payload is ITS child (a sibling's `wait` cannot reap
+# another shell's child), and `kill -0` keeps succeeding on a ZOMBIE, so
+# the pid alone cannot tell a finished probe from a hanging one — the
+# runner publishes the payload's pid, reaps it, and writes the done
+# marker; the loop below polls the MARKER (a fast probe costs one tick,
+# not the whole bound).
+(
+  "${stage}/${BINARY_NAME}" --version >"$probe_out" 2>/dev/null &
+  printf '%s\n' "$!" >"$probe_pid_file"
+  wait || true
+  printf 'done\n' >"$probe_done"
+) &
+probe_runner=$!
 probe_waited=0
-while kill -0 "$probe_pid" 2>/dev/null; do
+probe_timed_out=""
+while [ ! -f "$probe_done" ]; do
   probe_waited=$((probe_waited + 1))
   if [ "$probe_waited" -gt 10 ]; then
-    kill "$probe_pid" 2>/dev/null
+    # The bound: SIGTERM, then SIGKILL — a payload that ignores the
+    # first still dies, its runner then exits (its own wait returns),
+    # and nothing of the probe outlives this install. The timeout flag
+    # decides the verdict: a payload that printed its version BEFORE
+    # hanging was still unresponsive, and the captured stdout must not
+    # pass for an answer.
+    probe_timed_out="yes"
+    probe_pid="$(cat "$probe_pid_file" 2>/dev/null || true)"
+    if [ -n "$probe_pid" ]; then
+      kill "$probe_pid" 2>/dev/null || true
+      sleep 1
+      kill -9 "$probe_pid" 2>/dev/null || true
+    else
+      kill -9 "$probe_runner" 2>/dev/null || true
+    fi
     break
   fi
   sleep 1
 done
 # A nonzero-exiting payload still answers --version (its first line is
-# already captured): the wait reaps it without its exit status aborting
-# the installer under set -e.
-wait "$probe_pid" 2>/dev/null || true
+# already captured): the runner's reap happens inside it, and neither
+# wait's status aborts the installer under set -e.
+wait "$probe_runner" 2>/dev/null || true
+if [ -n "$probe_timed_out" ]; then
+  rm -f "$probe_out" "$probe_done" "$probe_pid_file"
+  # The stage goes too: this die predates the full cleanup trap's arming
+  # (the mismatch refusal below sweeps its own stage the same way), so a
+  # hung payload on a normal install leaves no staging tree behind.
+  rm -rf "$stage"
+  die "the archive names ${VERSION} but its payload did not answer --version within 10s; refusing an unresponsive payload"
+fi
 reported_version="$(head -n 1 "$probe_out" 2>/dev/null)"
-rm -f "$probe_out"
+rm -f "$probe_out" "$probe_done" "$probe_pid_file"
 if [ "$reported_version" != "$VERSION" ]; then
   rm -rf "$stage"
   die "the archive names ${VERSION} but its payload reports ${reported_version:-nothing}; rename the archive or publish it under its real version"

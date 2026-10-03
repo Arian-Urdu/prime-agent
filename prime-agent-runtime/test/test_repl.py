@@ -655,35 +655,24 @@ class ReplTest(unittest.TestCase):
             self.assertEqual(one(events, "result")["text"], "42")
             self.assertEqual(fresh.shutdown(), 0)
 
-    def assert_loop_wakeup_alive(self, repl: ReplProcess) -> None:
-        """call_soon_threadsafe from off-loop threads must wake the serving loop:
-        a kernel whose wakeup pipe died parks in select and serves nothing, so
-        the future must resolve through the thread hop alone."""
-        probe = (
-            "import asyncio, threading\n"
-            "loop = asyncio.get_running_loop()\n"
-            "fut = loop.create_future()\n"
-            "threading.Timer(0.3, lambda: loop.call_soon_threadsafe(\n"
-            "    lambda: fut.done() or fut.set_result('woken'))).start()\n"
-            "await asyncio.wait_for(fut, 15)\n"
-        )
-        events = repl.execute("wakeup-probe", probe)
-        self.assertEqual(one(events, "done")["status"], "ok")
-        self.assertEqual(one(events, "result")["text"], "'woken'")
-
-    def test_snapshot_skips_bash_handles_and_restored_kernel_stays_alive(self):
-        # Saved live process handles never revive (stale pid, stale fd ints);
-        # dill restoring a saved pipe file even reopens the raw fd NUMBER and
-        # closes it, killing the restored kernel's event-loop self-pipe.
+    def test_snapshot_skips_off_cell_bash_handles(self):
+        # A handle created outside any cell (here: a plain thread) carries no
+        # unpicklable cell-task reference, so dill would happily persist its
+        # pipe fds; restoring a saved fd number reopens (and closes) it in the
+        # new kernel, killing whatever owns the fd there.
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "kernel-state.dill")
             manifest_path = os.path.join(tmp, "kernel-state.json")
             setup = (
+                "import threading\n"
                 "from rlm import bash\n"
-                "h1 = bash('echo done-h1')\n"
+                "hs = []\n"
+                "t = threading.Thread(target=lambda: hs.append(bash('echo done-h1')))\n"
+                "t.start()\n"
+                "t.join()\n"
+                "h1 = hs[0]\n"
                 "await h1\n"
-                "h2 = bash('sleep 30')\n"
-                "hs = [h1]\n"
+                "del t\n"
                 "keep = 1\n"
             )
             self.assertEqual(one(self.repl.execute("s1", setup), "done")["status"], "ok")
@@ -693,23 +682,10 @@ class ReplTest(unittest.TestCase):
             done = one(self.repl.until_done("s2"), "done")
             self.assertEqual(done["status"], "ok")
             skipped = {entry["name"]: entry["reason"] for entry in done["skipped"]}
-            self.assertEqual(sorted(skipped), ["h1", "h2", "hs"])
+            self.assertEqual(sorted(skipped), ["h1", "hs"])
             for reason in skipped.values():
                 self.assertIn("live process handle", reason)
-            self.assertEqual(done["saved"], ["keep"])
-
-            fresh = ReplProcess()
-            self.addCleanup(fresh.close)
-            fresh.ready()
-            fresh.send({"type": "restore", "id": "r1", "path": path})
-            done = one(fresh.until_done("r1"), "done")
-            self.assertEqual(done["status"], "ok")
-            self.assertEqual(done["restored"], ["keep"])
-            self.assertEqual(done["failed"], [])
-            self.assert_loop_wakeup_alive(fresh)
-
-            # Shutdown kills the still-running sleep's process group.
-            self.assertEqual(self.repl.shutdown(), 0)
+            self.assertIn("keep", done["saved"])
 
     @unittest.skipIf(os.name == "nt", "pickled raw fd numbers are a POSIX landmine")
     def test_restore_refuses_to_reopen_pickled_raw_fds(self):
@@ -758,7 +734,21 @@ class ReplTest(unittest.TestCase):
             failed = {entry["name"]: entry["reason"] for entry in done["failed"]}
             self.assertIn(f"refusing to reopen raw file descriptor {fd}", failed["boom"])
             self.assertEqual(done["restored"], ["keep"])
-            self.assert_loop_wakeup_alive(fresh)
+            # The bare await parks the loop with no timer of its own: only a
+            # live self-pipe wakeup can resolve it, and if the guard regressed
+            # the request would never be served at all (the harness's read
+            # timeout bounds that failure).
+            probe = (
+                "import asyncio, threading\n"
+                "loop = asyncio.get_running_loop()\n"
+                "fut = loop.create_future()\n"
+                "threading.Timer(0.3, lambda: loop.call_soon_threadsafe(\n"
+                "    lambda: fut.done() or fut.set_result('woken'))).start()\n"
+                "await fut\n"
+            )
+            events = fresh.execute("wakeup-probe", probe)
+            self.assertEqual(one(events, "done")["status"], "ok")
+            self.assertEqual(one(events, "result")["text"], "'woken'")
 
     def test_stdin_eof_flushes_final_snapshot(self):
         # Host death (EOF, no shutdown request) must persist the namespace

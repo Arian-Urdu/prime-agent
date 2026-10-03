@@ -170,7 +170,21 @@ impl Supervisor {
             return AdoptionOutcome::AdoptedLive;
         }
         let socket_path = PathBuf::from(&descriptor.socket_path);
-        let alive = socket::can_connect(&socket_path, Duration::from_millis(500)).await;
+        // A tombstoned descriptor belongs to its recorded process, not
+        // whichever listener now owns its pathname. A dead pid (or a
+        // recycled one with a different start id) must bypass auth and
+        // finish the stop; a foreign listener can otherwise keep adoption
+        // waiting behind the worker-auth budget. TS adoptOrRecoverWorker
+        // checks the recorded pid before connecting a stopped worker.
+        // Ordinary descriptors retain the existing socket-based revival
+        // decision, which also handles descriptors without a start id.
+        let recorded_process_alive = crate::lease::is_process_alive(descriptor.pid as u32)
+            .unwrap_or(false)
+            && descriptor.process_start_id.as_ref().is_none_or(|start_id| {
+                crate::lease::get_process_start_id(descriptor.pid as u32).as_ref() == Some(start_id)
+            });
+        let alive = (descriptor.stop_requested_at.is_none() || recorded_process_alive)
+            && socket::can_connect(&socket_path, Duration::from_millis(500)).await;
         let pid = descriptor.pid;
         let journal_path = PathBuf::from(&descriptor.recovery_journal_path);
         let resident = ResidentWorker::new(worker_id.clone(), descriptor, path);

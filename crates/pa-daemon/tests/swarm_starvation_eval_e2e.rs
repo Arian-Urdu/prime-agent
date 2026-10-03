@@ -48,6 +48,10 @@ use serde_json::{json, Value};
 
 struct Daemon {
     child: Child,
+    // Lint exception, kept narrow (AGENTS.md lint discipline): the
+    // fixture keeps the supervisor's bound socket next to its process,
+    // mirroring the crate's other e2e daemon fixtures; this file's tests
+    // connect through their own copy of the path.
     #[allow(dead_code)]
     socket: PathBuf,
 }

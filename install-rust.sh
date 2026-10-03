@@ -1097,11 +1097,19 @@ esac
 # it: a prefix whose spelling hides a symlink into the shared store must
 # abort before mkdir -p ever writes there, not after. Windows resolves in
 # the MSYS form (the guard's ruling above).
+# The sentinel X rides both resolvers: a resolved path that ENDS in a
+# newline would have it stripped by the command substitution's trailing
+# newline trim (the newline guard below would then never see it), and
+# the stripped spelling would target a DIFFERENT directory. The sentinel
+# is appended before the substitution and removed after — ${out%X}
+# strips exactly the one appended X, so a path ending in X (or in X then
+# a newline) comes through byte-true.
 if [ "$WINDOWS" = "yes" ]; then
-  PREFIX="$(physical_path "$PREFIX")"
+  PREFIX="$(physical_path "$PREFIX")X"
 else
-  PREFIX="$("$UVPY" -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$PREFIX")"
+  PREFIX="$("$UVPY" -c 'import os, sys; print(os.path.realpath(sys.argv[1]) + "X")' "$PREFIX")"
 fi
+PREFIX="${PREFIX%X}"
 # The rollback's generations record is newline-delimited (one path per
 # line), so a prefix containing a newline can never be recorded or read
 # back — the rollback would silently misreport "nothing to roll back".
@@ -1173,8 +1181,14 @@ if [ "$MODE" = rollback ]; then
         *) continue ;;
       esac
       [ -d "$recorded" ] && [ -x "${recorded}/${BINARY_NAME}" ] || continue
-      head -n 1 "${recorded}/.prime-agent-install" 2>/dev/null \
-        | grep -q '^install-rust.sh channel ' || continue
+      # The normalized marker read covers recorded entries too: a ps1-
+      # marked live tree this script moved aside in a ROLLBACK becomes a
+      # recorded generation, and its encoding rides with it.
+      case "$(marker_text "${recorded}/.prime-agent-install" \
+                 | head -n 1)" in
+        "install-rust.sh channel "*) ;;
+        *) continue ;;
+      esac
       rollback_from="$recorded"
     done < "$generations_record"
   fi

@@ -723,15 +723,16 @@ impl Supervisor {
                         )
                         .await
                     {
-                        Ok(response) => Ok(response),
+                        Ok(response) => response,
                         Err(error) => Err(anyhow!(error)),
                     },
                     Err(error) => Err(anyhow!(error)),
                 }
             }
-            _ => Ok(self
-                .route_command_ready(&resident, worker_command, payload, timeout, admission)
-                .await),
+            _ => {
+                self.route_command_ready(&resident, worker_command, payload, timeout, admission)
+                    .await
+            }
         };
         // The byte relay: a routed response the supervisor neither edits nor
         // inspects goes to the client as the worker's own payload bytes with

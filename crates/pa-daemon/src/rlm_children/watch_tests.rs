@@ -1060,6 +1060,7 @@ fn an_already_settled_child_never_re_scores_as_an_unreachable_error() {
         closed_by_parent: false,
         session_file: None,
         attributed_rows: Some(0),
+        result_returned: false,
         usage_watch_live: false,
         usage_rearm: false,
         emit_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -1122,6 +1123,153 @@ async fn collect_recaptures_the_answer_of_a_settled_child_whose_capture_raced() 
         Some("the child final answer"),
         "the answer re-captures on the collect read"
     );
+}
+
+/// The "Collect grace skips watcher settles" pin: the stability grace
+/// guards the result's return history, not the settle's position
+/// relative to the collect's entry. The watcher's refresh can mint the
+/// admission-to-run misread (the child read idle between the prompt's
+/// admission and its turn pop) BEFORE any collect ran, and reading
+/// "settled at entry" as "already returned on a prior collect" skipped
+/// the grace for the first collect — it reported `done` with no
+/// captured answer, the exact empty settle the grace exists to un-settle
+/// (the factory executor consumes the result once and the child's output
+/// is lost). The first return gets the grace instead: the busy-again
+/// child re-clears inside the shared budget, waits out its turn, and the
+/// real answer rides the result.
+#[tokio::test]
+async fn a_settle_before_any_collect_was_returned_still_gets_the_stability_grace() {
+    let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+    let child_subagents = Arc::new(FakeChildSubagents::default());
+    let (sessions, _kill_rx) = sessions_with_fake_child_subagents(
+        follow_up_tx,
+        0,
+        FakeKill::Success,
+        FakeChild::Healthy,
+        Arc::clone(&child_subagents),
+    )
+    .await;
+    sessions
+        .push_test_child(RlmChildIdentity {
+            rlm_child_id: "sub-pre-settled".to_string(),
+            active_session_id: "child-live".to_string(),
+            session_id: Some("child-file".to_string()),
+            session_name: "pre-settled".to_string(),
+        })
+        .await;
+    // The watcher's refresh settled the admission-window misread before
+    // any collect ran: an unclaimed done verdict, no captured answer
+    // (the settle tail has not claimed it yet).
+    sessions.inner.children.lock().await[0]
+        .lock()
+        .await
+        .settled_status = Some("done");
+    // The turn popped after the misread: the child is busy running the
+    // task the settle claimed was over.
+    child_subagents.running.store(true, Ordering::SeqCst);
+    let collect_sessions = sessions.clone();
+    let results_task = tokio::spawn(async move {
+        collect_sessions
+            .collect(vec!["sub-pre-settled".to_string()], 10_000)
+            .await
+            .expect("collect the pre-settled child")
+    });
+    // The re-cleared collect waits out the busy turn inside the shared
+    // budget: the quiescent wait is the rendezvous for the turn
+    // finishing.
+    let mut waits = 0;
+    while child_subagents.quiescent_waits.load(Ordering::SeqCst) == 0 {
+        waits += 1;
+        assert!(waits < 1_000, "the collect must reach its quiescent wait");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    child_subagents.running.store(false, Ordering::SeqCst);
+
+    let results = tokio::time::timeout(Duration::from_secs(10), results_task)
+        .await
+        .expect("the collect returns after the re-cleared grace")
+        .expect("the collect task joins");
+    assert_eq!(results[0].status, "done");
+    assert!(
+        results[0].settled,
+        "the re-settled verdict reads settled with its answer"
+    );
+    assert_eq!(
+        results[0].answer_preview.as_deref(),
+        Some("the child final answer"),
+        "the first collect must not bind the empty admission-window misread"
+    );
+    let roster = sessions.list_subagents().await.expect("child roster");
+    assert_eq!(roster[0].status, "completed");
+}
+
+/// The readable-until-deleted pin, carried by the return marker: once a
+/// collect has returned a record's settled result, a later collect keeps
+/// that result for a busy-again child (the follow-up turn of delayed
+/// messaging) instead of re-running the stability grace on a verdict a
+/// reader already consumed. The entry-time condition this replaces
+/// skipped the grace on every pre-settled record; the marker scopes the
+/// skip to exactly the settled results a collect already returned —
+/// a settle no reader consumed still gets the grace, and a running
+/// snapshot never marks (a settle a later collect may still land needs
+/// the grace then).
+#[tokio::test]
+async fn a_settled_result_a_collect_already_returned_keeps_itself_on_later_collects() {
+    let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+    let child_subagents = Arc::new(FakeChildSubagents::default());
+    let (sessions, _kill_rx) = sessions_with_fake_child_subagents(
+        follow_up_tx,
+        0,
+        FakeKill::Success,
+        FakeChild::Healthy,
+        Arc::clone(&child_subagents),
+    )
+    .await;
+    sessions
+        .push_test_child(RlmChildIdentity {
+            rlm_child_id: "sub-already-returned".to_string(),
+            active_session_id: "child-live".to_string(),
+            session_id: Some("child-file".to_string()),
+            session_name: "already-returned".to_string(),
+        })
+        .await;
+    // A settled verdict with its answer captured, still unclaimed (the
+    // settle tail has not run): the first collect returns it.
+    {
+        let record = Arc::clone(&sessions.inner.children.lock().await[0]);
+        let mut record = record.lock().await;
+        record.settled_status = Some("done");
+        record.answer_preview = Some("the child final answer".to_string());
+        record.answer_captured = true;
+    }
+    let first = sessions
+        .collect(vec!["sub-already-returned".to_string()], 0)
+        .await
+        .expect("collect the settled child once");
+    assert_eq!(first[0].status, "done");
+    assert_eq!(
+        first[0].answer_preview.as_deref(),
+        Some("the child final answer")
+    );
+    // A follow-up prompt makes the child busy again after the returned
+    // settle.
+    child_subagents.running.store(true, Ordering::SeqCst);
+    let again = sessions
+        .collect(vec!["sub-already-returned".to_string()], 0)
+        .await
+        .expect("collect the settled child again");
+    assert_eq!(
+        again[0].status, "done",
+        "a settled result a collect already returned keeps itself"
+    );
+    assert!(again[0].settled, "the returned verdict stays settled");
+    assert_eq!(
+        again[0].answer_preview.as_deref(),
+        Some("the child final answer"),
+        "the busy follow-up turn never un-settles a consumed result"
+    );
+    let roster = sessions.list_subagents().await.expect("child roster");
+    assert_eq!(roster[0].status, "completed");
 }
 
 /// The collect-grace gate: only a settle no terminal claim has taken may

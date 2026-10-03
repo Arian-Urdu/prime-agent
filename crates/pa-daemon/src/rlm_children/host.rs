@@ -163,6 +163,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     closed_by_parent: false,
                     session_file: created.session_file.clone(),
                     attributed_rows: Some(0),
+                    result_returned: false,
                     usage_watch_live: false,
                     usage_rearm: false,
                     emit_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -496,12 +497,6 @@ impl RlmSubagentHost for SupervisorChildSessions {
             let deadline = Instant::now() + Duration::from_millis(timeout_ms);
             let mut results = Vec::with_capacity(records.len());
             for record in &records {
-                // Whether the record was already settled when this collect
-                // began: only a settle that happens INSIDE this collect (it
-                // was running on entry) gets the stability grace below —
-                // records settled on a previous collect keep their result
-                // (TS completed children stay readable until deleted).
-                let settled_on_entry = record.lock().await.settled_status.is_some();
                 this.refresh_record(record).await;
                 // A settled child that is busy again runs a follow-up turn
                 // (delayed messaging): re-arm usage observation — the
@@ -522,29 +517,41 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     this.wait_for_child(&active_session_id, remaining).await;
                     this.refresh_record(record).await;
                 }
-                // Stability re-check, the watcher's own defense — but only
-                // for a settle that happened inside THIS collect (records
-                // that were settled on entry keep their result; TS
-                // completed children stay readable until deleted). A prompt
-                // admitted to an idle worker can read idle once between the
-                // admission and the turn pop (the queue snapshot and the
-                // busy flag change under different locks on the far side of
-                // a socket). The watcher re-checks with a short grace
-                // before settling; a collect that settles the same record
-                // inside that window must not report it either — the
-                // factory executor (and any `rlm.collect` reader) would
-                // consume a `done` result with no captured answer and lose
-                // the child's output forever (the record recovers, the
-                // caller never re-reads). A child that went busy again
-                // inside the grace keeps waiting inside the shared budget;
-                // one that stays idle is really settled. A settle a
-                // terminal claim already owns stays final (the funnel's
-                // notice delivered and the watcher retired at its settle,
-                // or a cancel, delete, or close claimed the row): the busy
-                // child is a follow-up turn that keeps the settled result,
-                // and only the unclaimed misread re-clears
+                // Stability re-check, the watcher's own defense — for
+                // every settle whose result no collect has returned yet,
+                // whether the settle minted inside THIS collect or before
+                // it ever began. A prompt admitted to an idle worker can
+                // read idle once between the admission and the turn pop
+                // (the queue snapshot and the busy flag change under
+                // different locks on the far side of a socket). The
+                // watcher re-checks with a short grace before settling; a
+                // collect that settles the same record inside that window
+                // must not report it either — the factory executor (and
+                // any `rlm.collect` reader) would consume a `done` result
+                // with no captured answer and lose the child's output
+                // forever (the record recovers, the caller never re-reads).
+                // The watcher's refresh can mint the same misread BEFORE
+                // the first collect ran: reading "settled at entry" as
+                // "already returned on a prior collect" skipped the grace
+                // there, and the first collect bound the empty output —
+                // so the gate is the result's return history
+                // (`result_returned`), not the settle's position relative
+                // to this collect's entry. A settled result a previous
+                // collect already returned keeps itself (TS completed
+                // children stay readable until deleted). A child that
+                // went busy again inside the grace keeps waiting inside
+                // the shared budget; one that stays idle is really settled.
+                // A settle a terminal claim already owns stays final (the
+                // funnel's notice delivered and the watcher retired at its
+                // settle, or a cancel, delete, or close claimed the row):
+                // the busy child is a follow-up turn that keeps the
+                // settled result, and only the unclaimed misread re-clears
                 // (`collect_grace_may_reclear`).
-                if !settled_on_entry && record.lock().await.settled_status.is_some() {
+                let grace_due = {
+                    let record = record.lock().await;
+                    !record.result_returned && record.settled_status.is_some()
+                };
+                if grace_due {
                     let active_session_id = record.lock().await.active_session_id.clone();
                     tokio::time::sleep(Duration::from_millis(WATCH_SETTLE_GRACE_MS)).await;
                     let busy_again = matches!(this.child_busy(&active_session_id).await, Ok(true));
@@ -584,7 +591,18 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     this.refresh_record(record).await;
                 }
                 let result = {
-                    let record = record.lock().await;
+                    let mut record = record.lock().await;
+                    // The result this loop returns is now the record's
+                    // returned answer: once a collect has returned a
+                    // settled result, later collects keep it (TS completed
+                    // children stay readable until deleted) instead of
+                    // re-running the stability grace on a busy-again
+                    // child. A running snapshot does not mark: the settle
+                    // a later collect may still land needs the grace
+                    // then.
+                    if record.settled_status.is_some() {
+                        record.result_returned = true;
+                    }
                     SupervisorChildSessions::collect_result(&record)
                 };
                 results.push(result);

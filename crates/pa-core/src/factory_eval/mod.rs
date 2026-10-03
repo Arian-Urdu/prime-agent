@@ -3168,6 +3168,23 @@ const FACTORY_KERNEL_REQUIRED_IMPORTS: &str = "rlm.repl, rlm.factory, dill, requ
 /// with. Bounded at 60s (importing the numeric stack is slow on a cold
 /// filesystem); a hang fails the candidate, not the harness.
 fn probe_factory_kernel_python(python: &std::path::Path, python_path: Option<&str>) -> bool {
+    probe_factory_kernel_python_within(python, python_path, std::time::Duration::from_secs(60))
+}
+
+/// The bounded probe behind [`probe_factory_kernel_python`]: the
+/// production caller passes the 60s hang bound, the unit pin a short
+/// budget so the teardown path runs inside test time. Every failure
+/// path owns the child's teardown — kill, then reap (`wait`): a killed
+/// child nobody waits on stays a zombie for the harness's lifetime, and
+/// a failed poll (`try_wait` error) proves nothing about the child, so
+/// a live probe must not outlive the deadline on an unproven read (the
+/// process-control discipline: kill + wait, as in the platform process
+/// tests).
+fn probe_factory_kernel_python_within(
+    python: &std::path::Path,
+    python_path: Option<&str>,
+    hang_budget: std::time::Duration,
+) -> bool {
     use std::process::{Command, Stdio};
     let mut command = Command::new(python);
     command
@@ -3182,20 +3199,24 @@ fn probe_factory_kernel_python(python: &std::path::Path, python_path: Option<&st
     let Ok(mut child) = command.spawn() else {
         return false;
     };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + hang_budget;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return status.success(),
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    return false;
+                    break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            Err(_) => return false,
+            // The poll failed without proving the child exited: fall to
+            // the teardown instead of leaking a live probe.
+            Err(_) => break,
         }
     }
+    let _ = child.kill();
+    let _ = child.wait();
+    false
 }
 
 /// The checkout-local runtime venv (`prime-agent-runtime/.venv`, an

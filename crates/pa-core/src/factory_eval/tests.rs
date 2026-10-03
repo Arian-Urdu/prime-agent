@@ -2364,3 +2364,46 @@ fn a_thrown_trial_stays_in_the_sweep_as_its_own_failed_row() {
         "the errored trial's task is not correct"
     );
 }
+
+/// The "Kernel probe leaks child processes" pin: a hung import probe
+/// must be killed AND reaped. A kill without a wait leaves the probe a
+/// zombie — the killed child keeps its pid and exit status until the
+/// harness process exits, and the existence probe (`kill(pid, 0)`)
+/// counts a zombie as existing — and a failed `try_wait` poll proves
+/// nothing, so the teardown runs on every path where exit was not
+/// proven. The fake python hangs forever after writing its pid; the
+/// short-budget arm of the probe drives the deadline path inside test
+/// time (the production bound stays the 60s hang budget).
+#[cfg(unix)]
+#[test]
+fn a_hung_kernel_probe_is_killed_and_reaped_not_left_a_zombie() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("temp dir for the fake python");
+    let script = dir.path().join("hang-python.sh");
+    let pid_file = dir.path().join("probe.pid");
+    let pid_path = pid_file.display().to_string();
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\necho $$ > {pid_path}\nexec sleep 300\n"),
+    )
+    .expect("write the fake python");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("make the fake python executable");
+    assert!(
+        !super::probe_factory_kernel_python_within(
+            &script,
+            None,
+            std::time::Duration::from_millis(300),
+        ),
+        "the hung candidate fails the probe"
+    );
+    let pid: u32 = std::fs::read_to_string(&pid_file)
+        .expect("the probe waits its kill out, so the pid file is written")
+        .trim()
+        .parse()
+        .expect("the fake python wrote its pid");
+    assert!(
+        !crate::platform::process::pid_exists(pid),
+        "the killed probe is reaped, not left a zombie the harness must outlive"
+    );
+}

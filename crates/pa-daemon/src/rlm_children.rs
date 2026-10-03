@@ -209,6 +209,14 @@ struct ChildRecord {
     /// nothing has been observed since the reseed, and the first delivery
     /// primes the cursor at the file's tail.
     attributed_rows: Option<usize>,
+    /// A collect already returned this record's settled result: the
+    /// collect stability grace guards only a settle no reader has
+    /// consumed yet (an admission-window misread must not be a first
+    /// collect's binding answer), while an already-returned result keeps
+    /// itself on later collects (TS completed children stay readable
+    /// until deleted). A running snapshot does not set it: a later
+    /// collect may still settle the record and needs the grace then.
+    result_returned: bool,
     /// A follow-up usage watcher is live for this retained child
     /// (delayed agent messaging after the task run settled).
     usage_watch_live: bool,
@@ -748,6 +756,7 @@ impl SupervisorChildSessions {
                 closed_by_parent: false,
                 session_file: None,
                 attributed_rows: Some(0),
+                result_returned: false,
                 usage_watch_live: false,
                 usage_rearm: false,
                 emit_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -781,6 +790,7 @@ impl SupervisorChildSessions {
                 closed_by_parent: false,
                 session_file: None,
                 attributed_rows: Some(0),
+                result_returned: false,
                 usage_watch_live: false,
                 usage_rearm: false,
                 emit_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),

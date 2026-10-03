@@ -2405,3 +2405,112 @@ fn acp_user_bash_maps_to_a_synthetic_tool_call() {
     });
     assert!(end["params"]["update"].get("content").is_none(), "{end}");
 }
+
+#[cfg(unix)]
+#[test]
+fn acp_daemon_attached_close_stop_failure_fences_the_session() {
+    let mut client = AcpChild::spawn(
+        &["--mode", "acp", "--no-session"],
+        &json!({ "engine": "faux", "responses": ["unused"] }),
+    );
+    let session_id = initialize_and_new_session(&mut client);
+    let probe =
+        pa_types::platform::transport::connect_blocking(&client.socket).expect("daemon socket");
+    let reader = probe.try_clone_box().expect("daemon socket clone");
+    let _ = reader.set_read_timeout(Duration::from_mins(2));
+    let hello = BufReader::new(reader)
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<Value>(&line.expect("daemon line")).expect("daemon JSON")
+        })
+        .find(|frame| frame["type"] == json!("daemon_hello"))
+        .expect("the daemon closed without a hello");
+    let pid = hello["supervisorPid"].as_u64().expect("supervisor pid");
+    drop(probe);
+    let killed = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .expect("kill the supervisor");
+    assert!(killed.success(), "the supervisor crash did not run");
+
+    let close = client.request("session/close", &json!({ "sessionId": session_id }));
+    let (close_response, _) = client.wait_response(close, TIMEOUT);
+    assert_eq!(
+        close_response["error"]["code"], -32603,
+        "the failed stop errors the close: {close_response}"
+    );
+    let stop_failure = close_response["error"]["data"]["details"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        stop_failure.contains("the daemon connection"),
+        "the stop error is the fence's message: {stop_failure}"
+    );
+
+    let prompt = client.request(
+        "session/prompt",
+        &json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": "after the failed stop" }] }),
+    );
+    let (prompt_response, _) = client.wait_response(prompt, TIMEOUT);
+    assert_eq!(
+        prompt_response["error"]["data"]["details"],
+        format!("ACP session stop failed: {stop_failure}"),
+        "a prompt while the stop failed answers the TS fence: {prompt_response}"
+    );
+
+    let refused = client.request("session/new", &json!({ "mcpServers": [] }));
+    let (refused_response, _) = client.wait_response(refused, TIMEOUT);
+    assert_eq!(
+        refused_response["error"]["data"]["details"],
+        "prime-agent ACP mode hosts one session per connection; start another prime-agent process for a second session",
+        "the close-failed session keeps the single-session slot: {refused_response}"
+    );
+
+    let close_again = client.request("session/close", &json!({ "sessionId": session_id }));
+    let (again_response, _) = client.wait_response(close_again, TIMEOUT);
+    assert_eq!(again_response["error"]["code"], -32603);
+    assert_ne!(
+        again_response["error"]["data"]["details"],
+        format!("Unknown ACP session: {session_id}"),
+        "the session stays bound after the failed close: {again_response}"
+    );
+    drop(client);
+}
+
+#[test]
+fn acp_daemon_attached_close_holds_the_input_pause_until_the_next_session_new() {
+    let mut client = AcpChild::spawn(
+        &["--mode", "acp", "--no-session"],
+        &json!({ "engine": "faux", "responses": ["first", { "text": "FOREIGN", "delayMs": 150_000 }] }),
+    );
+    let socket = client.socket.clone();
+    let session_id = initialize_and_new_session(&mut client);
+    assert_prompt_ends_turn(&mut client, &session_id, "one");
+
+    let close = client.request("session/close", &json!({ "sessionId": session_id }));
+    let (close_response, _) = client.wait_response(close, TIMEOUT);
+    assert_eq!(close_response["result"], json!({}));
+
+    let active_session_id = live_sessions(&socket)[0]["activeSessionId"]
+        .as_str()
+        .expect("the resident session")
+        .to_string();
+    let _ = daemon_request(
+        &socket,
+        "foreign-follow-up",
+        &json!({ "type": "follow_up", "activeSessionId": active_session_id, "message": "foreign" }),
+    );
+    let idle = daemon_request(
+        &socket,
+        "foreign-idle",
+        &json!({ "type": "wait_for_idle", "activeSessionId": active_session_id }),
+    );
+    assert!(
+        idle["success"] == json!(true),
+        "no foreign turn runs on the resident session while the close holds the input pause: {idle}"
+    );
+
+    let _second = new_session(&mut client);
+    drop(client);
+}

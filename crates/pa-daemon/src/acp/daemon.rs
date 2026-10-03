@@ -171,6 +171,16 @@ impl DaemonLink {
         self.exchange(command, Some(REQUEST_TIMEOUT)).await
     }
 
+    pub(crate) async fn request_ok(&self, command: DaemonCommand) -> anyhow::Result<()> {
+        let response = self.request(command).await?;
+        if !response.success {
+            anyhow::bail!(response
+                .error
+                .unwrap_or_else(|| "unknown error".to_string()));
+        }
+        Ok(())
+    }
+
     /// Send one command envelope with no fixed cap: the response or the
     /// link close ends the wait (turn-long commands — declared
     /// divergence, TS caps them at 24 h; the link-close signal is the
@@ -248,10 +258,11 @@ struct DaemonBinding {
     /// The create's `client_owned` lifecycle (`--no-session`): the
     /// session ends with the connection.
     client_owned: bool,
+    mcp_owner_id: String,
 }
 
-/// The hosted daemon session: the ACP identity, the daemon routing id, the
-/// update producer, and the per-connection MCP owner state.
+/// The hosted daemon session: the ACP identity, the daemon routing id,
+/// the update producer, and the stop state.
 pub(crate) struct HostedSession {
     pub(crate) acp_session_id: String,
     pub(crate) daemon_active_session_id: String,
@@ -259,10 +270,13 @@ pub(crate) struct HostedSession {
     /// The picker state (TS `AcpSessionEntry`'s configOptions/models) and
     /// the serialized config queue (`configTask`).
     pub(crate) config: Arc<HostedConfig>,
-    mcp_owner_id: String,
-    mcp_server_names: Vec<String>,
+    cancelling: bool,
+    stop_failure: Option<String>,
+    input_pause_key: Option<String>,
+    input_pause_id: Option<String>,
+    cancel_task: Option<tokio::sync::watch::Receiver<bool>>,
     /// The running prompt turn; one at a time. A cancelled turn keeps
-    /// the slot until its stop sequence finishes (TS `entry.cancelling`).
+    /// the slot until its cancel stop finishes.
     turn: Option<ActiveTurn>,
     /// The newest assistant stop reason observed on the event stream.
     assistant_stop_reason: Option<String>,
@@ -275,9 +289,6 @@ struct ActiveTurn {
     admission_id: String,
     /// TS the per-turn `AbortController`.
     cancelled: bool,
-    /// Resolves when the stop sequence finished; the cancelled turn's
-    /// response waits for it, so the next prompt never sees "cancelling".
-    stop_done_rx: Option<oneshot::Receiver<()>>,
 }
 
 /// The ACP transport state: one hosted session at most.
@@ -285,7 +296,10 @@ struct ActiveTurn {
 pub(crate) struct DaemonAcpState {
     pub(crate) session: Option<HostedSession>,
     pub(crate) session_new_in_flight: bool,
-    pub(crate) session_close_in_flight: bool,
+    pub(crate) session_close_done: Option<tokio::sync::watch::Receiver<bool>>,
+    pub(crate) closed_input_pause_id: Option<String>,
+    pub(crate) closed_input_pause_key: Option<String>,
+    pub(crate) mcp_server_names: Vec<String>,
 }
 
 /// Serve the daemon-attached ACP mode until stdin closes. The caller
@@ -495,20 +509,40 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                         .await;
                 });
             }
-            // A refused prompt answers from the prefix; the running turn
-            // is untouched.
+            // A refused prompt or close answers from the prefix; the
+            // running turn is untouched.
             FrameOrder::Refused { id, message } => {
                 let _ = tx.send(super::internal_error(&id, &message));
             }
-            // A cancel arms the stop task (the notification form has no
-            // response).
-            FrameOrder::Cancel(stop) => {
-                if let Some(stop) = stop {
-                    let link = Arc::clone(&link);
-                    tokio::spawn(async move {
-                        run_cancel_stop(stop, &link).await;
-                    });
-                }
+            FrameOrder::Close { id, params, done } => {
+                let link = Arc::clone(&link);
+                let state = Arc::clone(&state);
+                let options_tx = tx.clone();
+                let owner_id = binding.mcp_owner_id.clone();
+                tokio::spawn(async move {
+                    handle_session_close(id, params, &link, &state, options_tx, done, owner_id)
+                        .await;
+                });
+            }
+            FrameOrder::Cancel(order) => {
+                let link = Arc::clone(&link);
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    let mut order = order;
+                    loop {
+                        order = match order {
+                            CancelOrder::None => return,
+                            CancelOrder::Armed(stop) => {
+                                run_cancel_stop(stop, &link, &state).await;
+                                return;
+                            }
+                            CancelOrder::WaitForClose { session_id } => {
+                                wait_for_session_close(&state).await;
+                                cancel_order(&json!({ "sessionId": session_id }), &state).await
+                            }
+                        };
+                    }
+                });
             }
         }
         // Reap finished prompt handlers.
@@ -550,6 +584,7 @@ async fn bind_daemon_session(
             .unwrap_or_default()
             .to_string(),
         client_owned,
+        mcp_owner_id: uuid::Uuid::new_v4().to_string(),
     };
     let attached = link
         .request(DaemonCommand::Attach {
@@ -592,13 +627,25 @@ enum FrameOrder {
         id: Value,
         message: String,
     },
-    Cancel(Option<CancelStop>),
+    Close {
+        id: Value,
+        params: Value,
+        done: tokio::sync::watch::Sender<bool>,
+    },
+    Cancel(CancelOrder),
+}
+
+enum CancelOrder {
+    None,
+    Armed(CancelStop),
+    WaitForClose { session_id: String },
 }
 
 struct CancelStop {
+    acp_session_id: String,
     daemon_session_id: String,
-    admission_id: String,
-    stop_done_tx: oneshot::Sender<()>,
+    admission_id: Option<String>,
+    done: tokio::sync::watch::Sender<bool>,
 }
 
 /// Prompt admission and cancel marking, in the client's frame order.
@@ -617,15 +664,47 @@ async fn frame_order_prefix(incoming: &Incoming, state: &Arc<Mutex<DaemonAcpStat
                 },
             }
         }
+        Incoming::Request { id, method, params } if method == "session/close" => {
+            let session_id = params
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+            let mut guard = state.lock().await;
+            if guard
+                .session
+                .as_ref()
+                .is_none_or(|hosted| hosted.acp_session_id != session_id)
+            {
+                return FrameOrder::Refused {
+                    id: id.clone(),
+                    message: format!("Unknown ACP session: {session_id}"),
+                };
+            }
+            if guard.session_close_done.is_some() {
+                return FrameOrder::Refused {
+                    id: id.clone(),
+                    message: format!("ACP session is already closing: {session_id}"),
+                };
+            }
+            guard.session_close_done = Some(done_rx);
+            FrameOrder::Close {
+                id: id.clone(),
+                params: params.clone(),
+                done: done_tx,
+            }
+        }
         Incoming::Notification { method, params } if method == "session/cancel" => {
-            FrameOrder::Cancel(arm_cancel(params, state).await)
+            FrameOrder::Cancel(cancel_order(params, state).await)
         }
         _ => FrameOrder::Spawn,
     }
 }
 
 /// Reserve the turn slot for one prompt. `Err` is the refusal message,
-/// checked in TS order: unknown session, cancelling, turn running.
+/// checked in TS order: unknown session, closing, cancelling, stop
+/// failure, turn running.
 async fn admit_prompt(
     params: &Value,
     state: &Arc<Mutex<DaemonAcpState>>,
@@ -635,6 +714,7 @@ async fn admit_prompt(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let mut guard = state.lock().await;
+    let session_closing = guard.session_close_done.is_some();
     let Some(hosted) = guard
         .session
         .as_mut()
@@ -642,53 +722,128 @@ async fn admit_prompt(
     else {
         return Err(format!("Unknown ACP session: {session_id}"));
     };
-    match &hosted.turn {
-        Some(turn) if turn.cancelled => {
-            return Err(format!("ACP session is cancelling: {session_id}"));
-        }
-        Some(_) => {
-            return Err("A prompt turn is already running for this ACP session".to_string());
-        }
-        None => {}
+    if session_closing {
+        return Err(format!("ACP session is closing: {session_id}"));
+    }
+    if hosted.cancelling {
+        return Err(format!("ACP session is cancelling: {session_id}"));
+    }
+    if let Some(stop_failure) = hosted.stop_failure.as_ref() {
+        return Err(format!("ACP session stop failed: {stop_failure}"));
+    }
+    if hosted.turn.is_some() {
+        return Err("A prompt turn is already running for this ACP session".to_string());
     }
     let admission_id = format!("prompt-admission:{}", uuid::Uuid::new_v4());
     hosted.turn = Some(ActiveTurn {
         admission_id: admission_id.clone(),
         cancelled: false,
-        stop_done_rx: None,
     });
     Ok(admission_id)
 }
 
-/// Mark the addressed turn cancelled and arm its stop sequence. `None`
-/// when there is no running turn or it is already cancelled.
-async fn arm_cancel(params: &Value, state: &Arc<Mutex<DaemonAcpState>>) -> Option<CancelStop> {
-    let session_id = params.get("sessionId").and_then(Value::as_str)?;
+async fn cancel_order(params: &Value, state: &Arc<Mutex<DaemonAcpState>>) -> CancelOrder {
+    let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
+        return CancelOrder::None;
+    };
     let mut guard = state.lock().await;
-    let hosted = guard
+    if guard.session_close_done.is_some() {
+        return CancelOrder::WaitForClose {
+            session_id: session_id.to_string(),
+        };
+    }
+    arm_cancel_locked(session_id, &mut guard)
+}
+
+fn arm_cancel_locked(session_id: &str, guard: &mut DaemonAcpState) -> CancelOrder {
+    let Some(hosted) = guard
         .session
         .as_mut()
-        .filter(|hosted| hosted.acp_session_id == session_id)?;
-    let daemon_session_id = hosted.daemon_active_session_id.clone();
-    let turn = hosted.turn.as_mut()?;
-    if turn.cancelled {
-        return None;
+        .filter(|hosted| hosted.acp_session_id == session_id)
+    else {
+        return CancelOrder::None;
+    };
+    if hosted.cancelling {
+        return CancelOrder::None;
     }
-    turn.cancelled = true;
-    let (stop_done_tx, stop_done_rx) = oneshot::channel();
-    turn.stop_done_rx = Some(stop_done_rx);
-    Some(CancelStop {
-        daemon_session_id,
-        admission_id: turn.admission_id.clone(),
-        stop_done_tx,
+    let admission_id = match hosted.turn.as_mut() {
+        Some(turn) => {
+            turn.cancelled = true;
+            Some(turn.admission_id.clone())
+        }
+        None if hosted.stop_failure.is_none() => return CancelOrder::None,
+        None => None,
+    };
+    let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+    hosted.cancel_task = Some(done_rx);
+    hosted.cancelling = true;
+    CancelOrder::Armed(CancelStop {
+        acp_session_id: hosted.acp_session_id.clone(),
+        daemon_session_id: hosted.daemon_active_session_id.clone(),
+        admission_id,
+        done: done_tx,
     })
 }
 
-/// The cancelled turn's stop sequence. Dropping `stop_done_tx` releases
-/// the cancelled turn's response.
-async fn run_cancel_stop(stop: CancelStop, link: &Arc<DaemonLink>) {
-    stop_session_work(link, &stop.daemon_session_id, Some(stop.admission_id)).await;
-    drop(stop.stop_done_tx);
+async fn wait_for_session_close(state: &Arc<Mutex<DaemonAcpState>>) {
+    let close_done = { state.lock().await.session_close_done.clone() };
+    if let Some(mut done) = close_done {
+        let _ = done.changed().await;
+    }
+}
+
+async fn run_cancel_stop(
+    stop: CancelStop,
+    link: &Arc<DaemonLink>,
+    state: &Arc<Mutex<DaemonAcpState>>,
+) {
+    let outcome = match acquire_stop_input_pause(link, state, &stop.acp_session_id).await {
+        Ok(lease) => {
+            match stop_session_work(link, &stop.daemon_session_id, stop.admission_id.as_deref())
+                .await
+            {
+                Ok(()) => {
+                    release_session_input_pause(link, &stop.daemon_session_id, &lease.pause_id)
+                        .await
+                        .map(|()| lease)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    {
+        let mut guard = state.lock().await;
+        let released_closed = matches!(
+            &outcome,
+            Ok(lease) if guard.closed_input_pause_id.as_deref() == Some(&lease.pause_id)
+        );
+        if let Some(hosted) = guard
+            .session
+            .as_mut()
+            .filter(|hosted| hosted.acp_session_id == stop.acp_session_id)
+        {
+            hosted.cancelling = false;
+            hosted.cancel_task = None;
+            match &outcome {
+                Ok(lease) => {
+                    if hosted.input_pause_id.as_deref() == Some(&lease.pause_id) {
+                        hosted.input_pause_id = None;
+                    }
+                    if hosted.input_pause_key.as_deref() == Some(&lease.lease_key) {
+                        hosted.input_pause_key = None;
+                    }
+                    hosted.stop_failure = None;
+                }
+                Err(error) => hosted.stop_failure = Some(error.to_string()),
+            }
+        }
+        if released_closed {
+            guard.closed_input_pause_id = None;
+            guard.closed_input_pause_key = None;
+        }
+    }
+    let _ = stop.done.send(true);
 }
 
 /// TS `stopSessionWork`: abort the worker's running and queued work, stop
@@ -697,53 +852,57 @@ async fn run_cancel_stop(stop: CancelStop, link: &Arc<DaemonLink>) {
 async fn stop_session_work(
     link: &Arc<DaemonLink>,
     daemon_session_id: &str,
-    admission_id: Option<String>,
-) {
-    let _ = link
-        .request(DaemonCommand::AbortAndClearQueue {
-            id: None,
-            active_session_id: daemon_session_id.to_string(),
-            rest: Map::default(),
-        })
-        .await;
+    admission_id: Option<&str>,
+) -> anyhow::Result<()> {
+    link.request_ok(DaemonCommand::AbortAndClearQueue {
+        id: None,
+        active_session_id: daemon_session_id.to_string(),
+        rest: Map::default(),
+    })
+    .await?;
     if let Some(admission_id) = admission_id {
         cancel_owned_admission(link, daemon_session_id, admission_id).await;
     }
-    let _ = link
-        .request(DaemonCommand::WaitForIdle {
-            id: None,
-            active_session_id: daemon_session_id.to_string(),
-            wait_for_rlm_quiescence: None,
-            rest: Map::default(),
-        })
-        .await;
-    cancel_outstanding_rlm_children(link, daemon_session_id).await;
+    link.request_ok(DaemonCommand::WaitForIdle {
+        id: None,
+        active_session_id: daemon_session_id.to_string(),
+        wait_for_rlm_quiescence: None,
+        rest: Map::default(),
+    })
+    .await?;
+    cancel_outstanding_rlm_children(link, daemon_session_id).await
 }
 
 /// TS `cancelOutstandingRlmChildren`: cancel every roster row, no status
 /// filter — a row already settling keeps its own settle, and the cancels
 /// run one after another (TS `Promise.allSettled` is the declared
-/// divergence). A failed roster fetch or cancel is ignored, like every
-/// other stop step.
-async fn cancel_outstanding_rlm_children(link: &Arc<DaemonLink>, daemon_session_id: &str) {
-    let Ok(children) = fetch_rlm_children(link, daemon_session_id).await else {
-        return;
-    };
+/// divergence). A failed roster fetch or the first failed cancel fails the
+/// stop; every row still gets its cancel.
+async fn cancel_outstanding_rlm_children(
+    link: &Arc<DaemonLink>,
+    daemon_session_id: &str,
+) -> anyhow::Result<()> {
+    let children = fetch_rlm_children(link, daemon_session_id).await?;
+    let mut failure = None;
     for child in children {
         let child_id = child
             .get("id")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let _ = link
-            .request(DaemonCommand::CancelRlmChild {
+        if let Err(error) = link
+            .request_ok(DaemonCommand::CancelRlmChild {
                 id: None,
                 active_session_id: daemon_session_id.to_string(),
                 child_id,
                 rest: Map::default(),
             })
-            .await;
+            .await
+        {
+            failure.get_or_insert(error);
+        }
     }
+    failure.map_or(Ok(()), Err)
 }
 
 /// TS `cancel_prompt_admission` with `cancelOwned`: a committed prompt's
@@ -751,17 +910,93 @@ async fn cancel_outstanding_rlm_children(link: &Arc<DaemonLink>, daemon_session_
 async fn cancel_owned_admission(
     link: &Arc<DaemonLink>,
     daemon_session_id: &str,
-    admission_id: String,
+    admission_id: &str,
 ) {
     let _ = link
         .request(DaemonCommand::CancelPromptAdmission {
             id: None,
             active_session_id: daemon_session_id.to_string(),
-            admission_id,
+            admission_id: admission_id.to_string(),
             cancel_owned: Some(true),
             rest: Map::default(),
         })
         .await;
+}
+
+struct InputPauseLease {
+    pause_id: String,
+    lease_key: String,
+}
+
+async fn acquire_stop_input_pause(
+    link: &Arc<DaemonLink>,
+    state: &Arc<Mutex<DaemonAcpState>>,
+    acp_session_id: &str,
+) -> anyhow::Result<InputPauseLease> {
+    let (daemon_session_id, lease_key) = {
+        let mut guard = state.lock().await;
+        let Some(hosted) = guard
+            .session
+            .as_mut()
+            .filter(|hosted| hosted.acp_session_id == acp_session_id)
+        else {
+            anyhow::bail!("Unknown ACP session: {acp_session_id}");
+        };
+        let lease_key = hosted
+            .input_pause_key
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        hosted.input_pause_key = Some(lease_key.clone());
+        (hosted.daemon_active_session_id.clone(), lease_key)
+    };
+    let response = link
+        .request(DaemonCommand::AcquireSessionInputPause {
+            id: None,
+            active_session_id: daemon_session_id.clone(),
+            lease_key: lease_key.clone(),
+            rest: Map::default(),
+        })
+        .await?;
+    if !response.success {
+        anyhow::bail!(response
+            .error
+            .unwrap_or_else(|| "unknown error".to_string()));
+    }
+    let pause_id = response
+        .data
+        .unwrap_or(Value::Null)
+        .get("pauseId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("the daemon returned no session input pause id"))?;
+    {
+        let mut guard = state.lock().await;
+        if let Some(hosted) = guard
+            .session
+            .as_mut()
+            .filter(|hosted| hosted.acp_session_id == acp_session_id)
+        {
+            hosted.input_pause_id = Some(pause_id.clone());
+        }
+    }
+    Ok(InputPauseLease {
+        pause_id,
+        lease_key,
+    })
+}
+
+async fn release_session_input_pause(
+    link: &Arc<DaemonLink>,
+    daemon_session_id: &str,
+    pause_id: &str,
+) -> anyhow::Result<()> {
+    link.request_ok(DaemonCommand::ReleaseSessionInputPause {
+        id: None,
+        active_session_id: daemon_session_id.to_string(),
+        pause_id: pause_id.to_string(),
+        rest: Map::default(),
+    })
+    .await
 }
 
 /// One incoming ACP frame. Requests answer.
@@ -785,9 +1020,6 @@ async fn handle_incoming(
         }
         "session/set_config_option" => {
             handle_set_config_option(id, params, link, state, tx).await;
-        }
-        "session/close" => {
-            handle_session_close(id, params, link, state, tx).await;
         }
         other => {
             let _ = tx.send(jsonrpc::error_response(
@@ -849,7 +1081,10 @@ async fn handle_session_new(
 ) {
     {
         let mut guard = state.lock().await;
-        if guard.session.is_some() || guard.session_new_in_flight || guard.session_close_in_flight {
+        if guard.session.is_some()
+            || guard.session_new_in_flight
+            || guard.session_close_done.is_some()
+        {
             let _ = tx.send(super::internal_error(
                 &id,
                 "prime-agent ACP mode hosts one session per connection; start another prime-agent process for a second session",
@@ -861,13 +1096,27 @@ async fn handle_session_new(
     // Failures below clear the in-flight flag on the way out; on success
     // the hosted session takes the slot.
     let params = types::NewSessionParams::parse(&params);
-    // MCP admission runs first: a rejected list fails the request with
-    // the same error payloads.
+    if !state.lock().await.mcp_server_names.is_empty() {
+        if let Err(error) = clear_connection_servers(
+            link,
+            &binding.active_session_id,
+            &binding.mcp_owner_id,
+            state,
+        )
+        .await
+        {
+            state.lock().await.session_new_in_flight = false;
+            let _ = tx.send(super::internal_error(&id, &error.to_string()));
+            return;
+        }
+    }
+    // MCP admission runs after the pending-clear retry: a rejected list
+    // fails the request with the same error payloads.
     let resolved =
         match super::mcp::resolve_acp_mcp_servers(&params.mcp_servers, &options.actual_cwd) {
             Ok(resolved) => resolved,
             Err(reason) => {
-                *state.lock().await = DaemonAcpState::default();
+                state.lock().await.session_new_in_flight = false;
                 let _ = tx.send(jsonrpc::error_response(
                     &id,
                     jsonrpc::INVALID_PARAMS,
@@ -878,7 +1127,7 @@ async fn handle_session_new(
             }
         };
     if let Err(details) = super::mcp::acp_mcp_tool_names(&resolved) {
-        *state.lock().await = DaemonAcpState::default();
+        state.lock().await.session_new_in_flight = false;
         let _ = tx.send(super::internal_error(&id, &details));
         return;
     }
@@ -900,34 +1149,51 @@ async fn handle_session_new(
         published: tokio::sync::Mutex::new(published),
         models: tokio::sync::Mutex::new(models),
     });
-    let mcp_owner_id = uuid::Uuid::new_v4().to_string();
     let mut hosted = HostedSession {
         acp_session_id: acp_session_id.clone(),
         daemon_active_session_id: binding.active_session_id.clone(),
         producer,
         config,
-        mcp_owner_id,
-        mcp_server_names: Vec::new(),
+        cancelling: false,
+        stop_failure: None,
+        input_pause_key: None,
+        input_pause_id: None,
+        cancel_task: None,
         turn: None,
         assistant_stop_reason: None,
         mapping: WireMappingState::default(),
     };
     // The ACP MCP servers ride the wire command, not a local manager.
-    if let Err(error) = replace_session_servers(link, &hosted, &resolved).await {
-        // The worker may have applied the list before this failed (a lost
-        // acknowledgement); the clear is best-effort, like TS.
-        if !resolved.is_empty() {
-            let _ = replace_session_servers(link, &hosted, &[]).await;
+    let replace_skipped = resolved.is_empty() && state.lock().await.mcp_server_names.is_empty();
+    if !replace_skipped {
+        if let Err(error) = replace_connection_servers(
+            link,
+            &binding.active_session_id,
+            &binding.mcp_owner_id,
+            &resolved,
+        )
+        .await
+        {
+            // The worker may have applied the list before this failed (a
+            // lost acknowledgement); the clear is best-effort, like TS.
+            let _ = clear_connection_servers(
+                link,
+                &binding.active_session_id,
+                &binding.mcp_owner_id,
+                state,
+            )
+            .await;
+            state.lock().await.session_new_in_flight = false;
+            let _ = tx.send(super::internal_error(&id, &error.to_string()));
+            return;
         }
-        *state.lock().await = DaemonAcpState::default();
-        let _ = tx.send(super::internal_error(&id, &error.to_string()));
-        return;
+        let names = resolved
+            .iter()
+            .map(pa_core::mcp::AcpMcpServerConfig::name)
+            .map(str::to_string)
+            .collect();
+        state.lock().await.mcp_server_names = names;
     }
-    hosted.mcp_server_names = resolved
-        .iter()
-        .map(pa_core::mcp::AcpMcpServerConfig::name)
-        .map(str::to_string)
-        .collect();
 
     // The admission response is queued below, after the session takes its
     // slot and before the producer gate opens.
@@ -954,35 +1220,79 @@ async fn handle_session_new(
     // producer gate opens only after the response is queued on the
     // sink, so no held update can precede the admission response.
     let producer = Arc::clone(&hosted.producer);
-    {
+    let inherited_pause = {
         let mut guard = state.lock().await;
         guard.session_new_in_flight = false;
+        if let Some(pause_id) = guard.closed_input_pause_id.clone() {
+            hosted.input_pause_id = Some(pause_id);
+            hosted.input_pause_key = guard.closed_input_pause_key.clone();
+        }
         guard.session = Some(hosted);
-    }
+        guard
+            .closed_input_pause_id
+            .clone()
+            .zip(guard.closed_input_pause_key.clone())
+    };
     let _ = tx.send(jsonrpc::response(&id, &result));
+    if let Some((pause_id, lease_key)) = inherited_pause {
+        match release_session_input_pause(link, &binding.active_session_id, &pause_id).await {
+            Ok(()) => {
+                let mut guard = state.lock().await;
+                if guard.closed_input_pause_id.as_deref() == Some(&pause_id) {
+                    guard.closed_input_pause_id = None;
+                    guard.closed_input_pause_key = None;
+                }
+                if let Some(hosted) = guard
+                    .session
+                    .as_mut()
+                    .filter(|hosted| hosted.input_pause_id.as_deref() == Some(&pause_id))
+                {
+                    hosted.input_pause_id = None;
+                    if hosted.input_pause_key.as_deref() == Some(&lease_key) {
+                        hosted.input_pause_key = None;
+                    }
+                }
+            }
+            Err(error) => {
+                if let Some(hosted) = state
+                    .lock()
+                    .await
+                    .session
+                    .as_mut()
+                    .filter(|hosted| hosted.input_pause_id.as_deref() == Some(&pause_id))
+                {
+                    hosted.stop_failure = Some(error.to_string());
+                }
+            }
+        }
+    }
     producer.commit_session_new_response().await;
 }
 
-/// Send the MCP replacement for one hosted session.
-async fn replace_session_servers(
+async fn replace_connection_servers(
     link: &Arc<DaemonLink>,
-    hosted: &HostedSession,
+    daemon_session_id: &str,
+    owner_id: &str,
     resolved: &[pa_core::mcp::AcpMcpServerConfig],
 ) -> anyhow::Result<()> {
-    let response = link
-        .request(DaemonCommand::ReplaceAcpMcpServers {
-            id: None,
-            active_session_id: hosted.daemon_active_session_id.clone(),
-            owner_id: hosted.mcp_owner_id.clone(),
-            servers: serde_json::to_value(resolved)?,
-            rest: Map::default(),
-        })
-        .await?;
-    if !response.success {
-        anyhow::bail!(response
-            .error
-            .unwrap_or_else(|| "unknown error".to_string()));
-    }
+    link.request_ok(DaemonCommand::ReplaceAcpMcpServers {
+        id: None,
+        active_session_id: daemon_session_id.to_string(),
+        owner_id: owner_id.to_string(),
+        servers: serde_json::to_value(resolved)?,
+        rest: Map::default(),
+    })
+    .await
+}
+
+async fn clear_connection_servers(
+    link: &Arc<DaemonLink>,
+    daemon_session_id: &str,
+    owner_id: &str,
+    state: &Arc<Mutex<DaemonAcpState>>,
+) -> anyhow::Result<()> {
+    replace_connection_servers(link, daemon_session_id, owner_id, &[]).await?;
+    state.lock().await.mcp_server_names.clear();
     Ok(())
 }
 
@@ -1003,23 +1313,22 @@ async fn handle_session_prompt(
 /// cancelled. A slot holding another prompt's turn (close + new while
 /// this prompt ran) is left alone.
 async fn release_turn_slot(state: &Arc<Mutex<DaemonAcpState>>, admission_id: &str) {
-    let stop_done = {
+    let mut cancel_task = {
         let mut guard = state.lock().await;
         let Some(hosted) = guard.session.as_mut() else {
             return;
         };
-        let stop_done = match hosted.turn.as_mut() {
-            Some(turn) if turn.admission_id != admission_id => return,
-            Some(turn) => turn.stop_done_rx.take(),
-            None => return,
-        };
-        let Some(stop_done) = stop_done else {
-            hosted.turn = None;
+        let Some(turn) = hosted.turn.as_mut() else {
             return;
         };
-        stop_done
+        if turn.admission_id != admission_id {
+            return;
+        }
+        hosted.cancel_task.clone()
     };
-    let _ = stop_done.await;
+    if let Some(cancel_task) = cancel_task.as_mut() {
+        let _ = cancel_task.changed().await;
+    }
     if let Some(hosted) = state.lock().await.session.as_mut() {
         hosted
             .turn
@@ -1411,50 +1720,115 @@ fn quiescence_meta(
     }
 }
 
-/// Close: stop the session's work, release the servers, and fence the
-/// producer. The daemon session stays; a later `session/new` binds it
-/// again (TS `closeSession`).
 async fn handle_session_close(
     id: Value,
     params: Value,
     link: &Arc<DaemonLink>,
     state: &Arc<Mutex<DaemonAcpState>>,
     tx: producer::FrameSink,
+    close_done: tokio::sync::watch::Sender<bool>,
+    owner_id: String,
 ) {
     let session_id = params
         .get("sessionId")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let taken = {
-        let mut guard = state.lock().await;
-        let taken = guard
+    let cancel_task = {
+        let guard = state.lock().await;
+        guard
             .session
-            .take_if(|hosted| hosted.acp_session_id == session_id);
-        if taken.is_some() {
-            guard.session_close_in_flight = true;
-        }
-        taken
+            .as_ref()
+            .filter(|hosted| hosted.acp_session_id == session_id)
+            .and_then(|hosted| hosted.cancel_task.clone())
     };
-    let Some(hosted) = taken else {
-        let _ = tx.send(super::internal_error(
-            &id,
-            &format!("Unknown ACP session: {session_id}"),
-        ));
-        return;
-    };
-    let admission_id = hosted.turn.as_ref().map(|turn| turn.admission_id.clone());
-    stop_session_work(link, &hosted.daemon_active_session_id, admission_id).await;
-    if !hosted.mcp_server_names.is_empty() {
-        let _ = replace_session_servers(link, &hosted, &[]).await;
+    if let Some(mut cancel_task) = cancel_task {
+        let _ = cancel_task.changed().await;
     }
-    // The serialized config work settles before the producer fences (TS
-    // `await configTask`).
-    let _ = hosted.config.queue.lock().await;
-    hosted.producer.close().await;
-    let _ = tx.send(jsonrpc::response(&id, &json!({})));
-    let mut guard = state.lock().await;
-    guard.session_close_in_flight = false;
+    let (acp_session_id, daemon_session_id, config, producer, admission_id) = {
+        let mut guard = state.lock().await;
+        let Some(hosted) = guard
+            .session
+            .as_mut()
+            .filter(|hosted| hosted.acp_session_id == session_id)
+        else {
+            drop(guard);
+            state.lock().await.session_close_done = None;
+            let _ = close_done.send(true);
+            return;
+        };
+        hosted.cancelling = true;
+        if let Some(turn) = hosted.turn.as_mut() {
+            turn.cancelled = true;
+        }
+        let admission_id = hosted.turn.as_ref().map(|turn| turn.admission_id.clone());
+        (
+            hosted.acp_session_id.clone(),
+            hosted.daemon_active_session_id.clone(),
+            Arc::clone(&hosted.config),
+            Arc::clone(&hosted.producer),
+            admission_id,
+        )
+    };
+    let close_result = match acquire_stop_input_pause(link, state, &acp_session_id).await {
+        Ok(lease) => {
+            match stop_session_work(link, &daemon_session_id, admission_id.as_deref()).await {
+                Ok(()) => {
+                    // The serialized config work settles before the
+                    // producer fences (TS `await configTask`).
+                    let _ = config.queue.lock().await;
+                    producer.close().await;
+                    let _ =
+                        clear_connection_servers(link, &daemon_session_id, &owner_id, state).await;
+                    let mut guard = state.lock().await;
+                    guard.closed_input_pause_id = Some(lease.pause_id.clone());
+                    guard.closed_input_pause_key = Some(lease.lease_key.clone());
+                    if let Some(hosted) = guard
+                        .session
+                        .as_mut()
+                        .filter(|hosted| hosted.acp_session_id == session_id)
+                    {
+                        if hosted.input_pause_id.as_deref() == Some(&lease.pause_id) {
+                            hosted.input_pause_id = None;
+                        }
+                        if hosted.input_pause_key.as_deref() == Some(&lease.lease_key) {
+                            hosted.input_pause_key = None;
+                        }
+                        hosted.stop_failure = None;
+                    }
+                    guard
+                        .session
+                        .take_if(|hosted| hosted.acp_session_id == session_id);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    {
+        let mut guard = state.lock().await;
+        if let Some(hosted) = guard
+            .session
+            .as_mut()
+            .filter(|hosted| hosted.acp_session_id == acp_session_id)
+        {
+            hosted.cancelling = false;
+            if let Err(error) = &close_result {
+                hosted.stop_failure = Some(error.to_string());
+            }
+        }
+        guard.session_close_done = None;
+    }
+    let _ = close_done.send(true);
+    match close_result {
+        Ok(()) => {
+            let _ = tx.send(jsonrpc::response(&id, &json!({})));
+        }
+        Err(error) => {
+            let _ = tx.send(super::internal_error(&id, &error.to_string()));
+        }
+    }
 }
 
 /// Release the connection's hold after stdin closes (TS dispose): the
@@ -1468,14 +1842,29 @@ async fn teardown(
     binding: &DaemonBinding,
 ) {
     let hosted = state.lock().await.session.take();
-    if let Some(turn) = hosted.as_ref().and_then(|hosted| hosted.turn.as_ref()) {
-        cancel_owned_admission(link, &binding.active_session_id, turn.admission_id.clone()).await;
-    }
-    if let Some(hosted) = &hosted {
-        if !hosted.mcp_server_names.is_empty() {
-            let _ = replace_session_servers(link, hosted, &[]).await;
+    if let Some(hosted) = hosted.as_ref() {
+        if let Some(turn) = hosted.turn.as_ref() {
+            cancel_owned_admission(link, &binding.active_session_id, &turn.admission_id).await;
+        }
+        if let Some(pause_id) = hosted.input_pause_id.as_ref() {
+            let _ = release_session_input_pause(link, &binding.active_session_id, pause_id).await;
         }
     }
+    let closed_pause = {
+        let mut guard = state.lock().await;
+        guard.closed_input_pause_key = None;
+        guard.closed_input_pause_id.take()
+    };
+    if let Some(pause_id) = closed_pause {
+        let _ = release_session_input_pause(link, &binding.active_session_id, &pause_id).await;
+    }
+    let _ = clear_connection_servers(
+        link,
+        &binding.active_session_id,
+        &binding.mcp_owner_id,
+        state,
+    )
+    .await;
     // The owned worker stops before the config queue drains: a stalled
     // config operation holding the queue on a wire request fails fast.
     if binding.client_owned {
@@ -1490,5 +1879,147 @@ async fn teardown(
     if let Some(hosted) = hosted {
         let _ = hosted.config.queue.lock().await;
         hosted.producer.close().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hosted_session() -> HostedSession {
+        let (sink, _drain) = mpsc::unbounded_channel();
+        HostedSession {
+            acp_session_id: "acp-1".to_string(),
+            daemon_active_session_id: "daemon-1".to_string(),
+            producer: UpdateProducer::new("acp-1", sink),
+            config: Arc::new(HostedConfig {
+                queue: tokio::sync::Mutex::new(()),
+                published: tokio::sync::Mutex::new(Vec::new()),
+                models: tokio::sync::Mutex::new(Vec::new()),
+            }),
+            cancelling: false,
+            stop_failure: None,
+            input_pause_key: None,
+            input_pause_id: None,
+            cancel_task: None,
+            turn: None,
+            assistant_stop_reason: None,
+            mapping: WireMappingState::default(),
+        }
+    }
+
+    fn state(session: Option<HostedSession>) -> DaemonAcpState {
+        DaemonAcpState {
+            session,
+            ..DaemonAcpState::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn admit_prompt_matches_the_ts_refusal_order() {
+        let none = Arc::new(Mutex::new(state(None)));
+        assert_eq!(
+            admit_prompt(&json!({ "sessionId": "nope" }), &none)
+                .await
+                .unwrap_err(),
+            "Unknown ACP session: nope"
+        );
+
+        let closing = Arc::new(Mutex::new({
+            let mut state = state(Some(hosted_session()));
+            let (_done_tx, done_rx) = tokio::sync::watch::channel(false);
+            state.session_close_done = Some(done_rx);
+            state
+        }));
+        assert_eq!(
+            admit_prompt(&json!({ "sessionId": "acp-1" }), &closing)
+                .await
+                .unwrap_err(),
+            "ACP session is closing: acp-1"
+        );
+
+        let mut cancelling = state(Some(hosted_session()));
+        cancelling.session.as_mut().unwrap().cancelling = true;
+        let cancelling = Arc::new(Mutex::new(cancelling));
+        assert_eq!(
+            admit_prompt(&json!({ "sessionId": "acp-1" }), &cancelling)
+                .await
+                .unwrap_err(),
+            "ACP session is cancelling: acp-1"
+        );
+
+        let mut failed = state(Some(hosted_session()));
+        failed.session.as_mut().unwrap().stop_failure = Some("boom".to_string());
+        failed.session.as_mut().unwrap().turn = Some(ActiveTurn {
+            admission_id: "prompt-admission:1".to_string(),
+            cancelled: false,
+        });
+        let failed = Arc::new(Mutex::new(failed));
+        assert_eq!(
+            admit_prompt(&json!({ "sessionId": "acp-1" }), &failed)
+                .await
+                .unwrap_err(),
+            "ACP session stop failed: boom"
+        );
+
+        let clean = Arc::new(Mutex::new(state(Some(hosted_session()))));
+        let admitted = admit_prompt(&json!({ "sessionId": "acp-1" }), &clean)
+            .await
+            .unwrap();
+        assert!(admitted.starts_with("prompt-admission:"));
+        assert_eq!(
+            admit_prompt(&json!({ "sessionId": "acp-1" }), &clean)
+                .await
+                .unwrap_err(),
+            "A prompt turn is already running for this ACP session"
+        );
+    }
+
+    #[test]
+    fn arm_cancel_arms_a_running_turn_a_stop_retry_or_nothing() {
+        let mut running = state(Some(hosted_session()));
+        running.session.as_mut().unwrap().turn = Some(ActiveTurn {
+            admission_id: "prompt-admission:1".to_string(),
+            cancelled: false,
+        });
+        let CancelOrder::Armed(stop) = arm_cancel_locked("acp-1", &mut running) else {
+            panic!("a running turn arms its stop");
+        };
+        assert_eq!(stop.admission_id.as_deref(), Some("prompt-admission:1"));
+        let turn = running.session.as_ref().unwrap().turn.as_ref().unwrap();
+        assert!(turn.cancelled);
+        assert!(running.session.as_ref().unwrap().cancelling);
+        assert!(running.session.as_ref().unwrap().cancel_task.is_some());
+
+        let mut idle = state(Some(hosted_session()));
+        assert!(matches!(
+            arm_cancel_locked("acp-1", &mut idle),
+            CancelOrder::None
+        ));
+        assert!(idle.session.as_ref().unwrap().turn.is_none());
+
+        let mut failed = state(Some(hosted_session()));
+        failed.session.as_mut().unwrap().stop_failure = Some("boom".to_string());
+        let CancelOrder::Armed(stop) = arm_cancel_locked("acp-1", &mut failed) else {
+            panic!("a stop failure arms the retry");
+        };
+        assert!(stop.admission_id.is_none());
+        assert!(failed.session.as_ref().unwrap().turn.is_none());
+        assert!(failed.session.as_ref().unwrap().cancelling);
+        assert!(failed.session.as_ref().unwrap().cancel_task.is_some());
+    }
+
+    #[test]
+    fn a_cancel_while_a_stop_runs_never_arms_a_second_stop() {
+        let mut stopping = state(Some(hosted_session()));
+        stopping.session.as_mut().unwrap().cancelling = true;
+        stopping.session.as_mut().unwrap().turn = Some(ActiveTurn {
+            admission_id: "prompt-admission:1".to_string(),
+            cancelled: true,
+        });
+        assert!(matches!(
+            arm_cancel_locked("acp-1", &mut stopping),
+            CancelOrder::None
+        ));
     }
 }

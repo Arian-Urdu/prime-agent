@@ -282,6 +282,7 @@ pub(crate) struct HostedSession {
     assistant_stop_reason: Option<String>,
     /// The event mapping state lives and dies with the session, like TS.
     mapping: WireMappingState,
+    observed_children: std::collections::HashSet<String>,
 }
 
 struct ActiveTurn {
@@ -365,6 +366,16 @@ pub async fn run_daemon_attached_acp_mode(options: DaemonAcpOptions) -> anyhow::
                             };
                             if let Some(stop) = wire_events::assistant_stop(&event) {
                                 current.assistant_stop_reason = stop.stop_reason;
+                            }
+                            if event.get("type").and_then(Value::as_str) == Some("rlm_child_update")
+                            {
+                                if let Some(id) = event
+                                    .get("child")
+                                    .and_then(|child| child.get("id"))
+                                    .and_then(Value::as_str)
+                                {
+                                    current.observed_children.insert(id.to_string());
+                                }
                             }
                             let turn_id = current.producer.active_prompt_turn().await;
                             for update in wire_events::wire_updates(&event, &mut current.mapping) {
@@ -1162,6 +1173,7 @@ async fn handle_session_new(
         turn: None,
         assistant_stop_reason: None,
         mapping: WireMappingState::default(),
+        observed_children: std::collections::HashSet::new(),
     };
     // The ACP MCP servers ride the wire command, not a local manager.
     let replace_skipped = resolved.is_empty() && state.lock().await.mcp_server_names.is_empty();
@@ -1233,6 +1245,42 @@ async fn handle_session_new(
             .clone()
             .zip(guard.closed_input_pause_key.clone())
     };
+    let children = match fetch_rlm_children(link, &binding.active_session_id).await {
+        Ok(children) => children,
+        Err(error) => {
+            let _ = clear_connection_servers(
+                link,
+                &binding.active_session_id,
+                &binding.mcp_owner_id,
+                state,
+            )
+            .await;
+            let mut guard = state.lock().await;
+            guard.session = None;
+            guard.session_new_in_flight = false;
+            drop(guard);
+            let _ = tx.send(super::internal_error(&id, &error.to_string()));
+            return;
+        }
+    };
+    {
+        let mut guard = state.lock().await;
+        if let Some(current) = guard.session.as_mut() {
+            for child in children {
+                let id = child.get("id").and_then(Value::as_str).unwrap_or_default();
+                if !current.observed_children.insert(id.to_string()) {
+                    continue;
+                }
+                let event = json!({ "type": "rlm_child_update", "child": child });
+                for update in wire_events::wire_updates(&event, &mut current.mapping) {
+                    let _ = current
+                        .producer
+                        .publish(&update, 0, PrimeAgentEventPhase::Event, None)
+                        .await;
+                }
+            }
+        }
+    }
     let _ = tx.send(jsonrpc::response(&id, &result));
     if let Some((pause_id, lease_key)) = inherited_pause {
         match release_session_input_pause(link, &binding.active_session_id, &pause_id).await {
@@ -1905,6 +1953,7 @@ mod tests {
             turn: None,
             assistant_stop_reason: None,
             mapping: WireMappingState::default(),
+            observed_children: std::collections::HashSet::new(),
         }
     }
 

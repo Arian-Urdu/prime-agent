@@ -18,6 +18,7 @@ import io
 import json
 import linecache
 import os
+import pickle
 import platform
 import select
 import signal
@@ -1058,6 +1059,31 @@ def _revive_with_live_globals(
     return rebound
 
 
+def _snapshot_unpickler(dill: Any) -> type:
+    """Unpickler that refuses to reopen a pickled raw fd number in this kernel.
+
+    dill serializes a pipe/socket-backed file as its fd NUMBER; restoring a
+    saved closed one reopens that number here and closes it again, killing
+    whatever owns the fd now (e.g. the event loop's self-pipe). The refusal
+    fails just that record; every other name still restores.
+    """
+    create_filehandle = dill._dill._create_filehandle
+
+    def refuse_raw_fd(name: Any, *args: Any) -> Any:
+        if isinstance(name, int):
+            raise pickle.UnpicklingError(
+                f"refusing to reopen raw file descriptor {name} from a snapshot"
+            )
+        return create_filehandle(name, *args)
+
+    class GuardedUnpickler(dill.Unpickler):
+        def find_class(self, module: str, name: str) -> Any:
+            target = super().find_class(module, name)
+            return refuse_raw_fd if target is create_filehandle else target
+
+    return GuardedUnpickler
+
+
 def _restore_state(
     ns: dict[str, Any],
     path: str,
@@ -1071,6 +1097,7 @@ def _restore_state(
         import dill
     except Exception as err:  # noqa: BLE001
         return {"error": f"dill unavailable: {err}"}
+    unpickler = _snapshot_unpickler(dill)
     try:
         with open(path, "rb") as fh:
             if fh.read(len(_SNAPSHOT_MAGIC)) == _SNAPSHOT_MAGIC:
@@ -1086,7 +1113,7 @@ def _restore_state(
             else:
                 # Legacy: one dill-pickled dict; old snapshot files must keep restoring.
                 fh.seek(0)
-                payload = dill.load(fh)
+                payload = unpickler(fh).load()
     except Exception as err:  # noqa: BLE001 - a corrupt snapshot yields an empty restore
         return {"error": f"load failed: {_safe_str(err)}"}
     if not isinstance(payload, dict):
@@ -1098,7 +1125,7 @@ def _restore_state(
         if name in _RESTORE_SKIP:
             continue
         try:
-            staged[name] = dill.loads(blob)
+            staged[name] = unpickler(io.BytesIO(blob)).load()
         except Exception as err:  # noqa: BLE001 - revive every other name regardless
             failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
     # Revive every staged name before parking: a failure must never abort the

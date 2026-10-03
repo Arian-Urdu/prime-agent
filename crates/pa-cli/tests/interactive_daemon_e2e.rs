@@ -5908,27 +5908,33 @@ async fn tui_accepted_then_killed_turn_renders_closed_error() {
     .await;
     let kill_socket = supervisor.socket.clone();
     let kill_session_id = session_id.clone();
-    let kill_dir = session_dir.clone();
     let kill_task = tokio::spawn(async move {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let admitted = std::fs::read_dir(&kill_dir)
-                .expect("read session dir")
-                .flatten()
-                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
-                .any(|entry| {
-                    std::fs::read_to_string(entry.path())
-                        .is_ok_and(|text| text.contains("held accepted prompt"))
-                });
-            if admitted {
-                break;
-            }
-            assert!(Instant::now() < deadline, "prompt never reached the durable session");
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
         let (client, _events) = pa_tui::daemon_client::DaemonClient::connect(&kill_socket)
             .await
             .expect("connect supervisor for kill");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let messages = client
+                .request_ok(DaemonCommand::GetMessages {
+                    id: None,
+                    active_session_id: kill_session_id.clone(),
+                    rest: serde_json::Map::default(),
+                })
+                .await
+                .expect("get admitted messages");
+            if messages["messages"].as_array().is_some_and(|items| {
+                items.iter().any(|message| {
+                    message["role"] == "user" && message.to_string().contains("held accepted prompt")
+                })
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "prompt never appeared in the worker's accepted messages"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         client
             .request_ok(DaemonCommand::Kill {
                 id: None,
@@ -5991,9 +5997,18 @@ async fn tui_accepted_then_killed_turn_renders_closed_error() {
         .expect("interactive run");
     kill_task.await.expect("the kill task");
     let rendered = outcome.frames.join("\n");
-    assert!(rendered.contains(error_row), "killed turn must show TS error row:\n{rendered}");
-    assert!(!rendered.contains("reply must not arrive"), "held response leaked:\n{rendered}");
+    assert!(
+        rendered.contains(error_row),
+        "killed turn must show TS error row:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("reply must not arrive"),
+        "held response leaked:\n{rendered}"
+    );
     let last = outcome.frames.last().expect("final frame");
-    assert!(!last.contains("session closed (killed)"), "info downgrade remains:\n{last}");
+    assert!(
+        !last.contains("session closed (killed)"),
+        "info downgrade remains:\n{last}"
+    );
     drop(supervisor);
 }

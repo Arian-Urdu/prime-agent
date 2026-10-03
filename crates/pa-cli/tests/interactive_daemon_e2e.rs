@@ -5914,24 +5914,20 @@ async fn tui_accepted_then_killed_turn_renders_closed_error() {
             .expect("connect supervisor for kill");
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let messages = client
-                .request_ok(DaemonCommand::GetMessages {
+            let state = client
+                .request_ok(DaemonCommand::GetConnectionState {
                     id: None,
                     active_session_id: kill_session_id.clone(),
                     rest: serde_json::Map::default(),
                 })
                 .await
-                .expect("get admitted messages");
-            if messages["messages"].as_array().is_some_and(|items| {
-                items.iter().any(|message| {
-                    message["role"] == "user" && message.to_string().contains("held accepted prompt")
-                })
-            }) {
+                .expect("get worker connection state");
+            if state["isStreaming"] == true {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "prompt never appeared in the worker's accepted messages"
+                "worker never began the accepted turn: {state}"
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }

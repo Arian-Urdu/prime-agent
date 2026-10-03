@@ -481,7 +481,14 @@ impl SupervisorChildSessionsInner {
                         eprintln!("pa-daemon: RLM child display completion failed: {error:#}");
                     }
                 }
-                self.deliver_settle_notice(record).await;
+                if !self.deliver_settle_notice(record).await {
+                    // The verdict was re-cleared while this tail ran its
+                    // round trips (a collect's grace found the child busy
+                    // again: a follow-up turn is running): the watcher
+                    // owns the run again and keeps watching instead of
+                    // retiring on a verdict nobody owns.
+                    continue;
+                }
                 // A settled child releases an owed goal continuation (TS
                 // `_maybeResumeGoalContinuationAfterRlmWork` at the child
                 // settle sites).
@@ -575,11 +582,21 @@ impl SupervisorChildSessionsInner {
     /// sent an agent message to the parent. Exactly-once: the record's
     /// notice claim collapses the races between the watcher, a natural
     /// settle during `delete_subagent`, and the delete path itself.
-    async fn deliver_settle_notice(&self, record: &Arc<Mutex<ChildRecord>>) {
+    ///
+    /// The claim is the settle tail's commit, and a verdict a collect's
+    /// grace re-cleared while the tail ran its round trips (the child went
+    /// busy again: a follow-up turn) has nothing to commit: claiming it
+    /// would deliver a completion notice for a running child and let the
+    /// funnel retire the watcher on a record nobody owns. Returns whether
+    /// the tail may retire (`false`: the watcher keeps watching the run).
+    pub(super) async fn deliver_settle_notice(&self, record: &Arc<Mutex<ChildRecord>>) -> bool {
         let message = {
             let mut record = record.lock().await;
+            if record.settled_status.is_none() {
+                return false;
+            }
             if record.notice_delivered || record.replied_since_task {
-                return;
+                return true;
             }
             record.notice_delivered = true;
             let notice = RlmChildTerminalNotice::CompletedWithoutReply {
@@ -590,6 +607,7 @@ impl SupervisorChildSessionsInner {
             create_rlm_child_terminal_notice(&notice, now_ms())
         };
         self.deliver_terminal_notice(message).await;
+        true
     }
 
     /// Settle one child as failed (TS's thrown-run arm): the record

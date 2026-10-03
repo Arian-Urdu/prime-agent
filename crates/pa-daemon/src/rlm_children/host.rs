@@ -548,9 +548,30 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     let active_session_id = record.lock().await.active_session_id.clone();
                     tokio::time::sleep(Duration::from_millis(WATCH_SETTLE_GRACE_MS)).await;
                     let busy_again = matches!(this.child_busy(&active_session_id).await, Ok(true));
-                    let reclearable = collect_grace_may_reclear(&*record.lock().await);
-                    if busy_again && reclearable {
-                        record.lock().await.settled_status = None;
+                    // The gate and the re-clear commit at ONE hold of the
+                    // record lock. Two acquisitions left a hand-off gap
+                    // where a claim already queued on the lock (the settle
+                    // funnel's notice claim, its `settled` latch, a
+                    // cancel) ran in between: the gate read the verdict as
+                    // unclaimed, the claim took it, and the clear still
+                    // stripped it — the funnel latched a record reading
+                    // `running`, quiescence saw the latch, the parent held
+                    // the terminal notice, and no watcher was left to
+                    // re-settle. A claim queued behind this hold lands
+                    // after the clear and aborts at its own commit (the
+                    // tail's notice claim keeps watching a re-cleared
+                    // verdict), so the record is consistent at every
+                    // interleave: claimed verdicts keep their status,
+                    // unclaimed misreads re-clear.
+                    let recleared = {
+                        let mut record = record.lock().await;
+                        let may = busy_again && collect_grace_may_reclear(&record);
+                        if may {
+                            record.settled_status = None;
+                        }
+                        may
+                    };
+                    if recleared {
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         if !remaining.is_zero() {
                             this.wait_for_child(&active_session_id, remaining).await;

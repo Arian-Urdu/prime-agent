@@ -1218,3 +1218,182 @@ async fn collect_grace_keeps_a_settle_the_funnel_already_finalized() {
         "the record never flips back to running with no watcher left"
     );
 }
+
+/// The "Grace reclear races the funnel latch" pin: the collect's grace
+/// gate and its re-clear commit at ONE hold of the record lock, and the
+/// settle tail's notice claim — the funnel's commit — aborts on a
+/// verdict the re-clear already took. The interleaving under test: the
+/// collect sits parked in its grace busy-check while the watcher's tail
+/// reaches its claim; the test grips the record lock so the collect's
+/// gate read queues behind the grip and the tail's claim queues behind
+/// the gate (the FIFO order a real waiter queued on the lock lands in).
+/// Without the shared hold the claim ran BETWEEN the gate and the clear:
+/// the gate read the verdict as unclaimed, the claim took it, the clear
+/// still stripped the status, and the tail's funnel then latched
+/// `settled` on a record reading `running` — quiescence saw the latch,
+/// the parent already received the completion notice, and no watcher was
+/// left to re-settle. With the fixes the record is consistent at every
+/// interleave: the claim lands after the atomic gate+clear and aborts,
+/// so nothing is claimed, nothing latches, and the record reads
+/// `running` everywhere (the watcher keeps watching the follow-up).
+#[tokio::test]
+async fn the_funnel_claim_never_lands_between_the_grace_gate_and_its_re_clear() {
+    let (follow_up_tx, mut follow_up_rx) = mpsc::unbounded_channel();
+    let child_subagents = Arc::new(FakeChildSubagents::default());
+    let (sessions, _kill_rx) = sessions_with_fake_child_subagents(
+        follow_up_tx,
+        0,
+        FakeKill::Success,
+        FakeChild::ParksGraceCheck,
+        Arc::clone(&child_subagents),
+    )
+    .await;
+    sessions
+        .push_test_child(RlmChildIdentity {
+            rlm_child_id: "sub-claim-race".to_string(),
+            active_session_id: "child-live".to_string(),
+            session_id: Some("child-file".to_string()),
+            session_name: "claim-race".to_string(),
+        })
+        .await;
+    let record = Arc::clone(&sessions.inner.children.lock().await[0]);
+    let collect_sessions = sessions.clone();
+    let results_task = tokio::spawn(async move {
+        collect_sessions
+            .collect(vec!["sub-claim-race".to_string()], 0)
+            .await
+            .expect("collect the claim-race child")
+    });
+    // The fake parks the collect's grace busy-check: the settle minted
+    // inside this collect, and the grace sleep has run.
+    GRACE_CHECK_PARKED.notified().await;
+    // Grip the record lock before the grace busy-check answers, so the
+    // collect's gate read queues behind the grip.
+    let grip = record.lock().await;
+    // A follow-up prompt makes the child busy again inside the grace: the
+    // re-clear path is armed.
+    child_subagents.running.store(true, Ordering::SeqCst);
+    GRACE_CHECK_RELEASE.notify_one();
+    // Let the collect resume and queue its gate read behind the grip,
+    // then queue the settle tail's claim behind the gate read (the FIFO
+    // hand-off a waiter already queued on the lock takes).
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let tail_sessions = sessions.clone();
+    let tail_record = Arc::clone(&record);
+    let tail = tokio::spawn(async move {
+        if tail_sessions
+            .inner
+            .deliver_settle_notice(&tail_record)
+            .await
+        {
+            tail_sessions.inner.fire_settle_hook(&tail_record).await;
+        }
+    });
+    // Run the queued claim task up to its lock request before the grip
+    // lifts (a spawned task has not queued its lock request yet).
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(grip);
+
+    let results = tokio::time::timeout(Duration::from_secs(10), results_task)
+        .await
+        .expect("the collect returns after the grace")
+        .expect("the collect task joins");
+    tokio::time::timeout(Duration::from_secs(10), tail)
+        .await
+        .expect("the tail task settles")
+        .expect("the tail task joins");
+    assert_eq!(
+        results[0].status, "running",
+        "the re-cleared verdict reads running to the collect (a follow-up turn runs)"
+    );
+    let (settled_latch, noticed) = {
+        let record = record.lock().await;
+        (record.settled, record.notice_delivered)
+    };
+    assert!(
+        !settled_latch,
+        "the funnel never latches a record the grace re-cleared"
+    );
+    assert!(
+        !noticed,
+        "no terminal notice claims a verdict the grace re-cleared"
+    );
+    assert!(
+        follow_up_rx.try_recv().is_err(),
+        "the parent receives no completion notice for a running child"
+    );
+    assert!(
+        sessions.any_running().await,
+        "quiescence sees the run too (the latch never fired on the re-cleared verdict)"
+    );
+    let roster = sessions.list_subagents().await.expect("child roster");
+    assert_eq!(
+        roster[0].status, "running",
+        "the record reads running everywhere (the watcher keeps watching the follow-up)"
+    );
+}
+
+/// The claim-abort contract pin: the settle tail's notice claim is its
+/// commit — a verdict the collect's grace re-cleared (the child went busy
+/// again: a follow-up turn) has nothing to commit, while a standing
+/// verdict claims and delivers exactly once.
+#[tokio::test]
+async fn the_settle_tail_claim_aborts_on_a_re_cleared_verdict() {
+    let (follow_up_tx, mut follow_up_rx) = mpsc::unbounded_channel();
+    let (sessions, _kill_rx) =
+        sessions_with_fake_supervisor(follow_up_tx, 0, FakeKill::Success, FakeChild::Healthy).await;
+    sessions
+        .push_test_child(RlmChildIdentity {
+            rlm_child_id: "sub-wiped-verdict".to_string(),
+            active_session_id: "child-live".to_string(),
+            session_id: Some("child-file".to_string()),
+            session_name: "wiped-verdict".to_string(),
+        })
+        .await;
+    let record = Arc::clone(&sessions.inner.children.lock().await[0]);
+    // The collect's grace re-cleared the verdict: the record reads running.
+    let claimed = sessions.inner.deliver_settle_notice(&record).await;
+    assert!(
+        !claimed,
+        "a re-cleared verdict has nothing to commit: the watcher keeps watching"
+    );
+    {
+        let record = record.lock().await;
+        assert!(!record.notice_delivered, "no notice claims a running child");
+        assert!(
+            !record.settled,
+            "the funnel never fires for a re-cleared verdict"
+        );
+    }
+    assert!(
+        follow_up_rx.try_recv().is_err(),
+        "no completion notice for a running child"
+    );
+    // A standing verdict commits: the notice claims once and delivers.
+    record.lock().await.settled_status = Some("done");
+    assert!(
+        sessions.inner.deliver_settle_notice(&record).await,
+        "a standing verdict commits its tail"
+    );
+    assert!(
+        record.lock().await.notice_delivered,
+        "the claim is taken under the same hold"
+    );
+    let notice = follow_up_rx
+        .try_recv()
+        .expect("the standing verdict's notice is delivered");
+    assert_eq!(
+        notice["customMessage"]["customType"],
+        "rlm_child_terminal_notice"
+    );
+    // Exactly-once: a second tail on the claimed verdict retires without
+    // a second notice.
+    assert!(
+        sessions.inner.deliver_settle_notice(&record).await,
+        "a claimed verdict still retires its tail"
+    );
+    assert!(
+        follow_up_rx.try_recv().is_err(),
+        "no second notice may arrive"
+    );
+}

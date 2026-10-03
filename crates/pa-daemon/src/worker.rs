@@ -892,8 +892,7 @@ impl Worker {
             self.listener_closed.notified().await;
         }
         let expected_identity = self.bound_socket_identity.lock().unwrap().clone();
-        crate::socket::cleanup_socket_path_after_close(&self.config.socket_path, expected_identity)
-            .await;
+        crate::socket::cleanup_socket_path_after_close(&self.config.socket_path, expected_identity);
     }
 
     /// The durable tail of a successful close: the resume entry, the

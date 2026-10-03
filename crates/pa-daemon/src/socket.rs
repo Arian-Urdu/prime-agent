@@ -213,43 +213,26 @@ pub fn cleanup_socket_path(path: &Path, expected_identity: Option<SocketIdentity
     let _ = std::fs::remove_file(path);
 }
 
-/// The exit-cleanup liveness probe budget: the same `250ms` the startup
-/// paths' probes use. A successor's live listener answers a connect at
-/// CONNECT time (the kernel completes the handshake while the listener's
-/// backlog has room, whether or not it accepts), so a live successor
-/// never slips past this probe as dead.
-const CLEANUP_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
-
 /// The exit cleanup after the owner's own listener is closed (the TS
-/// graceful-shutdown sequence: daemon-mode.ts:8011-8018 awaits
-/// `server.close()` before `cleanupSocketPath()`, and
-/// daemon-supervisor.ts:7436-7491 awaits its "daemon server" close step
-/// before its "daemon socket" cleanup step). With the owner's listener
-/// closed, a LIVE listener at the path can only be a successor's, so the
-/// probe skips the unlink entirely: even a poisoned bind-time capture (a
-/// replacement landing in the bind->capture window, whose identity the
-/// capture stores as the owner's own) never removes a successor's live
-/// socket - the identity gate below only unlinks a file that is provably
-/// dead.
-///
-/// Beyond TS, disclosed: the TS `cleanupDaemonSocketPath` gates on the
-/// identity alone, so the same poisoned capture unlinks a successor's live
-/// socket in TS; the probe is sound here only because every caller closes
-/// its own listener first - the sequence TS shutdown already runs. The
-/// still-ours direction is unchanged: the owner's closed listener leaves
-/// its own file dead, the probe passes it through, and the identity gate
-/// unlinks exactly the file it captured.
-pub async fn cleanup_socket_path_after_close(
-    path: &Path,
-    expected_identity: Option<SocketIdentity>,
-) {
+/// graceful-shutdown sequence closes before cleanup). A successor's live
+/// listener must survive even when a poisoned bind-time identity capture
+/// names the successor's inode. A nonblocking connect can distinguish a
+/// definitely closed listener (`ECONNREFUSED`) from a saturated backlog
+/// (`EAGAIN` on Linux); unknown outcomes preserve the socket path. Only
+/// after definite refusal may the existing cleanup lock and identity gate
+/// unlink the stale, still-ours socket. TS cleanup checks identity alone,
+/// so the poisoned-capture case remains a disclosed TS difference.
+pub fn cleanup_socket_path_after_close(path: &Path, expected_identity: Option<SocketIdentity>) {
     if !path.exists() {
         return;
     }
-    if can_connect(path, CLEANUP_PROBE_TIMEOUT).await {
-        return;
+    #[cfg(unix)]
+    {
+        if !pa_types::platform::transport::unix_listener_definitely_closed(path) {
+            return;
+        }
+        cleanup_socket_path(path, expected_identity);
     }
-    cleanup_socket_path(path, expected_identity);
 }
 
 /// Restrict the bound socket file to its owner (Unix mode 0o600; Windows
@@ -403,7 +386,7 @@ mod tests {
         std::fs::rename(&socket, &aside).unwrap();
         let successor = bind_transport(&socket).await.unwrap();
         let poisoned = socket_identity(&socket).unwrap();
-        cleanup_socket_path_after_close(&socket, Some(poisoned.clone())).await;
+        cleanup_socket_path_after_close(&socket, Some(poisoned.clone()));
         assert!(
             socket.exists(),
             "a live successor is never unlinked, even with a matching identity"
@@ -412,9 +395,70 @@ mod tests {
         drop(successor);
         // The same matching identity now describes a dead file: the
         // probe passes it through and the gate unlinks it.
-        cleanup_socket_path_after_close(&socket, Some(poisoned)).await;
+        cleanup_socket_path_after_close(&socket, Some(poisoned));
         assert!(!socket.exists(), "the dead still-ours file is unlinked");
         std::fs::remove_file(&aside).unwrap();
+    }
+
+    /// A full accept queue is not proof of a dead listener: the successor's
+    /// inode can exactly match a poisoned bind-time identity capture.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn exit_cleanup_preserves_a_backlogged_successor_with_a_matching_identity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let owner = bind_transport(&socket).await.unwrap();
+        drop(owner);
+        let aside = dir.path().join("owner.sock");
+        std::fs::rename(&socket, &aside).unwrap();
+        let successor = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        socket2::SockRef::from(&successor).listen(1).unwrap();
+        let poisoned = socket_identity(&socket).unwrap();
+        let mut queued = Vec::new();
+        // Never accept: hold each successful connection until the queue fills.
+        for _ in 0..4 {
+            match tokio::time::timeout(
+                Duration::from_millis(100),
+                tokio::net::UnixStream::connect(&socket),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => queued.push(stream),
+                _ => break,
+            }
+        }
+        assert!(!queued.is_empty());
+        assert!(
+            !can_connect(&socket, Duration::from_millis(100)).await,
+            "the successor's queue must be saturated for this oracle"
+        );
+        cleanup_socket_path_after_close(&socket, Some(poisoned.clone()));
+        assert!(
+            socket.exists(),
+            "a live backlogged successor must not be unlinked"
+        );
+        drop(successor);
+        cleanup_socket_path_after_close(&socket, Some(poisoned));
+        assert!(
+            !socket.exists(),
+            "the same inode unlinks after its listener closes"
+        );
+        drop(queued);
+        std::fs::remove_file(&aside).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn exit_cleanup_unlinks_a_closed_listener_on_a_long_socket_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let deep = dir.path().join("a".repeat(80)).join("b".repeat(80));
+        std::fs::create_dir_all(&deep).unwrap();
+        let socket = deep.join("daemon.sock");
+        let owner = bind_transport(&socket).await.unwrap();
+        let identity = socket_identity(&socket).unwrap();
+        drop(owner);
+        cleanup_socket_path_after_close(&socket, Some(identity));
+        assert!(!socket.exists(), "deep stale path still unlinks");
     }
 
     #[tokio::test]

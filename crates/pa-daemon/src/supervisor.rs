@@ -525,7 +525,7 @@ impl Supervisor {
         // listener provably closed, so a successor's live socket at the
         // path survives even a poisoned bind-time capture.
         let expected_identity = self.bound_socket_identity.lock().unwrap().clone();
-        socket::cleanup_socket_path_after_close(&self.options.socket_path, expected_identity).await;
+        socket::cleanup_socket_path_after_close(&self.options.socket_path, expected_identity);
         self.flush_telemetry_on_exit().await;
         Ok(())
     }

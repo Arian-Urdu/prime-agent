@@ -1150,6 +1150,31 @@ if [ "$MODE" = rollback ]; then
       rollback_from="$recorded"
     done < "$generations_record"
   fi
+  # The Windows-native installer's slot: install.ps1 keeps ITS replaced
+  # payload at the un-suffixed `prime-agent.old` and never writes the
+  # generations record (its own one-generation bookkeeping; its recovery
+  # is a printed manual Move-Item), so a ps1-updated machine has no
+  # recorded entry — but the CLI still sees an installer-owned payload,
+  # and `update --rollback` runs THIS script: install.ps1 has no rollback
+  # mode, so this fallback is that machine's only automated rollback. The
+  # slot takes the same three checks a recorded generation takes.
+  # THE CONFLICT POLICY: when a usable recorded entry AND the slot both
+  # exist, the RECORD wins — deliberately. No ordering signal separates
+  # the two bookkeeping systems (the asides' mtimes are publish times
+  # only until a rollback publishes a kept tree back into place with its
+  # OLD mtime, so a newer ps1 aside of a rolled-back tree compares as
+  # older than a stale record entry), and the marker check cannot tell
+  # install.ps1's slot from a user's own copy of the payload at that
+  # name — the record's entries are exactly the slots this script wrote
+  # and swept, so it stays authoritative whenever it answers. The slot
+  # serves the machines the record never covered.
+  ps1_slot="${PREFIX}/share/prime-agent.old"
+  if [ -z "$rollback_from" ] \
+     && [ -d "$ps1_slot" ] && [ -x "${ps1_slot}/${BINARY_NAME}" ] \
+     && head -n 1 "${ps1_slot}/.prime-agent-install" 2>/dev/null \
+        | grep -q '^install-rust.sh channel '; then
+    rollback_from="$ps1_slot"
+  fi
   [ -n "$rollback_from" ] || die "nothing to roll back: no previous version is kept under ${PREFIX}/share
 (each update keeps the version it replaced; a fresh install has none)"
   # THE ROLLBACK PRE-FLIGHT: with the knob set the resolved source is the

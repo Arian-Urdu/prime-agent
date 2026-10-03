@@ -549,6 +549,58 @@ fn update_archive_refuses_a_misnamed_payload_version() {
     sandbox.assert_session_preserved();
 }
 
+/// The install.ps1 slot: the Windows-native installer keeps its replaced
+/// payload at the un-suffixed `prime-agent.old` and never writes the
+/// generations record, so the CLI's rollback must fall back to that
+/// slot — a ps1-updated machine's only automated rollback path.
+#[test]
+fn update_rollback_reads_the_unsuffixed_installer_slot() {
+    let sandbox = Sandbox::new();
+    let live = sandbox.prefix.join("share/prime-agent");
+    std::fs::create_dir_all(&live).expect("payload dir");
+    let binary = live.join("prime-agent");
+    std::fs::copy(env!("CARGO_BIN_EXE_prime-agent"), &binary).expect("copy this build");
+    std::fs::write(
+        live.join(".prime-agent-install"),
+        "install-rust.sh channel beta\nversion 9.9.9\n",
+    )
+    .expect("install marker");
+    // The install.ps1 era: the replaced payload sits at the un-suffixed
+    // name, and no generations record exists.
+    let slot = sandbox.prefix.join("share/prime-agent.old");
+    std::fs::create_dir_all(&slot).expect("slot dir");
+    std::fs::write(
+        slot.join(".prime-agent-install"),
+        "install-rust.sh channel beta\nversion 1.0.0\n",
+    )
+    .expect("slot marker");
+    std::fs::write(slot.join("prime-agent"), b"payload\n").expect("slot payload");
+    make_executable(&slot.join("prime-agent"));
+
+    let mut command = Command::new(&binary);
+    command.args(["update", "--rollback"]);
+    installer_env(&mut command, &sandbox);
+    let output = command.output().expect("run the installed build");
+    assert!(output.status.success(), "the slot is a rollback source");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("rolled back to 1.0.0"), "{stdout}");
+    assert_eq!(
+        live_version(&sandbox),
+        "1.0.0",
+        "the slot's payload is live"
+    );
+    // The displaced live tree becomes a recorded generation: the machine
+    // converts to the sh bookkeeping, so the toggle keeps working.
+    let record = sandbox
+        .prefix
+        .join("share/.prime-agent-install-generations");
+    assert!(
+        record.exists(),
+        "the publish recorded the displaced payload"
+    );
+    sandbox.assert_session_preserved();
+}
+
 /// A fresh installer install has nothing to roll back: the run fails with
 /// the reason and the live payload stays.
 #[test]

@@ -567,20 +567,31 @@ impl RlmSubagentHost for SupervisorChildSessions {
             // across the family, and appends the child's RLM ledger
             // rename. `renamedBy: parent` marks the parent-directed
             // rename so the renamed session's transcript notice names it.
-            let command = DaemonCommand::Rename {
+            // The child may be passivated — or a prior wake may have
+            // re-keyed its roster row past the record's spawn-time id —
+            // so the rename rides the same durable-selector wake retry
+            // the child prompts use (the record keeps the spawn-time
+            // routing id; only its durable session id still names a
+            // passivated child).
+            let renamed_by = record.as_ref().map(|_| {
+                pa_core::session_engine::agent_messaging::AgentFamilyRelationship::Parent
+                    .as_str()
+                    .to_string()
+            });
+            let make_command = |selector: &str| DaemonCommand::Rename {
                 id: None,
-                active_session_id: active_session_id.clone(),
+                active_session_id: selector.to_string(),
                 name: name.clone(),
-                renamed_by: record.as_ref().map(|_| {
-                    pa_core::session_engine::agent_messaging::AgentFamilyRelationship::Parent
-                        .as_str()
-                        .to_string()
-                }),
+                renamed_by: renamed_by.clone(),
                 rest: serde_json::Map::default(),
             };
-            this.command(&command, RENAME_TIMEOUT_MS)
-                .await
-                .with_context(|| format!("rename session \"{active_session_id}\""))?;
+            this.command_with_durable_wake(
+                make_command,
+                &active_session_id,
+                RENAME_TIMEOUT_MS,
+                &format!("rename session \"{active_session_id}\""),
+            )
+            .await?;
             // A parent-directed rename updates the parent-side record so
             // the roster row, collect/delete selectors, and the parent's
             // name-availability check all stop matching the old name.

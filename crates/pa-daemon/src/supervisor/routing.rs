@@ -427,7 +427,10 @@ impl Supervisor {
                         // wakes it (reuse a resident host, otherwise launch
                         // a fresh worker over the file — TS's tier-2
                         // relaunch); a delete's kill marker resolves the
-                        // ledger edge and tombstones without a worker.
+                        // ledger edge and tombstones without a worker. A
+                        // parent-directed rename must hydrate its target
+                        // the same way (TS `renameAgentFamilySession`
+                        // resolves through the hydrated target).
                         if matches!(
                             command,
                             DaemonCommand::Prompt { .. }
@@ -436,6 +439,7 @@ impl Supervisor {
                                 | DaemonCommand::FollowUp { .. }
                                 | DaemonCommand::Attach { .. }
                                 | DaemonCommand::Reattach { .. }
+                                | DaemonCommand::Rename { .. }
                                 | DaemonCommand::WaitForIdle { .. }
                         ) {
                             match self.wake_saved_session(&selector).await {
@@ -707,10 +711,8 @@ impl Supervisor {
         // own rename can never mint a duplicate sibling name.
         let response = match command {
             DaemonCommand::Rename { name, .. } | DaemonCommand::SetSessionName { name, .. } => {
-                let scope =
-                    self.live_session_name_scope(&resident.worker_id, name.trim().to_string());
-                match scope {
-                    Ok(scope) => match self
+                match self.live_session_name_scope(&resident.worker_id, name.trim().to_string()) {
+                    Ok(scope) => self
                         .with_session_name_reservation(
                             &scope,
                             self.route_command_ready(
@@ -722,10 +724,7 @@ impl Supervisor {
                             ),
                         )
                         .await
-                    {
-                        Ok(response) => response,
-                        Err(error) => Err(anyhow!(error)),
-                    },
+                        .unwrap_or_else(|error| Err(anyhow!(error))),
                     Err(error) => Err(anyhow!(error)),
                 }
             }
@@ -744,9 +743,10 @@ impl Supervisor {
         // The typed path stays for every response this arm edits or reads
         // beyond the frame header's hints: the chunked-snapshot attach
         // clients, a rebound reattach (command echo rewrite), and the
-        // small-payload bookkeeping commands (detach, kill, rename, the
-        // promote-owned catalog forms). An attach-family relay also needs
-        // the frame header's success/activeSessionId hints for the
+        // small-payload bookkeeping commands (detach, kill, rename,
+        // set_session_name, the promote-owned catalog forms). An
+        // attach-family relay also needs the frame header's
+        // success/activeSessionId hints for the
         // supervisor's own bookkeeping; a hint-less one falls back to the
         // typed parse so the bookkeeping never silently changes shape.
         let client_wants_chunked = match command {
@@ -767,6 +767,7 @@ impl Supervisor {
                 DaemonCommand::Detach { .. }
                     | DaemonCommand::Kill { .. }
                     | DaemonCommand::Rename { .. }
+                    | DaemonCommand::SetSessionName { .. }
                     | DaemonCommand::CronAdd {
                         promote_owned_session: Some(true),
                         ..

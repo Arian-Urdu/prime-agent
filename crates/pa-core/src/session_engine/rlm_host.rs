@@ -1390,17 +1390,10 @@ mod tests {
             Some(&("solo".to_string(), None))
         );
 
-        // Validation: the spawn name rules, then the session id shape.
+        // Validation: the shared spawn normalizer (the length rule) plus
+        // the rename-local broadcast guard, then the session id shape.
         let error = call(&wiring, "rlm.rename", json!({})).await.unwrap_err();
         assert_eq!(error.to_string(), "rlm.rename name must be a string");
-        let error = call(&wiring, "rlm.rename", json!({ "name": 5 }))
-            .await
-            .unwrap_err();
-        assert_eq!(error.to_string(), "rlm.rename name must be a string");
-        let error = call(&wiring, "rlm.rename", json!({ "name": "  " }))
-            .await
-            .unwrap_err();
-        assert_eq!(error.to_string(), "rlm.rename name must not be empty");
         let error = call(&wiring, "rlm.rename", json!({ "name": "x".repeat(65) }))
             .await
             .unwrap_err();

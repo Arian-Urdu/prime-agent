@@ -829,7 +829,10 @@ impl Worker {
         // session); a first name leaves none.
         if let Some(previous) = previous.as_deref().filter(|previous| *previous != name) {
             let content = if payload.get("renamedBy").and_then(Value::as_str)
-                == Some(pa_types::daemon::RENAMED_BY_PARENT)
+                == Some(
+                    pa_core::session_engine::agent_messaging::AgentFamilyRelationship::Parent
+                        .as_str(),
+                )
             {
                 format!("Session renamed `{previous}` -> `{name}` by parent")
             } else {

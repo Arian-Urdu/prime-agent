@@ -72,6 +72,28 @@ pub(crate) struct NameScope {
     pub(crate) parent_session_path: Option<String>,
 }
 
+/// The roster summary's name-reservation fields, the one projection both
+/// rename scopes read (a saved row by file, a live row by active id).
+fn name_scope_from_summary(summary: &Value, name: String) -> NameScope {
+    NameScope {
+        id: summary
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        name,
+        depth: summary.get("rlmDepth").and_then(Value::as_u64).unwrap_or(0) as u32,
+        parent_session_id: summary
+            .get("parentSessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        parent_session_path: summary
+            .get("parentSessionPath")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
+}
+
 /// One family-catalog row (TS `AgentFamilyCatalogEntry`): the fields the
 /// name-availability assertion reads.
 struct FamilyRow {
@@ -357,26 +379,9 @@ impl Supervisor {
                 .roster
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            roster.by_session_file(&canonical).map(|entry| {
-                let summary = &entry.summary;
-                NameScope {
-                    id: summary
-                        .get("sessionId")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    name: name.clone(),
-                    depth: summary.get("rlmDepth").and_then(Value::as_u64).unwrap_or(0) as u32,
-                    parent_session_id: summary
-                        .get("parentSessionId")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    parent_session_path: summary
-                        .get("parentSessionPath")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                }
-            })
+            roster
+                .by_session_file(&canonical)
+                .map(|entry| name_scope_from_summary(&entry.summary, name.clone()))
         };
         if let Some(scope) = roster_row {
             return Ok(scope);
@@ -555,26 +560,9 @@ impl Supervisor {
                 .roster
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            roster.by_active_session_id(active_session_id).map(|entry| {
-                let summary = &entry.summary;
-                NameScope {
-                    id: summary
-                        .get("sessionId")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    name,
-                    depth: summary.get("rlmDepth").and_then(Value::as_u64).unwrap_or(0) as u32,
-                    parent_session_id: summary
-                        .get("parentSessionId")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    parent_session_path: summary
-                        .get("parentSessionPath")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                }
-            })
+            roster
+                .by_active_session_id(active_session_id)
+                .map(|entry| name_scope_from_summary(&entry.summary, name))
         };
         scope.ok_or_else(|| format!("Unknown active session: {active_session_id}"))
     }

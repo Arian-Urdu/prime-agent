@@ -540,10 +540,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     let children = this.children.lock().await;
                     for candidate in children.iter() {
                         let record = candidate.lock().await;
-                        if record.rlm_child_id == target
-                            || record.active_session_id == target
-                            || record.session_id.as_deref() == Some(target.as_str())
-                        {
+                        if record.matches_id(&target) {
                             by_ids = Some(Arc::clone(candidate));
                             break;
                         }
@@ -574,9 +571,11 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 id: None,
                 active_session_id: active_session_id.clone(),
                 name: name.clone(),
-                renamed_by: record
-                    .as_ref()
-                    .map(|_| pa_types::daemon::RENAMED_BY_PARENT.to_string()),
+                renamed_by: record.as_ref().map(|_| {
+                    pa_core::session_engine::agent_messaging::AgentFamilyRelationship::Parent
+                        .as_str()
+                        .to_string()
+                }),
                 rest: serde_json::Map::default(),
             };
             this.command(&command, RENAME_TIMEOUT_MS)

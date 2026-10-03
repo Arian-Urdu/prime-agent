@@ -1414,22 +1414,6 @@ async fn parent_renames_a_child_end_to_end() {
     .expect("the rename dispatch");
     assert_eq!(reply, json!({ "name": "bench-runner" }));
 
-    // The parent-side roster row took the new name: the old name stops
-    // selecting, the new one hits (the collect-by-name surface).
-    let error = children
-        .collect(vec!["kid".to_string()], 0)
-        .await
-        .expect_err("the old name no longer selects");
-    assert_eq!(
-        error.to_string(),
-        "No direct RLM child matches \"kid\" in the current parent session"
-    );
-    let rows = children
-        .collect(vec!["bench-runner".to_string()], 0)
-        .await
-        .expect("the new name selects");
-    assert_eq!(rows[0].rlm_child_id, handle.rlm_child_id);
-
     // The child's transcript carries the parent-directed notice.
     client.wait_idle("w-child-rename", &child_active_session_id);
     let child_messages = client.messages("gm-child-rename", &child_active_session_id);

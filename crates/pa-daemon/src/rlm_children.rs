@@ -242,9 +242,14 @@ impl ChildRecord {
     }
 
     fn matches(&self, target: &str) -> bool {
+        self.matches_id(target) || self.session_name == target
+    }
+
+    /// The id selectors (the rename target resolution): every field a
+    /// child handle or full session id can carry — never the name.
+    fn matches_id(&self, target: &str) -> bool {
         self.rlm_child_id == target
             || self.active_session_id == target
-            || self.session_name == target
             || self.session_id.as_deref() == Some(target)
     }
 }

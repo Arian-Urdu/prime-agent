@@ -2060,11 +2060,14 @@ rm -f "$probe_out" "$probe_done" "$probe_pid_file"
   # tree and the probe would then refuse a good archive or pass a
   # mismatched one.
   unset PI_PACKAGE_DIR || true
-  # The probe's own writes are bounded (64 blocks = 32 KB, ample for a
-  # version line): a payload that continuously emits would otherwise fill
-  # the filesystem for the whole watchdog window, and the limit kills it
-  # — the invocation-status verdict refuses the probe then.
-  ulimit -f 64
+  # The probe's redirected output is bounded (64 blocks = 32 KB, ample
+  # for a version line): a payload that continuously emits would
+  # otherwise fill the filesystem for the whole watchdog window, and the
+  # limit kills it — the invocation-status verdict refuses the probe
+  # then. The ulimit itself is GUARDED: under set -e a platform refusing
+  # the limit would take the runner down before the done marker and
+  # every --archive install would then fail at the bound.
+  ulimit -f 64 2>/dev/null || true
   "${stage}/${BINARY_NAME}" --version >"$probe_out" 2>/dev/null &
   printf '%s\n' "$!" >"$probe_pid_file"
   # The probe's OWN status rides a file (set -e would take the wait's

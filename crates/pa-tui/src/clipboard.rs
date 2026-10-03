@@ -402,9 +402,6 @@ mod tests {
 
     #[test]
     fn a_remote_helper_success_never_confirms_local_delivery() {
-        // The pre-fix arm returned Confirmed for a remote helper's write,
-        // which landed on the machine the TUI runs on, not the user's
-        // local clipboard.
         assert_eq!(
             helper_outcome(true),
             Err(OVERSIZED_REMOTE_COPIED.to_string())

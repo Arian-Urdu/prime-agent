@@ -1352,6 +1352,7 @@ async fn parent_renames_a_child_end_to_end() {
             name: Some("kid".to_string()),
             model: None,
             thinking: None,
+            spawned_by_request_id: None,
             cell_source_code: None,
         })
         .await

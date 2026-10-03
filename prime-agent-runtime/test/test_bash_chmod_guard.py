@@ -1799,6 +1799,15 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen, [("echo hi", "cd /safe")])
         self.assertEqual(handle._script, "cd /safe\necho hi")
         handle.kill()
+        # kill() only signals the group: the watch thread reaps and removes
+        # the handle from the module live set asynchronously, so bounded-wait
+        # the reap like the miss-path pin instead of returning with the
+        # handle (and its journal record) possibly still live.
+        deadline = time.monotonic() + AWAIT_TIMEOUT
+        while (handle.running or handle in bash_module._live_handles) and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        self.assertFalse(handle.running)
+        self.assertNotIn(handle, bash_module._live_handles)
 
     async def test_wrapper_script_gate_uses_the_captured_prefix(self):
         # The wrapper-script relocation gate reads the captured prefix, not a

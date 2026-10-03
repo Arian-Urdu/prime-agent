@@ -5931,6 +5931,7 @@ async fn tui_accepted_then_killed_turn_renders_closed_error() {
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+        eprintln!("[accepted-turn-test] worker streaming; sending kill");
         client
             .request_ok(DaemonCommand::Kill {
                 id: None,
@@ -5939,6 +5940,7 @@ async fn tui_accepted_then_killed_turn_renders_closed_error() {
             })
             .await
             .expect("kill admitted session");
+        eprintln!("[accepted-turn-test] kill ack");
         client.close();
     });
     let options = pa_tui::interactive::InteractiveOptions {
@@ -5995,7 +5997,19 @@ async fn tui_accepted_then_killed_turn_renders_closed_error() {
     let rendered = outcome.frames.join("\n");
     assert!(
         rendered.contains(error_row),
-        "killed turn must show TS error row:\n{rendered}"
+        "killed turn had {} frames; close_info={}; user_row={}; waiting={}; final={}",
+        outcome.frames.len(),
+        rendered.contains("session closed (killed)"),
+        rendered.contains("held accepted prompt"),
+        rendered.contains("Waiting"),
+        outcome
+            .frames
+            .last()
+            .unwrap_or(&String::new())
+            .lines()
+            .filter(|row| !row.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ")
     );
     assert!(
         !rendered.contains("reply must not arrive"),

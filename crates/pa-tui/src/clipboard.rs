@@ -64,26 +64,36 @@ fn tmux_output(args: &[&str]) -> Option<String> {
         .stdout(Stdio::piped())
         .spawn()
         .ok()?;
+    // Drain the pipe from its own thread (the pipe_to writer-thread
+    // shape): a probe that writes past the pipe buffer blocks on the
+    // write, and a child blocked there never exits for the wait below.
+    let stdout = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut output = String::new();
+        stdout
+            .and_then(|mut pipe| pipe.read_to_string(&mut output).ok())
+            .map(|_| output)
+    });
     let deadline = std::time::Instant::now() + HELPER_TIMEOUT;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                let mut output = String::new();
-                child.stdout.take()?.read_to_string(&mut output).ok()?;
-                return Some(output);
-            }
+            Ok(Some(status)) => break Some(status),
             Ok(None) if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                break None;
             }
             Ok(None) => std::thread::sleep(PIPE_POLL),
-            Err(_) => return None,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
         }
-    }
+    }?;
+    // The child exited, so its pipe reaches EOF and the reader ends.
+    let output = reader.join().ok().flatten()?;
+    status.success().then_some(output)
 }
 
 /// Ask tmux to originate the clipboard write. `external` allows tmux's own
@@ -98,29 +108,20 @@ pub(crate) fn copy_via_tmux(text: &str) -> bool {
     {
         return false;
     }
-    let Some(session) = tmux_output(&["display-message", "-p", "-t", &pane, "#{session_id}"])
-    else {
+    let Some(window) = tmux_output(&["display-message", "-p", "-t", &pane, "#{window_id}"]) else {
         return false;
     };
     let Some(clients) = tmux_output(&[
         "list-clients",
-        "-t",
-        session.trim(),
         "-F",
-        "#{client_activity} #{client_name}",
+        "#{client_activity} #{window_id} #{client_name}",
     ]) else {
         return false;
     };
-    let Some((_, client)) = clients
-        .lines()
-        .filter_map(|line| {
-            let (activity, client) = line.split_once(' ')?;
-            Some((activity.parse::<u64>().ok()?, client))
-        })
-        .max_by_key(|(activity, _)| *activity)
-    else {
+    let Some(client) = pane_client(&clients, window.trim()) else {
         return false;
     };
+    let client = client.as_str();
     let Some(terminal) = tmux_output(&["show-messages", "-T", "-t", client]) else {
         return false;
     };
@@ -131,6 +132,25 @@ pub(crate) fn copy_via_tmux(text: &str) -> bool {
         return false;
     }
     pipe_to("tmux", &["load-buffer", "-w", "-t", client, "-"], text)
+}
+
+/// The client a pane's copy is forwarded to: the most recently active
+/// client whose current window IS the pane's window. The typist types
+/// through that client, so it receives the copy; a busier client on
+/// another window must not — its user's clipboard would take the
+/// payload, and a sign-in link can ride a copy. Clients sharing the
+/// window (a mirrored session) fall back to activity, which can only
+/// misdeliver to someone already viewing the pane.
+fn pane_client(clients: &str, pane_window: &str) -> Option<String> {
+    clients
+        .lines()
+        .filter_map(|line| {
+            let (activity, rest) = line.split_once(' ')?;
+            let (window, client) = rest.split_once(' ')?;
+            (window == pane_window).then_some((activity.parse::<u64>().ok()?, client))
+        })
+        .max_by_key(|(activity, _)| *activity)
+        .map(|(_, client)| client.to_string())
 }
 
 /// TS `isRemoteSession`: any SSH or mosh transport means the local tools
@@ -316,13 +336,26 @@ pub(crate) fn copy_to_clipboard(text: &str, sink: &mut OscSink) -> Result<CopyOu
     copy_with_env(text, sink, &Env::process())
 }
 
+/// The containing tmux's rejected-application-OSC 52 explanation, only
+/// while the payload could ride OSC 52 at all: an oversized payload never
+/// reaches the terminal channel, so it must not blame tmux's client
+/// capability or the outer hops — the plain failure wording covers it.
+fn tmux_clipboard_blocked(
+    sequence: &Option<String>,
+    blocks: impl FnOnce() -> bool,
+) -> Option<String> {
+    match sequence {
+        Some(_) if blocks() => Some(TMUX_CLIPBOARD_BLOCKED.to_string()),
+        _ => None,
+    }
+}
+
 fn copy_with_env(text: &str, sink: &mut OscSink, env: &Env) -> Result<CopyOutcome, String> {
     let remote = is_remote_session(env);
+    let sequence = crate::osc52::sequence(text);
     // Remote tools target the wrong machine and can stall the input loop
     // before terminal forwarding. Keep them for payloads too large for OSC 52.
-    let copied = if matches!(sink, OscSink::Buffer(_))
-        || (remote && crate::osc52::sequence(text).is_some())
-    {
+    let copied = if matches!(sink, OscSink::Buffer(_)) || (remote && sequence.is_some()) {
         false
     } else {
         match std::env::consts::OS {
@@ -337,14 +370,14 @@ fn copy_with_env(text: &str, sink: &mut OscSink, env: &Env) -> Result<CopyOutcom
     if matches!(sink, OscSink::Stdout) && std::env::var_os("TMUX").is_some() {
         // The containing tmux originates this copy even with its default
         // `set-clipboard external`; raw application OSC 52 is rejected there.
-        if crate::osc52::sequence(text).is_some() && copy_via_tmux(text) {
+        if sequence.is_some() && copy_via_tmux(text) {
             return Ok(CopyOutcome::Requested);
         }
-        if tmux_blocks_osc52() {
-            return Err(TMUX_CLIPBOARD_BLOCKED.to_string());
+        if let Some(error) = tmux_clipboard_blocked(&sequence, tmux_blocks_osc52) {
+            return Err(error);
         }
     }
-    if let Some(sequence) = crate::osc52::sequence(text) {
+    if let Some(sequence) = sequence {
         sink.write_sequence(&sequence)
             .map_err(|error| format!("Failed to write clipboard request: {error}"))?;
         return Ok(CopyOutcome::Requested);
@@ -398,6 +431,31 @@ mod tests {
             }
             OscSink::Stdout => panic!("the buffer sink captured nothing"),
         }
+    }
+
+    #[test]
+    fn the_pane_window_client_wins_over_a_busier_client_elsewhere() {
+        // The busier client sits on another window: its user must not
+        // receive the copy; the client viewing the pane's window does.
+        let clients = "1780000000 @2 /dev/pts/2\n1770000000 @1 /dev/pts/1\n";
+        assert_eq!(pane_client(clients, "@1").as_deref(), Some("/dev/pts/1"));
+        // No client views the pane's window: forwarding must not guess.
+        assert_eq!(pane_client(clients, "@3"), None);
+    }
+
+    #[test]
+    fn an_oversized_payload_never_blames_tmux_capability() {
+        assert_eq!(
+            tmux_clipboard_blocked(&None, || true),
+            None,
+            "an oversized payload cannot ride the terminal channel at all"
+        );
+        let sequence = Some("\x1b]52;c;aGVsbG8=\x07".to_string());
+        assert_eq!(
+            tmux_clipboard_blocked(&sequence, || true),
+            Some(TMUX_CLIPBOARD_BLOCKED.to_string())
+        );
+        assert_eq!(tmux_clipboard_blocked(&sequence, || false), None);
     }
 
     #[test]

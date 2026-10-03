@@ -98,7 +98,7 @@ fn socket_stays_silent(socket: &Path, window: Duration) {
     let deadline = Instant::now() + window;
     loop {
         assert!(
-            !std::os::unix::net::UnixStream::connect(socket).is_ok(),
+            std::os::unix::net::UnixStream::connect(socket).is_err(),
             "a third-party successor bound the socket while the stop window was up: {}",
             socket.display()
         );

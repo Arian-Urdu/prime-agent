@@ -1037,7 +1037,7 @@ mod tests {
             pid,
             process_start_id: start_id,
             owner_token: "hello-owner-token".to_string(),
-            supervisor_generation: format!("sup:{pid}").to_string(),
+            supervisor_generation: format!("sup:{pid}"),
         };
         persist_startup_fence_in(registry.path(), &socket, &identity).expect("persist the fence");
         let raw = std::fs::read_to_string(startup_fence_path(registry.path(), &socket))

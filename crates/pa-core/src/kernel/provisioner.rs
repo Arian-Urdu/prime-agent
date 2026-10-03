@@ -816,12 +816,13 @@ async fn start_kernel_impl(
     // settles the cell aborted, and the aborted-status arm below tears the
     // kernel down instead of leaking it into a disposed provisioner.
     let bootstrap = manager
-        .execute_bootstrap(
+        .execute_bounded(
             &bootstrap_code,
             ExecuteOptions {
                 signal: Some(dispose_signal.clone()),
                 ..Default::default()
             },
+            Some(BOOTSTRAP_EXECUTION_TIMEOUT_MS),
         )
         .await;
     match bootstrap {
@@ -1117,10 +1118,20 @@ mod tests {
         );
     }
 
-    /// Speaks protocol v3: answers the ready handshake, stays silent on every
-    /// execute (the runtime bootstrap included), and answers the shutdown
-    /// frame so a teardown does not wait out its kill deadline.
-    const SILENT_BOOTSTRAP_RUNTIME: &str = r#"#!/usr/bin/env python3
+    /// A kernel that answers the ready handshake but never answers the
+    /// bootstrap execute (the wedged-kernel shape: the frame is lost inside
+    /// the kernel) fails `ensure` with the bound's message instead of parking
+    /// forever, tears its kernel down, and does not auto-retry the fatal
+    /// failure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn silent_bootstrap_fails_bounded_and_leaves_no_kernel() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Speaks protocol v3: answers the ready handshake, stays silent on
+        // every execute (the runtime bootstrap included), and answers the
+        // shutdown frame so a teardown does not wait out its kill deadline.
+        const SILENT_BOOTSTRAP_RUNTIME: &str = r#"#!/usr/bin/env python3
 import json
 import os
 import sys
@@ -1138,16 +1149,6 @@ for line in sys.stdin:
         print(json.dumps({"event": "done", "id": req.get("id"), "status": "ok"}), flush=True)
         break
 "#;
-
-    /// A kernel that answers the ready handshake but never answers the
-    /// bootstrap execute (the wedged-kernel shape: the frame is lost inside
-    /// the kernel) fails `ensure` with the bound's message instead of parking
-    /// forever, tears its kernel down, and does not auto-retry the fatal
-    /// failure.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn silent_bootstrap_fails_bounded_and_leaves_no_kernel() {
-        use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::TempDir::new().expect("temp dir");
         let python = dir.path().join("fake-kernel");

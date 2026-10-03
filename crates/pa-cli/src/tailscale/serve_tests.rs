@@ -102,6 +102,26 @@ async fn post_serve_verification_does_not_match_a_longer_port_via_substring() {
 }
 
 #[tokio::test]
+async fn post_serve_verification_accepts_an_ipv6_loopback_tcp_forward() {
+    // Upstream accepts `::1` as a TCP-forward target and stores it bracketed
+    // (`net.JoinHostPort`), so a forward to `[::1]:80` is the exact local
+    // endpoint for port 80 - the same loopback host the Web path accepts.
+    let ipv6 = Shim::write(
+        ONLINE,
+        &serde_json::json!({ "TCP": { "443": { "TCPForward": "[::1]:80" } } }).to_string(),
+    );
+    assert_eq!(run_serve(ipv6.path().as_os_str(), 80.0, false).await, 0);
+    let other_port = Shim::write(
+        ONLINE,
+        &serde_json::json!({ "TCP": { "443": { "TCPForward": "[::1]:8000" } } }).to_string(),
+    );
+    assert_eq!(
+        run_serve(other_port.path().as_os_str(), 80.0, false).await,
+        1
+    );
+}
+
+#[tokio::test]
 async fn post_serve_verification_treats_a_bare_https_proxy_target_as_port_443() {
     let shim = Shim::write(
         ONLINE,

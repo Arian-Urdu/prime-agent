@@ -194,8 +194,12 @@ fn verify_served(parsed: &Value, port: u16) -> (bool, bool) {
     if let Some(tcp) = parsed.get("TCP").and_then(Value::as_object) {
         for entry in tcp.values() {
             if let Some(forward) = entry.get("TCPForward").and_then(Value::as_str) {
+                // Upstream's loopback forward forms: `127.0.0.1:port` (it
+                // normalizes localhost) and the bracketed `[::1]:port` that
+                // `net.JoinHostPort` writes for an IPv6 target.
                 if forward == format!("127.0.0.1:{tcp_port}")
                     || forward == format!("localhost:{tcp_port}")
+                    || forward == format!("[::1]:{tcp_port}")
                 {
                     served_exactly = true;
                 }

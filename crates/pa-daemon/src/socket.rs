@@ -222,18 +222,16 @@ pub fn cleanup_socket_path(path: &Path, expected_identity: Option<SocketIdentity
 /// after definite refusal may the existing cleanup lock and identity gate
 /// unlink the stale, still-ours socket. TS cleanup checks identity alone,
 /// so the poisoned-capture case remains a disclosed TS difference.
+#[cfg(unix)]
 pub fn cleanup_socket_path_after_close(path: &Path, expected_identity: Option<SocketIdentity>) {
-    if !path.exists() {
+    if !path.exists() || !pa_types::platform::transport::unix_listener_definitely_closed(path) {
         return;
     }
-    #[cfg(unix)]
-    {
-        if !pa_types::platform::transport::unix_listener_definitely_closed(path) {
-            return;
-        }
-        cleanup_socket_path(path, expected_identity);
-    }
+    cleanup_socket_path(path, expected_identity);
 }
+
+#[cfg(not(unix))]
+pub fn cleanup_socket_path_after_close(_path: &Path, _expected_identity: Option<SocketIdentity>) {}
 
 /// Restrict the bound socket file to its owner (Unix mode 0o600; Windows
 /// named pipes use ACLs on the pipe object instead).

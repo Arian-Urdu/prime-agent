@@ -16,6 +16,7 @@ async fn spawn_gated_supervisor(
     socket: std::path::PathBuf,
     create_seen_tx: mpsc::UnboundedSender<Value>,
     verdict_rx: mpsc::UnboundedReceiver<bool>,
+    rename_seen_tx: mpsc::UnboundedSender<Value>,
 ) {
     let verdict_rx = std::sync::Arc::new(tokio::sync::Mutex::new(verdict_rx));
     let listener = bind_transport(&socket).await.unwrap();
@@ -25,6 +26,7 @@ async fn spawn_gated_supervisor(
                 return;
             };
             let create_seen_tx = create_seen_tx.clone();
+            let rename_seen_tx = rename_seen_tx.clone();
             let verdict_rx = std::sync::Arc::clone(&verdict_rx);
             tokio::spawn(async move {
                 let (reader, mut writer) = stream.split();
@@ -94,6 +96,10 @@ async fn spawn_gated_supervisor(
                             Some(json!({ "text": "the child final answer" })),
                         ),
                         "kill" => response_success(Some(&id), command_type, None),
+                        "rename" => {
+                            let _ = rename_seen_tx.send(command.clone());
+                            response_success(Some(&id), command_type, None)
+                        }
                         "follow_up" => response_success(
                             Some(&id),
                             command_type,
@@ -116,12 +122,13 @@ async fn spawn_gated_supervisor(
 async fn sessions_with_gated_supervisor(
     create_seen_tx: mpsc::UnboundedSender<Value>,
     verdict_rx: mpsc::UnboundedReceiver<bool>,
+    rename_seen_tx: mpsc::UnboundedSender<Value>,
 ) -> SupervisorChildSessions {
     let socket = std::env::temp_dir().join(format!(
         "pa-rlm-gate-{}.sock",
         uuid::Uuid::new_v4().simple()
     ));
-    spawn_gated_supervisor(socket.clone(), create_seen_tx, verdict_rx).await;
+    spawn_gated_supervisor(socket.clone(), create_seen_tx, verdict_rx, rename_seen_tx).await;
     let link = Arc::new(crate::supervisor_link::SupervisorLink::new(socket));
     let sessions = SupervisorChildSessions::new(
         link,
@@ -160,7 +167,8 @@ fn spawn_request(name: &str, prompt: &str) -> RlmSpawnRequest {
 async fn holds_a_spawn_name_reservation_until_admission_settles_then_frees_it() {
     let (create_seen_tx, mut create_seen_rx) = mpsc::unbounded_channel();
     let (verdict_tx, verdict_rx) = mpsc::unbounded_channel();
-    let sessions = sessions_with_gated_supervisor(create_seen_tx, verdict_rx).await;
+    let (rename_seen_tx, _rename_seen_rx) = mpsc::unbounded_channel();
+    let sessions = sessions_with_gated_supervisor(create_seen_tx, verdict_rx, rename_seen_tx).await;
     let unavailable = "Agent name \"slow-worker\" is unavailable: an agent of that name already exists at depth 1 under this parent";
 
     // The first spawn parks inside its create admission.
@@ -204,7 +212,8 @@ async fn holds_a_spawn_name_reservation_until_admission_settles_then_frees_it() 
 async fn a_cancelled_spawn_admission_frees_the_reserved_name() {
     let (create_seen_tx, mut create_seen_rx) = mpsc::unbounded_channel();
     let (verdict_tx, verdict_rx) = mpsc::unbounded_channel();
-    let sessions = sessions_with_gated_supervisor(create_seen_tx, verdict_rx).await;
+    let (rename_seen_tx, _rename_seen_rx) = mpsc::unbounded_channel();
+    let sessions = sessions_with_gated_supervisor(create_seen_tx, verdict_rx, rename_seen_tx).await;
 
     // The spawn parks inside its create admission.
     let parked = tokio::spawn(sessions.spawn(spawn_request("abandoned", "a parked admission")));
@@ -240,7 +249,8 @@ async fn a_cancelled_spawn_admission_frees_the_reserved_name() {
 async fn a_failed_admission_frees_the_reserved_name() {
     let (create_seen_tx, mut create_seen_rx) = mpsc::unbounded_channel();
     let (verdict_tx, verdict_rx) = mpsc::unbounded_channel();
-    let sessions = sessions_with_gated_supervisor(create_seen_tx, verdict_rx).await;
+    let (rename_seen_tx, _rename_seen_rx) = mpsc::unbounded_channel();
+    let sessions = sessions_with_gated_supervisor(create_seen_tx, verdict_rx, rename_seen_tx).await;
 
     let spawned = tokio::spawn(sessions.spawn(spawn_request("doomed", "kernel startup failed")));
     create_seen_rx
@@ -263,4 +273,132 @@ async fn a_failed_admission_frees_the_reserved_name() {
         .expect("the freed name spawns again");
     assert_eq!(handle.name, "doomed");
     assert!(!sessions.spawn_name_reserved("doomed"));
+}
+
+/// The rename target resolution (TS `renameAgentFamilySession`): a child
+/// renames only by rlm child id, active id, or durable session id — a
+/// name never selects — and a miss outside the caller's own session and
+/// its direct children fails closed.
+#[tokio::test]
+async fn rename_resolves_child_targets_by_id_only() {
+    let (create_seen_tx, mut create_seen_rx) = mpsc::unbounded_channel();
+    let (verdict_tx, verdict_rx) = mpsc::unbounded_channel();
+    let (rename_seen_tx, _rename_seen_rx) = mpsc::unbounded_channel();
+    let sessions = sessions_with_gated_supervisor(create_seen_tx, verdict_rx, rename_seen_tx).await;
+    let spawned = tokio::spawn(sessions.spawn(spawn_request("worker-a", "a named child")));
+    create_seen_rx
+        .recv()
+        .await
+        .expect("the create must reach the gated supervisor");
+    verdict_tx.send(true).expect("admit the create");
+    let _handle = spawned.await.expect("spawn task").expect("spawn the child");
+
+    // The child's NAME never selects a rename target.
+    let error = sessions
+        .rename("bench-runner".to_string(), Some("worker-a".to_string()))
+        .await
+        .expect_err("a child name never renames");
+    assert_eq!(
+        error.to_string(),
+        "rlm.rename session_id \"worker-a\" must be the full session id or a child handle, not a session name or id suffix"
+    );
+    // A selector outside the caller and its children fails closed.
+    let error = sessions
+        .rename("bench-runner".to_string(), Some("ghost".to_string()))
+        .await
+        .expect_err("an unknown target never renames");
+    assert_eq!(
+        error.to_string(),
+        "rlm.rename can only rename the current session or one of its direct children"
+    );
+}
+
+/// A parent-directed child rename rides the supervisor's live rename
+/// route (`renamedBy: parent`), and on success the parent-side record
+/// takes the new name — the old name stops matching, the new one hits.
+#[tokio::test]
+async fn parent_rename_forwards_and_reseeds_the_record_name() {
+    let (create_seen_tx, mut create_seen_rx) = mpsc::unbounded_channel();
+    let (verdict_tx, verdict_rx) = mpsc::unbounded_channel();
+    let (rename_seen_tx, mut rename_seen_rx) = mpsc::unbounded_channel();
+    let sessions = sessions_with_gated_supervisor(create_seen_tx, verdict_rx, rename_seen_tx).await;
+    let spawned = tokio::spawn(sessions.spawn(spawn_request("worker-a", "a named child")));
+    create_seen_rx
+        .recv()
+        .await
+        .expect("the create must reach the gated supervisor");
+    verdict_tx.send(true).expect("admit the create");
+    let handle = spawned.await.expect("spawn task").expect("spawn the child");
+
+    let renamed = sessions
+        .rename(
+            "bench-runner".to_string(),
+            Some(handle.rlm_child_id.clone()),
+        )
+        .await
+        .expect("rename the child by its handle id");
+    assert_eq!(renamed, "bench-runner");
+    let seen = rename_seen_rx
+        .recv()
+        .await
+        .expect("the rename reached the supervisor");
+    assert_eq!(seen["type"], "rename");
+    assert_eq!(seen["activeSessionId"], "child-live");
+    assert_eq!(seen["name"], "bench-runner");
+    assert_eq!(
+        seen["renamedBy"], "parent",
+        "a child rename is parent-directed"
+    );
+
+    // The record took the new name: the old selector misses, the new one
+    // hits (the collect-by-name and delete selectors read it).
+    let error = sessions
+        .collect(vec!["worker-a".to_string()], 0)
+        .await
+        .expect_err("the old name no longer selects");
+    assert_eq!(
+        error.to_string(),
+        "No direct RLM child matches \"worker-a\" in the current parent session"
+    );
+    let rows = sessions
+        .collect(vec!["bench-runner".to_string()], 0)
+        .await
+        .expect("the new name selects");
+    assert_eq!(rows[0].rlm_child_id, handle.rlm_child_id);
+}
+
+/// A self rename (an absent session id, the caller's own active id, or
+/// its durable session id) routes to the caller's own worker through the
+/// supervisor with no `renamedBy` marker.
+#[tokio::test]
+async fn self_rename_targets_the_caller_without_the_parent_marker() {
+    let (create_seen_tx, _create_seen_rx) = mpsc::unbounded_channel();
+    let (_verdict_tx, verdict_rx) = mpsc::unbounded_channel();
+    let (rename_seen_tx, mut rename_seen_rx) = mpsc::unbounded_channel();
+    let sessions = sessions_with_gated_supervisor(create_seen_tx, verdict_rx, rename_seen_tx).await;
+    sessions.set_identity(ParentIdentity {
+        model: Some("mock/mock-1".to_string()),
+        cwd: Some(std::env::temp_dir().to_string_lossy().to_string()),
+        session_id: Some("parent-file".to_string()),
+        ..ParentIdentity::with_default_depth()
+    });
+
+    for selector in [None, Some("parent-live"), Some("parent-file")] {
+        let renamed = sessions
+            .rename("solo".to_string(), selector.map(str::to_string))
+            .await
+            .expect("the self rename routes");
+        assert_eq!(renamed, "solo");
+        let seen = rename_seen_rx
+            .recv()
+            .await
+            .expect("the rename reached the supervisor");
+        assert_eq!(seen["type"], "rename");
+        assert_eq!(seen["activeSessionId"], "parent-live");
+        assert_eq!(seen["name"], "solo");
+        assert!(
+            seen.get("renamedBy").is_none(),
+            "a self rename carries no parent marker: {seen}"
+        );
+    }
 }

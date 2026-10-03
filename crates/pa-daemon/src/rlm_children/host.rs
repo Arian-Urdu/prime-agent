@@ -1,7 +1,7 @@
 //! The host adapter concern: the `RlmSubagentHost` wire surface
 //! (`spawn`, `create_session`, `list_subagents`, `delete_subagent`,
-//! `collect`) over the supervisor's child-sessions registry, with the
-//! spawn-admission helpers only this surface uses.
+//! `collect`, `rename`) over the supervisor's child-sessions registry,
+//! with the spawn-admission helpers only this surface uses.
 use super::{
     assert_thinking_supported, bail, create_default_rlm_subagent_session_name,
     create_rlm_child_terminal_notice, json, now_ms, resolve_child_model, rlm_child_label,
@@ -9,7 +9,8 @@ use super::{
     Instant, Mutex, Path, PathBuf, Result, RlmChildResult, RlmChildTerminalNotice,
     RlmCreateSessionHandle, RlmCreateSessionRequest, RlmDeleteSubagentResult, RlmHostFuture,
     RlmSpawnHandle, RlmSpawnRequest, RlmSubagentEntry, RlmSubagentHost, SpawnNameReservationGuard,
-    SupervisorChildSessions, SupervisorChildSessionsInner, Value, KILL_TIMEOUT_MS,
+    SupervisorChildSessions, SupervisorChildSessionsInner, Value,
+    KILL_TIMEOUT_MS, RENAME_TIMEOUT_MS,
 };
 
 /// Resolve the child model with the daemon `allowedModels` allowlist
@@ -510,6 +511,81 @@ impl RlmSubagentHost for SupervisorChildSessions {
             // (TS `collectRlmChildren` result order).
             results.extend(deleted_results);
             Ok(results)
+        })
+    }
+
+    fn rename(&self, name: String, session_id: Option<String>) -> RlmHostFuture<String> {
+        let this = Arc::clone(&self.inner);
+        Box::pin(async move {
+            // Resolve the target: the caller's own session (an absent
+            // session id, its live active id, or its durable session id),
+            // or one direct child by rlm child id, active id, or durable
+            // session id ONLY — a child NAME never selects a rename
+            // target (TS `renameAgentFamilySession`).
+            let identity = this.identity.lock().expect("identity lock").clone();
+            let self_target = match &session_id {
+                None => true,
+                Some(target) => {
+                    target == &this.parent_active_session_id
+                        || identity.session_id.as_deref() == Some(target.as_str())
+                }
+            };
+            let (active_session_id, record) = if self_target {
+                (this.parent_active_session_id.clone(), None)
+            } else {
+                let target = session_id.clone().unwrap_or_default();
+                let mut by_ids = None;
+                let mut by_name = false;
+                {
+                    let children = this.children.lock().await;
+                    for candidate in children.iter() {
+                        let record = candidate.lock().await;
+                        if record.rlm_child_id == target
+                            || record.active_session_id == target
+                            || record.session_id.as_deref() == Some(target.as_str())
+                        {
+                            by_ids = Some(Arc::clone(candidate));
+                            break;
+                        }
+                        if record.session_name == target {
+                            by_name = true;
+                        }
+                    }
+                }
+                match by_ids {
+                    Some(record) => (record.lock().await.active_session_id.clone(), Some(record)),
+                    None if by_name => bail!(
+                        "rlm.rename session_id \"{target}\" must be the full session id or a child handle, not a session name or id suffix"
+                    ),
+                    None => bail!(
+                        "rlm.rename can only rename the current session or one of its direct children"
+                    ),
+                }
+            };
+            // The rename itself is daemon-owned: the supervisor's live
+            // rename route reserves the name, asserts sibling uniqueness
+            // across the family, and appends the child's RLM ledger
+            // rename. `renamedBy: parent` marks the parent-directed
+            // rename so the renamed session's transcript notice names it.
+            let command = DaemonCommand::Rename {
+                id: None,
+                active_session_id: active_session_id.clone(),
+                name: name.clone(),
+                renamed_by: record
+                    .as_ref()
+                    .map(|_| pa_types::daemon::RENAMED_BY_PARENT.to_string()),
+                rest: serde_json::Map::default(),
+            };
+            this.command(&command, RENAME_TIMEOUT_MS)
+                .await
+                .with_context(|| format!("rename session \"{active_session_id}\""))?;
+            // A parent-directed rename updates the parent-side record so
+            // the roster row, collect/delete selectors, and the parent's
+            // name-availability check all stop matching the old name.
+            if let Some(record) = record {
+                record.lock().await.session_name = name.clone();
+            }
+            Ok(name)
         })
     }
 }

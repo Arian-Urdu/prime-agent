@@ -92,6 +92,12 @@ pub struct PromptInput {
     pub rlm_notice_nonce: Option<String>,
 }
 
+/// The one relationship a rename's `renamedBy` wire field carries (TS
+/// `AgentFamilyRelationship`; only a parent session's rename of one of its
+/// direct children is ever sent): the renamed session's transcript notice
+/// names it.
+pub const RENAMED_BY_PARENT: &str = "parent";
+
 /// Client commands, tagged by `type`. Every variant also carries `id` (when
 /// sent as a bare command) and a catch-all for unknown fields, so wire
 /// round-trips are lossless across schema revisions.
@@ -329,6 +335,12 @@ pub enum DaemonCommand {
         id: Option<String>,
         active_session_id: String,
         name: String,
+        /// Who directed the rename (`renamedBy` on the wire, TS
+        /// `AgentFamilyRelationship` — only `"parent"` is sent): set when a
+        /// parent session renames one of its direct children, so the
+        /// renamed session's transcript notice can name it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        renamed_by: Option<String>,
         #[serde(flatten)]
         rest: JsonMap,
     },
@@ -1279,5 +1291,12 @@ mod tests {
     #[test]
     fn mark_anthropic_warning_shown_roundtrip() {
         rt::<DaemonCommand>(r#"{"type":"mark_anthropic_warning_shown","activeSessionId":"s1"}"#);
+    }
+
+    #[test]
+    fn rename_roundtrip() {
+        rt::<DaemonCommand>(
+            r#"{"type":"rename","activeSessionId":"s1","name":"bench-runner","renamedBy":"parent"}"#,
+        );
     }
 }

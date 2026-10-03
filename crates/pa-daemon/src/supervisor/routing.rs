@@ -701,9 +701,39 @@ impl Supervisor {
             DaemonCommand::Kill { .. } => RouteAdmission::SupervisorInternal,
             _ => RouteAdmission::ClientRequest,
         };
-        let response = self
-            .route_command_ready(&resident, worker_command, payload, timeout, admission)
-            .await;
+        // TS daemon-supervisor's `routeClientCommand` wraps the live
+        // `rename`/`set_session_name` forward in the name-reservation
+        // ladder: name uniqueness is daemon-owned, so a session worker's
+        // own rename can never mint a duplicate sibling name.
+        let response = match command {
+            DaemonCommand::Rename { name, .. } | DaemonCommand::SetSessionName { name, .. } => {
+                let scope =
+                    self.live_session_name_scope(&resident.worker_id, name.trim().to_string());
+                match scope {
+                    Ok(scope) => match self
+                        .with_session_name_reservation(
+                            &scope,
+                            self.route_command_ready(
+                                &resident,
+                                worker_command,
+                                payload,
+                                timeout,
+                                admission,
+                            ),
+                        )
+                        .await
+                    {
+                        Ok(response) => Ok(response),
+                        Err(error) => Err(anyhow!(error)),
+                    },
+                    Err(error) => Err(anyhow!(error)),
+                }
+            }
+            _ => {
+                self.route_command_ready(&resident, worker_command, payload, timeout, admission)
+                    .await
+            }
+        };
         // The byte relay: a routed response the supervisor neither edits nor
         // inspects goes to the client as the worker's own payload bytes with
         // the client's command id spliced in front. The worker serializes
@@ -917,9 +947,14 @@ impl Supervisor {
                         }
                     }
                 }
-                if let DaemonCommand::Rename { name, .. } = command {
+                if let (DaemonCommand::Rename { name, .. }
+                | DaemonCommand::SetSessionName { name, .. }) = command
+                {
                     // A subagent rename is durable in the ledger, so the
                     // passive roster keeps the new name after passivation.
+                    // The TS worker appends it in `applyStateSessionName`
+                    // for both commands; the Rust port keeps the one
+                    // supervisor-side block.
                     if response.success {
                         let descriptor = resident.descriptor.lock().await;
                         let is_child = descriptor

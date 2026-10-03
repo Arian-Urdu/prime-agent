@@ -801,6 +801,10 @@ impl Worker {
             return response_failure(None, command, "Session name cannot be empty", None);
         }
         let mut core = self.core.lock().unwrap();
+        let previous = core
+            .store
+            .as_ref()
+            .and_then(|store| store.session_name().map(str::to_string));
         if let Some(store) = core.store.as_mut() {
             if let Err(error) = store.persist_entry("session_info", json!({ "name": name })) {
                 return response_failure(None, command, &error.to_string(), None);
@@ -818,6 +822,24 @@ impl Worker {
         // The sender identity follows the live name.
         if let Ok(summary_value) = serde_json::to_value(&summary) {
             self.engine.set_session_summary(summary_value);
+        }
+        // TS #2529 `applyStateSessionName`: a rename that changed an
+        // existing name leaves the renamed session a displayed transcript
+        // notice (" by parent" when the rename arrived from the parent
+        // session); a first name leaves none.
+        if let Some(previous) = previous.as_deref().filter(|previous| previous != name) {
+            let content = if payload.get("renamedBy").and_then(Value::as_str)
+                == Some(pa_types::daemon::RENAMED_BY_PARENT)
+            {
+                format!("Session renamed `{previous}` -> `{name}` by parent")
+            } else {
+                format!("Session renamed `{previous}` -> `{name}`")
+            };
+            self.emit_custom_row(&json!({
+                "customType": pa_core::session_engine::messages::SESSION_RENAMED_CUSTOM_TYPE,
+                "content": content,
+                "display": true,
+            }));
         }
         response_success(
             None,

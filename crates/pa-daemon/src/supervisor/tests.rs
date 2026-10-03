@@ -1897,3 +1897,96 @@ async fn off_window_daemon_events_never_count_into_the_summary() {
         "the off-window attach never counts"
     );
 }
+
+/// The live rename ladder (TS daemon-supervisor's `routeClientCommand`
+/// wraps the `rename`/`set_session_name` forward in the name reservation):
+/// a rename of one child onto a name a SIBLING already holds fails with
+/// the TS unavailability error before the forward ever reaches the
+/// target's worker — the supervisor, not the worker, owns sibling
+/// uniqueness.
+#[tokio::test]
+async fn a_live_rename_conflicting_with_a_sibling_fails_with_the_unavailability_error() {
+    let dir = std::env::temp_dir().join(format!("pa-rename-ladder-{}", uuid::Uuid::new_v4()));
+    let agent_dir = dir.join("agent");
+    let sessions_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    let parent_file = sessions_dir.join("parent.jsonl");
+    std::fs::write(&parent_file, "{\"type\":\"session\",\"id\":\"p\"}\n").unwrap();
+    let supervisor = Arc::new(
+        Supervisor::new(SupervisorOptions {
+            socket_path: dir.join("daemon.sock"),
+            agent_dir: agent_dir.clone(),
+        })
+        .expect("supervisor"),
+    );
+    // Two same-parent children: "lane" holds the name, the target is
+    // "worker-b".
+    for (id, active, name) in [("a", "a-live", "lane"), ("b", "b-live", "worker-b")] {
+        let row = json!({
+            "sessionId": id,
+            "activeSessionId": active,
+            "runtimeKind": "subagent",
+            "rlmDepth": 1,
+            "parentSessionPath": parent_file.to_string_lossy(),
+            "sessionFile": sessions_dir.join(format!("{id}.jsonl")).to_string_lossy(),
+            "sessionName": name,
+            "status": "idle",
+        });
+        supervisor.write_roster_summary(&row, Some(active));
+    }
+    // The target's resident: a registered worker with no live connection —
+    // the ladder must answer the conflict before any route touches it.
+    let descriptor = serde_json::from_value::<pa_types::daemon::DaemonWorkerDescriptor>(json!({
+        "version": 2,
+        "workerId": "b-live",
+        "pid": 4242,
+        "socketPath": "/tmp/none.sock",
+        "recoveryJournalPath": "/tmp/none.jsonl",
+        "supervisorSocketPath": "/tmp/none.sock",
+        "authenticationToken": "token",
+        "rootActiveSessionId": "b-live",
+        "createdAt": "t",
+        "updatedAt": "t",
+        "lifecycle": "ready",
+        "createCommand": {},
+        "consecutiveFailures": 0,
+    }))
+    .expect("descriptor");
+    supervisor
+        .registry
+        .insert(Arc::new(ResidentWorker::new(
+            "b-live".to_string(),
+            descriptor,
+            sessions_dir.join("b.descriptor.json"),
+        )))
+        .await;
+
+    let (queue_tx, _queue_rx) = tokio::sync::mpsc::channel(4);
+    let attached = subscribers::ClientSubscriptions::new("conn".to_string(), queue_tx);
+    let (lines, stop) = supervisor
+        .route_client_command(
+            &DaemonCommand::Rename {
+                id: None,
+                active_session_id: "b-live".to_string(),
+                name: "lane".to_string(),
+                renamed_by: None,
+                rest: Map::default(),
+            },
+            "client",
+            &attached,
+            "c1".to_string(),
+            "rename".to_string(),
+            None,
+        )
+        .await;
+    assert!(!stop);
+    let response = lines
+        .first()
+        .expect("the failed rename answers one line");
+    assert_eq!(response["success"], false, "the conflicting rename failed");
+    assert_eq!(
+        response["error"],
+        "Agent name \"lane\" is unavailable: an agent of that name already exists at depth 1 under this parent",
+        "the TS sibling-unavailability error surfaces: {response}"
+    );
+}

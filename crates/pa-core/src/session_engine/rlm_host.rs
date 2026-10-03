@@ -234,11 +234,14 @@ impl RlmSubagentHost for NoRlmChildren {
         Box::pin(async move { no_children_collect(&targets) })
     }
     fn rename(&self, name: String, session_id: Option<String>) -> RlmHostFuture<String> {
+        // The alias boxes a `'static` future, so the session handle moves
+        // in by value — nothing here borrows `self`.
+        let session = Arc::clone(&self.session);
         Box::pin(async move {
             if session_id.is_some() {
                 anyhow::bail!("rlm.rename with session_id requires a daemon-backed session");
             }
-            let mut session = self.session.lock().await;
+            let mut session = session.lock().await;
             session
                 .append_session_info(&name)
                 .map_err(anyhow::Error::from)?;
@@ -1363,14 +1366,14 @@ mod tests {
         // A child rename forwards the normalized name and the trimmed
         // session id (the Python side already resolved handles to child
         // ids).
-        let renamed = call(
+        let reply = call(
             &wiring,
             "rlm.rename",
             json!({ "name": "  bench-runner ", "session_id": "  sub-1  " }),
         )
         .await
         .unwrap();
-        assert_eq!(renamed, json!({ "name": "bench-runner" }));
+        assert_eq!(reply, json!({ "name": "bench-runner" }));
         assert_eq!(
             *renames.lock().await,
             vec![("bench-runner".to_string(), Some("sub-1".to_string()))]

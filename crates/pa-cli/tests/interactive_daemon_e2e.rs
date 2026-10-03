@@ -5980,6 +5980,13 @@ async fn tui_accepted_then_killed_turn_renders_closed_error() {
     let plan = pa_tui::interactive::HeadlessPlan {
         steps: vec![
             pa_tui::interactive::HeadlessStep::Submit("held accepted prompt".to_string()),
+            // The cancellation status is a later, replaceable note. Require
+            // it first so the error assertion covers the end state after
+            // the status that used to overwrite `session closed (killed)`.
+            pa_tui::interactive::HeadlessStep::WaitRender {
+                needle: "turn failed: prompt cancelled".to_string(),
+                timeout_ms: 30_000,
+            },
             pa_tui::interactive::HeadlessStep::WaitRender {
                 needle: error_row.to_string(),
                 timeout_ms: 30_000,
@@ -6005,7 +6012,14 @@ async fn tui_accepted_then_killed_turn_renders_closed_error() {
         "held response leaked:\n{rendered}"
     );
     let last = outcome.frames.last().expect("final frame");
-    assert!(last.contains(error_row), "close error row must persist:\n{last}");
+    assert!(
+        last.contains("turn failed: prompt cancelled"),
+        "the post-close cancellation must reach the frame:\n{last}"
+    );
+    assert!(
+        last.contains(error_row),
+        "close error row must persist after cancellation:\n{last}"
+    );
     assert!(
         !last.contains("session closed (killed)"),
         "info downgrade remains:\n{last}"

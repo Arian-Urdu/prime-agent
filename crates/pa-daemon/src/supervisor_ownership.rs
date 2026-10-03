@@ -31,7 +31,7 @@
 //! `<registry>/.guard`, stale 5 s, 500 retries x 10 ms - byte-compatible
 //! with the TS lock path so both builds serialize on the SAME on-disk
 //! lock). The guard-held actions here are single-record read-modify-write
-//! cycles, so the rust port keeps LockDir's momentary hold (no refresher):
+//! cycles, so the rust port keeps `LockDir`'s momentary hold (no refresher):
 //! the TS lock's 1000 ms mtime refresh is its long-hold safety valve, and
 //! nothing here holds long.
 //!
@@ -324,7 +324,7 @@ fn read_startup_fence(path: &Path) -> Result<Option<StartupFenceRecord>> {
 
 /// Wait out this socket's startup fence before the boot touches the
 /// socket path (TS `waitForDaemonStartupFence`, the choreography slot
-/// `daemon-supervisor.ts` start() visits before the ownership claim):
+/// `daemon-supervisor.ts` `start()` visits before the ownership claim):
 /// no fence means the path is free; a fence pinning a dead process is
 /// cleared under the guard (a replaced record re-reads the new pin); a
 /// fence pinning a LIVE process is waited out to the timeout and then
@@ -399,7 +399,7 @@ async fn wait_for_startup_fence_in(
 ///
 /// Returns the refusal error while a stop window is active, and any
 /// registry read error.
-pub async fn refuse_while_shutdown_admission_active() -> Result<()> {
+pub fn refuse_while_shutdown_admission_active() -> Result<()> {
     let registry_dir = registry_dir()?;
     if read_active_shutdown_admission(&registry_dir)?.is_some() {
         bail!("Daemon shutdown is in progress");

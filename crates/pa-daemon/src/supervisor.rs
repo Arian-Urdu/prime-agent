@@ -367,7 +367,7 @@ impl Supervisor {
             supervisor_ownership::STARTUP_FENCE_TIMEOUT_MS,
         )
         .await?;
-        supervisor_ownership::refuse_while_shutdown_admission_active().await?;
+        supervisor_ownership::refuse_while_shutdown_admission_active()?;
         // Before any socket or worker exists: workers and their kernels
         // inherit the raised limit.
         let open_file_limit = pa_core::platform::process::raise_open_file_limit();

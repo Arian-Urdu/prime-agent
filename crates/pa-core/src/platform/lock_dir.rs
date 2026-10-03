@@ -394,13 +394,30 @@ mod tests {
         // The TS supervisor registry guards its directory with a lock
         // directory named exactly `<registryDir>/.guard` (proper-lockfile's
         // lockfilePath), so a rust visitor must be able to take the same
-        // on-disk lock - not the `{file}.lock` convention.
+        // on-disk lock - not the `{file}.lock` convention - with the same
+        // empty-directory body and the same off-second mtime probe a TS
+        // holder writes (byte-compatibility both directions).
         let dir = tempfile::tempdir().unwrap();
         let guard = dir.path().join(".guard");
         {
             let _held = LockDir::acquire_at(&guard, MIN_STALE).unwrap();
             assert!(guard.is_dir(), "the named path itself is the lock");
+            assert!(
+                std::fs::read_dir(&guard).unwrap().next().is_none(),
+                "the lock body is the empty directory proper-lockfile writes"
+            );
             assert!(!lock_of(&guard).exists(), "no .lock twin is created");
+            let modified = std::fs::metadata(&guard)
+                .unwrap()
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap();
+            assert_eq!(
+                modified.as_millis() % 1000,
+                5,
+                "the same ceil-plus-5ms probe a TS holder's lock carries"
+            );
             assert!(
                 LockDir::acquire_at(&guard, MIN_STALE).is_err(),
                 "a fresh named lock is contention"

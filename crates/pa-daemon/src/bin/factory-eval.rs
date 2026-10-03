@@ -271,23 +271,42 @@ fn spawn_supervisor(
             command.env("PYTHONPATH", path);
         }
     }
-    let child = command
+    let mut child = command
         .spawn()
         .map_err(|error| format!("spawn the eval supervisor {}: {error}", binary.display()))?;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    wait_for_supervisor_socket(socket, &mut child, Instant::now() + Duration::from_secs(10))?;
+    Ok(Supervisor {
+        child,
+        socket: socket.to_path_buf(),
+    })
+}
+
+/// Wait for the spawned supervisor to bind its socket. On expiry the child
+/// is killed and reaped before one clean error surfaces: a `panic!` here
+/// would leak the process (a `std::process::Child`'s drop never kills), so
+/// the driver's exit must not leave a live supervisor — or any workers it
+/// already launched — behind. `run()` propagates the error to `main`'s
+/// clean exit path.
+#[cfg(unix)]
+fn wait_for_supervisor_socket(
+    socket: &Path,
+    child: &mut Child,
+    deadline: Instant,
+) -> Result<(), String> {
     while Instant::now() < deadline {
         if socket.exists() {
-            return Ok(Supervisor {
-                child,
-                socket: socket.to_path_buf(),
-            });
+            return Ok(());
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    panic!(
+    // The supervisor never bound its socket: kill and reap it, then name
+    // the socket in the error (its supervisor log sits beside it).
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(format!(
         "eval supervisor socket never appeared at {}",
         socket.display()
-    );
+    ))
 }
 
 #[cfg(unix)]
@@ -803,4 +822,44 @@ fn run(_config: &FactoryEvalConfig) -> Result<(), String> {
          has none (the offline --replay mode still works)"
             .to_string(),
     )
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// The expired socket wait must kill and reap the child instead of
+    /// panicking: a panic leaves the spawned supervisor alive (std's
+    /// `Child` drop never kills), and the driver would leak the process
+    /// past its exit. The live child below never binds the socket, and an
+    /// already-expired deadline exercises the failure path
+    /// deterministically; the kill's proof is that the child is gone once
+    /// the helper returns (a leaked `sleep` would still hold the pid).
+    #[test]
+    fn an_expired_socket_wait_kills_and_reaps_the_spawned_child() {
+        let socket = std::env::temp_dir().join("factory-eval-never.sock");
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the live child");
+        let error = wait_for_supervisor_socket(&socket, &mut child, Instant::now())
+            .expect_err("the socket never appears");
+        assert!(
+            error.contains(socket.to_string_lossy().as_ref()),
+            "the error names the socket: {error}"
+        );
+        let pid = child.id();
+        let gone = Command::new("bash")
+            .arg("-c")
+            .arg(format!("! kill -0 {pid}"))
+            .status()
+            .expect("probe the child pid");
+        assert!(
+            gone.success(),
+            "the child was killed and reaped (pid {pid} still lives)"
+        );
+    }
 }

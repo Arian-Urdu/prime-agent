@@ -1088,7 +1088,7 @@ mod tests {
     #[test]
     fn the_fence_identity_gate_requires_a_fixed_hello_for_this_socket() {
         let registry = tempfile::tempdir().expect("registry root");
-        let socket = registry.path().join("gate.sock");
+        let socket: &std::path::Path = &registry.path().join("gate.sock");
         let (pid, start_id) = own_identity();
         let identity = |pid: Option<u64>, start: Option<&str>| {
             pa_types::daemon::update_flow::UpdateProcessIdentity {

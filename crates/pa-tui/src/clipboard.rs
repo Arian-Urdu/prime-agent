@@ -345,22 +345,19 @@ pub(crate) fn copy_to_clipboard(text: &str, sink: &mut OscSink) -> Result<CopyOu
 /// while the payload could ride OSC 52 at all: an oversized payload never
 /// reaches the terminal channel, so it must not blame tmux's client
 /// capability or the outer hops — the plain failure wording covers it.
-fn tmux_clipboard_blocked(
-    sequence: &Option<String>,
-    blocks: impl FnOnce() -> bool,
-) -> Option<String> {
-    match sequence {
-        Some(_) if blocks() => Some(TMUX_CLIPBOARD_BLOCKED.to_string()),
-        _ => None,
-    }
+fn tmux_clipboard_blocked(carriable: bool, blocks: impl FnOnce() -> bool) -> Option<String> {
+    (carriable && blocks()).then(|| TMUX_CLIPBOARD_BLOCKED.to_string())
 }
 
 fn copy_with_env(text: &str, sink: &mut OscSink, env: &Env) -> Result<CopyOutcome, String> {
     let remote = is_remote_session(env);
-    let sequence = crate::osc52::sequence(text);
+    // The cap gate is a length check, not the encoding: the local
+    // helpers below take the raw payload, and only an OSC 52 write
+    // needs the encoded sequence.
+    let carriable = crate::osc52::carries(text);
     // Remote tools target the wrong machine and can stall the input loop
     // before terminal forwarding. Keep them for payloads too large for OSC 52.
-    let copied = if matches!(sink, OscSink::Buffer(_)) || (remote && sequence.is_some()) {
+    let copied = if matches!(sink, OscSink::Buffer(_)) || (remote && carriable) {
         false
     } else {
         match std::env::consts::OS {
@@ -375,14 +372,14 @@ fn copy_with_env(text: &str, sink: &mut OscSink, env: &Env) -> Result<CopyOutcom
     if matches!(sink, OscSink::Stdout) && std::env::var_os("TMUX").is_some() {
         // The containing tmux originates this copy even with its default
         // `set-clipboard external`; raw application OSC 52 is rejected there.
-        if sequence.is_some() && copy_via_tmux(text) {
+        if carriable && copy_via_tmux(text) {
             return Ok(CopyOutcome::Requested);
         }
-        if let Some(error) = tmux_clipboard_blocked(&sequence, tmux_blocks_osc52) {
+        if let Some(error) = tmux_clipboard_blocked(carriable, tmux_blocks_osc52) {
             return Err(error);
         }
     }
-    if let Some(sequence) = sequence {
+    if let Some(sequence) = crate::osc52::sequence(text) {
         sink.write_sequence(&sequence)
             .map_err(|error| format!("Failed to write clipboard request: {error}"))?;
         return Ok(CopyOutcome::Requested);
@@ -469,16 +466,15 @@ mod tests {
     #[test]
     fn an_oversized_payload_never_blames_tmux_capability() {
         assert_eq!(
-            tmux_clipboard_blocked(&None, || true),
+            tmux_clipboard_blocked(false, || true),
             None,
             "an oversized payload cannot ride the terminal channel at all"
         );
-        let sequence = Some("\x1b]52;c;aGVsbG8=\x07".to_string());
         assert_eq!(
-            tmux_clipboard_blocked(&sequence, || true),
+            tmux_clipboard_blocked(true, || true),
             Some(TMUX_CLIPBOARD_BLOCKED.to_string())
         );
-        assert_eq!(tmux_clipboard_blocked(&sequence, || false), None);
+        assert_eq!(tmux_clipboard_blocked(true, || false), None);
     }
 
     #[test]

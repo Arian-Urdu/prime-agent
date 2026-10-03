@@ -516,6 +516,14 @@ impl Theme {
         Style::default().fg(to_terminal_color(EFFORT_SQUARE_DARK_COLOR, self.mode))
     }
 
+    /// The `Decision API enabled` footer row: a soft magenta, muted enough
+    /// to sit with the dim footer rows.
+    #[must_use]
+    pub fn decision_api_style(&self) -> Style {
+        const DECISION_API_COLOR: Color = Color::Rgb(0xc8, 0x8a, 0xc4);
+        Style::default().fg(to_terminal_color(DECISION_API_COLOR, self.mode))
+    }
+
     /// Row-selection highlight for menu rows (TS
     /// `getSoftSelectionBackgroundColor`): the selection color blended
     /// halfway toward the editor surface — a softer band than the full

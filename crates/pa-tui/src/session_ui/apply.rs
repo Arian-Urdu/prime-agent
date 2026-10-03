@@ -459,6 +459,11 @@ impl SessionUi {
                 view.chrome.service_tier.clone_from(&self.service_tier);
                 self.dirty = true;
             }
+            TurnUpdate::DecisionApiChanged { provider } => {
+                self.decision_api = provider;
+                view.chrome.decision_api = provider;
+                self.dirty = true;
+            }
             TurnUpdate::CustomRow(entry) => {
                 view.push_entry(entry);
             }

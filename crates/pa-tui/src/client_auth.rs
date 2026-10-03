@@ -31,6 +31,10 @@ pub trait ClientAuthCommands: Send + Sync {
     /// it in the credential's auth slot — the slot the runtime reads.
     /// Resolves with the status line to show.
     fn api_key(&self, credential: &str, panel: crate::auth_panel::AuthPanelHandle) -> AuthFuture;
+    /// Whether an api-key credential currently has a stored key.
+    fn has_api_key(&self, _credential: &str) -> bool {
+        false
+    }
     /// Remove a stored MCP credential. Resolves with the status line
     /// (TS: `<name> is not connected.` / `Disconnected <name>.`).
     fn logout(&self, server: &str) -> AuthFuture;

@@ -110,6 +110,9 @@ impl SessionUi {
         // canonical name, before the command runs.
         self.track_command_used(resolved.name);
         match command.execution {
+            SlashCommandExecution::Session if resolved.name == "decision-api" => {
+                self.handle_decision_api_command(&resolved.args, text, behavior, view)
+            }
             SlashCommandExecution::Session => self.send_prompt(text, behavior, view),
             SlashCommandExecution::Client => {
                 self.dispatch_client_command(&resolved, text, view).await
@@ -236,7 +239,7 @@ impl SessionUi {
                     .map(str::to_string);
                 match effort_picker::effort_command(&levels, current.as_deref(), &resolved.args) {
                     effort_picker::EffortCommandOutcome::Open(picker) => {
-                        view.effort_picker = Some(picker);
+                        view.choice_picker = Some(picker);
                         self.track_feature_outcome("effort", "initiated", None);
                     }
                     effort_picker::EffortCommandOutcome::Unsupported => {

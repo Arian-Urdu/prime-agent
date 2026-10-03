@@ -1,9 +1,9 @@
 //! The keys concern: the terminal input grammar — key dispatch, mouse
 //! reports, paste, selection/auto-scroll, and the input-state seams.
 use super::{
-    key_event_to_id, AgentView, ChatEntry, DaemonCommand, DockFocusSource, Duration,
-    EffortPickerAction, Instant, KeyEvent, Map, QueueBrowseDirection, QueueLane, Result, SessionUi,
-    StatusKind, SubmitBehavior,
+    key_event_to_id, AgentView, ChatEntry, ChoicePickerAction, ChoicePurpose, DaemonCommand,
+    DockFocusSource, Duration, Instant, KeyEvent, Map, QueueBrowseDirection, QueueLane, Result,
+    SessionUi, StatusKind, SubmitBehavior,
 };
 
 /// How long the Ctrl+C exit hint arms the second-press exit (TS
@@ -118,7 +118,7 @@ impl SessionUi {
         // connections view, the `/share` loader, and the onboarding splash
         // own the frame like the TS overlays.
         let overlay_focused = view.model_picker.is_some()
-            || view.effort_picker.is_some()
+            || view.choice_picker.is_some()
             || view.heartbeats_picker.is_some()
             || view.goal_panel.is_some()
             || view.bash_view.is_some()
@@ -360,9 +360,9 @@ impl SessionUi {
         let _ = view.editor.handle_paste(text);
     }
 
-    /// One key press while the `/effort` picker is open: Esc/Ctrl+C close
-    /// it without applying; Enter applies the picked level.
-    async fn handle_effort_picker_key(
+    /// One key press while the `/effort` or `/decision-api` picker is open:
+    /// Esc/Ctrl+C close it without applying; Enter applies the picked row.
+    async fn handle_choice_picker_key(
         &mut self,
         key: KeyEvent,
         view: &mut AgentView,
@@ -377,18 +377,29 @@ impl SessionUi {
             self.exit_guard.note_ctrl_c_handled();
         }
         let action = view
-            .effort_picker
+            .choice_picker
             .as_mut()
             .map(|picker| picker.handle_key(&id, view.editor.keybindings()));
         match action {
-            Some(EffortPickerAction::None) | None => {}
-            Some(EffortPickerAction::Cancel) => {
-                view.effort_picker = None;
+            Some(ChoicePickerAction::None) | None => {}
+            Some(ChoicePickerAction::Cancel) => {
+                view.choice_picker = None;
                 self.dirty = true;
             }
-            Some(EffortPickerAction::Apply { level }) => {
-                view.effort_picker = None;
-                self.apply_thinking_level(&level, view).await;
+            Some(ChoicePickerAction::Apply { purpose, key }) => {
+                view.choice_picker = None;
+                self.dirty = true;
+                match purpose {
+                    ChoicePurpose::Effort => self.apply_thinking_level(&key, view).await,
+                    ChoicePurpose::DecisionApi => {
+                        return self.handle_decision_api_command(
+                            &key,
+                            &format!("/decision-api {key}"),
+                            SubmitBehavior::Steer,
+                            view,
+                        );
+                    }
+                }
             }
         }
         Ok(())
@@ -415,9 +426,9 @@ impl SessionUi {
         if view.model_picker.is_some() {
             return self.handle_model_picker_key(key, view).await;
         }
-        // The `/effort` picker owns the frame the same way.
-        if view.effort_picker.is_some() {
-            return self.handle_effort_picker_key(key, view).await;
+        // The `/effort` and `/decision-api` picker owns the frame the same way.
+        if view.choice_picker.is_some() {
+            return self.handle_choice_picker_key(key, view).await;
         }
         // The `/mcp` connections view owns the frame the same way.
         if view.mcp_view.is_some() {

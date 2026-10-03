@@ -1,5 +1,5 @@
 //! Session slash-command execution: the daemon-side behavior behind
-//! `/compact`, `/refine`, `/goal`, and `/autonomous`. Port of
+//! `/compact`, `/refine`, `/goal`, `/autonomous`, and `/decision-api`. Port of
 //! agent-session.ts `_executeSelectedSessionCommand` (the durable echo
 //! row) and `_executeQueuedSessionCommand` (the per-command executors and
 //! their result rows).
@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use pa_types::session::CustomMessage;
+use pa_types::slash_commands::DecisionApiProvider;
 
 use crate::autonomous::{
     autonomous_status, set_autonomous_enabled, set_autonomous_limits, AutonomousRuntimeState,
@@ -203,6 +204,7 @@ pub async fn execute_session_command(
         "refine" => execute_refine(engine, params, command, &mut execution).await,
         "goal" => execute_goal(engine, command, &mut execution).await,
         "autonomous" => execute_autonomous(params, command, &mut execution),
+        "decision-api" => execute_decision_api(engine, command, &mut execution).await,
         other => Err(format!("Unknown session command: {other}")),
     };
     if let Err(message) = result {
@@ -451,6 +453,57 @@ fn execute_autonomous(
     Ok(())
 }
 
+/// `/decision-api jev|clef|off`: pick this session's decision model or turn
+/// the Decision API off. The result row tells the user; the durable
+/// `decision_api_status` row records the state (sessions re-adopt it on
+/// rebuild) and tells the model.
+async fn execute_decision_api(
+    engine: &SessionEngine,
+    command: &SessionSlashCommand,
+    execution: &mut SessionCommandExecution,
+) -> Result<(), String> {
+    let provider = match command.args.trim() {
+        "off" => None,
+        arg => Some(
+            DecisionApiProvider::from_id(arg)
+                .ok_or_else(|| "Usage: /decision-api [jev|clef|clef-flash|off]".to_string())?,
+        ),
+    };
+    if let Some(provider) = provider {
+        if !engine
+            .decision_api_has_key(provider)
+            .await
+            .map_err(|error| format!("{error:#}"))?
+        {
+            return Err(format!(
+                "No {} API key is stored. Run /decision-api in the Prime Agent terminal UI to \
+                 add one.",
+                provider.vendor()
+            ));
+        }
+    }
+    engine.set_decision_api(provider).await;
+    let result = match provider {
+        Some(provider) => format!(
+            "Decision API enabled for this session: {}.",
+            provider.label()
+        ),
+        None => "Decision API disabled for this session.".to_string(),
+    };
+    execution.push_message(slash_command_result(
+        command, result, /*success*/ true, "info", None, /*display*/ true,
+    ));
+    execution.push_message(CustomMessage {
+        custom_type: super::decision_api::DECISION_API_STATUS_CUSTOM_TYPE.to_string(),
+        content: pa_types::ai::UserContent::Text(super::decision_api::status_note(provider)),
+        display: false,
+        details: Some(serde_json::json!({ "provider": provider.map(DecisionApiProvider::id) })),
+        timestamp: now_millis(),
+        rest: serde_json::Map::default(),
+    });
+    Ok(())
+}
+
 /// The rows are durable in the session's own entry chain: the live
 /// context rebuild and a later `/compact` see the same rows the host
 /// runtime persists (TS pushes each row onto `agent.state.messages`).
@@ -578,6 +631,122 @@ mod tests {
         assert_eq!(status.custom_type, "autonomous_status");
         assert!(message_text(status).starts_with("[autonomous-status: on]"));
         assert!(matches!(status.content, UserContent::Text(_)));
+    }
+
+    /// `/decision-api` is per session and off by default: picking a provider
+    /// needs its stored key, then lists the skill in the prompt and records
+    /// the state row a rebuilt session adopts again; `off` reverts both.
+    #[tokio::test]
+    async fn decision_api_switches_the_session_prompt_and_records_its_state() {
+        use super::super::decision_api::DECISION_API_STATUS_CUSTOM_TYPE;
+        let tmp = tempfile::tempdir().unwrap();
+        let (cwd, agent_dir) = (tmp.path().join("project"), tmp.path().join("agent"));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let model = pa_agent::types::Model {
+            id: "m".into(),
+            name: "m".into(),
+            api: "test".into(),
+            provider: "test".into(),
+            base_url: "http://localhost".into(),
+            reasoning: false,
+            cost: pa_agent::types::UsageCost::default(),
+            context_window: 1_000,
+            max_tokens: 100,
+        };
+        let provider = Arc::new(pa_agent::scripted::ScriptedProvider::new(model.clone()));
+        let engine =
+            super::super::engine::create_session(super::super::engine::SessionEngineConfig {
+                cwd,
+                agent_dir: agent_dir.clone(),
+                model: Some(model),
+                stream_fn: Some(provider.stream_fn()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let skill_entry = "<name>decision-api</name>";
+        let off_prompt = engine.system_prompt().to_string();
+        assert!(!off_prompt.contains(skill_entry));
+        let mut autonomous = crate::autonomous::create_autonomous_runtime_state(None, None);
+        let model = scripted_model();
+        let mut params = SessionCommandParams {
+            model: &model,
+            api_key: None,
+            global_harness_dir: tmp.path().join("harness"),
+            autonomous: &mut autonomous,
+        };
+
+        let mut run = async |args: &str| {
+            execute_session_command(&engine, &mut params, &command("decision-api", args)).await
+        };
+        assert_eq!(
+            run("").await.error.as_deref(),
+            Some("Usage: /decision-api [jev|clef|clef-flash|off]")
+        );
+        assert_eq!(
+            run("jev").await.error.as_deref(),
+            Some(
+                "No TypeSafe API key is stored. Run /decision-api in the Prime Agent terminal UI \
+                 to add one."
+            )
+        );
+        assert_eq!(engine.decision_api_switch().provider(), None);
+
+        let mut auth = crate::auth::AuthStorage::create(&agent_dir);
+        for credential in ["typesafe", "cloudflare"] {
+            auth.set(
+                credential,
+                crate::auth::AuthCredential::ApiKey {
+                    key: "test-key".to_string(),
+                    prime_team: None,
+                },
+            );
+        }
+        assert_eq!(run("jev").await.error, None);
+        assert!(engine.system_prompt().contains(skill_entry));
+        let clef = run("clef").await;
+        assert_eq!(clef.error, None);
+        assert_eq!(
+            engine.decision_api_switch().provider(),
+            Some(DecisionApiProvider::Clef)
+        );
+        assert!(engine.system_prompt().contains(skill_entry));
+        let rows: Vec<(String, String)> = clef
+            .messages
+            .iter()
+            .map(|row| (row.custom_type.clone(), message_text(row)))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "session_slash_command".to_string(),
+                    "/decision-api clef".to_string()
+                ),
+                (
+                    "session_slash_command_result".to_string(),
+                    "Decision API enabled for this session: Clef from Cloudflare \
+                     (vision-capable)."
+                        .to_string()
+                ),
+                (
+                    DECISION_API_STATUS_CUSTOM_TYPE.to_string(),
+                    super::super::decision_api::status_note(Some(DecisionApiProvider::Clef))
+                ),
+            ]
+        );
+
+        // A rebuilt session adopts the recorded provider.
+        engine.set_decision_api(None).await;
+        engine.sync_decision_api_from_context().await;
+        assert_eq!(
+            engine.decision_api_switch().provider(),
+            Some(DecisionApiProvider::Clef)
+        );
+
+        assert_eq!(run("off").await.error, None);
+        assert_eq!(engine.decision_api_switch().provider(), None);
+        assert_eq!(engine.system_prompt(), off_prompt);
     }
 
     fn scripted_model() -> pa_types::ai::Model {

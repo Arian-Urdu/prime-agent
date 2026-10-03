@@ -207,7 +207,10 @@ impl TerminalMcpAuth {
         if let Some(error) = auth.drain_errors().pop() {
             return Err(anyhow!(error)).context("could not save the API key");
         }
-        Ok(format!("Saved API key for {label}. Web search is ready."))
+        if credential == pa_core::auth::SERPER_CREDENTIAL_ID {
+            return Ok(format!("Saved API key for {label}. Web search is ready."));
+        }
+        Ok(format!("Saved API key for {label}."))
     }
 
     fn logout_inner(&self, server: &str) -> Result<String> {
@@ -244,6 +247,12 @@ impl ClientAuthCommands for TerminalMcpAuth {
         Box::pin(async move { auth.api_key_inner(&credential, panel).await })
     }
 
+    fn has_api_key(&self, credential: &str) -> bool {
+        AuthStorage::create(&self.agent_dir)
+            .get_all()
+            .get(credential)
+            .is_some()
+    }
     fn logout(&self, server: &str) -> AuthFuture {
         let (auth, server) = (self.clone(), server.to_string());
         Box::pin(async move { auth.logout_inner(&server) })

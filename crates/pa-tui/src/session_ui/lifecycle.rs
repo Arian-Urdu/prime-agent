@@ -87,6 +87,8 @@ impl SessionUi {
             show_images: options.show_images,
             fullscreen_mouse: options.fullscreen_mouse,
             service_tier: None,
+            decision_api: None,
+            decision_api_awaiting_key: None,
             speed_display_enabled: false,
             speed_stats: None,
             client_settings: options.client_settings.clone(),
@@ -466,6 +468,7 @@ impl SessionUi {
         self.daemon_closing_notice = None;
         self.session_name.clone_from(&reconstructed.session_name);
         self.service_tier.clone_from(&reconstructed.service_tier);
+        self.decision_api = reconstructed.decision_api;
         self.session_file = attach
             .snapshot
             .get("state")
@@ -642,6 +645,7 @@ impl SessionUi {
             self.speed_stats = None;
             view.chrome.speed_text = None;
         }
+        view.chrome.decision_api = self.decision_api;
         view.clear_chat();
         // The rebuilt transcript invalidates the tracked status row and
         // a pending click's entry index.

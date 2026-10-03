@@ -175,6 +175,7 @@ impl AgentSessionEngine {
             goal_backoff_wake_job_id: std::sync::Mutex::new(None),
             stale_goal_terminal_pending: std::sync::Mutex::new(None),
             turn_agent: std::sync::Mutex::new(None),
+            decision_api: std::sync::Mutex::default(),
             queue_modes,
             autonomous_boundary: std::sync::Mutex::new(None),
             background_bash_probe: std::sync::Mutex::new(None),
@@ -312,6 +313,8 @@ impl AgentSessionEngine {
         }
         let built = self.build_session(model).await?;
         self.adopt_built_session(&built).await?;
+        built.sync_decision_api_from_context().await;
+        *self.decision_api.lock().expect("decision api switch lock") = built.decision_api_switch();
         self.session.lock().await.replace(Arc::new(built));
         Ok(())
     }

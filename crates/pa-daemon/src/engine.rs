@@ -454,6 +454,12 @@ pub trait SessionEngine: Send + Sync {
         false
     }
 
+    /// The session's Decision API provider while it is switched on
+    /// (`/decision-api`). Scripted harness engines never enable it.
+    fn decision_api_provider(&self) -> Option<pa_types::slash_commands::DecisionApiProvider> {
+        None
+    }
+
     /// True while any RLM child this session spawned is still running
     /// (each child counts its own descendants the same way). Scripted
     /// harness engines spawn no children.

@@ -549,7 +549,9 @@ impl SessionEngine for AgentSessionEngine {
     /// unbuilt or busy session omits the section.
     fn export_system_prompt(&self) -> Option<String> {
         let session = self.session.try_lock().ok()?;
-        session.as_deref().map(|core| core.system_prompt.clone())
+        session
+            .as_deref()
+            .map(|core| core.system_prompt().to_string())
     }
 
     /// The built session's live tool registry mapped to the export's tools
@@ -623,6 +625,13 @@ impl SessionEngine for AgentSessionEngine {
     /// usage reset (TS `session.isQuotaParked`).
     fn is_quota_parked(&self) -> bool {
         AgentSessionEngine::is_quota_parked(self)
+    }
+
+    fn decision_api_provider(&self) -> Option<pa_types::slash_commands::DecisionApiProvider> {
+        self.decision_api
+            .lock()
+            .expect("decision api switch lock")
+            .provider()
     }
 
     fn has_running_subagents(&self) -> bool {
@@ -888,6 +897,7 @@ impl SessionEngine for AgentSessionEngine {
                 .session
                 .rebuild_branch_context(branch_entries)
                 .await?;
+            engine.sync_decision_api_from_context().await;
             // TS `_reloadGoalStateFromBranch({ monotonicTokens })` at the
             // `_navigateTree` tail: the rebuilt context reads the moved
             // branch's own latest persisted goal entry (the session manager
@@ -1262,7 +1272,7 @@ impl SessionEngine for AgentSessionEngine {
             self.ensure_core_session_async(&model).await?;
             let guard = self.session.lock().await;
             let engine = guard.as_deref().expect("session built above");
-            Ok(engine.system_prompt.clone())
+            Ok(engine.system_prompt().to_string())
         })
     }
 

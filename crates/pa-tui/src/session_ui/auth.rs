@@ -6,6 +6,8 @@ use super::{
     UI_REQUEST_TIMEOUT_MS,
 };
 
+use pa_types::slash_commands::DecisionApiProvider;
+
 /// The outcome of one daemon `set_model` attempt: the switch landed, the
 /// provider is not signed in (the typed refusal — the sign-in flow owns
 /// the retry), or the switch failed (the error row already rendered).
@@ -379,6 +381,19 @@ impl SessionUi {
             AuthPanelRequest::McpSettled { note } => {
                 view.auth_panel = None;
                 self.note(&note, view);
+                if let Some(provider) = self
+                    .decision_api_awaiting_key
+                    .take()
+                    .filter(|provider| self.has_decision_api_key(*provider))
+                {
+                    if let Err(error) = self.send_prompt(
+                        &format!("/decision-api {}", provider.id()),
+                        super::prompt::SubmitBehavior::Steer,
+                        view,
+                    ) {
+                        self.error_row(&format!("{error:#}"), view);
+                    }
+                }
             }
             AuthPanelRequest::TracesSettled { outcome, gen } => {
                 // A superseded run's late settle cannot clear a newer
@@ -439,6 +454,44 @@ impl SessionUi {
                     .await;
             panel.send(crate::auth_panel::AuthPanelRequest::McpSettled { note });
         });
+    }
+
+    /// `/decision-api [jev|clef|off]` switches the session (the daemon runs
+    /// it); without an argument it opens the provider picker. Picking a
+    /// provider whose key is not stored opens the key panel first; the saved
+    /// key then sends `/decision-api <provider>`.
+    pub(crate) fn handle_decision_api_command(
+        &mut self,
+        args: &str,
+        text: &str,
+        behavior: super::prompt::SubmitBehavior,
+        view: &mut AgentView,
+    ) -> Result<()> {
+        let args = args.trim();
+        if args.is_empty() {
+            view.choice_picker = Some(crate::choice_picker::ChoicePicker::decision_api(
+                self.decision_api,
+            ));
+            self.dirty = true;
+            return Ok(());
+        }
+        if let Some(provider) = DecisionApiProvider::from_id(args) {
+            if self.client_auth.is_some() && !self.has_decision_api_key(provider) {
+                self.pending_mcp_auth = Some(McpAuthIntent {
+                    args: format!("key {}", provider.credential()),
+                    title: format!("Log in to {}", provider.vendor()),
+                });
+                self.decision_api_awaiting_key = Some(provider);
+                return Ok(());
+            }
+        }
+        self.send_prompt(text, behavior, view)
+    }
+
+    fn has_decision_api_key(&self, provider: DecisionApiProvider) -> bool {
+        self.client_auth
+            .as_ref()
+            .is_some_and(|auth| auth.0.has_api_key(provider.credential()))
     }
 
     /// Open the inline `/mcp` connections view over the daemon's

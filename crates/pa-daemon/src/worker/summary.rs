@@ -117,6 +117,10 @@ impl Worker {
             scoped_models: core.scoped_models.clone(),
             active_tool_names: Vec::new(),
             context_usage: None,
+            decision_api: self
+                .engine
+                .decision_api_provider()
+                .map(|provider| provider.id().to_string()),
         }
     }
 

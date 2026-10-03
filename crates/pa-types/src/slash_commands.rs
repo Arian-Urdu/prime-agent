@@ -11,12 +11,87 @@
 use std::collections::HashMap;
 
 /// Session-executed commands (their behavior lives in the session engine).
-pub const SESSION_SLASH_COMMAND_NAMES: [&str; 4] = ["compact", "refine", "goal", "autonomous"];
+pub const SESSION_SLASH_COMMAND_NAMES: [&str; 5] =
+    ["compact", "refine", "goal", "autonomous", "decision-api"];
 
 /// Durable row custom types (TS core/messages.ts): the command echo and its
 /// result, as persisted in sessions and rendered by every surface.
 pub const SESSION_SLASH_COMMAND_CUSTOM_TYPE: &str = "session_slash_command";
 pub const SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE: &str = "session_slash_command_result";
+/// The durable `/decision-api` state row (`details.enabled`, `details.provider`):
+/// the newest one in the session context is the session's Decision API state.
+pub const DECISION_API_STATUS_CUSTOM_TYPE: &str = "decision_api_status";
+
+/// A decision model `/decision-api` can turn on for a session. The id is the
+/// command argument and the wire value; the credential names the stored API key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionApiProvider {
+    Jev,
+    Clef,
+    ClefFlash,
+}
+
+impl DecisionApiProvider {
+    pub const ALL: [Self; 3] = [Self::Jev, Self::Clef, Self::ClefFlash];
+
+    #[must_use]
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|provider| provider.id() == id)
+    }
+
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Jev => "jev",
+            Self::Clef => "clef",
+            Self::ClefFlash => "clef-flash",
+        }
+    }
+
+    #[must_use]
+    pub const fn model(self) -> &'static str {
+        match self {
+            Self::Jev => "Jev",
+            Self::Clef => "Clef",
+            Self::ClefFlash => "Clef Flash",
+        }
+    }
+
+    #[must_use]
+    pub const fn vendor(self) -> &'static str {
+        match self {
+            Self::Jev => "TypeSafe",
+            Self::Clef | Self::ClefFlash => "Cloudflare",
+        }
+    }
+
+    #[must_use]
+    pub const fn modality(self) -> &'static str {
+        match self {
+            Self::Jev => "text-only",
+            Self::Clef | Self::ClefFlash => "vision-capable",
+        }
+    }
+
+    #[must_use]
+    pub const fn credential(self) -> &'static str {
+        match self {
+            Self::Jev => "typesafe",
+            Self::Clef | Self::ClefFlash => "cloudflare",
+        }
+    }
+
+    /// The selector label, e.g. `Clef from Cloudflare (vision-capable)`.
+    #[must_use]
+    pub fn label(self) -> String {
+        format!(
+            "{} from {} ({})",
+            self.model(),
+            self.vendor(),
+            self.modality()
+        )
+    }
+}
 
 /// True when `value` names a session-executed command.
 #[must_use]
@@ -86,6 +161,7 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: &[BuiltinSlashCommand] = &[
     BuiltinSlashCommand { name: "heartbeats", description: "View and manage all user and agent heartbeats", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "resume", description: "Open the agents view, or resume a session by id or path", execution: SlashCommandExecution::Client, argument_hint: Some("[id|path]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "reload", description: "Reload keybindings, skills, prompts, and themes", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
+    BuiltinSlashCommand { name: "decision-api", description: "Choose this session's Decision API model (Jev, Clef, or Clef Flash), or turn it off", execution: SlashCommandExecution::Session, argument_hint: Some("[jev|clef|clef-flash|off]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "speed", description: "Toggle footer readout of model output tok/sec (latest response and session average)", execution: SlashCommandExecution::Client, argument_hint: Some("[on|off]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "quit", description: "Quit Prime Agent", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
 ];

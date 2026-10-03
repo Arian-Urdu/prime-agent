@@ -97,11 +97,15 @@ fn assemble_breakdown(
         .collect::<std::collections::HashMap<String, pa_core::mcp::McpServerConfig>>();
     let (skill_overrides, generic_servers, _manager) =
         pa_core::mcp::McpManager::prompt_gating(user_servers, &agent_dir);
-    let resources = load_resources(ResourceLoaderOptions {
+    let mut resources = load_resources(ResourceLoaderOptions {
         extra_builtin_skill_overrides: skill_overrides,
         system_prompt: None,
         ..ResourceLoaderOptions::new(cwd.to_path_buf(), agent_dir)
     })?;
+    // A session starts with the Decision API off (`/decision-api`).
+    resources.skills.retain(|skill| {
+        skill.name != pa_core::session_engine::decision_api::DECISION_API_SKILL_NAME
+    });
     Ok(pa_core::prompts::system_prompt::system_prompt_breakdown(
         &pa_core::prompts::BuildSystemPromptOptions {
             cwd: cwd.display().to_string(),

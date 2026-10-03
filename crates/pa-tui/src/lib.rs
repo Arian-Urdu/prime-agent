@@ -44,6 +44,7 @@ pub(crate) mod branch;
 pub(crate) mod browser;
 pub mod chat;
 pub mod chat_slash;
+pub mod choice_picker;
 pub mod chrome;
 mod click_dispatch;
 pub mod client_auth;

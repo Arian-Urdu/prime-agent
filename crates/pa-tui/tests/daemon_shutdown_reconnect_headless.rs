@@ -173,6 +173,12 @@ impl FirstGeneration {
                         &mut writer,
                         &json!({ "type": "daemon_closing", "reason": "shutdown" }),
                     );
+                    // The supervisor archive-stop relays a killed close under
+                    // the closing notice; it must not become a terminal row.
+                    write_json(
+                        &mut writer,
+                        &json!({ "type": "session_closed", "activeSessionId": "s1", "reason": "killed" }),
+                    );
                     break;
                 }
                 _ => write_json(&mut writer, &success_response(id, &command_type)),
@@ -467,6 +473,18 @@ fn an_announced_shutdown_reconnects_when_the_daemon_comes_back() {
     assert!(
         !all.contains("reconnected to the daemon"),
         "the hiccup loop's recovery row must not appear:\n{all}"
+    );
+    // The relayed killed close under daemon_closing is a reconnect signal,
+    // not a terminal close row (which would remain visible after reattach).
+    assert!(
+        !all.contains("session closed (killed)"),
+        "a shutdown-announced killed close never paints a row:
+{all}"
+    );
+    assert!(
+        !all.contains("The daemon stopped this agent session."),
+        "the future persistent killed error row is suppressed too:
+{all}"
     );
     // The successor saw the reattach: the same session, by DURABLE id
     // (the active id can change across a restart, TS #2458).

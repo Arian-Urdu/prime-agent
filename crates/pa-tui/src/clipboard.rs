@@ -67,13 +67,10 @@ fn tmux_output(args: &[&str]) -> Option<String> {
     probe_output(&mut child)
 }
 
-/// One bounded probe's output, or `None` when the child fails, misses the
-/// deadline, or writes no parsable stdout: the pipe drains from its own
-/// thread for the whole life of the child (the pipe_to writer-thread
-/// shape), so a probe that writes past the pipe buffer cannot block the
-/// child on its write — a blocked child never exits for the wait, and
-/// the deadline then turns a drain bug into a five-second stall plus a
-/// wrong "blocked" report.
+/// One bounded probe's output, or `None` when the child fails or misses
+/// the deadline: the pipe drains from its own thread for the whole life
+/// of the child (the pipe_to writer-thread shape), so a probe writing
+/// past the pipe buffer still exits.
 fn probe_output(child: &mut std::process::Child) -> Option<String> {
     let stdout = child.stdout.take();
     let reader = std::thread::spawn(move || {

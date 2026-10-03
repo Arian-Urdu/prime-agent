@@ -719,7 +719,7 @@ impl SupervisorChildSessions {
                 error: None,
                 closed_by_parent: false,
                 session_file: None,
-                attributed_rows: 0,
+                attributed_rows: Some(0),
                 usage_watch_live: false,
                 usage_rearm: false,
                 emit_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),

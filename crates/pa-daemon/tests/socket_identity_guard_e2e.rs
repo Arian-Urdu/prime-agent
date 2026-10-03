@@ -523,10 +523,15 @@ fn resumed_displaced_supervisor_fences_before_successor_binds() {
         "compromised holder must not unlink its socket"
     );
     assert!(lock.is_dir(), "old holder must leave successor lock intact");
+    // Pin the old socket inode while the successor binds. Removing the old
+    // file would let its dev+ino be recycled immediately by the new socket,
+    // making an identity comparison incapable of distinguishing holders.
+    let old_socket_aside = dir.path().join("old-supervisor.sock");
+    std::fs::rename(&socket, &old_socket_aside).expect("pin old socket inode");
+    assert_eq!(socket_identity(&old_socket_aside), original_socket);
     std::fs::remove_dir(&lock).expect("release simulated successor lock");
     let mut successor = spawn_supervisor(&socket, &dir.path().join("successor-agent"));
-    // The replacement can wait behind a stale 5s lease under CI load;
-    // TS's replacement connect helper also allows 30s (ENG-4600:287-302).
+    // TS's replacement connect helper allows 30s (ENG-4600:287-302).
     let deadline = Instant::now() + Duration::from_secs(30);
     while UnixStream::connect(&socket).is_err() || socket_identity(&socket) == original_socket {
         assert!(

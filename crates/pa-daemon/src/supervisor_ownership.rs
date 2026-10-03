@@ -288,22 +288,22 @@ fn shutdown_admission_is_active(record: &ShutdownAdmissionRecord) -> bool {
         && is_process_identity_alive(record.pid, record.process_start_id.as_deref())
 }
 
-/// Read the ACTIVE admission, reclaiming an inactive record under the
-/// guard (TS `readActiveShutdownAdmission`: an expired or dead-holder
-/// record is removed by the active reader - only `readShutdownAdmission`
-/// alone never touches the file).
+/// Read the ACTIVE admission, reclaiming an inactive record (TS
+/// `readActiveShutdownAdmission`: an expired or dead-holder record is
+/// removed by the active reader - only `readShutdownAdmission` alone never
+/// touches the file). NO GUARD HERE: like the TS function, the CALLER
+/// holds the registry guard (the refusal arm, the acquire arm) - a
+/// self-reentrant guard would deadlock its own holder.
 fn read_active_shutdown_admission(registry_dir: &Path) -> Result<Option<ShutdownAdmissionRecord>> {
-    with_registry_guard(registry_dir, || {
-        let path = shutdown_admission_path(registry_dir);
-        let Some(admission) = read_shutdown_admission(&path)? else {
-            return Ok(None);
-        };
-        if shutdown_admission_is_active(&admission) {
-            return Ok(Some(admission));
-        }
-        let _ = std::fs::remove_file(&path);
-        Ok(None)
-    })
+    let path = shutdown_admission_path(registry_dir);
+    let Some(admission) = read_shutdown_admission(&path)? else {
+        return Ok(None);
+    };
+    if shutdown_admission_is_active(&admission) {
+        return Ok(Some(admission));
+    }
+    let _ = std::fs::remove_file(&path);
+    Ok(None)
 }
 
 /// Read a startup-fence record; `Ok(None)` when absent (TS
@@ -401,7 +401,10 @@ async fn wait_for_startup_fence_in(
 /// registry read error.
 pub fn refuse_while_shutdown_admission_active() -> Result<()> {
     let registry_dir = registry_dir()?;
-    if read_active_shutdown_admission(&registry_dir)?.is_some() {
+    let active = with_registry_guard(&registry_dir, || {
+        read_active_shutdown_admission(&registry_dir)
+    })?;
+    if active.is_some() {
         bail!("Daemon shutdown is in progress");
     }
     Ok(())
@@ -768,7 +771,7 @@ mod tests {
         let socket = registry.path().join("daemon.sock");
         let path = startup_fence_path(registry.path(), &socket);
         let key = path.file_name().expect("fence file name").to_string_lossy();
-        assert_eq!(key.len(), 68, "sha256 hex + .json: {key}");
+        assert_eq!(key.len(), 69, "sha256 hex (64) + .json (5): {key}");
         // The TS spelling: normalizeSocketPath folds `.` segments, so the
         // key is the digest of the folded path.
         let folded = registry

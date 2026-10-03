@@ -98,15 +98,13 @@ fn socket_stays_silent(socket: &Path, window: Duration) {
     let deadline = Instant::now() + window;
     loop {
         assert!(
-            Instant::now() < deadline,
-            "the socket came up while a third-party successor had to stay out: {}",
-            socket.display()
-        );
-        assert!(
             !std::os::unix::net::UnixStream::connect(socket).is_ok(),
             "a third-party successor bound the socket while the stop window was up: {}",
             socket.display()
         );
+        if Instant::now() >= deadline {
+            return;
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 }

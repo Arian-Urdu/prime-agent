@@ -80,11 +80,30 @@ fn switch_from(env: impl Fn(&str) -> Option<String>, setting: Option<bool>) -> T
 
 /// Where events go: the platform endpoint in release builds, nowhere in
 /// debug builds (every `cargo test` and dev run), so tests and local
-/// development never reach production analytics.
+/// development never reach production analytics. One debug-only seam:
+/// [`TEST_ANALYTICS_ENDPOINT_ENV`] lets the startup-paint e2e point its
+/// client at a local stub, the sink that makes the awaited-vs-background
+/// flush observable.
 #[must_use]
 pub fn telemetry_endpoint() -> Option<&'static str> {
-    (!cfg!(debug_assertions)).then_some(pa_telemetry::ANALYTICS_ENDPOINT)
+    if cfg!(debug_assertions) {
+        static TEST_ENDPOINT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        return TEST_ENDPOINT
+            .get_or_init(|| {
+                std::env::var(TEST_ANALYTICS_ENDPOINT_ENV)
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })
+            .as_deref();
+    }
+    Some(pa_telemetry::ANALYTICS_ENDPOINT)
 }
+
+/// The debug-only analytics endpoint override: a test client points at
+/// its local stub so the startup-paint e2e can pin the flush ordering.
+/// Release builds never read it (one sink, one URL).
+pub const TEST_ANALYTICS_ENDPOINT_ENV: &str = "PRIME_AGENT_INTERNAL_TEST_ANALYTICS_ENDPOINT";
 
 /// The `status` report: state and why, the endpoint, the installation id.
 #[must_use]

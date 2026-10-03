@@ -137,8 +137,8 @@ pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
         }
         // `startup` (schema v1): process entry to a ready interactive
         // session environment (daemon listening). Emitted through a
-        // one-shot client that flushes immediately; the session's own
-        // telemetry rides the daemon worker.
+        // one-shot client; the session's own telemetry rides the daemon
+        // worker.
         if let Some(client) = startup_telemetry.as_ref() {
             let daemon_ready_ms = startup_started.elapsed().as_millis() as u64;
             let mut properties = pa_telemetry::base_properties("interactive");
@@ -155,7 +155,19 @@ pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
                 timing_scope: Some("system_work"),
             }
             .track(client);
-            let _ = client.shutdown().await;
+            // The flush is delivery, never a startup prerequisite: with
+            // the default analytics sink it is a network round trip
+            // (bounded by its 1.5s request timeout), so awaiting it here
+            // held the TUI's first paint behind the delivery — every new
+            // pane's client (the 2026-10-03 herdr tab-open report: ~25ms
+            // paint to ~190ms, the full round trip) stayed blank that
+            // long. The spawned drain still flushes immediately, off the
+            // interactive critical path; the exit-path flush keeps its
+            // own bound.
+            let client = client.clone();
+            tokio::spawn(async move {
+                let _ = client.shutdown().await;
+            });
         }
         // `prime-agent agents` and bare `--resume` open the agents view
         // (TS `agentsViewRequested`); the view then opens sessions, and a

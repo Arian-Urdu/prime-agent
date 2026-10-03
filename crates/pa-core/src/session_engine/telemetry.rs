@@ -61,7 +61,7 @@ mod status;
 use classify::{error_category, model_category, opt_value, run_outcome};
 pub use status::{
     set_telemetry_enabled_text, telemetry_endpoint, telemetry_status_text, telemetry_switch,
-    TelemetrySwitch,
+    TelemetrySwitch, TEST_ANALYTICS_ENDPOINT_ENV,
 };
 
 // The inline unit battery moved to the child module at the same tree

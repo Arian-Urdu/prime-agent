@@ -14,6 +14,7 @@ mod delete_stop;
 mod drill_down;
 mod edge_jumps;
 mod entry_anchor;
+mod heartbeat_badge;
 mod hints_render;
 mod hover_band;
 mod key_bindings;
@@ -22,6 +23,7 @@ mod render_pulse;
 mod reply;
 mod running_lines;
 mod saved_catalog;
+mod search_selection;
 mod selection_churn;
 
 /// One idle row under test plus a holder row that keeps the selection,

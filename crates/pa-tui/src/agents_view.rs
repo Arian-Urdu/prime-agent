@@ -45,6 +45,7 @@ use render::cell;
 use render::Renderer;
 
 mod delete;
+mod heartbeats;
 
 #[cfg(test)]
 use delete::no_effect_summary;
@@ -328,6 +329,12 @@ enum UiInput {
         key: String,
         outcome: Result<(), String>,
     },
+    /// A heartbeat-catalog fetch landed (TS `refreshHeartbeats`'s apply):
+    /// rows re-render their `◷` counts.
+    HeartbeatsLoaded {
+        generation: u64,
+        heartbeats: Vec<crate::heartbeats_picker::HeartbeatEntry>,
+    },
 }
 
 /// The flow's roster connection (TS `AgentsViewPersistentState.rosterClient`):
@@ -473,6 +480,10 @@ struct AgentsViewMode {
     /// user move cancels the wait. A scoped view never lists the anchor
     /// (the scope root is excluded), so the first-row default stands there.
     anchor_selection_pending: bool,
+    /// The selection a cleared search returns to: the row selected when
+    /// the query went non-empty. A move while searching drops it, so the
+    /// clear keeps the user's pick.
+    search_return: Option<(String, SelectionKey)>,
     /// First ctrl+c shows the exit hint; the second exits.
     exit_armed: bool,
     /// The double-Ctrl+C force-quit guard (the run's shared instance is
@@ -544,6 +555,9 @@ struct AgentsViewMode {
     /// end — the view owns no telemetry handle): `program_shown`,
     /// `renamed`.
     actions: Vec<&'static str>,
+    /// The daemon's heartbeat catalog (the dock's source, TS
+    /// `heartbeats`): each row counts its own session's jobs.
+    heartbeats: Vec<crate::heartbeats_picker::HeartbeatEntry>,
 }
 
 /// The press state of one left click on the agents view (TS
@@ -658,6 +672,7 @@ impl AgentsViewMode {
             selected_identity,
             selected_key,
             anchor_selection_pending,
+            search_return: None,
             exit_armed: false,
             exit_guard: crate::exit_guard::ExitGuard::new(),
             pulse: 0,
@@ -674,6 +689,7 @@ impl AgentsViewMode {
             hover_row: None,
             pressed_click: None,
             actions: Vec::new(),
+            heartbeats: Vec::new(),
         }
     }
 }
@@ -945,6 +961,13 @@ async fn run_agents_view_surface(
     let mut catalog_request = (!mode.saved_catalog_loaded).then(|| {
         spawn_saved_catalog_fetch(&client, ui_tx.clone(), cwd.clone(), session_dir.clone())
     });
+    // The heartbeat catalog feeds the rows' `◷ N` badges: the same
+    // selector-less `heartbeats_list` the activity dock reads, fetched
+    // open-time like TS `refreshHeartbeats` and re-read on every
+    // `heartbeats_changed` (the loop local below is the generation gate:
+    // a superseded fetch's answer never applies).
+    let mut heartbeat_generation: u64 = 1;
+    heartbeats::spawn_heartbeat_catalog_fetch(&client, ui_tx.clone(), heartbeat_generation);
     // TS `start()`'s open-time settle (`armSavedSearchFetch` followed by
     // `resolveMissingSelectionAnchor`): a carried catalog arms no fetch,
     // so no terminal load ever arrives to settle the entry anchor's wait -
@@ -1219,6 +1242,16 @@ async fn run_agents_view_surface(
                         StatusTone::Error,
                     );
                 }
+                // Only the newest fetch applies (TS
+                // `heartbeatCatalogGeneration`): responses can reorder.
+                UiInput::HeartbeatsLoaded {
+                    generation,
+                    heartbeats,
+                } => {
+                    if generation == heartbeat_generation {
+                        mode.heartbeats = heartbeats;
+                    }
+                }
                 // The headless plan ended: the run stops here (the
                 // interactive harness's `HeadlessDone` contract). A plan
                 // that ends without an exit key still captures its frames
@@ -1264,6 +1297,17 @@ async fn run_agents_view_surface(
                                         );
                                     }
                                 }
+                            }
+                            // TS `heartbeats_changed` → `refreshHeartbeats`:
+                            // the daemon-global broadcast re-reads the
+                            // catalog; the landed answer redraws, not this.
+                            Some(DaemonClientEvent::HeartbeatsChanged) => {
+                                heartbeat_generation += 1;
+                                heartbeats::spawn_heartbeat_catalog_fetch(
+                                    &client,
+                                    ui_tx.clone(),
+                                    heartbeat_generation,
+                                );
                             }
                             Some(_) => {}
                             None => {
@@ -1498,9 +1542,10 @@ fn advance_running_pulse(
 }
 
 /// The daemon-driven answers that jump an armed render barrier: the
-/// saved catalog's landing (or its terminal failure) and the
-/// stop-or-delete dispatch results are the events the plan's needles
-/// wait on — they must never queue behind the hold they satisfy.
+/// saved catalog's landing (or its terminal failure), the heartbeat
+/// catalog's landing, and the stop-or-delete dispatch results are the
+/// events the plan's needles wait on — they must never queue behind the
+/// hold they satisfy.
 fn is_daemon_answer(input: &UiInput) -> bool {
     matches!(
         input,
@@ -1512,6 +1557,7 @@ fn is_daemon_answer(input: &UiInput) -> bool {
             | UiInput::ReplyProgress(_)
             | UiInput::ReplyResult { .. }
             | UiInput::KillResult { .. }
+            | UiInput::HeartbeatsLoaded { .. }
     )
 }
 

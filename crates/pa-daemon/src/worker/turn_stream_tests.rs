@@ -14,10 +14,6 @@ mod abort_idle_race;
 mod broadcast;
 mod burst;
 mod feed;
-// The interleave harness's probe is a unix-socket JSONL listener, so the
-// family is unix-only (the workspace windows cross-check compiles every
-// test target; the sibling `feed` gates its own unix fns the same way).
-#[cfg(unix)]
 mod interleave;
 mod park;
 mod queue;

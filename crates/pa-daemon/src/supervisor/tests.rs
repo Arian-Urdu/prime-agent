@@ -1980,9 +1980,7 @@ async fn a_live_rename_conflicting_with_a_sibling_fails_with_the_unavailability_
         )
         .await;
     assert!(!stop);
-    let response = lines
-        .first()
-        .expect("the failed rename answers one line");
+    let response = lines.first().expect("the failed rename answers one line");
     assert_eq!(response["success"], false, "the conflicting rename failed");
     assert_eq!(
         response["error"],

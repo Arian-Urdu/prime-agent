@@ -1235,6 +1235,9 @@ async fn run_interactive_surface(
                 events.recv().await
             } => {
                                 if let Some(event) = maybe_event {
+                    if matches!(event, crate::daemon_client::DaemonClientEvent::SessionClosed { .. }) {
+                        eprintln!("[diagnostic loop-recv] {event:?}");
+                    }
                     session.apply_client_event(event, &mut view);
                     // Batch the rest of the queued frames before this
                     // iteration's render: a stream burst applies as one

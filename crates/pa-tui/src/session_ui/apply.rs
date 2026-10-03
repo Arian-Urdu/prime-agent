@@ -309,6 +309,7 @@ impl SessionUi {
                 active_session_id,
                 reason,
             } => {
+                eprintln!("[diagnostic apply-close] id={active_session_id} current={} reason={reason}", self.active_session_id);
                 if active_session_id == self.active_session_id {
                     self.turn_active = false;
                     view.working = None;

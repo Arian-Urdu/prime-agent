@@ -373,15 +373,10 @@ fn run_trial(
             // before reporting the failure.
             let reconcile = reconcile_orphaned_create(client, socket, &sessions_dir, &name);
             let _ = fs::remove_dir_all(&trial_root);
-            return Err(match reconcile {
-                Ok(0) => format!("create failed: {error}; reconcile found no orphaned session"),
-                Ok(count) => {
-                    format!("create failed: {error}; reconcile killed {count} orphaned session(s)")
-                }
-                Err(reconcile_error) => {
-                    format!("create failed: {error}; reconcile failed: {reconcile_error}")
-                }
-            });
+            return Err(format!(
+                "create failed: {error}; {}",
+                reconcile_outcome(reconcile)
+            ));
         }
     };
     let session_id = created
@@ -389,9 +384,17 @@ fn run_trial(
         .or_else(|| created.get("id"))
         .and_then(Value::as_str);
     let Some(session_id) = session_id else {
-        // No session id means nothing to kill, but the trial dir goes.
+        // A create that answered success but carried no id can still have
+        // left a live session: the daemon named the resident, and without
+        // an id there is nothing to drive or kill directly. The reconcile
+        // (row pass plus the name-addressed kill) is the only cleanup
+        // that can reach it before the trial dir goes.
+        let reconcile = reconcile_orphaned_create(client, socket, &sessions_dir, &name);
         let _ = fs::remove_dir_all(&trial_root);
-        return Err(format!("create returned no session id: {created}"));
+        return Err(format!(
+            "create returned no session id: {created}; {}",
+            reconcile_outcome(reconcile)
+        ));
     };
     let session_id = session_id.to_string();
 
@@ -445,25 +448,79 @@ fn run_trial(
 /// to the name reaches the orphan — and only this run's orphan. An
 /// envelope saying the session is unknown means the create never landed
 /// (or the path pass already killed it): settled, not an error.
+///
+/// The list pass is best-effort: a list that never answers (or answers
+/// without a sessions field) is recorded, not fatal — the name-addressed
+/// kill still runs, because the name is the only address an unlistable
+/// orphan answers on. Only a name kill that cannot reach the daemon
+/// fails the reconcile, carrying the list pass's error along when there
+/// is one.
 fn reconcile_orphaned_create(
     client: &mut Client,
     socket: &Path,
     sessions_dir: &Path,
     session_name: &str,
 ) -> Result<usize, String> {
-    let mut retry = Client::connect(socket)
+    // The fresh connection heals the sweep's shared client either way:
+    // the create's failure may have left its stream dead, and every
+    // later pass needs a live one.
+    *client = Client::connect(socket)
         .map_err(|connect_error| format!("reconnect failed: {connect_error}"))?;
-    let list_result = retry.command(
-        &json!({
-            "type": "list",
-            "all": true,
-            "sessionDir": sessions_dir.to_string_lossy(),
-        }),
-        Duration::from_secs(30),
-    );
-    // The fresh connection heals the sweep's shared client either way.
-    *client = retry;
-    let listed = list_result.map_err(|error| format!("the trial sessions list failed: {error}"))?;
+
+    // The row pass is best-effort: a list that never answers (or one
+    // without a sessions field) must not skip the name kill below — the
+    // name is the only address an unlistable orphan still answers on.
+    // The same holds for a kill the row pass loses mid-flight: the
+    // daemon is tried by name, and only a name kill that cannot reach
+    // the daemon fails the reconcile.
+    let mut killed = 0;
+    let mut row_pass_error = None;
+    match kill_listed_orphans(client, socket, sessions_dir) {
+        Ok(row_kills) => killed += row_kills,
+        Err(error) => row_pass_error = Some(error),
+    }
+    // The name-addressed kill of last resort: it reaches the orphan the
+    // row pass above cannot see (see the doc comment), and it runs even
+    // when that pass could not list the dir at all. Only a success
+    // envelope counts as a kill — an unknown-session answer means there
+    // was nothing left to kill.
+    match kill_session(client, socket, session_name) {
+        Ok(response) if response.get("success").and_then(Value::as_bool) == Some(true) => {
+            killed += 1;
+        }
+        Ok(_) => {}
+        Err(name_error) => {
+            return Err(match row_pass_error {
+                Some(row_pass_error) => {
+                    format!("{row_pass_error}; the name-addressed kill failed: {name_error}")
+                }
+                None => format!("the name-addressed kill failed: {name_error}"),
+            });
+        }
+    }
+    Ok(killed)
+}
+
+/// The reconcile's row pass: list the trial's own sessions dir and kill
+/// every daemon-reported row whose session file lives under it (the path
+/// filter's concurrent-session guard, described on
+/// [`reconcile_orphaned_create`]). The caller treats a failure here as
+/// best-effort: the name-addressed kill still runs.
+fn kill_listed_orphans(
+    client: &mut Client,
+    socket: &Path,
+    sessions_dir: &Path,
+) -> Result<usize, String> {
+    let listed = client
+        .command(
+            &json!({
+                "type": "list",
+                "all": true,
+                "sessionDir": sessions_dir.to_string_lossy(),
+            }),
+            Duration::from_secs(30),
+        )
+        .map_err(|error| format!("the trial sessions list failed: {error}"))?;
     let rows = listed
         .get("data")
         .and_then(|data| data.get("sessions"))
@@ -489,18 +546,18 @@ fn reconcile_orphaned_create(
         kill_session(client, socket, orphan_id)?;
         killed += 1;
     }
-    // The name-addressed kill of last resort: it reaches the orphan the
-    // row filter above cannot see (see the doc comment). Only a success
-    // envelope counts as a kill — an unknown-session answer means there
-    // was nothing left to kill.
-    if kill_session(client, socket, session_name)?
-        .get("success")
-        .and_then(Value::as_bool)
-        == Some(true)
-    {
-        killed += 1;
-    }
     Ok(killed)
+}
+
+/// The reconcile's verdict for the trial's error string: how many
+/// orphaned sessions died, or the transport-level failure that left
+/// their fate unknown.
+fn reconcile_outcome(reconcile: Result<usize, String>) -> String {
+    match reconcile {
+        Ok(0) => "reconcile found no orphaned session".to_string(),
+        Ok(count) => format!("reconcile killed {count} orphaned session(s)"),
+        Err(reconcile_error) => format!("reconcile failed: {reconcile_error}"),
+    }
 }
 
 /// The cleanup kill. Unlike a scored command, a transport failure here
@@ -1444,6 +1501,183 @@ mod tests {
         );
         assert!(kill_rx.recv_timeout(Duration::from_secs(1)).is_err());
         assert!(error.contains("create failed"), "{error}");
+        assert!(error.contains("reconcile killed 1"), "{error}");
+        assert!(!runs_root.join("size-2-trial-1").exists());
+    }
+
+    #[test]
+    fn a_lost_reconcile_list_still_kills_by_name() {
+        // The reconcile's row pass is best-effort: when the fresh
+        // connection itself loses the list (the degraded-daemon case
+        // that orphaned the create in the first place), the
+        // name-addressed kill must still run — the name is the only
+        // address the orphan still answers on. Skipping it on a list
+        // failure would leave the orphan running and spending tokens
+        // while the sweep moves on.
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let socket = dir.path().join("lost-list.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let (list_tx, list_rx) = channel();
+        let (name_kill_tx, name_kill_rx) = channel();
+        thread::spawn(move || {
+            // Connection 1: hello, read the create, drop (the response
+            // is lost).
+            let (stream, _) = listener.accept().expect("accept 1");
+            let mut writer = stream.try_clone().expect("clone 1");
+            let mut reader = BufReader::new(stream);
+            let _ = writeln!(writer, r#"{{"type":"daemon_hello"}}"#);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read create");
+            drop(writer);
+            drop(reader);
+            // Connection 2 (the reconcile): hello, read the list, then
+            // drop without answering — the list is lost on this
+            // connection too.
+            let (stream, _) = listener.accept().expect("accept 2");
+            let mut writer = stream.try_clone().expect("clone 2");
+            let mut reader = BufReader::new(stream);
+            let _ = writeln!(writer, r#"{{"type":"daemon_hello"}}"#);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read list");
+            let envelope: Value = serde_json::from_str(line.trim()).expect("list envelope");
+            let _ = list_tx.send(envelope.get("command").cloned().unwrap_or(Value::Null));
+            drop(writer);
+            drop(reader);
+            // Connection 3 (the kill's retry connection): answer the
+            // name-addressed kill.
+            let (stream, _) = listener.accept().expect("accept 3");
+            let mut writer = stream.try_clone().expect("clone 3");
+            let mut reader = BufReader::new(stream);
+            let _ = writeln!(writer, r#"{{"type":"daemon_hello"}}"#);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read name kill");
+            let envelope: Value = serde_json::from_str(line.trim()).expect("name kill envelope");
+            let _ = name_kill_tx.send(envelope.get("command").cloned().unwrap_or(Value::Null));
+            let _ = writeln!(
+                writer,
+                "{}",
+                json!({ "id": envelope.get("id").cloned().unwrap_or(Value::Null),
+                        "type": "response", "success": true })
+            );
+        });
+        let out_dir = tempfile::TempDir::new().expect("out dir");
+        let config = test_config(out_dir.path(), 2, 15.0);
+        let runs_root = dir.path().join("runs");
+        let mut client = Client::connect(&socket).expect("connect");
+        let tag = "77-880";
+        let error = run_trial(&mut client, &socket, &config, 2, 1, &runs_root, tag)
+            .expect_err("the lost create response fails the trial");
+        // The list ran on the fresh connection...
+        let list_command = list_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the reconcile list ran");
+        assert_eq!(list_command["type"], "list", "{list_command}");
+        // ...and although its response was lost, the name-addressed kill
+        // still ran over the kill's own retry connection.
+        let name_kill_command = name_kill_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the name kill ran despite the lost list");
+        assert_eq!(name_kill_command["type"], "kill", "{name_kill_command}");
+        assert_eq!(
+            name_kill_command["activeSessionId"],
+            session_name(tag, 2, 1),
+            "{name_kill_command}"
+        );
+        // The orphan died by name, so the reconcile reports its kill,
+        // not the lost list.
+        assert!(error.contains("create failed"), "{error}");
+        assert!(error.contains("reconcile killed 1"), "{error}");
+        assert!(!runs_root.join("size-2-trial-1").exists());
+    }
+
+    #[test]
+    fn a_create_without_a_session_id_is_reconciled_by_name() {
+        // A create that answers success but carries no parseable session
+        // id can still have left a live session: the daemon named the
+        // resident, and without an id there is nothing to drive or kill
+        // directly. The no-id path must run the same orphan reconcile —
+        // the row pass plus the name-addressed kill — before the trial
+        // dir goes.
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let socket = dir.path().join("no-id.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let (list_tx, list_rx) = channel();
+        let (kill_tx, kill_rx) = channel();
+        thread::spawn(move || {
+            // Connection 1: hello, answer the create with success but no
+            // session id in the data.
+            let (stream, _) = listener.accept().expect("accept 1");
+            let mut writer = stream.try_clone().expect("clone 1");
+            let mut reader = BufReader::new(stream);
+            let _ = writeln!(writer, r#"{{"type":"daemon_hello"}}"#);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read create");
+            let envelope: Value = serde_json::from_str(line.trim()).expect("create envelope");
+            let _ = writeln!(
+                writer,
+                "{}",
+                json!({ "id": envelope.get("id").cloned().unwrap_or(Value::Null),
+                        "type": "response", "success": true,
+                        "data": { "named": "but no id" } })
+            );
+            // Connection 2 (the reconcile): the list reports nothing
+            // path-addressable, so only the name kill can reach the
+            // orphan.
+            let (stream, _) = listener.accept().expect("accept 2");
+            let mut writer = stream.try_clone().expect("clone 2");
+            let mut reader = BufReader::new(stream);
+            let _ = writeln!(writer, r#"{{"type":"daemon_hello"}}"#);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read list");
+            let envelope: Value = serde_json::from_str(line.trim()).expect("list envelope");
+            let _ = list_tx.send(envelope.get("command").cloned().unwrap_or(Value::Null));
+            let _ = writeln!(
+                writer,
+                "{}",
+                json!({
+                    "id": envelope.get("id").cloned().unwrap_or(Value::Null),
+                    "type": "response",
+                    "success": true,
+                    "data": { "sessions": [] }
+                })
+            );
+            // The name kill resolves the id-less orphan by its name
+            // label and succeeds.
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read name kill");
+            let envelope: Value = serde_json::from_str(line.trim()).expect("name kill envelope");
+            let _ = kill_tx.send(envelope.get("command").cloned().unwrap_or(Value::Null));
+            let _ = writeln!(
+                writer,
+                "{}",
+                json!({ "id": envelope.get("id").cloned().unwrap_or(Value::Null),
+                        "type": "response", "success": true })
+            );
+        });
+        let out_dir = tempfile::TempDir::new().expect("out dir");
+        let config = test_config(out_dir.path(), 2, 15.0);
+        let runs_root = dir.path().join("runs");
+        let mut client = Client::connect(&socket).expect("connect");
+        let tag = "77-880";
+        let error = run_trial(&mut client, &socket, &config, 2, 1, &runs_root, tag)
+            .expect_err("the id-less create fails the trial");
+        // The no-id path reconciled: the trial's own sessions dir was
+        // listed...
+        let list_command = list_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the reconcile list ran");
+        assert_eq!(list_command["type"], "list", "{list_command}");
+        // ...and the name-addressed kill reached the id-less orphan.
+        let kill_command = kill_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the name kill ran");
+        assert_eq!(kill_command["type"], "kill", "{kill_command}");
+        assert_eq!(
+            kill_command["activeSessionId"],
+            session_name(tag, 2, 1),
+            "{kill_command}"
+        );
+        assert!(error.contains("create returned no session id"), "{error}");
         assert!(error.contains("reconcile killed 1"), "{error}");
         assert!(!runs_root.join("size-2-trial-1").exists());
     }

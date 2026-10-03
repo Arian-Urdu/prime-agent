@@ -103,25 +103,21 @@ impl SessionNavigation {
         let _ =
             tokio::task::spawn_blocking(move || crate::session_store::read_session_info(&primed))
                 .await;
-        let previous = {
-            let mut core = self.core.lock().unwrap();
-            let previous = core.store.replace(file);
-            // The lane reset rides the SAME core hold as the store swap:
-            // a delivery acquiring the lock after the swap sees the
-            // replacement store already push-pinned — never the
-            // replacement store with the retired session's pin/mode (a
-            // digest pin would route its entries into the replacement's
-            // durable file).
-            crate::worker::AgentMessageDigest::reset_lane_state_locked(&mut core);
-            previous
-        };
-        // The replacement session starts with fresh counters (the TS
-        // replacement built a new AgentSession) — reset outside the core
-        // hold (the delivery path locks counters first, core second).
+        // The store swap, the lane reset, and the counters reset ride ONE
+        // `[counters -> core]` hold on the digest (the delivery path
+        // evaluates under the same order; the turn runner accounts under
+        // the core lock): a delivery acquiring the locks after the swap
+        // sees the replacement store already push-pinned with fresh
+        // counters — never the replacement store with the retired
+        // session's pin/mode, never the retired session's in-flight
+        // traffic in the replacement's counters, and never the
+        // replacement's early traffic erased by the reset.
+        let previous = self
+            .agent_digest
+            .reset_for_replacement(|core| core.store.replace(file));
         // And its watches die with the replaced session (TS #2356: the
         // registry is cleared on dispose; stale subscriptions must not
         // bleed into the new session's notices).
-        self.agent_digest.reset_counters();
         self.engine.clear_agent_watches();
         // The old store's lease release flushes the window and info
         // sidecars (megabytes for a large session): off the core lock

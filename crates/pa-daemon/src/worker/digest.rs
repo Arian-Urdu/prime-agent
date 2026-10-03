@@ -515,38 +515,45 @@ impl AgentMessageDigest {
         (model_turns > 0).then(|| ingestion_turns as f64 / model_turns as f64)
     }
 
-    /// Reset the core-held lane state (the pin + the mode) at a session
-    /// replacement (`switch_session`/`new_session`/`import_jsonl`/`fork`):
-    /// the TS `AgentSession` was per-session, so its replacement started
-    /// with the default lane and fresh counters — the new Rust session
-    /// inherits neither the retired session's pin nor its traffic. The
-    /// reset must run in the SAME core hold as the store swap
-    /// ([`SessionNavigation::replace_session`]): a delivery acquiring the
-    /// lock after the swap must see the replacement store already
-    /// push-pinned, never the replacement store with the retired
-    /// session's pin/mode. The caller holds the core lock.
+    /// Reset the core-held lane state (the pin + the mode) — the part of
+    /// a session replacement's reset ([`Self::reset_for_replacement`],
+    /// driven by `SessionNavigation::replace_session`) that touches the
+    /// core-held fields. The TS `AgentSession` was per-session, so its
+    /// replacement started with the default lane; the new Rust session
+    /// inherits neither the retired session's pin nor its mode. The
+    /// caller holds the core lock.
     pub(crate) fn reset_lane_state_locked(core: &mut SessionCore) {
         core.agent_message_digest_mode = false;
         core.agent_message_digest_pin = DigestLanePin::default();
     }
 
-    /// Reset the controller's counters at the same session replacement —
-    /// the part of the reset that must NOT run under the core lock (the
-    /// delivery path takes the counters lock first, then the core lock;
-    /// nesting them the other way would invert that order).
-    pub(crate) fn reset_counters(&self) {
-        {
-            let mut counters = self
-                .counters
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            counters.arrivals.clear();
-            counters.controller = DigestLaneController::default();
-        }
+    /// The session-replacement reset: ONE `[counters -> core]` hold
+    /// covering the store swap (the `swap` closure), the lane reset, and
+    /// the counters reset. The delivery path evaluates under the same
+    /// order (counters first, then core — nesting them the other way
+    /// would invert that order and deadlock), and the turn runner
+    /// accounts its turns while holding the core lock, so nothing can
+    /// interleave the reset: neither a retired session's in-flight
+    /// delivery can populate the replacement's fresh counters nor the
+    /// replacement's early traffic can be erased by the reset.
+    pub(crate) fn reset_for_replacement<R>(&self, swap: impl FnOnce(&mut SessionCore) -> R) -> R {
+        let mut counters = self
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut core = self
+            .core
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let swapped = swap(&mut core);
+        Self::reset_lane_state_locked(&mut core);
+        counters.arrivals.clear();
+        counters.controller = DigestLaneController::default();
         self.model_turns
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.ingestion_turns
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        swapped
     }
 
     /// The user pin (`rlm.inbox.configure`, PR D): "push"/"digest" fixes
@@ -794,13 +801,27 @@ impl AgentMessageDigest {
         data: &InboxEntryData,
     ) -> anyhow::Result<()> {
         let id = match core.store.as_mut() {
-            Some(store) => store.persist_entry(
-                "custom",
-                json!({
+            Some(store) => {
+                let entry = json!({
                     "customType": AGENT_MESSAGE_INBOX_ENTRY_CUSTOM_TYPE,
                     "data": data,
-                }),
-            )?,
+                });
+                match store.persist_entry("custom", entry) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        // The failed append can be pre- OR post-write (the
+                        // lease append reaches the file before its flush
+                        // errors), so the in-memory records must not keep
+                        // trusting the pre-append load: invalidate the
+                        // loaded key so the next inbox access reloads the
+                        // store's truth — a post-write failure's row
+                        // reappears (a retry's duplicate stays visible with
+                        // it) instead of hiding until a restart.
+                        inbox.loaded_key = None;
+                        return Err(error);
+                    }
+                }
+            }
             None => String::new(),
         };
         inbox.records.push(InboxRecord {
@@ -942,7 +963,7 @@ impl AgentMessageDigest {
     /// withdrawal) cannot slip between the check and the enqueue, so a
     /// notice never lands for an inbox the read already emptied — the
     /// stale wake the two-section form allowed.
-    fn ensure_digest_notice(&self) {
+    pub(crate) fn ensure_digest_notice(&self) {
         let mut inbox = self
             .inbox
             .lock()
@@ -1692,18 +1713,12 @@ mod tests {
             })
         };
         std::thread::sleep(std::time::Duration::from_millis(200));
-        // The replacement: one atomic store swap + pin reset (the same
-        // section `SessionNavigation::replace_session` runs).
-        {
-            let mut core = core.lock().unwrap();
-            let mut fresh = crate::session_store::SessionFile::create("/tmp", None, 0);
-            fresh.set_path(dir.path().join("fresh-session.jsonl"));
-            fresh.rewrite().unwrap();
-            let previous = core.store.replace(fresh);
-            AgentMessageDigest::reset_lane_state_locked(&mut core);
-            drop(previous);
-        }
-        digest.reset_counters();
+        // The replacement: the digest's one [counters -> core] hold (the
+        // same section `SessionNavigation::replace_session` runs).
+        let mut fresh = crate::session_store::SessionFile::create("/tmp", None, 0);
+        fresh.set_path(dir.path().join("fresh-session.jsonl"));
+        fresh.rewrite().unwrap();
+        drop(digest.reset_for_replacement(|core| core.store.replace(fresh)));
         // Release the parked delivery: the stale digest decision must be
         // refused at the append.
         drop(parked_inbox);
@@ -1714,6 +1729,112 @@ mod tests {
             snapshot["total"],
             json!(0),
             "the replacement's inbox: {snapshot}"
+        );
+    }
+
+    /// A replacement reset leaves the controller's counters fresh: the
+    /// retired session's arrivals and turn accounting must not leak into
+    /// the replacement's lane evaluation (an auto-armed replacement would
+    /// read stale pressure and mis-decide).
+    #[test]
+    fn a_replacement_reset_clears_the_counters_and_turn_accounting() {
+        let (digest, _dir) = digest_over_store();
+        digest.record_arrival(crate::util::now_ms());
+        digest.note_model_turn(true);
+        digest.reset_for_replacement(|_| ());
+        let ring = digest
+            .counters
+            .lock()
+            .unwrap()
+            .arrivals_last_5m(crate::util::now_ms());
+        assert_eq!(ring, 0, "the retired session's arrival survived the reset");
+        assert!(
+            digest.ingestion_turn_share().is_none(),
+            "the retired session's turn accounting survived the reset"
+        );
+    }
+
+    /// A failed durable append must not leave the in-memory inbox
+    /// trusting its pre-append load: the store append can fail AFTER the
+    /// row reached the file (the lease append's post-write flush), and a
+    /// stale loaded key would hide that row until a restart — the
+    /// sender's retry would then surface BOTH rows as duplicates with
+    /// the original invisible in between. The failed append invalidates
+    /// the loaded key, so the next inbox read reloads the store's truth.
+    #[test]
+    fn a_failed_durable_append_reloads_the_inbox_from_the_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store_path = dir.path().join("session.jsonl");
+        // A directory at the store's path: every append fails, and the
+        // store's identity (path + session id) stays fixed.
+        std::fs::create_dir(&store_path).unwrap();
+        let mut broken = crate::session_store::SessionFile::create("/tmp", None, 0);
+        let session_id = broken.session_id().to_string();
+        broken.set_path(store_path.clone());
+        let digest = AgentMessageDigest::new(
+            std::sync::Arc::new(std::sync::Mutex::new(SessionCore::test_core(
+                Some(broken),
+                "/tmp".to_string(),
+            ))),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        );
+        digest.configure_pin("digest").unwrap();
+        digest
+            .route_inbound_message(
+                "agentmsg_failed",
+                "must not silently digest",
+                &sibling_sender(),
+                Some("sibling"),
+            )
+            .expect_err("the directory-path store answered success");
+        // The durable truth appears at the same path and under the same
+        // session id (the post-write failure's row): a real session file
+        // with one unread inbox entry.
+        std::fs::remove_dir(&store_path).unwrap();
+        let inbox_row = json!({
+            "type": "custom",
+            "id": "crash-row",
+            "timestamp": "2026-01-01T00:00:03.000Z",
+            "customType": AGENT_MESSAGE_INBOX_ENTRY_CUSTOM_TYPE,
+            "data": {
+                "messageId": "agentmsg_failed",
+                "content": "must not silently digest",
+                "from": { "activeSessionId": "sender", "sessionName": "sender" },
+                "fromRelationship": "sibling",
+                "target": { "activeSessionId": "target", "sessionId": "target" },
+                "receivedAt": "2026-01-01T00:00:03.000Z",
+                "kind": "agent_message",
+            },
+        });
+        let header = json!({
+            "type": "session",
+            "version": 3,
+            "id": session_id,
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "cwd": "/tmp",
+        });
+        std::fs::write(&store_path, format!("{header}\n{inbox_row}\n")).unwrap();
+        let reopened = crate::session_store::SessionFile::open(&store_path).unwrap();
+        {
+            let mut core = digest
+                .core
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            core.store = Some(reopened);
+        }
+        // The next snapshot must show the durable row: a stale loaded key
+        // would answer the pre-append empty records.
+        let snapshot = digest.inbox_snapshot();
+        assert_eq!(
+            snapshot["total"],
+            json!(1),
+            "the failed append left the inbox stale: {snapshot}"
+        );
+        assert_eq!(snapshot["unread"], json!(1));
+        assert_eq!(
+            snapshot["entries"][0]["content"],
+            json!("must not silently digest")
         );
     }
 }

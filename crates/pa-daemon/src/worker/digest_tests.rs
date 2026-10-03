@@ -587,13 +587,9 @@ async fn session_replacement_resets_the_lane_and_counters() {
         let mut core = worker.core.lock().unwrap();
         core.agent_message_digest_mode = true;
     }
-    // The replacement's reset section (the navigation's store swap runs
-    // the lane reset in its own core hold, then the counters reset).
-    {
-        let mut core = worker.core.lock().unwrap();
-        AgentMessageDigest::reset_lane_state_locked(&mut core);
-    }
-    worker.agent_digest.reset_counters();
+    // The replacement's reset (the navigation's store swap runs inside
+    // the digest's one [counters -> core] hold).
+    worker.agent_digest.reset_for_replacement(|_| ());
     assert_eq!(
         worker.agent_digest.configure_pin("auto").unwrap()["digest"],
         json!(false)
@@ -601,4 +597,67 @@ async fn session_replacement_resets_the_lane_and_counters() {
     let receipt = deliver(&worker, "fresh session").await;
     assert_eq!(receipt["deliveryStatus"], "delivered");
     assert_eq!(worker.agent_digest.inbox_snapshot()["total"], json!(0));
+}
+/// A worker reload over a crashed predecessor's session file: the
+/// digested row reached the durable inbox, but the crash landed between
+/// the durable append and the notice's enqueue + checkpoint — the reload
+/// must reconcile the unread entries and re-arm the one-per-batch notice,
+/// so the backlog never sits silent with no later trigger to wake the
+/// session.
+#[tokio::test]
+async fn a_reloaded_worker_re_arms_the_notice_for_unread_inbox_entries() {
+    let dir =
+        std::env::temp_dir().join(format!("pa-worker-digest-reload-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let session_path = dir.join("reloaded-session.jsonl");
+    // The crashed predecessor's durable backlog: one unread inbox entry.
+    let mut store = crate::session_store::SessionFile::create("/tmp", None, 0);
+    store.set_path(session_path.clone());
+    store.rewrite().unwrap();
+    store
+        .persist_entry(
+            "custom",
+            json!({
+                "customType": crate::worker::digest::AGENT_MESSAGE_INBOX_ENTRY_CUSTOM_TYPE,
+                "data": {
+                    "messageId": "agentmsg_crashed",
+                    "content": "REPORT 481",
+                    "from": { "activeSessionId": "sender", "sessionName": "sender" },
+                    "fromRelationship": "sibling",
+                    "target": { "activeSessionId": "target", "sessionId": "target" },
+                    "receivedAt": "2026-01-01T00:00:00.000Z",
+                    "kind": "agent_message",
+                },
+            }),
+        )
+        .unwrap();
+    let worker = test_worker();
+    // The queue stays parked across the create so the re-armed notice's
+    // queued state is deterministic (the runner would otherwise consume
+    // the wake turn asynchronously).
+    {
+        let mut core = worker.core.lock().unwrap();
+        core.queued_input_suspended = true;
+    }
+    let created = worker
+        .dispatch(
+            "create",
+            &json!({ "sessionPath": session_path.to_string_lossy(), "cwd": "/tmp" }),
+        )
+        .await;
+    assert!(created.success, "create failed: {created:?}");
+    // The durable backlog reloaded...
+    let snapshot = worker.agent_digest.inbox_snapshot();
+    assert_eq!(snapshot["unread"], json!(1), "{snapshot}");
+    assert_eq!(
+        snapshot["entries"][0]["content"],
+        json!("REPORT 481"),
+        "{snapshot}"
+    );
+    // ...and its notice re-armed (the one-per-batch wake).
+    assert_eq!(
+        lane_custom_types(&worker.core, Lane::FollowUp),
+        vec!["agent_message_digest_notice"],
+        "the reload did not re-arm the digest notice"
+    );
 }

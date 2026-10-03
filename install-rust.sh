@@ -2190,7 +2190,10 @@ if [ -n "$probe_timed_out" ]; then
   rm -rf "$stage"
   die "the archive names ${VERSION} but its payload did not answer --version within 10s; refusing an unresponsive payload"
 fi
-reported_version="$(head -n 1 "$probe_out" 2>/dev/null)"
+# tr -d '' strips the trailing CR Git Bash text-mode redirection can
+# append (the lock-pid reader's precedent): a CR would make every exact
+# case arm miss and refuse a correctly named archive.
+reported_version="$(head -n 1 "$probe_out" 2>/dev/null | tr -d '')"
 probe_exit_status="$(cat "$probe_status" 2>/dev/null || true)"
 rm -f "$probe_out" "$probe_done" "$probe_pid_file" "$probe_status"
 if [ "$probe_exit_status" != "0" ]; then

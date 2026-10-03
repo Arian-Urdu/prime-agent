@@ -414,11 +414,37 @@ async fn local_mode_preflight(
     Err(UpdateFailure { message: refusal })
 }
 
+/// Flatten an install marker's ps1-era encodings to plain bytes: strip a
+/// leading UTF-8 or UTF-16 BOM, then drop the NULs (UTF-16's interleave;
+/// this script's own ASCII markers contain none). UTF-16BE text loses its
+/// byte pairing, but the marker content is ASCII, so both UTF-16 orders
+/// read back as the same ASCII bytes.
+fn normalize_marker_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let bytes = match bytes {
+        [0xEF, 0xBB, 0xBF, rest @ ..] | [0xFF, 0xFE, rest @ ..] | [0xFE, 0xFF, rest @ ..] => rest,
+        _ => bytes,
+    };
+    if bytes.contains(&0) {
+        std::borrow::Cow::Owned(
+            bytes
+                .iter()
+                .copied()
+                .filter(|byte| *byte != 0)
+                .collect::<Vec<u8>>(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(bytes)
+    }
+}
+
 /// The installed payload's version, read from the install marker's
-/// "version <v>" line.
+/// "version <v>" line — through the same encoding normalization as
+/// [`installed_channel`]: a ps1-written marker can be UTF-16 or
+/// BOM-prefixed, and the version line of an encoded marker must read too.
 fn installed_version(prefix: &Path) -> Option<String> {
-    let marker =
-        std::fs::read_to_string(prefix.join("share/prime-agent/.prime-agent-install")).ok()?;
+    let bytes = std::fs::read(prefix.join("share/prime-agent/.prime-agent-install")).ok()?;
+    let normalized = normalize_marker_bytes(&bytes).into_owned();
+    let marker = String::from_utf8_lossy(&normalized);
     let version = marker.lines().nth(1)?.strip_prefix("version ")?.trim();
     (!version.is_empty()).then(|| version.to_string())
 }
@@ -430,8 +456,16 @@ fn installed_version(prefix: &Path) -> Option<String> {
 /// the update then rides the fetched script's own default.
 #[must_use]
 pub fn installed_channel(prefix: &Path) -> Option<&'static str> {
-    let marker =
-        std::fs::read_to_string(prefix.join("share/prime-agent/.prime-agent-install")).ok()?;
+    // The marker read mirrors install-rust.sh's marker_text: install.ps1's
+    // Set-Content follows $PSDefaultParameterValues['*:Encoding'], so a
+    // ps1-published live marker can be UTF-16 (NUL-interleaved, and its
+    // BOM is not valid UTF-8, failing the whole read) or BOM-prefixed.
+    // Flattening the NULs and stripping a leading BOM keeps the exact
+    // prefix check working for this script's own ASCII writes and for the
+    // ps1-written ones alike (a plain marker passes through untouched).
+    let bytes = std::fs::read(prefix.join("share/prime-agent/.prime-agent-install")).ok()?;
+    let bytes = normalize_marker_bytes(&bytes);
+    let marker = String::from_utf8_lossy(&bytes);
     // The marker's first line must be the installer's OWN write shape —
     // "install-rust.sh channel <name>" — not merely any line that ends in
     // a channel claim: a foreign marker ("other installer channel beta")
@@ -723,6 +757,76 @@ mod tests {
         let message = no_build_message("windows", "aarch64");
         assert!(message.contains("windows aarch64"), "{message}");
         assert!(message.contains("x86_64-pc-windows-msvc"), "{message}");
+    }
+
+    /// The ps1-era marker encodings read back as their ASCII content: a
+    /// UTF-16 or BOM-prefixed live marker (install.ps1's Set-Content
+    /// followed $`PSDefaultParameterValues`) keeps the installer-ownership
+    /// gate working instead of sending a ps1-updated machine down the
+    /// managed path.
+    #[test]
+    fn installed_channel_reads_the_ps1_encoded_marker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let prefix = dir.path().join("prefix");
+        let payload = prefix.join("share/prime-agent");
+        std::fs::create_dir_all(&payload).unwrap();
+        let cases: [(&str, Vec<u8>, &str); 4] = [
+            (
+                "utf-16le",
+                {
+                    let text: Vec<u16> = "install-rust.sh channel beta\nversion 1\n"
+                        .encode_utf16()
+                        .collect();
+                    let mut bytes = vec![0xFF, 0xFE];
+                    for unit in &text {
+                        bytes.extend_from_slice(&unit.to_le_bytes());
+                    }
+                    bytes
+                },
+                "beta",
+            ),
+            (
+                "utf-8-bom",
+                {
+                    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+                    bytes.extend_from_slice(b"install-rust.sh channel stable\nversion 1\n");
+                    bytes
+                },
+                "stable",
+            ),
+            (
+                "utf-16be",
+                {
+                    let text: Vec<u16> = "install-rust.sh channel stable\nversion 1\n"
+                        .encode_utf16()
+                        .collect();
+                    let mut bytes = vec![0xFE, 0xFF];
+                    for unit in &text {
+                        bytes.extend_from_slice(&unit.to_be_bytes());
+                    }
+                    bytes
+                },
+                "stable",
+            ),
+            (
+                "ascii",
+                b"install-rust.sh channel stable\nversion 1\n".to_vec(),
+                "stable",
+            ),
+        ];
+        for (name, bytes, expected) in cases {
+            std::fs::write(payload.join(".prime-agent-install"), &bytes).unwrap();
+            assert_eq!(
+                installed_channel(&prefix),
+                Some(expected),
+                "{name}: the ps1-era encoding reads back as its ASCII channel"
+            );
+            assert_eq!(
+                installed_version(&prefix).as_deref(),
+                Some("1"),
+                "{name}: the version line of an encoded marker reads too"
+            );
+        }
     }
 
     /// The installed-marker channel read: a beta install's update must

@@ -542,10 +542,23 @@ impl Supervisor {
                         // window (TS `socket.setTimeout` resets on every
                         // socket write), so a slow-but-live reader is
                         // never cut mid-bundle while a stalled one parks
-                        // and is closed at the armed deadline.
-                        if write_deadline.is_some() {
-                            write_deadline =
-                                Some(tokio::time::Instant::now() + self.tcp_idle_timeout());
+                        // and is closed at the armed deadline. The fresh
+                        // window rides the ONE signal the expiry watchdog
+                        // arms - never a private copy: the watchdog
+                        // re-arms to the same instant the write path
+                        // honors, so a later stalled write is cut at the
+                        // window the expired arm committed, and a
+                        // slow-but-live bundle that crosses the original
+                        // armed window leaves no fired watchdog (no
+                        // leftover expiry signal to drop the live peer at
+                        // the next select).
+                        if let Some(deadline_tx) = tcp_deadline_tx.as_ref() {
+                            if tcp_authenticated {
+                                let renewed =
+                                    tokio::time::Instant::now() + self.tcp_idle_timeout();
+                                deadline_tx.send_replace(renewed);
+                                write_deadline = Some(renewed);
+                            }
                         }
                     }
                     if stop {
@@ -1677,5 +1690,186 @@ mod tests {
             "the cut must ride the pinned 300ms window, not another timeout (closed after {:?})",
             armed.elapsed()
         );
+    }
+
+    /// A bundle's per-write renewal must ride the ONE deadline signal the
+    /// expiry watchdog arms - a private `write_deadline` copy desyncs the
+    /// write path from the watchdog (the Bugbot "write deadline desyncs
+    /// from watchdog" round): the watchdog, still armed at the ORIGINAL
+    /// idle window, fired and exited for good while the bundle's writes
+    /// kept riding the local copy's renewals, so a later stalled write
+    /// outlived the window the expired arm committed and - the live-peer
+    /// harm - the leftover expiry signal dropped a slow-but-live peer at
+    /// the next select. This drives one saved-catalog [item, progress]
+    /// bundle (two writes in ONE dispatched arm body) over a paced drain
+    /// that keeps every write live while crossing the original armed
+    /// window, then pins that the connection keeps serving afterwards.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_slow_but_live_bundle_survives_crossing_the_armed_window() {
+        use pa_types::platform::transport::{AsyncReadHalf, AsyncWriteHalf};
+        use tokio::io::AsyncReadExt as _;
+
+        struct DuplexTransport(tokio::io::DuplexStream);
+        impl TransportStream for DuplexTransport {
+            fn split(self: Box<Self>) -> (Box<dyn AsyncReadHalf>, Box<dyn AsyncWriteHalf>) {
+                let (reader, writer) = tokio::io::split(self.0);
+                (Box::new(reader), Box::new(writer))
+            }
+        }
+
+        // Read one newline-terminated frame off the duplex, retaining any
+        // bytes read past the newline for the next frame (the daemon is
+        // the only writer, so a chunk cannot overrun into a frame that
+        // does not exist yet; the retention keeps the drain byte-exact).
+        async fn drain_frame(
+            stream: &mut tokio::io::DuplexStream,
+            carry: &mut Vec<u8>,
+        ) -> serde_json::Value {
+            loop {
+                if let Some(newline) = carry.iter().position(|byte| *byte == b'\n') {
+                    let mut frame: Vec<u8> = carry.drain(..=newline).collect();
+                    frame.pop();
+                    let text = String::from_utf8_lossy(&frame);
+                    return serde_json::from_str(&text)
+                        .unwrap_or_else(|error| panic!("a daemon frame is not JSON: {error}"));
+                }
+                let mut chunk = vec![0u8; 64 * 1024];
+                let read = stream
+                    .read(&mut chunk)
+                    .await
+                    .expect("the client pipe stayed readable");
+                assert!(
+                    read > 0,
+                    "the daemon closed the connection before the frame arrived"
+                );
+                carry.extend_from_slice(&chunk[..read]);
+            }
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let options = SupervisorOptions {
+            tcp_port: None,
+            tcp_bind_host: None,
+            remote_agent_mesh: None,
+            socket_path: dir.path().join("daemon.sock"),
+            agent_dir: dir.path().join("agent"),
+        };
+        let supervisor = Arc::new(Supervisor::new(options).expect("supervisor"));
+        supervisor.pin_tcp_idle_timeout_for_tests(Duration::from_millis(750));
+        // One valid saved session in its own scan dir: `list_saved_sessions`
+        // streams a per-file [item, progress] bundle - two writes in ONE
+        // dispatched arm body, the multi-write surface whose renewal must
+        // reach the watchdog.
+        let scan_dir = tempfile::TempDir::new().unwrap();
+        let mut session = crate::session_store::SessionFile::create("/tmp", None, 0);
+        session.append_session_info("slow-live-bundle");
+        session.set_path(
+            scan_dir
+                .path()
+                .join(crate::session_store::session_file_name(
+                    session.session_id(),
+                )),
+        );
+        session.rewrite().unwrap();
+        // A 64KB duplex pipe: every catalog frame (each embeds the echoed
+        // ~350KB command id) dwarfs it, so each of the bundle's two writes
+        // parks until the client drains.
+        let (server_side, mut client_side) = tokio::io::duplex(64 * 1024);
+        let connection = {
+            let supervisor = Arc::clone(&supervisor);
+            let stream: Box<dyn TransportStream> = Box::new(DuplexTransport(server_side));
+            tokio::spawn(async move {
+                supervisor
+                    .handle_client(
+                        stream,
+                        crate::supervisor::ClientTrust::Remote {
+                            auth_token: "token".to_string(),
+                        },
+                    )
+                    .await
+            })
+        };
+        let mut carry: Vec<u8> = Vec::new();
+        let hello = drain_frame(&mut client_side, &mut carry).await;
+        assert_eq!(hello["type"], "daemon_hello", "the greeting: {hello}");
+        // The paced-drain schedule (the idle window pinned to 750ms): the
+        // item frame drains at t=500ms - live, inside the original window -
+        // and the progress frame at t=1000ms - past the original 750ms
+        // armed instant, inside the window the item's completion renewed.
+        // Every write stays live; the bundle crosses the armed window.
+        let envelope = serde_json::json!({
+            "type": "command",
+            "id": "i".repeat(350 * 1024),
+            "protocol": {
+                "name": crate::protocol::DAEMON_PROTOCOL_NAME,
+                "version": crate::protocol::DAEMON_PROTOCOL_VERSION,
+            },
+            "command": {
+                "type": "list_saved_sessions",
+                "cwd": "/tmp",
+                "sessionDir": scan_dir.path().to_string_lossy(),
+            },
+            "auth": { "token": "token" },
+        });
+        client_side
+            .write_all((serde_json::to_string(&envelope).unwrap() + "\n").as_bytes())
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let item = drain_frame(&mut client_side, &mut carry).await;
+        assert_eq!(
+            item["type"], "session_list_item",
+            "the bundle's first write"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let progress = drain_frame(&mut client_side, &mut carry).await;
+        assert_eq!(
+            progress["type"], "session_list_progress",
+            "the bundle's second write"
+        );
+        // The bundle finished past the original armed window while every
+        // write stayed live: a desynced watchdog has already fired and
+        // left its expiry signal behind, so the harm lands HERE - the next
+        // select must not drop this live peer.
+        let completion = drain_frame(&mut client_side, &mut carry).await;
+        assert_eq!(
+            completion["type"], "session_list_progress",
+            "the scan's completion frame after the bundle"
+        );
+        assert_eq!(
+            completion["loaded"], 1,
+            "the completion frame reaches the scan's file total"
+        );
+        let response = drain_frame(&mut client_side, &mut carry).await;
+        assert_eq!(response["type"], "response", "the terminal response");
+        assert_eq!(response["success"], true, "the catalog answer: {response}");
+        // Liveness past the crossed window, the direct live-peer proof: a
+        // follow-up command round-trips on the SAME connection.
+        let follow_up = serde_json::json!({
+            "type": "command",
+            "id": "after-the-window",
+            "protocol": {
+                "name": crate::protocol::DAEMON_PROTOCOL_NAME,
+                "version": crate::protocol::DAEMON_PROTOCOL_VERSION,
+            },
+            "command": { "type": "list" },
+            "auth": { "token": "token" },
+        });
+        client_side
+            .write_all((serde_json::to_string(&follow_up).unwrap() + "\n").as_bytes())
+            .await
+            .expect("the connection stays writable for the follow-up command");
+        let after = drain_frame(&mut client_side, &mut carry).await;
+        assert_eq!(
+            after["type"], "response",
+            "a frame after the crossed window"
+        );
+        assert_eq!(
+            after["success"], true,
+            "a command answered after the crossed window: {after}"
+        );
+        connection.abort();
     }
 }

@@ -228,25 +228,24 @@ pub struct AgentTracesSettings {
     pub enabled: Option<bool>,
 }
 
+/// `factory` (the agent factory's opt-in gate): `factory.enabled` is
+/// unset/false by default, and the `/factory on` client command persists
+/// it. Both the daemon's `factory_activity` lane advertisement and the
+/// kernel's factory gate read the same shared settings key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FactorySettings {
+    pub enabled: Option<bool>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TelemetrySettings {
     pub enabled: Option<bool>,
     pub notice_shown: Option<bool>,
-    /// Self-hosted `PostHog` capture configuration. Nothing is compiled in;
-    /// an empty configuration resolves to the no-op sink.
-    pub posthog: Option<PostHogSettings>,
     /// Local JSONL mirror at `<agentDir>/telemetry.jsonl` (default on:
     /// user-observable transparency).
     pub local_mirror: Option<bool>,
-}
-
-/// Settings `telemetry.posthog`: endpoint + project capture key.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PostHogSettings {
-    pub endpoint: Option<String>,
-    pub api_key: Option<String>,
 }
 
 /// User-declared MCP server (settings `mcpServers` entry).
@@ -326,6 +325,7 @@ pub struct Settings {
     pub compaction: Option<CompactionSettings>,
     pub auto_refine: Option<AutoRefineSettings>,
     pub agent_traces: Option<AgentTracesSettings>,
+    pub factory: Option<FactorySettings>,
     pub telemetry: Option<TelemetrySettings>,
     pub branch_summary: Option<BranchSummarySettings>,
     pub retry: Option<RetrySettings>,

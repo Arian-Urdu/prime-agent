@@ -351,6 +351,7 @@ fn settings_sink_completes_a_provisioned_home_without_touching_the_choice() {
         created_at: std::time::Instant::now(),
         onboarding_id: uuid::Uuid::new_v4().to_string(),
         ready_emitted: std::sync::atomic::AtomicBool::new(false),
+        completion_reported: std::sync::atomic::AtomicBool::new(false),
         probe: StartupModelProbe {
             cwd: dir.path().to_path_buf(),
             agent_dir: agent_dir.clone(),
@@ -381,6 +382,58 @@ fn settings_sink_completes_a_provisioned_home_without_touching_the_choice() {
     );
 }
 
+/// A flow that ran but did not complete reports `onboarding completed`
+/// with the `aborted` outcome (TS `runStartupOnboarding`'s `finally`), and
+/// a completed flow never reports a second, aborted outcome. Telemetry is
+/// on for this test (the repo's `cargo test` env opts out).
+#[test]
+fn settings_sink_reports_an_aborted_flow_once() {
+    crate::mode::tests::with_clean_telemetry_env(|| {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(report_an_aborted_flow_once());
+    });
+}
+
+async fn report_an_aborted_flow_once() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    let sink = SettingsOnboardingSink {
+        cwd: dir.path().to_path_buf(),
+        agent_dir: agent_dir.clone(),
+        created_at: std::time::Instant::now(),
+        onboarding_id: uuid::Uuid::new_v4().to_string(),
+        ready_emitted: std::sync::atomic::AtomicBool::new(false),
+        completion_reported: std::sync::atomic::AtomicBool::new(false),
+        probe: StartupModelProbe {
+            cwd: dir.path().to_path_buf(),
+            agent_dir: agent_dir.clone(),
+            cli_provider: None,
+            cli_model: None,
+            models: None,
+            is_continuing: false,
+            api_key: None,
+        },
+    };
+    // The sink's own report resolves only once the event is delivered.
+    pa_tui::interactive::OnboardingSink::onboarding_incomplete(&sink, "aborted").await;
+    let mirror = std::fs::read_to_string(agent_dir.join("telemetry.jsonl")).unwrap();
+    let lines: Vec<&str> = mirror.lines().collect();
+    assert_eq!(lines.len(), 1);
+    let event: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(event["name"], "onboarding completed");
+    assert_eq!(event["properties"]["outcome"], "aborted");
+    assert_eq!(event["properties"]["execution_mode"], "interactive");
+
+    sink.completion_reported
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        sink.track_incomplete("aborted").is_none(),
+        "a reported completion never adds an aborted outcome"
+    );
+}
+
 /// A fresh home (no choice written) is the one home the question still
 /// mounts for — the opt-in moment: the flow's `Share` answer persists
 /// beside the completion flag, and both read back through the next
@@ -401,6 +454,7 @@ fn settings_sink_persists_the_fresh_home_answer_with_the_flag() {
         created_at: std::time::Instant::now(),
         onboarding_id: uuid::Uuid::new_v4().to_string(),
         ready_emitted: std::sync::atomic::AtomicBool::new(false),
+        completion_reported: std::sync::atomic::AtomicBool::new(false),
         probe: StartupModelProbe {
             cwd: dir.path().to_path_buf(),
             agent_dir: agent_dir.clone(),
@@ -849,4 +903,191 @@ fn a_fork_launch_never_opens_the_agents_view() {
         should_open_agents_view(&options, /*onboarding_pending*/ false, /*continue_view*/ true,),
         "a --continue with a saved candidate still opens the view"
     );
+}
+
+/// A sink whose `send_batch` hangs until the test releases it: the
+/// stand-in for the analytics POST's network round-trip (the same
+/// delivery contract the production sink carries, minus its own
+/// timeout — the point is that delivery takes longer than the paint).
+#[derive(Default)]
+struct GatedSink {
+    /// Send entry: `notify_one` when a batch reaches the sink; a
+    /// stored permit keeps the entry wait race-free in both orders.
+    entered_notify: tokio::sync::Notify,
+    /// The delivered batches' event names (delivery finished).
+    delivered: std::sync::Mutex<Vec<String>>,
+    /// The release flag the hanging send waits on.
+    released: std::sync::atomic::AtomicBool,
+    /// The hang gate's waker: `notify_waiters` on release, no
+    /// permits — a stale permit would unhang the sink before the
+    /// test releases it.
+    notify: tokio::sync::Notify,
+    /// Delivery completion: `notify_one` stores a permit when no
+    /// waiter is registered yet, so the completion future is
+    /// race-free in both orders and can be awaited directly.
+    delivered_notify: tokio::sync::Notify,
+}
+
+impl GatedSink {
+    fn release(&self) {
+        self.released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    fn delivered_names(&self) -> Vec<String> {
+        self.delivered.lock().expect("gate lock").clone()
+    }
+
+    /// The first send's entry future.
+    fn wait_until_entered(&self) -> impl std::future::Future<Output = ()> + '_ {
+        self.entered_notify.notified()
+    }
+
+    /// The first delivery's completion future.
+    fn wait_until_delivered(&self) -> impl std::future::Future<Output = ()> + '_ {
+        self.delivered_notify.notified()
+    }
+}
+
+impl pa_telemetry::TelemetrySink for GatedSink {
+    fn send_batch<'a>(
+        &'a self,
+        _install_id: &'a str,
+        events: Vec<pa_telemetry::TelemetryEvent>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = pa_telemetry::SinkOutcome> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.entered_notify.notify_one();
+            // Race-free wait, tokio's documented pattern: the waiter
+            // registers (or consumes a permit) BEFORE the flag check, so
+            // a release that fires between the check and the await is
+            // never lost — a naive `while !flag { notified().await }` can
+            // miss `notify_waiters` and hang.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            loop {
+                notified.as_mut().enable();
+                if self.released.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                notified.as_mut().await;
+                notified.set(self.notify.notified());
+            }
+            let mut delivered = self.delivered.lock().expect("gate lock");
+            for event in &events {
+                delivered.push(event.name.clone());
+            }
+            self.delivered_notify.notify_one();
+            pa_telemetry::SinkOutcome::Sent
+        })
+    }
+}
+
+/// The interactive startup flush is fire-and-forget from the paint
+/// path's perspective: the first frame must never await the tracked
+/// `startup` events' delivery. The gated sink stands in for the
+/// analytics POST's network round-trip: the flush hand-off must
+/// complete while delivery still hangs, and the released drain must
+/// still deliver the tracked events.
+#[test]
+fn the_startup_flush_never_blocks_the_first_frame() {
+    tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(startup_flush_never_blocks_the_first_frame());
+}
+
+async fn startup_flush_never_blocks_the_first_frame() {
+    let sink = std::sync::Arc::new(GatedSink::default());
+    let mut config = pa_telemetry::TelemetryClientConfig::new("install-1");
+    config.batch_size = 20;
+    config.flush_interval = std::time::Duration::from_mins(10);
+    config.sinks = vec![sink.clone() as std::sync::Arc<dyn pa_telemetry::TelemetrySink>];
+    let client = pa_telemetry::TelemetryClient::spawn(config).expect("startup client");
+
+    // The composition root's startup tracks: the event and the ui_ready
+    // stage on the one-shot client.
+    let mut properties = pa_telemetry::base_properties("interactive");
+    properties.set("duration_ms", serde_json::Value::from(1));
+    client.track("startup", properties);
+    pa_telemetry::AgentStartupStage {
+        stage: "ui_ready",
+        outcome: "completed",
+        duration_ms: Some(1),
+        startup_kind: Some("cold"),
+        timing_scope: Some("system_work"),
+    }
+    .track(&client);
+
+    // The paint path's contract, run as its own task so a regression
+    // back to a blocking flush reds the timeout instead of wedging the
+    // suite (an inner assert failure reds through the join error).
+    let hand_off = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::spawn(async move {
+            // The hand-off: while the sink still hangs, it must already
+            // be done — the first frame paints with delivery pending.
+            let flush = flush_startup_telemetry(client);
+            // The batch must have entered the sink before the boundary
+            // is meaningful: a release that beats the send's entry
+            // drains without ever hanging, and the hand-off below would
+            // pass vacuously. The entry deadline sits under the outer
+            // hand-off bound, so a sink that never starts reports
+            // here, not as a blocked paint path.
+            let entered = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                sink.wait_until_entered(),
+            )
+            .await;
+            assert!(
+                entered.is_ok(),
+                "the tracked startup batch entered the gated sink"
+            );
+            assert!(
+                sink.delivered_names().is_empty(),
+                "delivery was still pending when the paint path proceeded"
+            );
+
+            // The released drain still delivers the tracked startup
+            // events: completion is awaited on the sink's own notify,
+            // the timeout only bounds failure — no polling loop.
+            sink.release();
+            let delivered = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                sink.wait_until_delivered(),
+            )
+            .await;
+            assert!(
+                delivered.is_ok(),
+                "the released drain delivered the tracked startup events"
+            );
+            let names = sink.delivered_names();
+            assert!(
+                names.contains(&"startup".to_string()),
+                "the startup event delivered: {names:?}"
+            );
+            assert!(
+                names.contains(&"agent startup stage".to_string()),
+                "the ui_ready stage delivered: {names:?}"
+            );
+
+            // The quick-exit seam: the composition root joins this
+            // handle under the shared exit bound when a run ends inside
+            // the delivery window — the join settles with the drain, so
+            // the events never die with the runtime teardown.
+            let joined = tokio::time::timeout(std::time::Duration::from_millis(500), flush).await;
+            assert!(
+                matches!(joined, Ok(Ok(()))),
+                "the exit join settled once the drain delivered"
+            );
+        }),
+    )
+    .await;
+    match hand_off {
+        Ok(Ok(())) => {}
+        Ok(Err(joined)) => panic!("the first-paint contract task panicked: {joined}"),
+        Err(elapsed) => panic!(
+            "the flush hand-off completed while the sink still hung (the paint path never waits out delivery): {elapsed}"
+        ),
+    }
 }

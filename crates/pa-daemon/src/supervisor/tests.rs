@@ -1,5 +1,54 @@
 use super::*;
 
+/// The cargo test config sets `DO_NOT_TRACK=1`; the daemon's live
+/// recording gate reads it (env before settings). Tests that exercise
+/// gated daemon-event paths hold this guard while the three override
+/// vars are scrubbed, and restore them after. The env is process-wide,
+/// so these tests serialize through the crate-wide
+/// `test_support::TELEMETRY_ENV_MUTEX` (shared with `agent_engine`'s
+/// `telemetry_opt_in`) while they hold it.
+const TELEMETRY_ENV_VARS: [&str; 3] = ["DO_NOT_TRACK", "PI_OFFLINE", "PRIME_AGENT_TELEMETRY"];
+
+struct CleanTelemetryEnv {
+    saved: Vec<(&'static str, Option<String>)>,
+    _env_lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Default for CleanTelemetryEnv {
+    fn default() -> Self {
+        // Held first: the vars may not be touched while another env test
+        // runs.
+        let env_lock = crate::test_support::TELEMETRY_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let saved = TELEMETRY_ENV_VARS
+            .iter()
+            .map(|var| {
+                let value = std::env::var(var).ok();
+                std::env::remove_var(var);
+                (*var, value)
+            })
+            .collect();
+        Self {
+            saved,
+            _env_lock: env_lock,
+        }
+    }
+}
+
+impl Drop for CleanTelemetryEnv {
+    fn drop(&mut self) {
+        // The manual drop runs before the field drops: the restore lands
+        // while the env lock is still held.
+        for (var, value) in self.saved.drain(..) {
+            match value {
+                Some(value) => std::env::set_var(var, value),
+                None => std::env::remove_var(var),
+            }
+        }
+    }
+}
+
 /// The crash-path failure count: spawn-dies-fast churn accumulates to
 /// the give-up cap (the storm's counter could never grow while
 /// relaunch-spawns kept resetting it); a child that lived past the
@@ -947,6 +996,93 @@ async fn first_signal_drains_a_settling_turn_and_rejects_new_work() {
     pump.abort();
 }
 
+/// A turn-long client route rides TS's 24 h worker-request budget
+/// (`WORKER_REQUEST_TIMEOUT_MS`, daemon-supervisor.ts:204), not the
+/// invented ten-minute cap: a `prompt_and_wait` whose worker answers a
+/// virtual hour later still succeeds.
+#[tokio::test(start_paused = true)]
+async fn a_prompt_and_wait_route_outlives_the_old_ten_minute_cap() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let options = SupervisorOptions {
+        socket_path: dir.path().join("daemon.sock"),
+        agent_dir: dir.path().join("agent"),
+    };
+    let supervisor = Arc::new(Supervisor::new(options).expect("supervisor"));
+    let descriptor: DaemonWorkerDescriptor = serde_json::from_value(serde_json::json!({
+        "version": 2,
+        "workerId": "w-longroute",
+        "pid": 0,
+        "socketPath": "/tmp/none.sock",
+        "recoveryJournalPath": "/tmp/none.jsonl",
+        "supervisorSocketPath": "/tmp/none.sock",
+        "authenticationToken": "test",
+        "rootActiveSessionId": "w-longroute",
+        "createdAt": "t",
+        "updatedAt": "t",
+        "lifecycle": "ready",
+        "createCommand": {},
+        "consecutiveFailures": 0,
+    }))
+    .expect("descriptor");
+    let descriptor_dir = dir.path().join("descriptors");
+    std::fs::create_dir_all(&descriptor_dir).unwrap();
+    let resident = Arc::new(ResidentWorker::new(
+        "w-longroute".to_string(),
+        descriptor,
+        descriptor_dir.join("w-longroute.descriptor.json"),
+    ));
+    // The fake worker holds the turn for a virtual hour — past the old
+    // ten-minute cap, inside the 24 h worker-request budget.
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<WorkerRequest>(1);
+    *resident.cmd_tx.lock().await = Some(cmd_tx);
+    let pump_resident = Arc::clone(&resident);
+    tokio::spawn(async move {
+        let request = cmd_rx.recv().await.expect("the route lands the prompt");
+        tokio::time::sleep(Duration::from_hours(1)).await;
+        let reply = pump_resident
+            .pending
+            .lock()
+            .await
+            .remove(&request.request_id)
+            .expect("the routed prompt holds a reply slot");
+        let _ = reply.send(WorkerReply::Typed(crate::protocol::response_success(
+            None,
+            "prompt_and_wait",
+            None,
+        )));
+    });
+    supervisor.registry.insert(Arc::clone(&resident)).await;
+    resident.note_connection_live();
+    resident.note_session_ready();
+    let (targeted_tx, _targeted_rx) = tokio::sync::mpsc::channel::<Arc<Value>>(16);
+    let attached = subscribers::ClientSubscriptions::new("c".to_string(), targeted_tx);
+    let command: DaemonCommand = serde_json::from_value(serde_json::json!({
+        "type": "prompt_and_wait",
+        "activeSessionId": "w-longroute",
+        "message": "go",
+    }))
+    .expect("command");
+    let route = {
+        let supervisor = Arc::clone(&supervisor);
+        tokio::spawn(async move {
+            supervisor
+                .route_client_command(
+                    &command,
+                    "c",
+                    &attached,
+                    "p-1".to_string(),
+                    "prompt_and_wait".to_string(),
+                    None,
+                )
+                .await
+        })
+    };
+    let (lines, stop) = route.await.expect("the route task lives");
+    assert!(!stop);
+    let line = lines.first().expect("the route answers with one line");
+    assert_eq!(line["success"], json!(true));
+}
+
 /// Every signal that finds a shutdown already in flight is the force
 /// request: the drain's own second signal, a signal racing the
 /// shutdown command's gate, and a signal racing an update exit - the
@@ -1776,5 +1912,75 @@ async fn a_ledger_child_wake_joins_an_already_hosting_resident() {
         supervisor.registry.list().await.len(),
         before,
         "the ledger wake's reuse arm must not launch a second worker"
+    );
+}
+
+/// The daemon's exit sends the partial `daemon event` summary of the
+/// current window (the window is under an hour, so no count sent it yet).
+#[tokio::test]
+async fn the_exit_flush_sends_the_partial_daemon_event_summary() {
+    let _env = CleanTelemetryEnv::default();
+    let dir = tempfile::TempDir::new().unwrap();
+    let supervisor = Supervisor::new(SupervisorOptions {
+        socket_path: dir.path().join("daemon.sock"),
+        agent_dir: dir.path().join("agent"),
+    })
+    .expect("supervisor");
+    let mock = Arc::new(pa_telemetry::MockSink::new());
+    let mut config = pa_telemetry::TelemetryClientConfig::new("install-1");
+    config.sinks = vec![mock.clone() as Arc<dyn pa_telemetry::TelemetrySink>];
+    *supervisor.telemetry.lock().unwrap() =
+        Some(pa_telemetry::TelemetryClient::spawn(config).unwrap());
+    supervisor.note_daemon_event("attach", None);
+    supervisor.note_daemon_event("attach", None);
+    assert!(mock.events().is_empty(), "the window is still open");
+    supervisor.flush_telemetry_on_exit().await;
+    let events = mock.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].name, "daemon event");
+    assert_eq!(
+        events[0].properties.get("kind"),
+        Some(&Value::from("summary"))
+    );
+    assert_eq!(
+        events[0].properties.get("attach_count"),
+        Some(&Value::from(2))
+    );
+}
+
+/// The daemon's live gate counts only while telemetry is on: events
+/// that fire during a settings opt-out window never ride the summary
+/// after a re-enable. The counters skip while off (they are not
+/// severed), so the on-period count before the window still reports.
+#[tokio::test]
+async fn off_window_daemon_events_never_count_into_the_summary() {
+    let _env = CleanTelemetryEnv::default();
+    let dir = tempfile::TempDir::new().unwrap();
+    let agent_dir = dir.path().join("agent");
+    let mut settings = pa_core::settings::SettingsManager::create(dir.path(), &agent_dir);
+    settings.set_telemetry_enabled(false).unwrap();
+    let supervisor = Supervisor::new(SupervisorOptions {
+        socket_path: dir.path().join("daemon.sock"),
+        agent_dir: agent_dir.clone(),
+    })
+    .expect("supervisor");
+    let mock = Arc::new(pa_telemetry::MockSink::new());
+    let mut config = pa_telemetry::TelemetryClientConfig::new("install-1");
+    config.sinks = vec![mock.clone() as Arc<dyn pa_telemetry::TelemetrySink>];
+    *supervisor.telemetry.lock().unwrap() =
+        Some(pa_telemetry::TelemetryClient::spawn(config).unwrap());
+    // Off: the event skips, so nothing counts.
+    supervisor.note_daemon_event("attach", None);
+    settings.set_telemetry_enabled(true).unwrap();
+    // Back on: the event counts again.
+    supervisor.note_daemon_event("attach", None);
+    supervisor.flush_telemetry_on_exit().await;
+    let events = mock.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].name, "daemon event");
+    assert_eq!(
+        events[0].properties.get("attach_count"),
+        Some(&Value::from(1)),
+        "the off-window attach never counts"
     );
 }

@@ -105,6 +105,10 @@ impl SessionUi {
         let command = registry
             .get(resolved.name)
             .expect("resolved name is builtin");
+        // `agent command used` (TS `captureAgentCommandUsed`): one report
+        // per submitted builtin, client and session commands alike, by its
+        // canonical name, before the command runs.
+        self.track_command_used(resolved.name);
         match command.execution {
             SlashCommandExecution::Session => self.send_prompt(text, behavior, view),
             SlashCommandExecution::Client => {
@@ -190,7 +194,6 @@ impl SessionUi {
             // removed; a partial + Tab opens the picker filtered instead,
             // and a submitted argument is the usage error).
             "model" => {
-                self.track_command_used("model");
                 if !resolved.args.trim().is_empty() {
                     view.editor
                         .set_text(&format!("/{} {}", resolved.original_name, resolved.args));
@@ -206,7 +209,6 @@ impl SessionUi {
             // without reasoning reports the TS note, a missing argument
             // opens the picker, and a valid argument applies directly.
             "effort" => {
-                self.track_command_used("effort");
                 let Some(state) = self.connection_state(view).await else {
                     return Ok(());
                 };
@@ -259,7 +261,6 @@ impl SessionUi {
             // `/tree` (TS `showTreeSelector`): the session-tree navigator.
             "tree" => {
                 if resolved.args.is_empty() {
-                    self.track_command_used("tree");
                     self.track_feature_outcome("tree", "initiated", None);
                     self.open_tree_selector(view, None).await?;
                 } else {
@@ -270,7 +271,6 @@ impl SessionUi {
             // message into a new session.
             "fork" => {
                 if resolved.args.is_empty() {
-                    self.track_command_used("fork");
                     self.track_feature_outcome("fork", "initiated", None);
                     self.open_fork_selector(view).await?;
                 } else {
@@ -281,7 +281,6 @@ impl SessionUi {
             // the current position.
             "clone" => {
                 if resolved.args.is_empty() {
-                    self.track_command_used("clone");
                     self.track_feature_outcome("clone", "initiated", None);
                     self.handle_clone_command(view).await?;
                 } else {
@@ -294,7 +293,6 @@ impl SessionUi {
             // the usage error with the text kept in the editor.
             "copy" => {
                 if resolved.args.is_empty() {
-                    self.track_command_used("copy");
                     self.handle_copy_command(view).await?;
                 } else {
                     view.editor
@@ -308,7 +306,6 @@ impl SessionUi {
             // TS `OAuthSelectorComponent` the tab mounts).
             "login" => {
                 if resolved.args.is_empty() {
-                    self.track_command_used("login");
                     self.open_provider_auth(AuthSelectorKind::Login, view)
                         .await?;
                     self.track_feature_outcome("login", "initiated", None);
@@ -322,7 +319,6 @@ impl SessionUi {
             // selector; an empty store answers the TS status directly.
             "logout" => {
                 if resolved.args.is_empty() {
-                    self.track_command_used("logout");
                     self.open_provider_auth(AuthSelectorKind::Logout, view)
                         .await?;
                     self.track_feature_outcome("logout", "initiated", None);
@@ -336,7 +332,6 @@ impl SessionUi {
             // path parses like `/export`'s, then the confirm guards the
             // replacement.
             "import" => {
-                self.track_command_used("import");
                 let command_text = if resolved.args.is_empty() {
                     "/import".to_string()
                 } else {
@@ -349,7 +344,6 @@ impl SessionUi {
             // block, the settings writes, and the TS command shapes over
             // the upload subsystem this build has.
             "traces" => {
-                self.track_command_used("traces");
                 self.handle_traces_command(resolved, view).await?;
             }
             // `/nightly [on|off|status]` (TS `interactive-mode.ts`
@@ -357,7 +351,6 @@ impl SessionUi {
             // bare) and off/stable save the `updateChannel` setting that
             // `/update` and `prime-agent update` follow.
             "nightly" => {
-                self.track_command_used("nightly");
                 let arg = resolved.args.trim().to_lowercase();
                 if arg == "status" {
                     // The effective channel resolves through the
@@ -420,6 +413,138 @@ impl SessionUi {
                     view,
                 );
             }
+            // `/factory [on|off|status]`: the factory's opt-in gate (the
+            // operator's directive: the factory is disabled until the
+            // user turns it on). The toggle persists `factory.enabled` —
+            // the shared settings key the daemon's `factory_activity`
+            // advertisement and the kernel's factory gate read — so the
+            // factory surfaces on the next client start (the running
+            // connection keeps the advertisement its hello was built
+            // with).
+            "factory" => {
+                let arg = resolved.args.trim().to_lowercase();
+                match arg.as_str() {
+                    "on" => {
+                        let Some(settings) = &self.client_settings else {
+                            self.note("/factory is not available in this client yet", view);
+                            return Ok(());
+                        };
+                        if let Err(error) = settings.set_factory_enabled(true) {
+                            self.error_row(&format!("{error:#}"), view);
+                            return Ok(());
+                        }
+                        self.note(
+                            "The factory is enabled. Restart the client to surface the factory group (the factory page and the agent-side factory API follow the same gate).",
+                            view,
+                        );
+                    }
+                    "off" => {
+                        // The lifecycle guard (the review round's finding):
+                        // the kernel's control loop is not gated by the
+                        // setting, so `off` while runs are live would keep
+                        // admitting and collecting children while every
+                        // factory surface — the namespace, the activity
+                        // lane, and the page after the next client start —
+                        // refuses: a running factory loses its stop and
+                        // visibility path until the gate is enabled again.
+                        // The write refuses while the session's kernel
+                        // reports live runs, naming the count the dock
+                        // shows; the runs stop first (the page's stop
+                        // action or `rlm.factory.stop`). An unreadable
+                        // count fails closed on the lane-advertised client
+                        // (the only state where the guard matters): the
+                        // count's own failure classes — a timed-out or
+                        // malformed lane reply — cannot prove zero live
+                        // runs, and an unknown liveness must not open the
+                        // gate; the client retries once the lane answers.
+                        // The kernel-not-running refusal never reaches the
+                        // unreadable arm: the lane never builds a kernel
+                        // and the kernel owns its run registry in memory,
+                        // so that class reads as a definitive zero
+                        // (`live_factory_runs`), not an unknown liveness —
+                        // the off proceeds for a session with no kernel.
+                        // A client whose hello never advertised the lane
+                        // keeps the fail-open read: an older daemon has no
+                        // executor to protect, and a client started before
+                        // `/factory on` already sees the frozen hello the
+                        // settled surfaces rule describes.
+                        let lane_advertised = self.factory_activity_supported();
+                        match self.live_factory_runs().await {
+                            Some(live) if live > 0 => {
+                                let runs = if live == 1 { "run is" } else { "runs are" };
+                                let them = if live == 1 { "it" } else { "them" };
+                                self.error_row(
+                                    &format!(
+                                        "Cannot disable the factory while {live} {runs} still live — stop {them} first (the factory page's stop action or rlm.factory.stop), then /factory off."
+                                    ),
+                                    view,
+                                );
+                                return Ok(());
+                            }
+                            None if lane_advertised => {
+                                self.error_row(
+                                    "Cannot disable the factory: the live-run count could not be read from the factory lane — try /factory off again once it answers.",
+                                    view,
+                                );
+                                return Ok(());
+                            }
+                            Some(_) | None => {}
+                        }
+                        let Some(settings) = &self.client_settings else {
+                            self.note("/factory is not available in this client yet", view);
+                            return Ok(());
+                        };
+                        if let Err(error) = settings.set_factory_enabled(false) {
+                            self.error_row(&format!("{error:#}"), view);
+                            return Ok(());
+                        }
+                        self.note(
+                            "The factory is disabled. The factory group and page disappear on the next client start.",
+                            view,
+                        );
+                    }
+                    "" | "status" => {
+                        let Some(settings) = &self.client_settings else {
+                            self.note("/factory is not available in this client yet", view);
+                            return Ok(());
+                        };
+                        if settings.factory_enabled() {
+                            self.note(
+                                "The factory is enabled. Run /factory off to disable it.",
+                                view,
+                            );
+                        } else {
+                            self.note(
+                                "The factory is disabled (off by default). Run /factory on to enable it (takes effect on the next client start).",
+                                view,
+                            );
+                        }
+                    }
+                    _ => self.error_row("Usage: /factory [on|off|status]", view),
+                }
+            }
+            // `/telemetry [status|on|off]`: the report (on/off and why, the
+            // endpoint, the installation id), or the persisted switch the
+            // running telemetry clients re-read at their next send.
+            "telemetry" => {
+                let Some(settings) = &self.client_settings else {
+                    self.note("/telemetry is not available in this client yet", view);
+                    return Ok(());
+                };
+                let report = match resolved.args.trim().to_lowercase().as_str() {
+                    "" | "status" => Ok(settings.telemetry_status()),
+                    "on" => settings.set_telemetry_enabled(true),
+                    "off" => settings.set_telemetry_enabled(false),
+                    _ => {
+                        self.error_row("Usage: /telemetry [status|on|off]", view);
+                        return Ok(());
+                    }
+                };
+                match report {
+                    Ok(report) => self.note(&report, view),
+                    Err(error) => self.error_row(&format!("{error:#}"), view),
+                }
+            }
             // `/update` (the TS->Rust migration path): the confirm, then
             // the download+install runs OUT-OF-BAND (a background task —
             // the TUI stays mounted, the daemon keeps running, and the
@@ -431,7 +556,6 @@ impl SessionUi {
             // sessions and configuration (~/.prime/agent) are never
             // touched.
             "update" => {
-                self.track_command_used("update");
                 if !resolved.args.trim().is_empty() {
                     view.editor.set_text(text);
                     self.error_row("Usage: /update", view);
@@ -467,7 +591,6 @@ impl SessionUi {
             // surfaces), so the command opens that view; an argument
             // prefills its search field like TS's initial search.
             "plugins" => {
-                self.track_command_used("plugins");
                 self.open_mcp_view("/plugins", view, "").await?;
                 let search = resolved.args.trim();
                 if !search.is_empty() {
@@ -480,7 +603,6 @@ impl SessionUi {
             // the current branch; anything else (including no argument)
             // exports HTML.
             "export" => {
-                self.track_command_used("export");
                 self.handle_export_command(resolved, view).await?;
             }
             // TS `handleShareCommand`: an argument is the usage error (the
@@ -488,7 +610,6 @@ impl SessionUi {
             // temp file and uploads as a secret gist.
             "share" => {
                 if resolved.args.is_empty() {
-                    self.track_command_used("share");
                     self.handle_share_command(view).await?;
                 } else {
                     view.editor
@@ -503,7 +624,6 @@ impl SessionUi {
             // `keybindings.json` overrides show their keys. Client-side
             // rows only, never durable session entries.
             "hotkeys" => {
-                self.track_command_used("hotkeys");
                 if !resolved.args.is_empty() {
                     // TS keeps the text in the editor on the usage error.
                     view.editor
@@ -528,7 +648,6 @@ impl SessionUi {
             // read-only info panel (the operator's 2026-09-26
             // directive), not as transcript rows.
             "session" => {
-                self.track_command_used("session");
                 if !resolved.args.is_empty() {
                     view.editor.set_text(text);
                     self.error_row("Usage: /session", view);
@@ -574,7 +693,6 @@ impl SessionUi {
             // collapses to the highest-usage agents plus a summary row
             // and the expand hint, and `all` renders the whole tree.
             "context" => {
-                self.track_command_used("context");
                 let scope = match resolved.args.as_str() {
                     "" => info_commands::ContextTreeScope::Collapsed,
                     "all" => info_commands::ContextTreeScope::EveryAgent,
@@ -620,7 +738,6 @@ impl SessionUi {
             // scrollable read-only info panel (the operator's 2026-09-26
             // directive) instead of flooding the transcript.
             "system-prompt" => {
-                self.track_command_used("system-prompt");
                 if !resolved.args.is_empty() {
                     view.editor.set_text(text);
                     self.error_row("Usage: /system-prompt", view);
@@ -660,7 +777,6 @@ impl SessionUi {
             // it), rendered in the read-only info panel (the operator's
             // 2026-09-26 directive).
             "logs" => {
-                self.track_command_used("logs");
                 if !resolved.args.is_empty() {
                     view.editor.set_text(text);
                     self.error_row("Usage: /logs", view);
@@ -687,7 +803,6 @@ impl SessionUi {
             // panel (the operator's 2026-09-26 directive; the TS accent
             // `What's New` title is the panel's title).
             "changelog" => {
-                self.track_command_used("changelog");
                 if !resolved.args.is_empty() {
                     view.editor.set_text(text);
                     self.error_row("Usage: /changelog", view);
@@ -711,7 +826,6 @@ impl SessionUi {
                     self.error_row("Usage: /settings", view);
                     return Ok(());
                 }
-                self.track_command_used("settings");
                 self.open_settings_menu(view).await;
             }
             // `/btw` (TS `handleSideQuestion` via the submit ladder; `/side`
@@ -723,7 +837,6 @@ impl SessionUi {
                     self.note_as("Usage: /btw <question>", StatusKind::Warning, view);
                     return Ok(());
                 }
-                self.track_command_used("btw");
                 self.start_side_question(&resolved.args, view).await?;
             }
             // `/name` (TS `handleNameCommand`; `/rename` resolves to it):
@@ -731,7 +844,6 @@ impl SessionUi {
             // rename travels to the daemon (`set_session_name` persists
             // the `session_info` entry and broadcasts the change).
             "name" => {
-                self.track_command_used("name");
                 let name = resolved.args.trim();
                 if name.is_empty() {
                     match &self.session_name {
@@ -765,7 +877,6 @@ impl SessionUi {
             // tier on a fast-mode-eligible model; the state refresh after
             // the switch drives the status row.
             "fast" => {
-                self.track_command_used("fast");
                 if !resolved.args.is_empty() {
                     self.error_row("Usage: /fast", view);
                     return Ok(());
@@ -775,13 +886,11 @@ impl SessionUi {
             // `/tier [tier]` (TS `handleTierCommand`): show or set the
             // session service tier.
             "tier" => {
-                self.track_command_used("tier");
                 self.handle_tier_command(view, &resolved.args).await;
             }
             // `/rlm-max-depth` (TS `handleRlmMaxDepthCommand`): view or set
             // the per-chat recursive depth limit.
             "rlm-max-depth" => {
-                self.track_command_used("rlm-max-depth");
                 self.handle_rlm_max_depth_command(view, &resolved.args)
                     .await;
             }
@@ -789,7 +898,6 @@ impl SessionUi {
             // tok/sec readout for this session — the dim dock row with the
             // latest response's rate and the session average.
             "speed" => {
-                self.track_command_used("speed");
                 let arg = resolved.args.trim().to_lowercase();
                 if !arg.is_empty() && arg != "on" && arg != "off" {
                     self.error_row("Usage: /speed [on|off]", view);
@@ -813,7 +921,6 @@ impl SessionUi {
                     self.error_row("Usage: /reload", view);
                     return Ok(());
                 }
-                self.track_command_used("reload");
                 if self.turn_active || view.working.is_some() || self.work_in_flight() {
                     self.note_as(
                         "Wait for the current response to finish before reloading.",
@@ -844,7 +951,6 @@ impl SessionUi {
                     self.error_row("Usage: /heartbeats", view);
                     return Ok(());
                 }
-                self.track_command_used("heartbeats");
                 self.open_heartbeats_view(view);
             }
             other => {

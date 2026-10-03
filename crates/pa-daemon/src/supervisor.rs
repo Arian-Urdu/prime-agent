@@ -60,7 +60,7 @@ pub(crate) use clients::client_command_payload;
 
 // The routing consts and refusal string keep their crate::supervisor::* paths stable
 // (external callers: supervisor_parent_death, create_reuse, prompt_admission, update_restore).
-pub(crate) use routing::{LONG_ROUTE_TIMEOUT_MS, ROUTE_TIMEOUT_MS, WORKER_NOT_CONNECTED};
+pub(crate) use routing::{client_route_timeout, ROUTE_TIMEOUT_MS, WORKER_NOT_CONNECTED};
 
 // probe_worker_socket/worker_connect_deadline are called only by the supervision sibling
 // module and this facade's in-file tests (through the module's pub(super) fns); the
@@ -97,9 +97,9 @@ use crate::paths;
 use crate::prompt_admission::input_admission_id;
 use crate::protocol::{
     command_active_session_id, command_type_name, current_protocol_info,
-    default_server_capabilities, parse_supervisor_command_line, response_failure, response_line,
-    response_success, DaemonResponse, DaemonRuntimeIdentity, EnvelopeParseError,
-    TypedCreateRejection, DAEMON_APP_VERSION, DAEMON_SCHEMA_ID, DAEMON_SCHEMA_REVISION,
+    parse_supervisor_command_line, response_failure, response_line, response_success,
+    DaemonResponse, DaemonRuntimeIdentity, EnvelopeParseError, TypedCreateRejection,
+    DAEMON_APP_VERSION, DAEMON_SCHEMA_ID, DAEMON_SCHEMA_REVISION,
 };
 use crate::registry::{
     ResidentWorker, SessionRegistry, WorkerRegistration, WorkerReply, WorkerRequest,
@@ -153,6 +153,10 @@ pub struct Supervisor {
     /// Daemon-lifecycle telemetry (`daemon event` schema v1), resolved at
     /// run start (None = opted out); never blocks supervision paths.
     telemetry: std::sync::Mutex<Option<pa_telemetry::TelemetryClient>>,
+    /// The frequent supervision events (attach/detach, worker exits and
+    /// restarts, overloads, saved-session listings), counted and sent as
+    /// one `daemon event` summary per window instead of one event each.
+    daemon_event_counts: std::sync::Mutex<notes::DaemonEventCounts>,
     pub(crate) registry: SessionRegistry,
     /// Worker outbound frames, with their client routing. The payload is
     /// shared (`Arc`): every connected client's event arm receives every
@@ -311,6 +315,7 @@ impl Supervisor {
             session_bindings: crate::session_bindings::SessionBindingTable::new(),
             opening_files: std::sync::Mutex::new(std::collections::HashMap::new()),
             telemetry: std::sync::Mutex::new(None),
+            daemon_event_counts: std::sync::Mutex::default(),
             registry: SessionRegistry::new(),
             events,
             session_subscribers: subscribers::SessionSubscribers::new(),
@@ -357,17 +362,20 @@ impl Supervisor {
         // inherit the raised limit.
         let open_file_limit = pa_core::platform::process::raise_open_file_limit();
         // Daemon telemetry: same env/settings posture as the sessions
-        // (the supervisor is the `daemon` execution mode).
+        // (the supervisor is the `daemon` execution mode). Only an
+        // environment opt-out skips the client: a settings opt-out is the
+        // client's live switch, so `/telemetry on` resumes without a
+        // daemon restart.
         {
             let settings = pa_core::settings::SettingsManager::create(
                 std::env::current_dir().unwrap_or_default(),
                 &self.options.agent_dir,
             );
-            let disabled = match pa_telemetry::env_telemetry_override() {
-                Some(enabled) => !enabled,
-                None => !settings.get_telemetry_enabled(),
-            };
-            *self.telemetry.lock().unwrap() = (!disabled).then(|| {
+            let env_forced_off = matches!(
+                pa_core::session_engine::telemetry::telemetry_switch(&settings),
+                pa_core::session_engine::telemetry::TelemetrySwitch::Env { enabled: false, .. }
+            );
+            *self.telemetry.lock().unwrap() = (!env_forced_off).then(|| {
                 pa_core::session_engine::telemetry::build_client(&settings, &self.options.agent_dir)
             });
         }
@@ -518,6 +526,7 @@ impl Supervisor {
             &self.options.socket_path,
             self.bound_socket_identity.lock().unwrap().clone(),
         );
+        self.flush_telemetry_on_exit().await;
         Ok(())
     }
 }

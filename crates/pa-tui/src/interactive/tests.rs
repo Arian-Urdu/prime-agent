@@ -147,6 +147,15 @@ fn create_config_carries_the_requested_thinking_level() {
     assert_eq!(config["thinking"], "max");
 }
 
+/// The daemon worker stamps the client's mode on the session's telemetry
+/// (TS `executionMode: appMode`): interactive sessions report
+/// `interactive`, never the worker's own `daemon` context.
+#[test]
+fn create_config_names_the_interactive_execution_mode() {
+    let config = options(ModelSelection::default()).create_config();
+    assert_eq!(config["executionMode"], "interactive");
+}
+
 #[test]
 fn create_config_omits_thinking_when_no_flag_was_given() {
     let config = options(ModelSelection::default()).create_config();
@@ -164,6 +173,7 @@ fn create_config_binds_a_new_child_to_its_parent() {
         opts.create_config(),
         json!({
             "cwd": "/tmp",
+            "executionMode": "interactive",
             "parentSessionPath": "/x/p.jsonl",
             "rlmDepth": 2
         })
@@ -315,7 +325,9 @@ fn the_headless_settle_names_every_stuck_member() {
 /// The pre-attach placeholder (painted for a NEW chat before the attach
 /// lands) carries the zero dock the fresh session mounts: the landed
 /// frame keeps the placeholder's geometry, so the splash never reflows
-/// two rows when the session attaches.
+/// two rows when the session attaches. The factory group stays off the
+/// placeholder (the opt-in gate: the group mounts only after the
+/// daemon's hello advertises the `factory_activity` lane).
 #[test]
 fn the_startup_placeholder_carries_the_dock_a_fresh_session_mounts() {
     let mut view = AgentView::new(crate::theme::Theme::builtin(

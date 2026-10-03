@@ -182,6 +182,13 @@ impl ClientSettings for CliClientSettings {
         set_chat_detail
     );
     setting!(
+        factory_enabled,
+        set_factory_enabled,
+        get_factory_enabled,
+        set_factory_enabled,
+        bool
+    );
+    setting!(
         warnings_anthropic_extra_usage,
         set_warnings_anthropic_extra_usage,
         get_warnings_anthropic_extra_usage,
@@ -226,6 +233,33 @@ impl ClientSettings for CliClientSettings {
         pa_core::update::version::resolve_update_channel(version, preferred)
             .wire_name()
             .to_string()
+    }
+
+    fn telemetry_status(&self) -> String {
+        pa_core::session_engine::telemetry::telemetry_status_text(&self.manager(), &self.agent_dir)
+    }
+
+    fn set_telemetry_enabled(&self, enabled: bool) -> Result<String> {
+        pa_core::session_engine::telemetry::set_telemetry_enabled_text(
+            &mut self.manager(),
+            &self.agent_dir,
+            enabled,
+        )
+    }
+
+    fn telemetry_notice_due(&self) -> bool {
+        // TS agent-session-services: telemetry enabled, onboarding
+        // already shown (a first interactive launch belongs to the
+        // onboarding screen; the notice surfaces on the next launch),
+        // and the notice not yet shown.
+        let manager = self.manager();
+        pa_core::session_engine::telemetry::telemetry_switch(&manager).enabled()
+            && manager.get_onboarding_shown()
+            && !manager.get_telemetry_notice_shown()
+    }
+
+    fn set_telemetry_notice_shown(&self) -> Result<()> {
+        self.manager().set_telemetry_notice_shown(true)
     }
 }
 
@@ -282,5 +316,27 @@ mod tests {
         // ...and the /nightly on path's.
         settings.set_update_channel("nightly").expect("channel");
         assert_eq!(settings.update_channel().as_deref(), Some("nightly"));
+
+        // The factory's opt-in gate (`/factory on|off|status`): unset reads
+        // as disabled (the default off), and the write persists the exact
+        // nested-camelCase key the kernel's gate and the daemon's lane
+        // advertisement read -- over the same document, leaving the other
+        // keys alone.
+        assert!(!settings.factory_enabled());
+        settings.set_factory_enabled(true).expect("factory enabled");
+        assert!(settings.factory_enabled());
+        let content =
+            std::fs::read_to_string(agent_dir.join("settings.json")).expect("settings file");
+        let value: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        assert_eq!(value["factory"]["enabled"], true);
+        assert_eq!(value["theme"], "dark", "the write leaves the other keys");
+        settings
+            .set_factory_enabled(false)
+            .expect("factory disabled");
+        assert!(!settings.factory_enabled());
+        let content =
+            std::fs::read_to_string(agent_dir.join("settings.json")).expect("settings file");
+        let value: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        assert_eq!(value["factory"]["enabled"], false);
     }
 }

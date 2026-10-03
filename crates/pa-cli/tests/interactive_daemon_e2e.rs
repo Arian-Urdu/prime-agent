@@ -1575,9 +1575,13 @@ async fn tui_dispatches_slash_commands_menu_and_suggestions() {
             // background `get_commands` response swaps the provider and
             // closes an open dropdown when it lands (TS
             // `setAutocompleteProvider` parity), so this pass may lose its
-            // menu to the swap. The `skill:goal` row renders only in a
-            // post-landing menu frame, and the fetch is bounded (10s), so
-            // the barrier pops at (never past) the landing.
+            // menu to the swap. Two cases keep the asserted passes below
+            // behind the landing: with the menu still open, the
+            // `skill:goal` row renders in a post-landing frame and the
+            // barrier pops at the landing; a landing that closes the menu
+            // without re-parking never renders the needle, and the 15s
+            // bound — past the 10s fetch deadline — is what waits out
+            // that case.
             pa_tui::interactive::HeadlessStep::Type("/".to_string()),
             pa_tui::interactive::HeadlessStep::SettleIdle,
             pa_tui::interactive::HeadlessStep::Type("goa".to_string()),

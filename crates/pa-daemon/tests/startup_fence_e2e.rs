@@ -265,7 +265,10 @@ fn an_active_shutdown_admission_refuses_a_successor_boot() {
     let socket = root.path().join("daemon.sock");
     let (pid, start_id) = this_process_identity();
     let admission = admission_path(&registry);
-    write_record(&admission, &admission_record(pid, &start_id, 5_000));
+    // A 60s lease: the refusal must not race the record's own expiry under
+    // a loaded machine; the TS active-window shape allows any future
+    // expiry (a real coordinator renews at 5s).
+    write_record(&admission, &admission_record(pid, &start_id, 60_000));
 
     let mut successor = spawn_supervisor(&socket, &agent_dir, &registry);
     // An active admission (live holder, unexpired lease) means a stop

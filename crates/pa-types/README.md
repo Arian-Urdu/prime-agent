@@ -19,8 +19,8 @@ Daemon wire mechanics shared by the serving side (pa-daemon) and clients (pa-tui
   CLI suggestion help) plus its pure parse/suggestion helpers — the TS
   product keeps the same single table in core and imports it from its TUI.
   It also carries the `/decision-api` vocabulary every surface reads: the
-  `decision_api_status` row type and `DecisionApiProvider` (Jev, Clef, Clef
-  Flash: command id, selector label, modality, auth-store credential).
+  `decision_api_status` row type and `DecisionApiProvider` (Jev, Clef:
+  command id, selector label, modality, auth-store credential).
 - `incident`: the daemon incident classifier shared by the incident CLI
   (pa-cli's `prime-agent incident`, TS `src/cli/incident.ts`) and the
   agents-view incident notice (pa-tui's `incident_notices`, TS

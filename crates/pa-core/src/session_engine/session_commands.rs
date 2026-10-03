@@ -466,7 +466,7 @@ async fn execute_decision_api(
         "off" => None,
         arg => Some(
             DecisionApiProvider::from_id(arg)
-                .ok_or_else(|| "Usage: /decision-api [jev|clef|clef-flash|off]".to_string())?,
+                .ok_or_else(|| "Usage: /decision-api [jev|clef|off]".to_string())?,
         ),
     };
     if let Some(provider) = provider {
@@ -681,7 +681,7 @@ mod tests {
         };
         assert_eq!(
             run("").await.error.as_deref(),
-            Some("Usage: /decision-api [jev|clef|clef-flash|off]")
+            Some("Usage: /decision-api [jev|clef|off]")
         );
         assert_eq!(
             run("jev").await.error.as_deref(),

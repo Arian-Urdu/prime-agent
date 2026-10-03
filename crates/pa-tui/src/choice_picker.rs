@@ -206,17 +206,15 @@ mod tests {
         for label in [
             "Jev from TypeSafe (text-only)",
             "Clef from Cloudflare (vision-capable)",
-            "Clef Flash from Cloudflare (vision-capable)",
         ] {
             assert!(text.iter().any(|row| row.contains(label)), "{label}");
         }
-        picker.handle_key("down", &kb());
         picker.handle_key("down", &kb());
         assert_eq!(
             picker.handle_key("enter", &kb()),
             ChoicePickerAction::Apply {
                 purpose: ChoicePurpose::DecisionApi,
-                key: "clef-flash".to_string()
+                key: "clef".to_string()
             }
         );
     }

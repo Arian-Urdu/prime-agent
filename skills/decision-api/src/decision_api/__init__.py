@@ -1,7 +1,7 @@
 """Prime Agent decision-api skill: an experimental System 1 / System 2 loop.
 
 System 1 is the session's decision model, picked by the user with
-/decision-api: TypeSafe's Jev (text-only), or Cloudflare's Clef or Clef Flash
+/decision-api: TypeSafe's Jev (text-only) or Cloudflare's Clef
 (vision-capable). One call per observation picks the next action. System 2 is
 a Prime Agent subagent that
 reads the newest observation plus System 1's action history and writes the
@@ -23,7 +23,7 @@ from typing import Any, Callable
 import agent_message
 import rlm
 
-# None uses the model the user picked (jev-latest, clef, or clef-flash).
+# None uses the picked provider's model (jev-latest or clef).
 DEFAULT_MODEL: str | None = None
 DEFAULT_INSTRUCTIONS = "Choose the next action that best advances the goal given the observation."
 DEFAULT_SYSTEM2_PROMPT = """You are System 2 in a real-time control loop.
@@ -95,7 +95,7 @@ async def _ask_system1(
 ) -> dict[str, Any]:
     """One System 1 decision for an arbitrary `state`. The host calls the
     session's provider with the key the user saved via /decision-api; the key
-    never enters this kernel. `images` (Clef models only, at most 4) are data
+    never enters this kernel. `images` (Clef only, at most 4) are data
     URL strings (`data:image/png;base64,...`).
     Returns `action`, `confidence`, `probabilities`, `latency_ms`, and `model`."""
     question = {"type": "choice", "instructions": instructions, "criteria": actions}
@@ -182,7 +182,7 @@ class Loop:
     - `objective`: the overall task, sent to System 2 with every message.
     - `state`: `(observation, goal, history) -> Any`, what System 1 sees.
     - `images`: None, or `(observation) -> list` of data URL strings System 1 sees
-      next to `state` (Clef models only; see `decide`).
+      next to `state` (Clef only; see `decide`).
     - `instructions`, `model`: System 1's question instructions and model
       (None picks the provider's default).
     - `system1`: None for the session's decision model, or `(observation,

@@ -1,6 +1,6 @@
 ---
 name: decision-api
-description: Experimental System 1 / System 2 loop for real-time, low-latency tasks. System 1 is a decision model (TypeSafe's text-only Jev, or Cloudflare's vision-capable Clef or Clef Flash) choosing every action from observations; the optional System 2 is a subagent for slower, longer-horizon goals. You design, measure, and optimize the whole loop. Requires /decision-api.
+description: Experimental System 1 / System 2 loop for real-time, low-latency tasks. System 1 is a decision model (TypeSafe's text-only Jev or Cloudflare's vision-capable Clef) choosing every action from observations; the optional System 2 is a subagent for slower, longer-horizon goals. You design, measure, and optimize the whole loop. Requires /decision-api.
 ---
 
 # Decision API (System 1 / System 2)
@@ -9,11 +9,10 @@ Use this for real-time control tasks where every step is one choice from an
 action set (a game, a device, a UI) and a full agent turn per step is too slow.
 
 - **System 1** is the decision model the user picked with `/decision-api`:
-  TypeSafe's Jev (text-only), or Cloudflare's Clef or the faster Clef Flash
-  (both vision-capable). Each
+  TypeSafe's Jev (text-only) or Cloudflare's Clef (vision-capable). Each
   observation becomes one call that returns the chosen action and its
   confidence. It is an API call, not a subagent: it knows only what one
-  request carries (`state`, `images` with the Clef models, `instructions`, the action
+  request carries (`state`, `images` with Clef, `instructions`, the action
   descriptions), so that is how you tune it. The session's status note says
   which model is active; `loop.status()["system1_model"]` reports it too.
 - **System 2** (optional, on by default) is one subagent (`rlm.spawn`, your
@@ -25,7 +24,7 @@ action set (a game, a device, a UI) and a full agent turn per step is too slow.
 ## Your role: optimize the whole loop
 
 You own the loop's design and performance:
-- what System 1 sees (`state`, and `images` with the Clef models);
+- what System 1 sees (`state`, and `images` with Clef);
 - how its question reads (`instructions` and the action descriptions);
 - its `model`, `history_size`, and `tick`;
 - whether System 2 runs at all, and how.
@@ -65,16 +64,15 @@ writes (see `loop.errors`).
 ## Setup
 
 The Decision API is off by default and switched per session: the user runs
-`/decision-api` and picks Jev from TypeSafe (text-only), Clef from Cloudflare,
-or Clef Flash from Cloudflare (both vision-capable), pasting that provider's
-API key the first time, and `/decision-api off` turns it off. Keys stay in Prime Agent's auth store
+`/decision-api` and picks Jev from TypeSafe (text-only) or Clef from
+Cloudflare (vision-capable), pasting that provider's API key the first time,
+and `/decision-api off` turns it off. Keys stay in Prime Agent's auth store
 and the host makes every provider call. If a call reports that the Decision
 API is off, or you need images while Jev is active, ask the user to run
 `/decision-api`. Do not ask for keys yourself.
 
-Models: `loop.model = None` (default) uses the model the user picked
-(`jev-latest`, `clef`, or `clef-flash`). With either Clef pick you may set
-`"clef"` or `"clef-flash"` (faster, somewhat less accurate) to compare them.
+Models: `loop.model = None` (default) uses the picked provider's model
+(`jev-latest` or `clef`); with Jev you may set another Jev model.
 
 ## Usage
 
@@ -98,9 +96,9 @@ Every attribute is read again each step, so assignments take effect live:
 
 ```python
 loop.actions["fire"] = "Fire when an enemy is straight ahead"   # or a function (observation) -> dict
-loop.instructions = "..."; loop.model = "clef-flash"; loop.tick = 0.2
+loop.instructions = "..."; loop.tick = 0.2
 loop.state = lambda observation, goal, history: {...}           # exactly what System 1 sees
-loop.images = lambda observation: [png_data_url]                # Clef models only: up to 4 images per step
+loop.images = lambda observation: [png_data_url]                # Clef only: up to 4 images per step
 loop.on_error = "skip"            # "stop" (default), "skip", or (error, observation) -> action
 loop.on_step = lambda record, observation: ...                  # log or render; return "stop" to end
 loop.objective = "..."            # System 2 sees it in its next message
@@ -126,7 +124,7 @@ For a single System 1 decision, `await decision_api.decide(observation,
 actions, goal="...", images=None)` returns `action`, `confidence`,
 `probabilities`, `latency_ms`, and `model`.
 
-Images (Clef and Clef Flash only): at most 4 per decision, each a data URL
+Images (Clef only): at most 4 per decision, each a data URL
 string such as `f"data:image/png;base64,{base64.b64encode(png_bytes).decode()}"`
 (not bytes, paths, or dicts); PNG, JPEG, or WebP, up to 4 MiB and 16
 megapixels each and 8 MiB in total. Small, cropped images keep latency low; degenerate ones (a 1x1 pixel)

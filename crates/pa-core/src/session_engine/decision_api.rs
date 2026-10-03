@@ -32,9 +32,6 @@ const SYSTEMONE_URL: &str = "https://api.typesafe.ai/v1/systemone";
 const JEV_DEFAULT_MODEL: &str = "jev-latest";
 const CLOUDFLARE_API: &str = "https://api.cloudflare.com/client/v4";
 const CLEF_MODEL: &str = "clef";
-const CLEF_FLASH_MODEL: &str = "clef-flash";
-/// Each Clef model runs at its own `@cf/cloudflare/<model>` endpoint.
-const CLEF_MODELS: [&str; 2] = [CLEF_MODEL, CLEF_FLASH_MODEL];
 /// Picks the Cloudflare account when the token can reach more than one.
 const CLOUDFLARE_ACCOUNT_ENV: &str = "CLOUDFLARE_ACCOUNT_ID";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -115,9 +112,7 @@ pub(crate) fn status_note(provider: Option<DecisionApiProvider>) -> String {
     };
     let images = match provider {
         DecisionApiProvider::Jev => "It is text-only: decisions cannot carry images.",
-        DecisionApiProvider::Clef | DecisionApiProvider::ClefFlash => {
-            "It is vision-capable: decisions can carry up to 4 images."
-        }
+        DecisionApiProvider::Clef => "It is vision-capable: decisions can carry up to 4 images.",
     };
     format!(
         "[decision-api: {id}] The user enabled the Decision API for this session with {label}: \
@@ -253,28 +248,24 @@ pub(crate) fn register_decision_api_handler(
                 } else if provider == DecisionApiProvider::Jev {
                     bail!(
                         "{} from {vendor} is text-only, so decisions cannot carry images. Drop \
-                         the images, or ask the user to run /decision-api and pick Clef or Clef \
-                         Flash, which are vision-capable.",
+                         the images, or ask the user to run /decision-api and pick Clef, which \
+                         is vision-capable.",
                         provider.model()
                     );
                 }
                 let default_model = match provider {
                     DecisionApiProvider::Jev => JEV_DEFAULT_MODEL,
                     DecisionApiProvider::Clef => CLEF_MODEL,
-                    DecisionApiProvider::ClefFlash => CLEF_FLASH_MODEL,
                 };
                 let model = match request.get("model") {
                     None | Some(Value::Null) => default_model.to_string(),
                     Some(Value::String(model)) => model.clone(),
                     Some(other) => bail!("The decision model must be a string, not {other}."),
                 };
-                let is_clef_model = CLEF_MODELS.contains(&model.as_str());
-                if (provider == DecisionApiProvider::Jev) == is_clef_model {
+                if (provider == DecisionApiProvider::Clef) != (model == CLEF_MODEL) {
                     let served = match provider {
-                        DecisionApiProvider::Jev => "Jev models".to_string(),
-                        DecisionApiProvider::Clef | DecisionApiProvider::ClefFlash => {
-                            CLEF_MODELS.join(" and ")
-                        }
+                        DecisionApiProvider::Jev => "Jev models",
+                        DecisionApiProvider::Clef => CLEF_MODEL,
                     };
                     bail!(
                         "{} from {vendor} serves {served}, not {model}. Leave the model unset to \
@@ -298,7 +289,7 @@ pub(crate) fn register_decision_api_handler(
                         )
                         .await
                     }
-                    DecisionApiProvider::Clef | DecisionApiProvider::ClefFlash => {
+                    DecisionApiProvider::Clef => {
                         // `CLOUDFLARE_ACCOUNT_ID`, else the single account the
                         // token can reach (looked up once per key).
                         let mut cached = clef_account.lock().await;
@@ -345,7 +336,7 @@ pub(crate) fn register_decision_api_handler(
                         };
                         drop(cached);
                         let url = format!(
-                            "{CLOUDFLARE_API}/accounts/{account}/ai/run/@cf/cloudflare/{model}"
+                            "{CLOUDFLARE_API}/accounts/{account}/ai/run/@cf/cloudflare/{CLEF_MODEL}"
                         );
                         cloudflare_result(
                             send_json(client.post(url).bearer_auth(key).json(&request), vendor)
@@ -400,14 +391,14 @@ mod tests {
         assert_eq!(
             error(with_image.clone()).await,
             "Jev from TypeSafe is text-only, so decisions cannot carry images. Drop \
-             the images, or ask the user to run /decision-api and pick Clef or Clef Flash, \
-             which are vision-capable."
+             the images, or ask the user to run /decision-api and pick Clef, which is \
+             vision-capable."
         );
         let with_model =
             |model: &str| serde_json::json!({ "request": { "state": {}, "model": model } });
         assert_eq!(
-            error(with_model("clef-flash")).await,
-            "Jev from TypeSafe serves Jev models, not clef-flash. Leave the model unset to use \
+            error(with_model("clef")).await,
+            "Jev from TypeSafe serves Jev models, not clef. Leave the model unset to use \
              jev-latest, or ask the user to run /decision-api and pick another model."
         );
         assert_eq!(
@@ -415,12 +406,11 @@ mod tests {
             "No TypeSafe API key is stored. Ask the user to run /decision-api and paste their \
              TypeSafe API key."
         );
-        switch.replace(Some(DecisionApiProvider::ClefFlash));
+        switch.replace(Some(DecisionApiProvider::Clef));
         assert_eq!(
             error(with_model("jev-latest")).await,
-            "Clef Flash from Cloudflare serves clef and clef-flash, not jev-latest. Leave the \
-             model unset to use clef-flash, or ask the user to run /decision-api and pick \
-             another model."
+            "Clef from Cloudflare serves clef, not jev-latest. Leave the model unset to use \
+             clef, or ask the user to run /decision-api and pick another model."
         );
         assert_eq!(
             error(with_image).await,

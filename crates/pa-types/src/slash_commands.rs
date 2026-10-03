@@ -28,11 +28,10 @@ pub const DECISION_API_STATUS_CUSTOM_TYPE: &str = "decision_api_status";
 pub enum DecisionApiProvider {
     Jev,
     Clef,
-    ClefFlash,
 }
 
 impl DecisionApiProvider {
-    pub const ALL: [Self; 3] = [Self::Jev, Self::Clef, Self::ClefFlash];
+    pub const ALL: [Self; 2] = [Self::Jev, Self::Clef];
 
     #[must_use]
     pub fn from_id(id: &str) -> Option<Self> {
@@ -44,7 +43,6 @@ impl DecisionApiProvider {
         match self {
             Self::Jev => "jev",
             Self::Clef => "clef",
-            Self::ClefFlash => "clef-flash",
         }
     }
 
@@ -53,7 +51,6 @@ impl DecisionApiProvider {
         match self {
             Self::Jev => "Jev",
             Self::Clef => "Clef",
-            Self::ClefFlash => "Clef Flash",
         }
     }
 
@@ -61,7 +58,7 @@ impl DecisionApiProvider {
     pub const fn vendor(self) -> &'static str {
         match self {
             Self::Jev => "TypeSafe",
-            Self::Clef | Self::ClefFlash => "Cloudflare",
+            Self::Clef => "Cloudflare",
         }
     }
 
@@ -69,7 +66,7 @@ impl DecisionApiProvider {
     pub const fn modality(self) -> &'static str {
         match self {
             Self::Jev => "text-only",
-            Self::Clef | Self::ClefFlash => "vision-capable",
+            Self::Clef => "vision-capable",
         }
     }
 
@@ -77,7 +74,7 @@ impl DecisionApiProvider {
     pub const fn credential(self) -> &'static str {
         match self {
             Self::Jev => "typesafe",
-            Self::Clef | Self::ClefFlash => "cloudflare",
+            Self::Clef => "cloudflare",
         }
     }
 
@@ -162,7 +159,7 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: &[BuiltinSlashCommand] = &[
     BuiltinSlashCommand { name: "factory", description: "Show or set the agent factory opt-in gate (off by default)", execution: SlashCommandExecution::Client, argument_hint: Some("[on|off|status]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "resume", description: "Open the agents view, or resume a session by id or path", execution: SlashCommandExecution::Client, argument_hint: Some("[id|path]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "reload", description: "Reload keybindings, skills, prompts, and themes", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
-    BuiltinSlashCommand { name: "decision-api", description: "Choose this session's Decision API model (Jev, Clef, or Clef Flash), or turn it off", execution: SlashCommandExecution::Session, argument_hint: Some("[jev|clef|clef-flash|off]"), aliases: &[], takes_argument: true },
+    BuiltinSlashCommand { name: "decision-api", description: "Choose this session's Decision API model (Jev or Clef), or turn it off", execution: SlashCommandExecution::Session, argument_hint: Some("[jev|clef|off]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "speed", description: "Toggle footer readout of model output tok/sec (latest response and session average)", execution: SlashCommandExecution::Client, argument_hint: Some("[on|off]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "quit", description: "Quit Prime Agent", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
 ];

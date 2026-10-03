@@ -299,6 +299,16 @@ pub async fn run_bundled_installer(
             .arg("--")
             .args(args)
             .stdin(std::process::Stdio::from(file));
+        // THE PROCESS-CONTROL WALL (the in-house detached-spawn wrapper:
+        // CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW,
+        // the product's own detached-survives-parent mapping): a console-
+        // attached child dies with the caller's terminal close (the
+        // CTRL_CLOSE broadcast) — mid-publish, exactly when the handoff
+        // exists to let it finish — and Ctrl+C at the caller's terminal
+        // must not reach the installer either. The inherited stdio
+        // handles keep the installer's own steps printing to the
+        // caller's window for as long as that window lives.
+        crate::platform::process::set_new_process_group(command.as_std_mut());
         let spawned = command.spawn();
         let _ = std::fs::remove_file(&script);
         spawned.map_err(|error| UpdateFailure {

@@ -64,9 +64,17 @@ fn tmux_output(args: &[&str]) -> Option<String> {
         .stdout(Stdio::piped())
         .spawn()
         .ok()?;
-    // Drain the pipe from its own thread (the pipe_to writer-thread
-    // shape): a probe that writes past the pipe buffer blocks on the
-    // write, and a child blocked there never exits for the wait below.
+    probe_output(&mut child)
+}
+
+/// One bounded probe's output, or `None` when the child fails, misses the
+/// deadline, or writes no parsable stdout: the pipe drains from its own
+/// thread for the whole life of the child (the pipe_to writer-thread
+/// shape), so a probe that writes past the pipe buffer cannot block the
+/// child on its write — a blocked child never exits for the wait, and
+/// the deadline then turns a drain bug into a five-second stall plus a
+/// wrong "blocked" report.
+fn probe_output(child: &mut std::process::Child) -> Option<String> {
     let stdout = child.stdout.take();
     let reader = std::thread::spawn(move || {
         let mut output = String::new();
@@ -431,6 +439,24 @@ mod tests {
             }
             OscSink::Stdout => panic!("the buffer sink captured nothing"),
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_probe_that_fills_the_pipe_still_drains_and_exits() {
+        use std::process::{Command, Stdio};
+        // The payload overruns any platform's pipe buffer: the drain runs
+        // while the child is alive, or the child blocks on its write and
+        // the probe misses the deadline.
+        let mut child = Command::new("sh")
+            .args(["-c", "head -c 262144 /dev/zero | tr '\\0' x"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("sh spawns");
+        let output = probe_output(&mut child).expect("the probe drains the full pipe");
+        assert_eq!(output.len(), 262_144);
     }
 
     #[test]

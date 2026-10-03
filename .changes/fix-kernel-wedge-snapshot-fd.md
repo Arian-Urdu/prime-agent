@@ -1,0 +1,1 @@
+- Session resume no longer wedges when the saved state held a `bash()` handle: snapshots skip live process handles, whose restore reopened a stale fd number and killed the restored kernel's event loop. A kernel that drops a protocol frame now logs it to kernel-stderr.log instead of failing silently.

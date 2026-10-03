@@ -655,6 +655,62 @@ class ReplTest(unittest.TestCase):
             self.assertEqual(one(events, "result")["text"], "42")
             self.assertEqual(fresh.shutdown(), 0)
 
+    def assert_loop_wakeup_alive(self, repl: ReplProcess) -> None:
+        """call_soon_threadsafe from off-loop threads must wake the serving loop:
+        a kernel whose wakeup pipe died parks in select and serves nothing, so
+        the future must resolve through the thread hop alone."""
+        probe = (
+            "import asyncio, threading\n"
+            "loop = asyncio.get_running_loop()\n"
+            "fut = loop.create_future()\n"
+            "threading.Timer(0.3, lambda: loop.call_soon_threadsafe(\n"
+            "    lambda: fut.done() or fut.set_result('woken'))).start()\n"
+            "await asyncio.wait_for(fut, 15)\n"
+        )
+        events = repl.execute("wakeup-probe", probe)
+        self.assertEqual(one(events, "done")["status"], "ok")
+        self.assertEqual(one(events, "result")["text"], "'woken'")
+
+    def test_snapshot_skips_bash_handles_and_restored_kernel_stays_alive(self):
+        # Saved live process handles never revive (stale pid, stale fd ints);
+        # dill restoring a saved pipe file even reopens the raw fd NUMBER and
+        # closes it, killing the restored kernel's event-loop self-pipe.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "kernel-state.dill")
+            manifest_path = os.path.join(tmp, "kernel-state.json")
+            setup = (
+                "from rlm import bash\n"
+                "h1 = bash('echo done-h1')\n"
+                "await h1\n"
+                "h2 = bash('sleep 30')\n"
+                "hs = [h1]\n"
+                "keep = 1\n"
+            )
+            self.assertEqual(one(self.repl.execute("s1", setup), "done")["status"], "ok")
+            self.repl.send(
+                {"type": "snapshot", "id": "s2", "path": path, "manifest_path": manifest_path}
+            )
+            done = one(self.repl.until_done("s2"), "done")
+            self.assertEqual(done["status"], "ok")
+            skipped = {entry["name"]: entry["reason"] for entry in done["skipped"]}
+            self.assertEqual(sorted(skipped), ["h1", "h2", "hs"])
+            for reason in skipped.values():
+                self.assertIn("live process handle", reason)
+            self.assertEqual(done["saved"], ["keep"])
+
+            fresh = ReplProcess()
+            self.addCleanup(fresh.close)
+            fresh.ready()
+            fresh.send({"type": "restore", "id": "r1", "path": path})
+            done = one(fresh.until_done("r1"), "done")
+            self.assertEqual(done["status"], "ok")
+            self.assertEqual(done["restored"], ["keep"])
+            self.assertEqual(done["failed"], [])
+            self.assert_loop_wakeup_alive(fresh)
+
+            # Shutdown kills the still-running sleep's process group.
+            self.assertEqual(self.repl.shutdown(), 0)
+
     def test_stdin_eof_flushes_final_snapshot(self):
         # Host death (EOF, no shutdown request) must persist the namespace
         # tail that postdates the last explicit snapshot.

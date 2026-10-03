@@ -65,6 +65,9 @@ _RESTORE_SKIP = {"In", "Out", "get_ipython"}
 _last_snapshot_target: dict[str, Any] | None = None
 
 _protocol_fd: int = -1
+# The host's stderr before _setup_fds captures fd 2: the only channel that can
+# report a dropped protocol frame without feeding it back into the protocol.
+_host_stderr_fd: int = -1
 _write_lock = threading.Lock()
 _loop: asyncio.AbstractEventLoop | None = None
 _serve_task: asyncio.Task[Any] | None = None
@@ -106,8 +109,11 @@ def _send(event: dict[str, Any]) -> None:
         try:
             while view:
                 view = view[os.write(_protocol_fd, view) :]
-        except OSError:
-            pass
+        except OSError as err:
+            try:
+                os.write(_host_stderr_fd, f"rlm.repl: dropped protocol frame: {err}\n".encode())
+            except OSError:
+                pass
 
 
 def _check_payload(event: str, data: dict[str, Any]) -> None:
@@ -1580,9 +1586,11 @@ _pump_err: _Pump
 
 def _setup_fds() -> int:
     """Reserve stdout for the protocol; route fds 1/2 through captured pipes."""
-    global _protocol_fd, _pump_out, _pump_err
+    global _protocol_fd, _pump_out, _pump_err, _host_stderr_fd
     _protocol_fd = os.dup(1)
     os.set_inheritable(_protocol_fd, False)
+    _host_stderr_fd = os.dup(2)
+    os.set_inheritable(_host_stderr_fd, False)
     out_r, out_w = os.pipe()
     err_r, err_w = os.pipe()
     os.dup2(out_w, 1)

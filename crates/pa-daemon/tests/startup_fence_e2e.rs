@@ -22,9 +22,8 @@
 //!   admission whose holder died is inert to a reader even before its 5s
 //!   lease elapses — the liveness-checked record, not the file's presence,
 //!   is the authority (the disclosed durability-vs-availability call);
-//! * a read-only boot never reclaims: an elapsed lease stays on disk (TS:
-//!   only `acquireDaemonShutdownAdmission` removes an abandoned
-//!   admission).
+//! * an inert record never blocks, and the boot's active read reclaims it
+//!   (TS `readActiveShutdownAdmission`'s rmSync).
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
@@ -103,12 +102,11 @@ fn socket_stays_silent(socket: &Path, window: Duration) {
             "the socket came up while a third-party successor had to stay out: {}",
             socket.display()
         );
-        if std::os::unix::net::UnixStream::connect(socket).is_ok() {
-            panic!(
-                "a third-party successor bound the socket while the stop window was up: {}",
-                socket.display()
-            );
-        }
+        assert!(
+            !std::os::unix::net::UnixStream::connect(socket).is_ok(),
+            "a third-party successor bound the socket while the stop window was up: {}",
+            socket.display()
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -142,7 +140,11 @@ fn fence_path(registry: &Path, socket: &Path) -> PathBuf {
         hasher.update(socket.to_string_lossy().as_bytes());
         hasher.finalize()
     };
-    let key: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let key: String = digest.iter().fold(String::new(), |mut key, byte| {
+        use std::fmt::Write;
+        write!(key, "{byte:02x}").expect("write to String");
+        key
+    });
     registry.join("startup-fences").join(format!("{key}.json"))
 }
 
@@ -159,7 +161,7 @@ fn spawn_pinned_process() -> (Child, u32, String) {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn the pinned stand-in");
-    let pid = u32::from(child.id());
+    let pid = child.id();
     let start_id =
         pa_daemon::lease::get_process_start_id(pid).expect("the pinned process has a start id");
     (child, pid, start_id)
@@ -174,7 +176,7 @@ fn spawn_dead_process() -> (u32, String) {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn the short-lived stand-in");
-    let pid = u32::from(child.id());
+    let pid = child.id();
     let start_id = pa_daemon::lease::get_process_start_id(pid)
         .expect("the short-lived process has a start id");
     let _ = child.wait();
@@ -314,30 +316,36 @@ fn a_crashed_admission_holder_does_not_wedge_the_boot() {
     // A coordinator that crashed mid-stop leaves an unexpired admission
     // record behind. The holder is dead, so the record is inert: the
     // liveness check - not the lease clock alone - is the authority (the
-    // disclosed availability call; a live holder stalls out in <=5s).
+    // disclosed availability call; a live holder stalls out in <=5s), and
+    // the boot's active read reclaims the inert record (TS
+    // readActiveShutdownAdmission).
     let (pinned_pid, pinned_start) = spawn_dead_process();
-    write_record(
-        &admission_path(&registry),
-        &admission_record(pinned_pid, &pinned_start, 60_000),
-    );
+    let admission = admission_path(&registry);
+    write_record(&admission, &admission_record(pinned_pid, &pinned_start, 60_000));
 
     let mut successor = spawn_supervisor(&socket, &agent_dir, &registry);
     wait_socket_ready(&socket);
     let _ = successor.child.kill();
     let _ = successor.child.wait();
+    assert!(
+        !admission.exists(),
+        "the boot reclaims the crashed holder's inert record"
+    );
 }
 
 #[test]
-fn an_elapsed_admission_lease_stays_on_disk_and_does_not_block() {
+fn an_elapsed_admission_lease_does_not_block_and_reclaims_at_boot() {
     let root = tempfile::tempdir().expect("test root");
     let registry = root.path().join("registry");
     let agent_dir = root.path().join("agent");
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
     let socket = root.path().join("daemon.sock");
     // A live holder whose lease merely elapsed (a stalled renewal): the
-    // record is not active, so the boot proceeds - and a read-only boot
-    // never reclaims the record (TS: only the acquire path removes an
-    // abandoned admission).
+    // record is not active, so the boot proceeds; the refusal's active
+    // read reclaims the abandoned record (TS
+    // readActiveShutdownAdmission's rmSync - the read-ONLY probe of the
+    // worker-side replacement monitor is the shape that never reclaims,
+    // and this tree has no replacement launch to gate).
     let (pid, start_id) = this_process_identity();
     let admission = admission_path(&registry);
     write_record(&admission, &admission_record(pid, &start_id, 0));
@@ -347,7 +355,7 @@ fn an_elapsed_admission_lease_stays_on_disk_and_does_not_block() {
     let _ = successor.child.kill();
     let _ = successor.child.wait();
     assert!(
-        admission.exists(),
-        "a read-only boot must leave an elapsed (abandoned) admission record on disk"
+        !admission.exists(),
+        "the boot's active read reclaims the elapsed record"
     );
 }

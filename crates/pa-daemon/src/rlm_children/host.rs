@@ -56,6 +56,21 @@ async fn resolve_child_model_allowlisted(
     }
 }
 
+/// Whether the collect's stability grace may re-clear the settle verdict it
+/// watched land: only a verdict no terminal claim has taken. The settle
+/// funnel (the watcher's notice claim plus its `settled` latch), a cancel,
+/// a delete, and a parent close each claim the record and own their
+/// verdict — a busy-again child after any of them is a follow-up turn
+/// (delayed messaging) that keeps the settled result, and un-setting it
+/// would leave a `running` record no watcher owns, quiescence still
+/// settled, and a parent already told the run completed (TS never un-settles
+/// a run after its task's `finally`). Only the unclaimed verdict — the
+/// admission-to-run hand-off misread the grace exists to un-settle — is
+/// re-cleared for re-reading.
+pub(super) fn collect_grace_may_reclear(record: &ChildRecord) -> bool {
+    !record.settled && !record.notice_delivered
+}
+
 impl RlmSubagentHost for SupervisorChildSessions {
     fn spawn(&self, request: RlmSpawnRequest) -> RlmHostFuture<RlmSpawnHandle> {
         let this = Arc::clone(&self.inner);
@@ -522,11 +537,19 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 // the child's output forever (the record recovers, the
                 // caller never re-reads). A child that went busy again
                 // inside the grace keeps waiting inside the shared budget;
-                // one that stays idle is really settled.
+                // one that stays idle is really settled. A settle a
+                // terminal claim already owns stays final (the funnel's
+                // notice delivered and the watcher retired at its settle,
+                // or a cancel, delete, or close claimed the row): the busy
+                // child is a follow-up turn that keeps the settled result,
+                // and only the unclaimed misread re-clears
+                // (`collect_grace_may_reclear`).
                 if !settled_on_entry && record.lock().await.settled_status.is_some() {
                     let active_session_id = record.lock().await.active_session_id.clone();
                     tokio::time::sleep(Duration::from_millis(WATCH_SETTLE_GRACE_MS)).await;
-                    if matches!(this.child_busy(&active_session_id).await, Ok(true)) {
+                    let busy_again = matches!(this.child_busy(&active_session_id).await, Ok(true));
+                    let reclearable = collect_grace_may_reclear(&*record.lock().await);
+                    if busy_again && reclearable {
                         record.lock().await.settled_status = None;
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         if !remaining.is_zero() {

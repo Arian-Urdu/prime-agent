@@ -646,7 +646,7 @@ impl ReferenceFactory {
 }
 
 /// Stable harness entry ids for the seeded specs.
-pub const FACTORY_ENTRY_IDS: [&str; 6] = [
+const FACTORY_ENTRY_IDS: [&str; 6] = [
     "factory-dag-eval-review-sweep",
     "factory-dag-eval-builder",
     "factory-dag-eval-resident-watcher",
@@ -3161,7 +3161,7 @@ pub struct FactoryKernelPython {
 /// The imports a factory-capable kernel needs: the runtime (with
 /// `rlm.factory`, this branch's addition) plus the kernel's default
 /// packages.
-pub const FACTORY_KERNEL_REQUIRED_IMPORTS: &str = "rlm.repl, rlm.factory, dill, requests, httpx, yaml, tomli, dotenv, pandas, numpy, scipy, bs4, lxml, pydantic, tyro";
+const FACTORY_KERNEL_REQUIRED_IMPORTS: &str = "rlm.repl, rlm.factory, dill, requests, httpx, yaml, tomli, dotenv, pandas, numpy, scipy, bs4, lxml, pydantic, tyro";
 
 /// Probe one candidate python for factory capability: it must import the
 /// runtime and the default packages under the PYTHONPATH it would run
@@ -3205,7 +3205,7 @@ fn probe_factory_kernel_python(python: &std::path::Path, python_path: Option<&st
 /// `#[must_use]` because every caller falls back to the shared venv when
 /// the checkout-local pieces are absent.
 #[must_use]
-pub fn checkout_runtime_dirs() -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+fn checkout_runtime_dirs() -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)

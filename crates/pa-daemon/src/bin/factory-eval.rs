@@ -217,8 +217,6 @@ fn real_agent_dir() -> Result<PathBuf, String> {
 #[cfg(unix)]
 struct Supervisor {
     child: Child,
-    #[allow(dead_code)]
-    socket: PathBuf,
 }
 
 #[cfg(unix)]
@@ -275,10 +273,7 @@ fn spawn_supervisor(
         .spawn()
         .map_err(|error| format!("spawn the eval supervisor {}: {error}", binary.display()))?;
     wait_for_supervisor_socket(socket, &mut child, Instant::now() + Duration::from_secs(10))?;
-    Ok(Supervisor {
-        child,
-        socket: socket.to_path_buf(),
-    })
+    Ok(Supervisor { child })
 }
 
 /// Wait for the spawned supervisor to bind its socket. On expiry the child
@@ -381,6 +376,9 @@ struct TrialDriveError {
 /// capture the ANSWER and the token counts. Cleanup is the caller's
 /// (`run_trial` kills the session and removes the trial dir on every
 /// path).
+// Each parameter is the trial's own identity (factory, arm, trial number)
+// or an isolated filesystem role (trial root, sessions dir, ledger); a
+// parameter struct would only shuttle the same values once.
 #[allow(clippy::too_many_arguments)]
 #[cfg(unix)]
 fn drive_trial(
@@ -495,6 +493,9 @@ fn drive_trial(
 /// Run one factory- or baseline-arm trial: create the isolated session,
 /// drive the parent prompt to completion, score the answer against the
 /// ledger the parent saved, and clean up on every path.
+// The trial's identity plus its isolated runs root: the call site owns
+// one trial per invocation, so bundling the few scalars would only add a
+// struct to shuttle them.
 #[allow(clippy::too_many_arguments)]
 #[cfg(unix)]
 fn run_trial(

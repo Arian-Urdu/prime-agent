@@ -31,6 +31,9 @@ enum FakeChild {
     /// Unreachable; the watcher's give-up poll parks until the test
     /// lands a reader's verdict.
     UnreachableUntilVerdict,
+    /// Healthy, but the third `get_state` read — the collect's grace
+    /// busy-check in the funnel pin — parks until the test releases it.
+    ParksGraceCheck,
 }
 
 /// A scripted JSONL supervisor for the watcher tests: creates one child
@@ -162,15 +165,28 @@ async fn spawn_fake_supervisor(
                             }
                             response_success(Some(&id), command_type, None)
                         }
-                        "get_state" => response_success(
-                            Some(&id),
-                            command_type,
-                            Some(json!({
-                                "isStreaming": false,
-                                "hasRunningSubagents": child_subagents.running.load(Ordering::SeqCst),
-                                "sessionActions": { "queuedCount": 0 },
-                            })),
-                        ),
+                        "get_state" => {
+                            // The collect-grace pin: the collect's grace
+                            // busy-check is the third state read of the
+                            // pinned flow (refresh, settle arm, grace) —
+                            // park it until the test lands the funnel's
+                            // latch.
+                            if matches!(child, FakeChild::ParksGraceCheck)
+                                && state_reads.fetch_add(1, Ordering::SeqCst) + 1 == 3
+                            {
+                                GRACE_CHECK_PARKED.notify_one();
+                                GRACE_CHECK_RELEASE.notified().await;
+                            }
+                            response_success(
+                                Some(&id),
+                                command_type,
+                                Some(json!({
+                                    "isStreaming": false,
+                                    "hasRunningSubagents": child_subagents.running.load(Ordering::SeqCst),
+                                    "sessionActions": { "queuedCount": 0 },
+                                })),
+                            )
+                        }
                         "get_last_assistant_text" => {
                             // The settle capture: with the knob set, the
                             // worker leaves right after its final answer.
@@ -511,6 +527,12 @@ async fn an_unreachable_child_delivers_the_failure_notice_instead_of_no_reply() 
 /// the poll. Only the lost-claim test uses these.
 static GIVE_UP_POLL: tokio::sync::Notify = tokio::sync::Notify::const_new();
 static VERDICT_LANDED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Hand-off into the collect's grace busy-check: the fake parks the
+/// check, the test lands the settle funnel's latch, the fake releases
+/// the check. Only the funnel pin uses these.
+static GRACE_CHECK_PARKED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+static GRACE_CHECK_RELEASE: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 /// A reader's refresh can settle the child between the watcher's settle
 /// read and its unreachable give-up claim: the claim keeps that verdict,
@@ -1078,5 +1100,121 @@ async fn collect_recaptures_the_answer_of_a_settled_child_whose_capture_raced() 
         results[0].answer_preview.as_deref(),
         Some("the child final answer"),
         "the answer re-captures on the collect read"
+    );
+}
+
+/// The collect-grace gate: only a settle no terminal claim has taken may
+/// re-clear. The funnel's `settled` latch, and the notice claim on its own
+/// (the cancel/delete/close window before the hook fires), each own their
+/// verdict — a busy-again child after either is a follow-up turn that keeps
+/// the settled result.
+#[tokio::test]
+async fn only_an_unclaimed_settle_re_clears_inside_the_collect_grace() {
+    let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+    let (sessions, _kill_rx) =
+        sessions_with_fake_supervisor(follow_up_tx, 0, FakeKill::Success, FakeChild::Healthy).await;
+    sessions
+        .push_test_child(RlmChildIdentity {
+            rlm_child_id: "grace-gate".to_string(),
+            active_session_id: "child-live".to_string(),
+            session_id: Some("child-file".to_string()),
+            session_name: "grace-gate".to_string(),
+        })
+        .await;
+    let record = Arc::clone(&sessions.inner.children.lock().await[0]);
+    // Unclaimed (the admission-window misread): re-clearable.
+    assert!(
+        super::host::collect_grace_may_reclear(&*record.lock().await),
+        "a settle no claim took is the misread the grace un-does"
+    );
+    // The funnel completed (the watcher retired at its settle): final.
+    record.lock().await.settled = true;
+    assert!(
+        !super::host::collect_grace_may_reclear(&*record.lock().await),
+        "the funnel's latch owns the verdict"
+    );
+    // The notice claim alone (the cancel/delete window before the hook):
+    // final.
+    {
+        let mut record = record.lock().await;
+        record.settled = false;
+        record.notice_delivered = true;
+    }
+    assert!(
+        !super::host::collect_grace_may_reclear(&*record.lock().await),
+        "a claimed notice owns the verdict"
+    );
+}
+
+/// The "Collect grace undoes watcher settle" pin: the settle funnel can
+/// finalize the record (the watcher's notice claimed, `settled` latched,
+/// the watcher retired at its settle) while a collect that entered before
+/// the settle sits inside its stability grace, and a follow-up prompt can
+/// make the child busy again before the grace's busy re-check. The grace
+/// must keep the funnel's verdict — the busy child is a follow-up turn
+/// (delayed messaging) — instead of flipping the settled record back to
+/// `running` with no watcher left to re-settle it: quiescence reads the
+/// funnel's latch and would stay settled, the parent already received the
+/// terminal notice, and the collect reader would block on a turn it never
+/// spawned.
+#[tokio::test]
+async fn collect_grace_keeps_a_settle_the_funnel_already_finalized() {
+    let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+    let child_subagents = Arc::new(FakeChildSubagents::default());
+    let (sessions, _kill_rx) = sessions_with_fake_child_subagents(
+        follow_up_tx,
+        0,
+        FakeKill::Success,
+        FakeChild::ParksGraceCheck,
+        Arc::clone(&child_subagents),
+    )
+    .await;
+    sessions
+        .push_test_child(RlmChildIdentity {
+            rlm_child_id: "sub-funnel-settled".to_string(),
+            active_session_id: "child-live".to_string(),
+            session_id: Some("child-file".to_string()),
+            session_name: "funnel-settled".to_string(),
+        })
+        .await;
+    let collect_sessions = sessions.clone();
+    let results_task = tokio::spawn(async move {
+        collect_sessions
+            .collect(vec!["sub-funnel-settled".to_string()], 0)
+            .await
+            .expect("collect the funnel-settled child")
+    });
+    // The fake parks the collect's grace busy-check: the settle minted
+    // inside this collect, and the grace sleep has run.
+    GRACE_CHECK_PARKED.notified().await;
+    // The watcher's funnel completed while the collect sat in its grace:
+    // the verdict is claimed and latched (the watcher retired at its
+    // settle).
+    sessions.settle_test_child("child-live").await;
+    // A follow-up prompt makes the child busy again inside the grace.
+    child_subagents.running.store(true, Ordering::SeqCst);
+    GRACE_CHECK_RELEASE.notify_one();
+
+    let results = tokio::time::timeout(Duration::from_secs(10), results_task)
+        .await
+        .expect("the collect returns after the grace")
+        .expect("the collect task joins");
+    assert_eq!(
+        results[0].status, "done",
+        "the funnel's verdict stands for a busy-again follow-up turn"
+    );
+    assert!(
+        results[0].settled,
+        "the record stays settled (the settle funnel already finalized it)"
+    );
+    assert_eq!(
+        results[0].answer_preview.as_deref(),
+        Some("the child final answer"),
+        "the captured answer rides the settled result"
+    );
+    let roster = sessions.list_subagents().await.expect("child roster");
+    assert_eq!(
+        roster[0].status, "completed",
+        "the record never flips back to running with no watcher left"
     );
 }

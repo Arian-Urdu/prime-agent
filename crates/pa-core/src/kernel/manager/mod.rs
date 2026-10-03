@@ -27,11 +27,12 @@ use crate::kernel::shared::{
     KernelDiffDisplay, KernelError, KernelManagerOptions, KernelSentAgentMessage,
     KernelShutdownOptions, LateSentAgentMessageCallback, StreamName, AGENT_MESSAGE_DISPLAY_MIME,
     ATTACHMENT_DISPLAY_MIME, BASH_ACTIVITY_DISPLAY_MIME, BASH_COMMAND_DISPLAY_MIME,
-    DEFAULT_MAX_OUTPUT_CHARS, DEFAULT_SNAPSHOT_DEBOUNCE_MS, DIFF_DISPLAY_MIME,
-    HOST_REQUEST_SHUTDOWN_TIMEOUT_MS, KERNEL_ABORT_GRACE_MS, KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE,
-    KERNEL_BUSY_INTERRUPT_INTERVAL_MS, KERNEL_BUSY_REUSE_WAIT_MS, KERNEL_SHUTDOWN_TIMEOUT_MS,
-    KERNEL_STDERR_LOG_BUDGET_MARKER, MAX_ATTACHMENT_DATA_CHARS, MAX_BACKGROUND_OUTPUT_CHARS,
-    MAX_KERNEL_STDERR_CHARS, MAX_KERNEL_STDERR_LOG_BYTES, MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS,
+    BOOTSTRAP_EXECUTION_TIMEOUT_MS, DEFAULT_MAX_OUTPUT_CHARS, DEFAULT_SNAPSHOT_DEBOUNCE_MS,
+    DIFF_DISPLAY_MIME, HOST_REQUEST_SHUTDOWN_TIMEOUT_MS, KERNEL_ABORT_GRACE_MS,
+    KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE, KERNEL_BUSY_INTERRUPT_INTERVAL_MS,
+    KERNEL_BUSY_REUSE_WAIT_MS, KERNEL_SHUTDOWN_TIMEOUT_MS, KERNEL_STDERR_LOG_BUDGET_MARKER,
+    MAX_ATTACHMENT_DATA_CHARS, MAX_BACKGROUND_OUTPUT_CHARS, MAX_KERNEL_STDERR_CHARS,
+    MAX_KERNEL_STDERR_LOG_BYTES, MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS,
     RESTORE_EXECUTION_TIMEOUT_MS, SNAPSHOT_EXECUTION_TIMEOUT_MS,
 };
 use crate::kernel::state_snapshot::{
@@ -628,8 +629,37 @@ impl ReplKernelManager {
     /// Returns an error when the in-flight protocol repair fails, or when the
     /// enqueued execution fails (kernel error, timeout, or aborted request).
     pub async fn execute(&self, code: &str, opts: ExecuteOptions) -> anyhow::Result<ExecuteResult> {
+        self.execute_bounded(code, opts, /*execution_timeout_ms*/ None)
+            .await
+    }
+
+    /// The provisioner's runtime bootstrap cell: `execute`'s semantics with
+    /// the bootstrap bound, so a lost bootstrap frame fails the boot loudly
+    /// instead of parking it forever.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the in-flight protocol repair fails, or when the
+    /// enqueued execution fails (kernel error, timeout, or aborted request).
+    pub(crate) async fn execute_bootstrap(
+        &self,
+        code: &str,
+        opts: ExecuteOptions,
+    ) -> anyhow::Result<ExecuteResult> {
+        self.execute_bounded(code, opts, Some(BOOTSTRAP_EXECUTION_TIMEOUT_MS))
+            .await
+    }
+
+    async fn execute_bounded(
+        &self,
+        code: &str,
+        opts: ExecuteOptions,
+        execution_timeout_ms: Option<u64>,
+    ) -> anyhow::Result<ExecuteResult> {
         self.wait_for_protocol_repair(opts.signal.as_ref()).await?;
-        let result = self.enqueue_execute(code, opts, None).await?;
+        let result = self
+            .enqueue_execute(code, opts, execution_timeout_ms)
+            .await?;
         if result.result.status == ExecuteStatus::Ok {
             self.schedule_snapshot();
         }

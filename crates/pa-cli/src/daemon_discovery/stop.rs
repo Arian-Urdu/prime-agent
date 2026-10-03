@@ -425,6 +425,10 @@ fn stop_background_service(
         )));
     }
     if !probe_daemon(socket_path).reachable {
+        // The 5 s graceful wait above can outlast the window: the
+        // admission is re-asserted before the socket file is touched (TS
+        // stopBackgroundService asserts at every post-wait step).
+        assert()?;
         remove_socket_file(socket_path);
         return Ok(StopOutcome::Reaped(
             "background service already stopped".to_string(),
@@ -440,6 +444,11 @@ fn stop_background_service(
             "did not stop gracefully; retry with --force".to_string(),
         ));
     }
+    // The last action before the kill: the window must still be ours after
+    // the wait (TS asserts between the graceful attempt and the force
+    // kill, and again before the socket removal rides the kill's
+    // confirmed-death path inside the helper).
+    assert()?;
     Ok(verified_force_kill(
         pid,
         socket_path,

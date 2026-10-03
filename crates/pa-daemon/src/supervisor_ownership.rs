@@ -230,10 +230,12 @@ struct StartupFenceRecord {
 }
 
 /// Whether a pinned process identity is still that process (TS
-/// `isProcessIdentityAlive`): a dead pid is dead, and a start id the
-/// platform does not expose keeps the pin alive.
+/// `isProcessIdentityAlive`): a dead pid is dead, a start id the
+/// platform does not expose keeps the pin alive, and an unanswerable
+/// liveness probe counts as alive (the lease API's rule - a live owner
+/// is never reclaimed on a probe failure; TS's kill(0) EPERM -> alive).
 fn is_process_identity_alive(pid: u32, process_start_id: Option<&str>) -> bool {
-    if !crate::lease::is_process_alive(pid).unwrap_or(false) {
+    if !crate::lease::is_process_alive(pid).unwrap_or(true) {
         return false;
     }
     match process_start_id {
@@ -251,7 +253,7 @@ fn is_process_identity_alive(pid: u32, process_start_id: Option<&str>) -> bool {
 /// `matchesExactProcessIdentity`): a dead pid is dead; a start id must
 /// still be observable AND match.
 fn matches_exact_process_identity(pid: u32, process_start_id: Option<&str>) -> bool {
-    if !crate::lease::is_process_alive(pid).unwrap_or(false) {
+    if !crate::lease::is_process_alive(pid).unwrap_or(true) {
         return false;
     }
     match process_start_id {
@@ -348,7 +350,10 @@ async fn wait_for_startup_fence_in(
 ) -> Result<()> {
     let path = startup_fence_path(registry_dir, socket_path);
     let normalized = normalize_socket_path(socket_path);
-    let deadline = crate::util::now_ms().saturating_add(timeout_ms);
+    // The wait's bound is local elapsed time: a monotonic deadline keeps
+    // the 10 s/60 s budgets honest under clock adjustments (the record's
+    // own timestamps stay wall-clock - TS's lease shape).
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms.max(1));
     loop {
         let Some(fence) = read_startup_fence(&path)? else {
             return Ok(());
@@ -380,7 +385,7 @@ async fn wait_for_startup_fence_in(
             }
             continue;
         }
-        if crate::util::now_ms() >= deadline {
+        if tokio::time::Instant::now() >= deadline {
             bail!(
                 "Timed out waiting for predecessor daemon process {} to exit",
                 fence.pid
@@ -578,7 +583,7 @@ impl ShutdownAdmission {
             std::thread::sleep(SHUTDOWN_ADMISSION_WAIT_MS);
         }
         let thread_state = Arc::clone(&state);
-        let renewal = std::thread::Builder::new()
+        let renewal = match std::thread::Builder::new()
             .name("shutdown-admission-renewal".to_string())
             .spawn(move || {
                 loop {
@@ -594,8 +599,29 @@ impl ShutdownAdmission {
                         break;
                     }
                 }
-            })
-            .map_err(|error| anyhow!("spawn the shutdown admission renewal: {error}"))?;
+            }) {
+            Ok(renewal) => renewal,
+            Err(error) => {
+                // No renewal thread, no window: the record this acquire
+                // just wrote would hold every other boot for its whole
+                // 5 s lease, so it is removed under the guard (the token
+                // match) before the failure surfaces.
+                state.stopped.store(true, Ordering::SeqCst);
+                let registry_dir = &state.registry_dir;
+                let token = &state.token;
+                let _ = with_registry_guard(registry_dir, || {
+                    let path = shutdown_admission_path(registry_dir);
+                    if read_shutdown_admission(&path)?
+                        .is_some_and(|current| &current.token == token)
+                    {
+                        std::fs::remove_file(&path)
+                            .with_context(|| format!("remove {}", path.display()))?;
+                    }
+                    Ok(())
+                });
+                return Err(anyhow!("spawn the shutdown admission renewal: {error}"));
+            }
+        };
         Ok(ShutdownAdmission {
             state,
             renewal: Some(renewal),

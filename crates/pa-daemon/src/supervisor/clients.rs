@@ -100,6 +100,31 @@ async fn write_raw_line<W: AsyncWriteExt + Unpin>(writer: &mut W, line: &[u8]) -
     Ok(bytes)
 }
 
+/// One client write bounded by the connection's scheduled admission
+/// deadline - the same watch value the expiry watchdog arms (the
+/// pre-ready budget, the auth window, or the traffic-renewed idle
+/// window). A remote peer that stops reading parks `write_all` in flow
+/// control, and the select loop never returns to the expired arm while a
+/// write waits, so the deadline must cut the parked write itself: a
+/// stalled authenticated peer otherwise pins its
+/// `DAEMON_TCP_MAX_CONNECTIONS` slot past every window. Local
+/// connections carry no deadline: their writes pass through unbounded,
+/// exactly as before.
+async fn deadline_write<F>(deadline: Option<tokio::time::Instant>, write: F) -> Result<usize>
+where
+    F: std::future::Future<Output = Result<usize>>,
+{
+    let Some(deadline) = deadline else {
+        return write.await;
+    };
+    match tokio::time::timeout_at(deadline, write).await {
+        Ok(written) => written,
+        Err(_stalled) => Err(anyhow!(
+            "TCP admission deadline expired while a client write was stalled"
+        )),
+    }
+}
+
 pub(crate) fn client_command_payload(
     command: &DaemonCommand,
     client_id: &str,
@@ -184,6 +209,12 @@ impl Supervisor {
         // a line must not renew its own admission window.
         let mut tcp_deadline_tx = None;
         let mut tcp_expired_rx = None;
+        // The write-side view of the same deadline: a second watch
+        // receiver for the loop's writes to borrow (the expired arm owns
+        // the mpsc signal; the writes must observe the SAME scheduled
+        // instant the watchdog fires at, so a parked write is cut at the
+        // exact moment the expired arm would have honored).
+        let mut tcp_deadline_rx = None;
         let mut tcp_authenticated = false;
         if let ClientTrust::Remote { .. } = trust {
             let (deadline_tx, deadline_rx) = tokio::sync::watch::channel(
@@ -210,6 +241,7 @@ impl Supervisor {
             // task return (the TS `clearTimeout` on close). Dropping the
             // handle does not abort the spawned task.
             drop(watchdog);
+            tcp_deadline_rx = Some(deadline_tx.subscribe());
             tcp_deadline_tx = Some(deadline_tx);
             tcp_expired_rx = Some(expired_rx);
         }
@@ -268,7 +300,18 @@ impl Supervisor {
             server_capabilities: default_server_capabilities(),
             rest: Map::default(),
         };
-        write_line(&mut writer, &serde_json::to_value(&hello)?).await?;
+        // The greeting write rides the pre-ready budget (the hello round's
+        // settled claim - "the budget still has a real job: bounding a
+        // wedged write" - is only true if the parked write observes the
+        // budget): a peer that wedges the banner write is closed at the
+        // budget instead of parking outside the loop where the expired
+        // arm cannot reach it.
+        let write_deadline = tcp_deadline_rx.as_ref().map(|rx| *rx.borrow());
+        deadline_write(
+            write_deadline,
+            write_line(&mut writer, &serde_json::to_value(&hello)?),
+        )
+        .await?;
         // `daemon_hello` is written: the admission deadline re-arms to the
         // short auth window (TS #2517's review fix: the auth window runs
         // from the handshake, not from accept, so a pre-ready client is
@@ -352,6 +395,12 @@ impl Supervisor {
                 }
             }
             saw_socket_traffic = false;
+            // The deadline this iteration's client writes are bounded by:
+            // the same watch value the expiry watchdog fires at, so a
+            // write parked on a stalled peer is cut at the identical
+            // instant the expired arm would have honored it. None on
+            // local connections: their writes stay unbounded as before.
+            let mut write_deadline = tcp_deadline_rx.as_ref().map(|rx| *rx.borrow());
             tokio::select! {
                 read = read_connection_line(&mut reader, &mut line, &mut line_bytes, trust.tcp_auth_token().map(|_| crate::tcp::DAEMON_TCP_MAX_LINE_CHARS)), if dispatch_slots.available_permits() > 0 => {
                     match read {
@@ -382,7 +431,11 @@ impl Supervisor {
                             crate::tcp::check_daemon_tcp_line_auth(&trimmed, auth_token);
                         if !verdict.ok {
                             let failure = crate::supervisor::tcp::tcp_refusal_lines(&self, &verdict);
-                            let _ = write_line(&mut writer, &failure).await;
+                            // The refusal write rides the pre-auth window
+                            // like every other unauthenticated write.
+                            let _ =
+                                deadline_write(write_deadline, write_line(&mut writer, &failure))
+                                    .await;
                             return Err(anyhow!(
                                 "TCP authentication failed ({}); closing connection",
                                 verdict.reason
@@ -451,8 +504,14 @@ impl Supervisor {
                     let Some((lines, stop)) = dispatched else { break };
                     for outbound in lines {
                         let written = match &outbound {
-                            Outbound::Line(value) => write_line(&mut writer, value).await,
-                            Outbound::Raw(line) => write_raw_line(&mut writer, line).await,
+                            Outbound::Line(value) => {
+                                deadline_write(write_deadline, write_line(&mut writer, value))
+                                    .await
+                            }
+                            Outbound::Raw(line) => {
+                                deadline_write(write_deadline, write_raw_line(&mut writer, line))
+                                    .await
+                            }
                         };
                         let bytes = match written {
                             Ok(bytes) => bytes,
@@ -478,6 +537,16 @@ impl Supervisor {
                         drop(outbound);
                         pa_types::memory_release::trim_freed_heap_if_large(bytes);
                         saw_socket_traffic = true;
+                        // A completed write is socket traffic: the next
+                        // line of the same bundle rides a fresh idle
+                        // window (TS `socket.setTimeout` resets on every
+                        // socket write), so a slow-but-live reader is
+                        // never cut mid-bundle while a stalled one parks
+                        // and is closed at the armed deadline.
+                        if write_deadline.is_some() {
+                            write_deadline =
+                                Some(tokio::time::Instant::now() + self.tcp_idle_timeout());
+                        }
                     }
                     if stop {
                         // The initiating client's response and daemon_closing
@@ -496,7 +565,9 @@ impl Supervisor {
                     // publish order).
                     if let Some(payload) = targeted {
                         saw_socket_traffic = true;
-                        if let Err(error) = write_line(&mut writer, &payload).await {
+                        if let Err(error) =
+                            deadline_write(write_deadline, write_line(&mut writer, &payload)).await
+                        {
                             // An event-write failure must not strand an
                             // accepted shutdown: if this connection owns
                             // the stop, it still starts the pass.
@@ -546,7 +617,10 @@ impl Supervisor {
                             };
                             if deliver {
                                 saw_socket_traffic = true;
-                                if let Err(error) = write_line(&mut writer, &payload).await {
+                                if let Err(error) =
+                                    deadline_write(write_deadline, write_line(&mut writer, &payload))
+                                        .await
+                                {
                                     // An event-write failure must not strand an
                                     // accepted shutdown: if this connection owns
                                     // the stop, it still starts the pass.
@@ -1522,5 +1596,86 @@ mod tests {
             "the log names the dropped count: {line}"
         );
         connection.abort();
+    }
+
+    /// A remote peer that authenticates, then stalls its reads, parks the
+    /// daemon's response write in flow control (a response the peer never
+    /// reads cannot drain the transport window). The expired arm only
+    /// fires while the select loop polls, and a write parked inside an
+    /// arm body never yields to it, so the deadline must cut the parked
+    /// write itself - otherwise the stalled peer pins its
+    /// `DAEMON_TCP_MAX_CONNECTIONS` slot past every window (the Bugbot
+    /// "idle deadline misses blocked writes" round). The idle window is
+    /// pinned short (the production 10 minutes is pinned by
+    /// `admission_budgets_pin_the_ts_values`); the response line rides a
+    /// command id far larger than the duplex pipe, so the write parks the
+    /// moment it starts and the pinned window must close it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stalled_write_is_cut_at_the_admission_deadline() {
+        use pa_types::platform::transport::{AsyncReadHalf, AsyncWriteHalf};
+
+        struct DuplexTransport(tokio::io::DuplexStream);
+        impl TransportStream for DuplexTransport {
+            fn split(self: Box<Self>) -> (Box<dyn AsyncReadHalf>, Box<dyn AsyncWriteHalf>) {
+                let (reader, writer) = tokio::io::split(self.0);
+                (Box::new(reader), Box::new(writer))
+            }
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let options = SupervisorOptions {
+            tcp_port: None,
+            tcp_bind_host: None,
+            remote_agent_mesh: None,
+            socket_path: dir.path().join("daemon.sock"),
+            agent_dir: dir.path().join("agent"),
+        };
+        let supervisor = Arc::new(Supervisor::new(options).expect("supervisor"));
+        supervisor.pin_tcp_idle_timeout_for_tests(Duration::from_millis(300));
+        // A 64KB duplex pipe: the greeting (<1KB) lands; a response line
+        // carrying a ~700KB command id can never fit, so the daemon's
+        // response write parks in flow control against the stalled peer.
+        let (server_side, mut client_side) = tokio::io::duplex(64 * 1024);
+        let connection = {
+            let supervisor = Arc::clone(&supervisor);
+            let stream: Box<dyn TransportStream> = Box::new(DuplexTransport(server_side));
+            tokio::spawn(async move {
+                supervisor
+                    .handle_client(
+                        stream,
+                        crate::supervisor::ClientTrust::Remote {
+                            auth_token: "token".to_string(),
+                        },
+                    )
+                    .await
+            })
+        };
+        // Authenticate with a `list` whose echoed id dwarfs the pipe: the
+        // authenticated line re-arms the idle window, the dispatch answers
+        // a response the peer never reads, and the write parks.
+        let big_id = "i".repeat(700 * 1024);
+        let line = format!(
+            "{{\"type\":\"command\",\"id\":\"{big_id}\",\"protocol\":{{\"name\":\"{}\",\"version\":{}}},\"command\":{{\"type\":\"list\"}},\"auth\":{{\"token\":\"token\"}}}}\n",
+            crate::protocol::DAEMON_PROTOCOL_NAME,
+            crate::protocol::DAEMON_PROTOCOL_VERSION,
+        );
+        let armed = std::time::Instant::now();
+        client_side.write_all(line.as_bytes()).await.unwrap();
+        // The pinned window must cut the parked write: the connection
+        // resolves closed, instead of parking until this timeout fails.
+        let closed = tokio::time::timeout(Duration::from_secs(10), connection)
+            .await
+            .expect("the idle window must cut the stalled write, not park forever");
+        let outcome = closed.expect("the connection task must end");
+        assert!(
+            outcome.is_err(),
+            "a stalled write closes the connection with an error"
+        );
+        assert!(
+            armed.elapsed() <= Duration::from_secs(4),
+            "the cut must ride the pinned 300ms window, not another timeout (closed after {:?})",
+            armed.elapsed()
+        );
     }
 }

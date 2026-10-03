@@ -765,7 +765,7 @@ async fn a_parent_rename_after_a_revival_and_second_passivation_reaches_the_chil
         });
     assert!(
         named,
-        "the woken child must carry the renamed session_info row ({child_file:?}, tail: {:?})",
+        "the woken child must carry the renamed session_info row (tail: {:?})",
         entries
             .lines()
             .rev()

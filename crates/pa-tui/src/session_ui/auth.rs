@@ -473,6 +473,7 @@ impl SessionUi {
                 self.decision_api,
             ));
             self.dirty = true;
+            self.track_feature_outcome("decision_api", "initiated", None);
             return Ok(());
         }
         if let Some(provider) = DecisionApiProvider::from_id(args) {

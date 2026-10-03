@@ -462,46 +462,63 @@ async fn execute_decision_api(
     command: &SessionSlashCommand,
     execution: &mut SessionCommandExecution,
 ) -> Result<(), String> {
-    let provider = match command.args.trim() {
-        "off" => None,
-        arg => Some(
-            DecisionApiProvider::from_id(arg)
-                .ok_or_else(|| "Usage: /decision-api [jev|clef|off]".to_string())?,
-        ),
-    };
-    if let Some(provider) = provider {
-        if !engine
-            .decision_api_has_key(provider)
-            .await
-            .map_err(|error| format!("{error:#}"))?
-        {
-            return Err(format!(
-                "No {} API key is stored. Run /decision-api in the Prime Agent terminal UI to \
-                 add one.",
-                provider.vendor()
-            ));
+    let outcome = async {
+        let provider = match command.args.trim() {
+            "off" => None,
+            arg => Some(
+                DecisionApiProvider::from_id(arg)
+                    .ok_or_else(|| "Usage: /decision-api [jev|clef|off]".to_string())?,
+            ),
+        };
+        if let Some(provider) = provider {
+            if !engine
+                .decision_api_has_key(provider)
+                .await
+                .map_err(|error| format!("{error:#}"))?
+            {
+                return Err(format!(
+                    "No {} API key is stored. Run /decision-api in the Prime Agent terminal UI to \
+                     add one.",
+                    provider.vendor()
+                ));
+            }
         }
+        engine.set_decision_api(provider).await;
+        let result = match provider {
+            Some(provider) => format!(
+                "Decision API enabled for this session: {}.",
+                provider.label()
+            ),
+            None => "Decision API disabled for this session.".to_string(),
+        };
+        execution.push_message(slash_command_result(
+            command, result, /*success*/ true, "info", None, /*display*/ true,
+        ));
+        execution.push_message(CustomMessage {
+            custom_type: super::decision_api::DECISION_API_STATUS_CUSTOM_TYPE.to_string(),
+            content: pa_types::ai::UserContent::Text(super::decision_api::status_note(provider)),
+            display: false,
+            details: Some(serde_json::json!({ "provider": provider.map(DecisionApiProvider::id) })),
+            timestamp: now_millis(),
+            rest: serde_json::Map::default(),
+        });
+        Ok(())
     }
-    engine.set_decision_api(provider).await;
-    let result = match provider {
-        Some(provider) => format!(
-            "Decision API enabled for this session: {}.",
-            provider.label()
-        ),
-        None => "Decision API disabled for this session.".to_string(),
-    };
-    execution.push_message(slash_command_result(
-        command, result, /*success*/ true, "info", None, /*display*/ true,
-    ));
-    execution.push_message(CustomMessage {
-        custom_type: super::decision_api::DECISION_API_STATUS_CUSTOM_TYPE.to_string(),
-        content: pa_types::ai::UserContent::Text(super::decision_api::status_note(provider)),
-        display: false,
-        details: Some(serde_json::json!({ "provider": provider.map(DecisionApiProvider::id) })),
-        timestamp: now_millis(),
-        rest: serde_json::Map::default(),
-    });
-    Ok(())
+    .await;
+    // Adoption rides `agent session ended` (`feature_decision_api_*_count`),
+    // the same seam `/goal` uses. The configuration (which provider) stays out.
+    if let Some(telemetry) = engine.telemetry.as_ref() {
+        telemetry.note_feature_outcome(
+            "decision_api",
+            if outcome.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+            None,
+        );
+    }
+    outcome
 }
 
 /// The rows are durable in the session's own entry chain: the live

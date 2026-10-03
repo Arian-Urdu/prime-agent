@@ -212,12 +212,35 @@ fn cloudflare_result(mut envelope: Value) -> anyhow::Result<Value> {
     bail!("Cloudflare returned errors: {errors}")
 }
 
-/// Register `decision_api.decide`, routed by `switch`, against the auth store
-/// under `agent_dir`.
+/// Where decisions go. The default is the production APIs, with the Clef
+/// account from `CLOUDFLARE_ACCOUNT_ID` when it is set.
+#[derive(Debug, Clone)]
+pub(crate) struct DecisionApiEndpoints {
+    systemone_url: String,
+    cloudflare_api: String,
+    cloudflare_account: Option<String>,
+}
+
+impl Default for DecisionApiEndpoints {
+    fn default() -> Self {
+        Self {
+            systemone_url: SYSTEMONE_URL.to_string(),
+            cloudflare_api: CLOUDFLARE_API.to_string(),
+            cloudflare_account: std::env::var(CLOUDFLARE_ACCOUNT_ENV)
+                .ok()
+                .map(|account| account.trim().to_string())
+                .filter(|account| !account.is_empty()),
+        }
+    }
+}
+
+/// Register `decision_api.decide`, routed by `switch` to `endpoints`, against
+/// the auth store under `agent_dir`.
 pub(crate) fn register_decision_api_handler(
     handlers: &mut HostRequestHandlers,
     switch: DecisionApiSwitch,
     agent_dir: PathBuf,
+    endpoints: DecisionApiEndpoints,
 ) {
     let client = reqwest::Client::new();
     // The Cloudflare account resolved for a key: one lookup per key, not per decision.
@@ -228,6 +251,7 @@ pub(crate) fn register_decision_api_handler(
             let client = client.clone();
             let switch = switch.clone();
             let agent_dir = agent_dir.clone();
+            let endpoints = endpoints.clone();
             let clef_account = clef_account.clone();
             Box::pin(async move {
                 let Some(provider) = switch.provider() else {
@@ -284,28 +308,29 @@ pub(crate) fn register_decision_api_handler(
                 match provider {
                     DecisionApiProvider::Jev => {
                         send_json(
-                            client.post(SYSTEMONE_URL).bearer_auth(key).json(&request),
+                            client
+                                .post(&endpoints.systemone_url)
+                                .bearer_auth(key)
+                                .json(&request),
                             vendor,
                         )
                         .await
                     }
                     DecisionApiProvider::Clef => {
-                        // `CLOUDFLARE_ACCOUNT_ID`, else the single account the
+                        // The configured account, else the single account the
                         // token can reach (looked up once per key).
+                        let cloudflare_api = &endpoints.cloudflare_api;
                         let mut cached = clef_account.lock().await;
-                        let account = match (std::env::var(CLOUDFLARE_ACCOUNT_ENV), cached.as_ref())
-                        {
-                            (Ok(account), _) if !account.trim().is_empty() => {
-                                account.trim().to_string()
-                            }
-                            (_, Some((cached_key, account))) if *cached_key == key => {
+                        let account = match (&endpoints.cloudflare_account, cached.as_ref()) {
+                            (Some(account), _) => account.clone(),
+                            (None, Some((cached_key, account))) if *cached_key == key => {
                                 account.clone()
                             }
-                            (Ok(_) | Err(_), Some(_) | None) => {
+                            (None, Some(_) | None) => {
                                 let accounts = cloudflare_result(
                                     send_json(
                                         client
-                                            .get(format!("{CLOUDFLARE_API}/accounts"))
+                                            .get(format!("{cloudflare_api}/accounts"))
                                             .bearer_auth(&key),
                                         vendor,
                                     )
@@ -336,7 +361,7 @@ pub(crate) fn register_decision_api_handler(
                         };
                         drop(cached);
                         let url = format!(
-                            "{CLOUDFLARE_API}/accounts/{account}/ai/run/@cf/cloudflare/{CLEF_MODEL}"
+                            "{cloudflare_api}/accounts/{account}/ai/run/@cf/cloudflare/{CLEF_MODEL}"
                         );
                         cloudflare_result(
                             send_json(client.post(url).bearer_auth(key).json(&request), vendor)
@@ -351,29 +376,251 @@ pub(crate) fn register_decision_api_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::kernel::shared::HostRequestPayload;
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    #[tokio::test]
-    async fn decide_refuses_before_any_network_call() {
-        let agent_dir = tempfile::tempdir().expect("tempdir");
-        let switch = DecisionApiSwitch::default();
+    use super::*;
+    use crate::auth::AuthCredential;
+    use crate::kernel::shared::{HostHandlerFuture, HostRequestPayload};
+
+    /// The registered `decision_api.decide`, called with a payload's data.
+    fn decider(
+        switch: &DecisionApiSwitch,
+        agent_dir: &Path,
+        endpoints: DecisionApiEndpoints,
+    ) -> impl Fn(Value) -> HostHandlerFuture {
         let mut handlers = HostRequestHandlers::default();
         register_decision_api_handler(
             &mut handlers,
             switch.clone(),
-            agent_dir.path().to_path_buf(),
+            agent_dir.to_path_buf(),
+            endpoints,
         );
         let decide = handlers
             .get("decision_api.decide")
             .expect("registered")
             .clone();
-        let call = |data| {
+        move |data| {
             decide(HostRequestPayload {
                 data,
                 cell_source_code: None,
             })
+        }
+    }
+
+    fn store_key(agent_dir: &Path, credential: &str, key: &str) {
+        AuthStorage::create(agent_dir).set(
+            credential,
+            AuthCredential::ApiKey {
+                key: key.to_string(),
+                prime_team: None,
+            },
+        );
+    }
+
+    /// One request the loopback provider received.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Seen {
+        method: String,
+        path: String,
+        authorization: String,
+        body: Value,
+    }
+
+    impl Seen {
+        fn new(method: &str, path: &str, key: &str, body: Value) -> Self {
+            Self {
+                method: method.to_string(),
+                path: path.to_string(),
+                authorization: format!("Bearer {key}"),
+                body,
+            }
+        }
+    }
+
+    /// A loopback provider answering each path in `routes` with its status
+    /// and JSON body (404 elsewhere), serving both APIs from one base URL.
+    /// Returns the endpoints aimed at it and the requests it received.
+    async fn serve(
+        routes: Vec<(&'static str, u16, Value)>,
+    ) -> (DecisionApiEndpoints, Arc<Mutex<Vec<Seen>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("local addr"));
+        let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut raw = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let (head, body) = loop {
+                    let read = socket.read(&mut chunk).await.expect("read request");
+                    assert_ne!(read, 0, "the client closed mid-request");
+                    raw.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&raw).to_string();
+                    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                        continue;
+                    };
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            let line = line.to_ascii_lowercase();
+                            Some(line.strip_prefix("content-length:")?.trim().parse().ok()?)
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= length {
+                        break (head.to_string(), body.to_string());
+                    }
+                };
+                let mut request_line = head.lines().next().unwrap_or_default().split(' ');
+                let method = request_line.next().unwrap_or_default().to_string();
+                let path = request_line.next().unwrap_or_default().to_string();
+                let authorization = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("authorization")
+                            .then(|| value.trim().to_string())
+                    })
+                    .unwrap_or_default();
+                let body = serde_json::from_str(&body).unwrap_or(Value::Null);
+                let (status, reply) = routes
+                    .iter()
+                    .find(|(route, ..)| *route == path)
+                    .map_or((404, Value::Null), |(_, status, reply)| {
+                        (*status, reply.clone())
+                    });
+                log.lock().expect("log").push(Seen {
+                    method,
+                    path,
+                    authorization,
+                    body,
+                });
+                let reply = reply.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status} Status\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+        });
+        let endpoints = DecisionApiEndpoints {
+            systemone_url: format!("{base}/v1/systemone"),
+            cloudflare_api: base,
+            cloudflare_account: None,
         };
+        (endpoints, seen)
+    }
+
+    #[tokio::test]
+    async fn jev_posts_the_request_with_the_stored_key_and_the_default_model() {
+        let agent_dir = tempfile::tempdir().expect("tempdir");
+        store_key(agent_dir.path(), "typesafe", "ts-key");
+        let answer =
+            json!({ "model": "jev-latest", "answers": { "action": { "choice": "left" } } });
+        let (endpoints, seen) = serve(vec![("/v1/systemone", 200, answer.clone())]).await;
+        let switch = DecisionApiSwitch::default();
+        switch.replace(Some(DecisionApiProvider::Jev));
+        let decide = decider(&switch, agent_dir.path(), endpoints);
+        let request = json!({ "state": { "x": 1 }, "questions": {}, "images": [] });
+        assert_eq!(decide(json!({ "request": request })).await.unwrap(), answer);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [Seen::new(
+                "POST",
+                "/v1/systemone",
+                "ts-key",
+                json!({ "state": { "x": 1 }, "questions": {}, "model": "jev-latest" })
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn clef_looks_up_the_account_once_per_key_and_unwraps_the_envelope() {
+        let agent_dir = tempfile::tempdir().expect("tempdir");
+        store_key(agent_dir.path(), "cloudflare", "cf-key");
+        let result = json!({ "model": "clef", "answers": { "action": { "choice": "up" } } });
+        let run = "/accounts/acct-1/ai/run/@cf/cloudflare/clef";
+        let (endpoints, seen) = serve(vec![
+            (
+                "/accounts",
+                200,
+                json!({ "success": true, "errors": [], "result": [{ "id": "acct-1" }] }),
+            ),
+            (
+                run,
+                200,
+                json!({ "success": true, "errors": [], "result": result }),
+            ),
+        ])
+        .await;
+        let switch = DecisionApiSwitch::default();
+        switch.replace(Some(DecisionApiProvider::Clef));
+        let decide = decider(&switch, agent_dir.path(), endpoints);
+        let request = json!({ "state": {}, "images": ["data:image/png;base64,AA=="] });
+        for _ in 0..2 {
+            assert_eq!(decide(json!({ "request": request })).await.unwrap(), result);
+        }
+        let sent = Seen::new(
+            "POST",
+            run,
+            "cf-key",
+            json!({ "state": {}, "images": ["data:image/png;base64,AA=="], "model": "clef" }),
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                Seen::new("GET", "/accounts", "cf-key", Value::Null),
+                sent.clone(),
+                sent
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_failures_reach_the_kernel_with_their_detail() {
+        let agent_dir = tempfile::tempdir().expect("tempdir");
+        store_key(agent_dir.path(), "typesafe", "ts-key");
+        store_key(agent_dir.path(), "cloudflare", "cf-key");
+        let (endpoints, _) = serve(vec![
+            ("/v1/systemone", 500, json!({ "error": "overloaded" })),
+            (
+                "/accounts",
+                200,
+                json!({ "success": true, "errors": [], "result": [{ "id": "a" }, { "id": "b" }] }),
+            ),
+        ])
+        .await;
+        let switch = DecisionApiSwitch::default();
+        let decide = decider(&switch, agent_dir.path(), endpoints);
+        let error = async |provider| {
+            switch.replace(Some(provider));
+            decide(json!({ "request": { "state": {} } }))
+                .await
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(
+            error(DecisionApiProvider::Jev).await,
+            r#"TypeSafe returned HTTP 500 Internal Server Error: {"error":"overloaded"}"#
+        );
+        assert_eq!(
+            error(DecisionApiProvider::Clef).await,
+            "The Cloudflare API token can reach 2 accounts. Set CLOUDFLARE_ACCOUNT_ID to the one \
+             that runs Clef."
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_refuses_before_any_network_call() {
+        let agent_dir = tempfile::tempdir().expect("tempdir");
+        let switch = DecisionApiSwitch::default();
+        let call = decider(&switch, agent_dir.path(), DecisionApiEndpoints::default());
         let error = |data| async { call(data).await.unwrap_err().to_string() };
         let request = serde_json::json!({ "request": { "state": {}, "images": [] } });
         let with_image = serde_json::json!({
@@ -452,5 +699,25 @@ mod tests {
         assert_eq!(latest_state(&[]), None);
         assert_eq!(latest_state(&[row(clef)]), clef);
         assert_eq!(latest_state(&[row(clef), row(None)]), None);
+    }
+
+    /// The skill's `Loop` and `decide` (image strings, step control, System 2's
+    /// action gate) run as the package's own unittest.
+    #[test]
+    fn the_decision_api_python_loop_follows_its_contract() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../skills/decision-api");
+        let output = std::process::Command::new("python3")
+            .args(["-m", "unittest", "discover", "-s"])
+            .arg(root.join("tests"))
+            .arg("-v")
+            .env("PYTHONPATH", root.join("src"))
+            .output()
+            .expect("python3 runs the decision-api loop tests");
+        assert!(
+            output.status.success(),
+            "decision-api loop tests failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 }

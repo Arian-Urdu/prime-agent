@@ -381,6 +381,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         &mut handlers,
         decision_api.clone(),
         config.agent_dir.clone(),
+        super::decision_api::DecisionApiEndpoints::default(),
     );
     let keep_recent_tokens = compaction_settings
         .keep_recent_tokens

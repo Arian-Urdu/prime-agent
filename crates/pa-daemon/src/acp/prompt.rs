@@ -187,8 +187,11 @@ async fn run_prompt_turn(
                     )
                     .await;
                     session.producer().finish_prompt(turn_id).await;
-                    let _ = tx.send(internal_error(&id, &format!("{error:#}")));
+                    // The slot frees before the response leaves: a client
+                    // that prompts again the instant it reads this error
+                    // must not hit the still-set slot's refusal.
                     clear_prompt_slot(&state, &session_id).await;
+                    let _ = tx.send(internal_error(&id, &format!("{error:#}")));
                     return;
                 }
             }
@@ -207,8 +210,8 @@ async fn run_prompt_turn(
             )
             .await;
             session.producer().finish_prompt(turn_id).await;
-            let _ = tx.send(internal_error(&id, &format!("{error:#}")));
             clear_prompt_slot(&state, &session_id).await;
+            let _ = tx.send(internal_error(&id, &format!("{error:#}")));
             return;
         }
     }
@@ -590,11 +593,11 @@ async fn settle_turn(
         // A cancellation before the response boundary resolves the request
         // with the protocol stop reason and no boundary frames.
         session.producer().finish_prompt(turn_id).await;
+        clear_prompt_slot(state, session_id).await;
         let _ = tx.send(jsonrpc::response(
             id,
             &stop_reason_response(AcpStopReason::Cancelled),
         ));
-        clear_prompt_slot(state, session_id).await;
         return;
     }
 
@@ -603,6 +606,12 @@ async fn settle_turn(
     } else {
         PrimeAgentOutcome::Result
     };
+    // The failure text rides the internal_error response, where a test
+    // asserting only the stop reason loses it: echo it to stderr so every
+    // harness's child-stderr dump shows WHY the turn failed.
+    if let Some(failure) = &turn_failure {
+        eprintln!("pa-daemon: acp turn failed: {failure}");
+    }
     // The response boundary precedes the correlated response; the completion
     // event and terminal quiescence envelope follow it in publication order.
     if session::publish_response_boundary(session, turn_id, true, outcome)
@@ -610,11 +619,11 @@ async fn settle_turn(
         .is_err()
     {
         session.producer().finish_prompt(turn_id).await;
+        clear_prompt_slot(state, session_id).await;
         let _ = tx.send(internal_error(
             id,
             "Failed to publish ACP response boundary",
         ));
-        clear_prompt_slot(state, session_id).await;
         return;
     }
 
@@ -648,11 +657,11 @@ async fn settle_turn(
     .is_err()
     {
         session.producer().finish_prompt(turn_id).await;
+        clear_prompt_slot(state, session_id).await;
         let _ = tx.send(internal_error(
             id,
             "Failed to publish ACP completion update",
         ));
-        clear_prompt_slot(state, session_id).await;
         return;
     }
 
@@ -671,8 +680,14 @@ async fn settle_turn(
         Some(failure) => internal_error(id, &format!("prime-agent turn failed: {failure}")),
         None => jsonrpc::response(id, &stop_reason_response(stop_reason)),
     };
-    let _ = tx.send(response);
+    // The settled turn frees the prompt slot BEFORE the response leaves:
+    // the FrameSink is an async channel, so the writer task can put the
+    // response on the wire while this task still waits on the connection
+    // mutex — a client that prompts again the instant it reads the
+    // response would otherwise race the slot clear and get the
+    // still-set slot's "A prompt turn is already running" refusal.
     clear_prompt_slot(state, session_id).await;
+    let _ = tx.send(response);
 }
 
 /// The running turn released the prompt slot; close/EOF no longer awaits it.

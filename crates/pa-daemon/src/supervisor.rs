@@ -145,6 +145,12 @@ pub struct Supervisor {
     /// mutating that env var (a set value would leak into every
     /// parallel test's launch).
     worker_connect_budget: std::sync::Mutex<Option<Duration>>,
+    /// The per-supervisor authenticated TCP idle-window override:
+    /// `None` rides the production constant (TS #2517's
+    /// `DAEMON_TCP_IDLE_TIMEOUT_MS`), a pinned window keeps the deadline
+    /// state machine's tests bounded without sleeping the production
+    /// 10 minutes.
+    tcp_idle_timeout_budget: std::sync::Mutex<Option<Duration>>,
     /// The durable session-binding table (the stale-active-id rebind
     /// surface): every active id the supervisor has routed stays
     /// addressable through its session's durable identity, so a client
@@ -342,6 +348,7 @@ impl Supervisor {
             descriptor_dir,
             bound_socket_identity: std::sync::Mutex::new(None),
             worker_connect_budget: std::sync::Mutex::new(None),
+            tcp_idle_timeout_budget: std::sync::Mutex::new(None),
             session_bindings: crate::session_bindings::SessionBindingTable::new(),
             opening_files: std::sync::Mutex::new(std::collections::HashMap::new()),
             telemetry: std::sync::Mutex::new(None),

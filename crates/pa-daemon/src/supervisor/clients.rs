@@ -1,6 +1,7 @@
 //! Client connections: the per-connection task - read loop, dispatch,
 //! and the parsed-command execution surface.
 use anyhow::anyhow;
+use std::time::Duration;
 
 use super::{
     broadcast, command_type_name, current_protocol_info, daemon_closing_shutdown_event,
@@ -138,6 +139,29 @@ pub(crate) fn client_command_payload(
         }
     }
     Ok((type_name, payload))
+}
+
+impl Supervisor {
+    /// The authenticated idle window (TS #2517's
+    /// `DAEMON_TCP_IDLE_TIMEOUT_MS`): the supervisor's pinned value when
+    /// one is set, else the production constant.
+    pub(crate) fn tcp_idle_timeout(&self) -> Duration {
+        self.tcp_idle_timeout_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or(crate::tcp::DAEMON_TCP_IDLE_TIMEOUT)
+    }
+
+    /// Test-only: pin this supervisor's TCP idle window so the deadline
+    /// state machine's tests can exercise the idle expiry without
+    /// sleeping the production 10 minutes.
+    #[cfg(test)]
+    pub(crate) fn pin_tcp_idle_timeout_for_tests(&self, timeout: Duration) {
+        *self
+            .tcp_idle_timeout_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(timeout);
+    }
 }
 
 impl Supervisor {
@@ -308,20 +332,26 @@ impl Supervisor {
         // TCP only): a precomputed bool keeps the select arm's precondition
         // from borrowing the shared option the arm's future mutates.
         let tcp_admission_armed = tcp_expired_rx.is_some();
+        // Whether the CURRENT iteration's wake moved bytes on the socket:
+        // an inbound line, a dispatched response, or a delivered event.
+        // Broadcast wakes the connection does not receive (and lagged-ring
+        // notices) write nothing, so they must not renew the idle window
+        // (TS #2517: `socket.setTimeout` counts only socket traffic; a
+        // busy mesh's chatter must not keep a silent peer's cap slot
+        // open past its idle window).
+        let mut saw_socket_traffic = false;
         loop {
             line.clear();
-            // An authenticated TCP socket's idle window resets on any
-            // traffic: every loop re-arms the deadline, so an inbound
-            // line, a dispatched response, or a routed event each renew
-            // it (the pre-auth windows stay absolute - nothing re-arms
-            // them, so a dribbling peer cannot renew its admission).
+            // An authenticated TCP socket's idle window resets on socket
+            // traffic only (the pre-auth windows stay absolute - nothing
+            // re-arms them, so a dribbling peer cannot renew its
+            // admission).
             if let Some(deadline_tx) = tcp_deadline_tx.as_mut() {
-                if tcp_authenticated {
-                    deadline_tx.send_replace(
-                        tokio::time::Instant::now() + crate::tcp::DAEMON_TCP_IDLE_TIMEOUT,
-                    );
+                if tcp_authenticated && saw_socket_traffic {
+                    deadline_tx.send_replace(tokio::time::Instant::now() + self.tcp_idle_timeout());
                 }
             }
+            saw_socket_traffic = false;
             tokio::select! {
                 read = read_connection_line(&mut reader, &mut line, &mut line_bytes, trust.tcp_auth_token().map(|_| crate::tcp::DAEMON_TCP_MAX_LINE_CHARS)), if dispatch_slots.available_permits() > 0 => {
                     match read {
@@ -336,6 +366,7 @@ impl Supervisor {
                         Ok(ConnectionLine::Eof) => break,
                         Ok(ConnectionLine::Line) => {}
                     }
+                    saw_socket_traffic = true;
                     let trimmed = line.trim().to_string();
                     if trimmed.is_empty() {
                         continue;
@@ -446,6 +477,7 @@ impl Supervisor {
                         // supervisor's write path).
                         drop(outbound);
                         pa_types::memory_release::trim_freed_heap_if_large(bytes);
+                        saw_socket_traffic = true;
                     }
                     if stop {
                         // The initiating client's response and daemon_closing
@@ -463,6 +495,7 @@ impl Supervisor {
                     // frame only writes (the queue preserves per-session
                     // publish order).
                     if let Some(payload) = targeted {
+                        saw_socket_traffic = true;
                         if let Err(error) = write_line(&mut writer, &payload).await {
                             // An event-write failure must not strand an
                             // accepted shutdown: if this connection owns
@@ -512,6 +545,7 @@ impl Supervisor {
                                 }
                             };
                             if deliver {
+                                saw_socket_traffic = true;
                                 if let Err(error) = write_line(&mut writer, &payload).await {
                                     // An event-write failure must not strand an
                                     // accepted shutdown: if this connection owns

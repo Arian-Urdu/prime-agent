@@ -484,6 +484,77 @@ mod integration_tests {
         assert_eq!(second["success"], true, "{second}");
     }
 
+    /// Broadcast wakes the connection does not receive must not renew the
+    /// authenticated idle window (TS #2517: the idle timer is Node's
+    /// `socket.setTimeout`, which only socket traffic resets - Bugbot round:
+    /// on a busy mesh, a routing-filtered wake wrote nothing, so a silent
+    /// peer must still close at its own deadline and free its cap slot).
+    /// The idle window is pinned short (the production 10 minutes is pinned
+    /// by `admission_budgets_pin_the_ts_values`): the connection must close
+    /// in the window armed by the auth traffic, never one the undelivered
+    /// wakes pushed out.
+    #[tokio::test]
+    async fn undelivered_broadcasts_do_not_renew_the_idle_window() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let port = free_port();
+        let supervisor = tcp_supervisor(dir.path(), port);
+        supervisor.pin_tcp_idle_timeout_for_tests(Duration::from_secs(2));
+        start_listener(&supervisor).await;
+        let token = token_of(&supervisor);
+        let (mut stream, mut reader) = connect_split(port).await;
+        let hello = read_line(&mut reader).await.expect("the protocol banner");
+        let client_id = hello["clientId"].as_str().unwrap().to_string();
+        stream
+            .write_all(envelope("list", Some(&token)).as_bytes())
+            .await
+            .unwrap();
+        let response = read_line(&mut reader)
+            .await
+            .expect("authenticated response");
+        assert_eq!(response["success"], true);
+        let armed = std::time::Instant::now();
+
+        // The busy mesh, mid-window: broadcasts this connection does not
+        // receive (BroadcastExcept excludes its own id; a RosterSubscribers
+        // push reaches non-subscribers only as a wake) rouse its loop but
+        // write nothing to its socket.
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        supervisor
+            .events
+            .send((
+                crate::supervisor::ClientRouting::BroadcastExcept {
+                    connection_id: client_id.clone(),
+                },
+                std::sync::Arc::new(serde_json::json!({ "type": "daemon_closing" })),
+            ))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        supervisor
+            .events
+            .send((
+                crate::supervisor::ClientRouting::RosterSubscribers,
+                std::sync::Arc::new(serde_json::json!({ "type": "roster_update" })),
+            ))
+            .unwrap();
+
+        // The silent connection must close in the window the auth traffic
+        // armed: the undelivered wakes must not have re-armed it.
+        let mut line = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(8), reader.read_line(&mut line))
+            .await
+            .expect("the idle window must close the silent connection");
+        assert_eq!(
+            read.unwrap_or(0),
+            0,
+            "the connection must be closed, not answered"
+        );
+        assert!(
+            armed.elapsed() <= Duration::from_secs(2) + Duration::from_millis(600),
+            "an undelivered broadcast wake must not extend the idle window (closed after {:?})",
+            armed.elapsed()
+        );
+    }
+
     /// The connection cap refuses the 257th concurrent socket (TS #2517:
     /// idle remote peers cannot exhaust file descriptors).
     #[tokio::test]

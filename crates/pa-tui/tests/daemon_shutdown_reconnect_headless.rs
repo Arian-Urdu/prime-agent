@@ -173,12 +173,13 @@ impl FirstGeneration {
                         &mut writer,
                         &json!({ "type": "daemon_closing", "reason": "shutdown" }),
                     );
-                    // The supervisor archive-stop relays a killed close under
-                    // the closing notice; it must not become a terminal row.
+                    // The archive-stop relay follows the closing notice;
+                    // keep the socket alive so the UI renders its state.
                     write_json(
                         &mut writer,
                         &json!({ "type": "session_closed", "activeSessionId": "s1", "reason": "killed" }),
                     );
+                    std::thread::sleep(Duration::from_millis(300));
                     break;
                 }
                 _ => write_json(&mut writer, &success_response(id, &command_type)),

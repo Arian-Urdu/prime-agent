@@ -249,6 +249,7 @@ fn an_in_flight_poll_pass_dies_with_the_replaced_session() {
     // The in-flight pass snapshots the subscriptions (and their
     // generation) before the child snapshot queries run.
     let generation = engine.watch_host_state().generation;
+    let subscriptions = engine.watch_host_state().registry.list();
     // ...the session replacement clears the watches mid-poll...
     engine.clear_agent_watches();
     // ...and the replacement session registers a fresh watch for the
@@ -271,9 +272,12 @@ fn an_in_flight_poll_pass_dies_with_the_replaced_session() {
         },
     );
     let mut events: Vec<String> = Vec::new();
-    let polled = engine
-        .watch_host_state()
-        .poll_if_current(generation, &snapshots, &mut events);
+    let polled = engine.watch_host_state().poll_if_current(
+        generation,
+        &subscriptions,
+        &snapshots,
+        &mut events,
+    );
     assert!(!polled, "the stale pass polled the replacement's registry");
     assert!(events.is_empty(), "the stale pass delivered: {events:?}");
     // The replacement's baseline is untouched.
@@ -288,10 +292,14 @@ fn an_in_flight_poll_pass_dies_with_the_replaced_session() {
     // A pass under the CURRENT generation still polls: the replacement's
     // watch emits from its own baseline.
     let generation = engine.watch_host_state().generation;
+    let subscriptions = engine.watch_host_state().registry.list();
     let mut events: Vec<String> = Vec::new();
-    let polled = engine
-        .watch_host_state()
-        .poll_if_current(generation, &snapshots, &mut events);
+    let polled = engine.watch_host_state().poll_if_current(
+        generation,
+        &subscriptions,
+        &snapshots,
+        &mut events,
+    );
     assert!(polled, "a current-generation pass did not poll");
     assert_eq!(events.len(), 1, "{events:?}");
     let baseline = engine
@@ -302,4 +310,130 @@ fn an_in_flight_poll_pass_dies_with_the_replaced_session() {
         .find(|watch| watch.id == "watch-agent-new")
         .expect("the replacement's watch");
     assert_eq!(baseline.last_seen_messages, 5);
+}
+/// A poll pass must discard snapshots captured before the subscription it
+/// snapshotted was re-registered: the re-registration (the handler's
+/// cancel+register) re-baselined the subscription with a FRESHER count,
+/// and the pass's in-flight snapshot of the older count must not be
+/// accepted as compaction — that would move the baseline BACKWARDS and
+/// the next poll would re-emit the already-baselined range.
+#[test]
+fn a_stale_snapshot_never_moves_a_re_registered_baseline_backwards() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = std::sync::Arc::new(bare_engine(dir.path()));
+    // The pass snapshots its subscriptions while the child reports 10.
+    let ten = crate::agent_watch::AgentWatchSnapshot {
+        message_count: 10,
+        status: "idle".to_string(),
+    };
+    {
+        let mut state = engine.watch_host_state();
+        state
+            .registry
+            .register("watch-agent-c1", "active-1", "c1", ten.clone())
+            .unwrap();
+    }
+    let generation = engine.watch_host_state().generation;
+    let subscriptions = engine.watch_host_state().registry.list();
+    let mut snapshots = std::collections::HashMap::new();
+    snapshots.insert("active-1".to_string(), ten);
+    // ...the child grows to 11 and the session re-registers the watch
+    // (re-baselining it at 11) while the pass's in-flight snapshot still
+    // reports the older 10...
+    let eleven = crate::agent_watch::AgentWatchSnapshot {
+        message_count: 11,
+        status: "idle".to_string(),
+    };
+    {
+        let mut state = engine.watch_host_state();
+        state.registry.cancel("watch-agent-c1");
+        state
+            .registry
+            .register("watch-agent-c1", "active-1", "c1", eleven)
+            .unwrap();
+    }
+    // ...so the pass must drop its stale snapshot for the re-registered
+    // subscription: no event, and the baseline holds at 11 (a poll that
+    // accepted the stale 10 as compaction would re-baseline to 10).
+    let mut events: Vec<String> = Vec::new();
+    let polled = engine.watch_host_state().poll_if_current(
+        generation,
+        &subscriptions,
+        &snapshots,
+        &mut events,
+    );
+    assert!(polled, "the current-generation pass refused to poll");
+    assert!(events.is_empty(), "the stale pass emitted: {events:?}");
+    let baseline = engine
+        .watch_host_state()
+        .registry
+        .list()
+        .into_iter()
+        .find(|watch| watch.id == "watch-agent-c1")
+        .expect("the re-registered watch");
+    assert_eq!(
+        baseline.last_seen_messages, 11,
+        "the stale snapshot moved the baseline backwards"
+    );
+    // The next pass (a FRESH snapshot of 12) emits from the 11 baseline
+    // — never the duplicated 10..12 the stale baseline would allow.
+    let subscriptions = engine.watch_host_state().registry.list();
+    let mut snapshots = std::collections::HashMap::new();
+    snapshots.insert(
+        "active-1".to_string(),
+        crate::agent_watch::AgentWatchSnapshot {
+            message_count: 12,
+            status: "idle".to_string(),
+        },
+    );
+    let mut events: Vec<String> = Vec::new();
+    engine
+        .watch_host_state()
+        .poll_if_current(generation, &subscriptions, &snapshots, &mut events);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(
+        events[0].contains("messages 11..12 (+1)"),
+        "the re-baselined range: {events:?}"
+    );
+}
+
+/// A watch registration that captured the session generation BEFORE its
+/// pre-registration awaits must not land in the replacement's registry:
+/// the handler resolves the child and snapshots it across awaits, and a
+/// session replacement's `clear_agent_watches` can run in between — the
+/// retired session's watcher must not poll and notify for the
+/// replacement (replacements never inherit the retired session's
+/// subscriptions).
+#[test]
+fn a_registration_from_the_retired_session_never_lands_in_the_replacement() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = std::sync::Arc::new(bare_engine(dir.path()));
+    let idle = crate::agent_watch::AgentWatchSnapshot {
+        message_count: 0,
+        status: "idle".to_string(),
+    };
+    // The handler's capture, before its awaits.
+    let generation = engine.watch_host_state().generation;
+    // ...the child resolution and the child snapshot awaits run, and a
+    // session replacement clears the watches mid-flight...
+    engine.clear_agent_watches();
+    // ...so the post-await registration must refuse.
+    let error = engine
+        .register_agent_watch(generation, "watch-agent-c1", "active-1", "c1", idle.clone())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("session was replaced"),
+        "{error}"
+    );
+    assert!(
+        engine.watch_host_state().registry.is_empty(),
+        "the retired session's watch landed in the replacement"
+    );
+    // The replacement session's OWN registration (captured after the
+    // clear) still lands.
+    let generation = engine.watch_host_state().generation;
+    engine
+        .register_agent_watch(generation, "watch-agent-c2", "active-2", "c2", idle)
+        .unwrap();
+    assert_eq!(engine.watch_host_state().registry.list().len(), 1);
 }

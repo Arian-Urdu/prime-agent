@@ -515,20 +515,26 @@ impl AgentMessageDigest {
         (model_turns > 0).then(|| ingestion_turns as f64 / model_turns as f64)
     }
 
-    /// Reset the per-session lane state at a session replacement
-    /// (`switch_session`/`new_session`/`import_jsonl`/`fork`): the TS
-    /// `AgentSession` was per-session, so its replacement started with the
-    /// default lane and fresh counters — the new Rust session inherits
-    /// neither the retired session's pin nor its traffic.
-    pub(crate) fn reset_session_state(&self) {
-        {
-            let mut core = self
-                .core
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            core.agent_message_digest_mode = false;
-            core.agent_message_digest_pin = DigestLanePin::default();
-        }
+    /// Reset the core-held lane state (the pin + the mode) at a session
+    /// replacement (`switch_session`/`new_session`/`import_jsonl`/`fork`):
+    /// the TS `AgentSession` was per-session, so its replacement started
+    /// with the default lane and fresh counters — the new Rust session
+    /// inherits neither the retired session's pin nor its traffic. The
+    /// reset must run in the SAME core hold as the store swap
+    /// ([`SessionNavigation::replace_session`]): a delivery acquiring the
+    /// lock after the swap must see the replacement store already
+    /// push-pinned, never the replacement store with the retired
+    /// session's pin/mode. The caller holds the core lock.
+    pub(crate) fn reset_lane_state_locked(core: &mut SessionCore) {
+        core.agent_message_digest_mode = false;
+        core.agent_message_digest_pin = DigestLanePin::default();
+    }
+
+    /// Reset the controller's counters at the same session replacement —
+    /// the part of the reset that must NOT run under the core lock (the
+    /// delivery path takes the counters lock first, then the core lock;
+    /// nesting them the other way would invert that order).
+    pub(crate) fn reset_counters(&self) {
         {
             let mut counters = self
                 .counters
@@ -641,15 +647,18 @@ impl AgentMessageDigest {
             return Ok(None);
         }
         // The inbox admission cap (the push lane's pending-message bound,
-        // applied to unread inbox entries): a digested backlog never grows
-        // the durable store without bound.
-        if self.inbox_unread_count()? >= INBOX_MAX_UNREAD {
-            anyhow::bail!(
-                "Target session has too many pending messages: {INBOX_MAX_UNREAD} unread inbox entries, limit is {INBOX_MAX_UNREAD}"
-            );
-        }
-        let (target, digest_at) =
-            self.append_inbox_message(message_id, message, sender, from_relationship)?;
+        // applied to unread inbox entries) rides the append's ONE lock
+        // section (see [`Self::append_inbox_message`]): the dispatcher runs
+        // deliveries concurrently, so a separate check-then-append would
+        // let every in-flight delivery observe the cap and append past it.
+        let Some((target, digest_at)) =
+            self.append_inbox_message(message_id, message, sender, from_relationship)?
+        else {
+            // The lane flipped to push between the evaluate and the
+            // append (a session replacement reset it): the push path
+            // delivers this message instead.
+            return Ok(None);
+        };
         // Accepted: the entry reached the durable store (the arrivals
         // ring counts it — never the rejected attempts above).
         self.record_arrival(now_ms);
@@ -660,35 +669,33 @@ impl AgentMessageDigest {
         })))
     }
 
-    /// The unread-entry count for the admission cap.
-    fn inbox_unread_count(&self) -> anyhow::Result<usize> {
-        let mut inbox = self
-            .inbox
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let core = self
-            .core
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(store) = core.store.as_ref() {
-            inbox.load_from(store);
-        }
-        Ok(inbox.records.iter().filter(|record| !record.read).count())
-    }
-
     /// Store one agent message durably and return the receipt's target
-    /// endpoint plus the digest timestamp.
+    /// endpoint plus the digest timestamp, or `None` when the lane is no
+    /// longer digest under this hold.
+    ///
+    /// Both the admission cap and the lane re-validation run inside this
+    /// ONE inbox+core lock section. The cap: the dispatcher delivers
+    /// agent messages concurrently, so a cap check in a separate section
+    /// could let every in-flight delivery observe the cap and append past
+    /// it — the durable inbox must never grow beyond its advertised
+    /// bound. The lane: the delivery's evaluate ran in an earlier lock
+    /// section, and a session replacement (one atomic store swap + pin
+    /// reset) may have completed in between — a stale digest decision
+    /// must never append into the replacement's store (replacements
+    /// start push-pinned), so the lane is re-read here and a flipped
+    /// lane answers `None` (the caller runs the push path).
     ///
     /// # Errors
     ///
-    /// Returns the store's error when the durable append fails.
+    /// Returns the store's error when the durable append fails, and the
+    /// capacity error when the unread inbox is at its admission cap.
     fn append_inbox_message(
         &self,
         message_id: &str,
         message: &str,
         sender: &Value,
         from_relationship: Option<&str>,
-    ) -> anyhow::Result<(Value, String)> {
+    ) -> anyhow::Result<Option<(Value, String)>> {
         let mut inbox = self
             .inbox
             .lock()
@@ -697,8 +704,17 @@ impl AgentMessageDigest {
             .core
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !core.agent_message_digest_mode {
+            return Ok(None);
+        }
         if let Some(store) = core.store.as_ref() {
             inbox.load_from(store);
+        }
+        let unread = inbox.records.iter().filter(|record| !record.read).count();
+        if unread >= INBOX_MAX_UNREAD {
+            anyhow::bail!(
+                "Target session has too many pending messages: {INBOX_MAX_UNREAD} unread inbox entries, limit is {INBOX_MAX_UNREAD}"
+            );
         }
         let received_at = crate::util::now_iso();
         let from = InboxEndpoint {
@@ -740,7 +756,7 @@ impl AgentMessageDigest {
             watch: None,
         };
         Self::append_entry_locked(&mut inbox, &mut core, &data)?;
-        Ok((target, received_at))
+        Ok(Some((target, received_at)))
     }
 
     /// The receiving session's endpoint (TS `createAgentSessionMessageEndpoint`):
@@ -796,8 +812,14 @@ impl AgentMessageDigest {
     }
 
     /// Store one watch event (agent or job) on the digest lane (PR E):
-    /// a `watch`-kinded inbox entry.
-    fn append_watch_locked(&self, inbox: &mut InboxState, watch: &str, content: &str) {
+    /// a `watch`-kinded inbox entry. The caller holds the inbox and core
+    /// locks (the admission cap rides the same section).
+    fn append_watch_locked(
+        inbox: &mut InboxState,
+        core: &mut SessionCore,
+        watch: &str,
+        content: &str,
+    ) {
         let received_at = crate::util::now_iso();
         let data = InboxEntryData {
             message_id: format!(
@@ -820,11 +842,7 @@ impl AgentMessageDigest {
             kind: "watch".to_string(),
             watch: Some(watch.to_string()),
         };
-        let mut core = self
-            .core
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = Self::append_entry_locked(inbox, &mut core, &data);
+        let _ = Self::append_entry_locked(inbox, core, &data);
     }
 
     /// The unread/total counts of the durable inbox.
@@ -1046,16 +1064,34 @@ impl AgentMessageDigest {
             // The same admission cap as digested messages: a watch event at
             // a full inbox is dropped quietly (advisory range notices never
             // grow the durable file past the bound). The capacity check and
-            // the append run in separate lock sections — `append_watch_locked`
-            // takes the core lock itself, so holding it here would
-            // self-deadlock.
-            let under_cap = self.inbox_unread_count().unwrap_or(0) < INBOX_MAX_UNREAD;
-            if under_cap {
+            // the append run in ONE inbox+core lock section — watch events
+            // arrive concurrently with message deliveries, and a separate
+            // check-then-append could let them all observe the cap and
+            // append past it. The lane re-validation rides the same hold:
+            // the mode was read in an earlier section, and a session
+            // replacement (store swap + pin reset) may have completed in
+            // between — the retired session's watch event must not land
+            // in the replacement's store (the replacement's own poll
+            // passes re-emit from its own baselines). The event drops
+            // quietly on a flipped lane.
+            {
                 let mut inbox = self
                     .inbox
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                self.append_watch_locked(&mut inbox, watch, content);
+                let mut core = self
+                    .core
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if core.agent_message_digest_mode {
+                    if let Some(store) = core.store.as_ref() {
+                        inbox.load_from(store);
+                    }
+                    let unread = inbox.records.iter().filter(|record| !record.read).count();
+                    if unread < INBOX_MAX_UNREAD {
+                        Self::append_watch_locked(&mut inbox, &mut core, watch, content);
+                    }
+                }
             }
             self.ensure_digest_notice();
             return;
@@ -1500,5 +1536,184 @@ mod tests {
             .expect("route failed");
         assert!(routed.is_none(), "a push-pinned route digested");
         assert_eq!(ring(&digest), 0, "the push route pre-recorded an arrival");
+    }
+
+    /// A test digest over a real store (the burst tests need the durable
+    /// append to run in full).
+    fn digest_over_store() -> (Arc<AgentMessageDigest>, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut store = crate::session_store::SessionFile::create("/tmp", None, 0);
+        store.set_path(dir.path().join("session.jsonl"));
+        store.rewrite().unwrap();
+        let digest = AgentMessageDigest::new(
+            std::sync::Arc::new(std::sync::Mutex::new(SessionCore::test_core(
+                Some(store),
+                "/tmp".to_string(),
+            ))),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        );
+        digest.configure_pin("digest").unwrap();
+        (std::sync::Arc::new(digest), dir)
+    }
+
+    fn sibling_sender() -> Value {
+        json!({ "activeSessionId": "sender", "sessionName": "sender" })
+    }
+
+    /// The admission cap and the durable append are ONE lock section: with
+    /// the cap check in a separate section, every concurrently in-flight
+    /// delivery observes the below-cap count and appends, growing the
+    /// durable inbox past its advertised bound. The test parks a burst of
+    /// deliveries at the append's inbox lock (the check would already
+    /// have run in the two-section form), then releases them at once —
+    /// exactly ONE lands; the rest answer the capacity error.
+    #[test]
+    fn concurrent_deliveries_cannot_append_past_the_inbox_cap() {
+        let (digest, _dir) = digest_over_store();
+        // Fill the inbox to one below the cap.
+        for index in 0..INBOX_MAX_UNREAD - 1 {
+            digest
+                .route_inbound_message(
+                    &format!("agentmsg_fill_{index}"),
+                    "fill",
+                    &sibling_sender(),
+                    Some("sibling"),
+                )
+                .expect("route failed")
+                .expect("the capped prefill digested");
+        }
+        // Park the burst at the append section.
+        let parked_inbox = digest.inbox.lock().unwrap();
+        let mut deliveries = Vec::new();
+        for index in 0..8 {
+            let digest = std::sync::Arc::clone(&digest);
+            deliveries.push(std::thread::spawn(move || {
+                digest.route_inbound_message(
+                    &format!("agentmsg_burst_{index}"),
+                    "burst",
+                    &sibling_sender(),
+                    Some("sibling"),
+                )
+            }));
+        }
+        // The burst settles at the inbox acquisition (their evaluates ran:
+        // the lane is digest-pinned).
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(parked_inbox);
+        let mut digested = 0;
+        for delivery in deliveries {
+            match delivery.join().unwrap() {
+                Ok(Some(_receipt)) => digested += 1,
+                Ok(None) => panic!("a digest-lane route fell to push"),
+                Err(error) => assert!(
+                    error.to_string().contains("too many pending messages"),
+                    "unexpected refusal: {error}"
+                ),
+            }
+        }
+        assert_eq!(digested, 1, "more than one burst delivery landed");
+        let snapshot = digest.inbox_snapshot();
+        assert_eq!(
+            snapshot["unread"],
+            json!(INBOX_MAX_UNREAD),
+            "the burst grew the inbox past the cap: {snapshot}"
+        );
+    }
+
+    /// The watch-event admission cap rides the same ONE lock section as
+    /// its durable append: with the check in a separate section, a burst
+    /// of watch events (which arrive concurrently with the digest
+    /// deliveries through the shared poll sink) would all observe the
+    /// below-cap count and all append. The parked-burst shape again
+    /// allows exactly ONE entry.
+    #[test]
+    fn concurrent_watch_events_cannot_append_past_the_inbox_cap() {
+        let (digest, _dir) = digest_over_store();
+        for index in 0..INBOX_MAX_UNREAD - 1 {
+            digest.emit_watch_notice("agent", &format!("[watch-agent child:c{index}]"));
+        }
+        let parked_inbox = digest.inbox.lock().unwrap();
+        let mut watchers = Vec::new();
+        for index in 0..8 {
+            let digest = std::sync::Arc::clone(&digest);
+            watchers.push(std::thread::spawn(move || {
+                digest.emit_watch_notice("agent", &format!("[watch-agent child:w{index}]"));
+            }));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(parked_inbox);
+        for watcher in watchers {
+            watcher.join().unwrap();
+        }
+        let snapshot = digest.inbox_snapshot();
+        assert_eq!(
+            snapshot["unread"],
+            json!(INBOX_MAX_UNREAD),
+            "the watch burst grew the inbox past the cap: {snapshot}"
+        );
+    }
+
+    /// A delivery that decided digest BEFORE a session replacement must
+    /// not append into the replacement's store: the evaluate ran in an
+    /// earlier lock section, the replacement's store swap + pin reset can
+    /// complete while the delivery is parked between its sections, and
+    /// the append's own lane re-validation must answer push — the stale
+    /// decision falls to the push path and the replacement's durable
+    /// inbox stays empty (replacements start push-pinned).
+    #[test]
+    fn a_delivery_parked_across_a_replacement_never_digests_into_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut old_store = crate::session_store::SessionFile::create("/tmp", None, 0);
+        old_store.set_path(dir.path().join("old-session.jsonl"));
+        old_store.rewrite().unwrap();
+        let core = std::sync::Arc::new(std::sync::Mutex::new(SessionCore::test_core(
+            Some(old_store),
+            "/tmp".to_string(),
+        )));
+        let digest = std::sync::Arc::new(AgentMessageDigest::new(
+            std::sync::Arc::clone(&core),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        ));
+        digest.configure_pin("digest").unwrap();
+        // Park the delivery between its evaluate (which decides digest)
+        // and its append: hold the inbox lock across the replacement.
+        let parked_inbox = digest.inbox.lock().unwrap();
+        let delivery = {
+            let digest = std::sync::Arc::clone(&digest);
+            std::thread::spawn(move || {
+                digest.route_inbound_message(
+                    "agentmsg_parked",
+                    "REPORT 481",
+                    &sibling_sender(),
+                    Some("sibling"),
+                )
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // The replacement: one atomic store swap + pin reset (the same
+        // section `SessionNavigation::replace_session` runs).
+        {
+            let mut core = core.lock().unwrap();
+            let mut fresh = crate::session_store::SessionFile::create("/tmp", None, 0);
+            fresh.set_path(dir.path().join("fresh-session.jsonl"));
+            fresh.rewrite().unwrap();
+            let previous = core.store.replace(fresh);
+            AgentMessageDigest::reset_lane_state_locked(&mut core);
+            drop(previous);
+        }
+        digest.reset_counters();
+        // Release the parked delivery: the stale digest decision must be
+        // refused at the append.
+        drop(parked_inbox);
+        let routed = delivery.join().unwrap().expect("route failed");
+        assert!(routed.is_none(), "the stale decision digested: {routed:?}");
+        let snapshot = digest.inbox_snapshot();
+        assert_eq!(
+            snapshot["total"],
+            json!(0),
+            "the replacement's inbox: {snapshot}"
+        );
     }
 }

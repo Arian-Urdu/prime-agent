@@ -105,14 +105,23 @@ impl SessionNavigation {
                 .await;
         let previous = {
             let mut core = self.core.lock().unwrap();
-            core.store.replace(file)
+            let previous = core.store.replace(file);
+            // The lane reset rides the SAME core hold as the store swap:
+            // a delivery acquiring the lock after the swap sees the
+            // replacement store already push-pinned — never the
+            // replacement store with the retired session's pin/mode (a
+            // digest pin would route its entries into the replacement's
+            // durable file).
+            crate::worker::AgentMessageDigest::reset_lane_state_locked(&mut core);
+            previous
         };
-        // The replacement session starts on the default push lane with
-        // fresh counters (the TS replacement built a new AgentSession) —
-        // and its watches die with the replaced session (TS #2356: the
+        // The replacement session starts with fresh counters (the TS
+        // replacement built a new AgentSession) — reset outside the core
+        // hold (the delivery path locks counters first, core second).
+        // And its watches die with the replaced session (TS #2356: the
         // registry is cleared on dispose; stale subscriptions must not
         // bleed into the new session's notices).
-        self.agent_digest.reset_session_state();
+        self.agent_digest.reset_counters();
         self.engine.clear_agent_watches();
         // The old store's lease release flushes the window and info
         // sidecars (megabytes for a large session): off the core lock
@@ -1042,6 +1051,97 @@ mod tests {
             engine.cleared_agent_watches_count(),
             1,
             "the replacement cleared the agent watches"
+        );
+    }
+
+    /// One iteration's replacement file name (the concurrent-replacement
+    /// test's fresh stores).
+    fn session_file_name_of(dir: &std::path::Path, index: usize) -> std::path::PathBuf {
+        dir.join(format!("fresh-session-{index}.jsonl"))
+    }
+
+    /// The store swap and the digest-lane reset are ONE core-lock section
+    /// (the thread's seam): with the reset in a separate section, a delivery
+    /// squeezing between the two reads the swapped-in store while the
+    /// retired session's digest pin still stands, and persists its inbox
+    /// entry into the replacement — violating the push-pinned start. A
+    /// hammering delivery loops the route across a run of replacements; no
+    /// replaced-in store may ever receive a digested entry (the append's own
+    /// lane re-validation also refuses a decision the replacement straddled).
+    #[tokio::test]
+    async fn a_concurrent_delivery_never_digests_into_a_replacement_store() {
+        let dir =
+            std::env::temp_dir().join(format!("pa-nav-replace-race-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut live_file = SessionFile::create("/tmp", None, 0);
+        live_file.set_path(dir.join("live-session.jsonl"));
+        live_file.rewrite().unwrap();
+        let core = Arc::new(std::sync::Mutex::new(SessionCore::test_core(
+            Some(live_file),
+            "/tmp".to_string(),
+        )));
+        let digest = Arc::new(crate::worker::AgentMessageDigest::new(
+            Arc::clone(&core),
+            Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
+        digest.configure_pin("digest").unwrap();
+        let engine = Arc::new(crate::engine::ScriptedEngine::default());
+        let navigation = SessionNavigation::new(
+            Arc::clone(&engine) as Arc<dyn SessionEngine>,
+            Arc::clone(&core),
+            Arc::clone(&digest),
+        );
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hammer = {
+            let digest = Arc::clone(&digest);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let sender = json!({ "activeSessionId": "sender", "sessionName": "sender" });
+                let mut index = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _ = digest.route_inbound_message(
+                        &format!("agentmsg_hammer_{index}"),
+                        "hammer",
+                        &sender,
+                        Some("sibling"),
+                    );
+                    index += 1;
+                }
+            })
+        };
+        for index in 0..12 {
+            // Re-pin so the hammer runs a live digest lane into this
+            // iteration (the previous replacement reset the pin).
+            digest.configure_pin("digest").unwrap();
+            let fresh_path = dir.join(session_file_name_of(&dir, index));
+            let mut fresh = SessionFile::create("/tmp", None, 0);
+            fresh.set_path(fresh_path.clone());
+            fresh.rewrite().unwrap();
+            navigation.replace_session(fresh).await.unwrap();
+            // The replaced-in store: after the swap every route pushes (the
+            // pin reset rode the swap's hold), so a digested row in THIS file
+            // means a delivery read the swapped store with the retired pin.
+            let content = std::fs::read_to_string(&fresh_path).unwrap();
+            let digested = crate::session_store::parse_session_entries(&content)
+                .iter()
+                .filter(|entry| {
+                    entry.get("type").and_then(|value| value.as_str()) == Some("custom")
+                        && entry.get("customType").and_then(|value| value.as_str())
+                            == Some(crate::worker::AGENT_MESSAGE_INBOX_ENTRY_CUSTOM_TYPE)
+                })
+                .count();
+            assert_eq!(
+                digested, 0,
+                "iteration {index}: a delivery digested into the replacement store"
+            );
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        hammer.join().unwrap();
+        assert_eq!(
+            digest.configure_pin("auto").unwrap()["digest"],
+            json!(false),
+            "the final replacement left the lane push-pinned"
         );
     }
 }

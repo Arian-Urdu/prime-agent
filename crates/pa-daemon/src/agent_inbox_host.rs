@@ -77,15 +77,34 @@ impl AgentWatchHostState {
     pub(crate) fn poll_if_current(
         &mut self,
         generation: u64,
+        subscriptions: &[crate::agent_watch::AgentWatchSubscription],
         snapshots: &HashMap<String, AgentWatchSnapshot>,
         events: &mut Vec<String>,
     ) -> bool {
         if self.generation != generation {
             return false;
         }
+        // Discard snapshots captured before the subscription they answer
+        // to was replaced: a (re-)registration that ran while this pass
+        // was querying the children re-baselined the subscription with a
+        // FRESHER count, so the pass's stale lower count must not be
+        // accepted as compaction (it would move the baseline BACKWARDS
+        // and the next poll re-emit the already-baselined range). The
+        // current pass skips the child; the next pass re-snapshots.
+        let mut current: HashMap<String, AgentWatchSnapshot> = HashMap::new();
+        for subscription in subscriptions {
+            if self.registry.registration_seq(&subscription.id)
+                != Some(subscription.registration_seq)
+            {
+                continue;
+            }
+            if let Some(snapshot) = snapshots.get(&subscription.active_session_id) {
+                current.insert(subscription.active_session_id.clone(), snapshot.clone());
+            }
+        }
         self.registry
             .poll(&mut crate::agent_watch::AgentWatchState {
-                message_count: &|child_id: &str| snapshots.get(child_id).cloned(),
+                message_count: &|child_id: &str| current.get(child_id).cloned(),
                 on_event: &mut |event| {
                     events.push(crate::agent_watch::format_agent_watch_notice(&event));
                 },
@@ -268,6 +287,14 @@ impl AgentSessionEngine {
                     if target.is_empty() {
                         anyhow::bail!("rlm.watch.agent requires a target child name or id");
                     }
+                    // Capture the session generation BEFORE the awaits: a
+                    // session replacement's `clear_agent_watches` can run
+                    // while the child resolution and the snapshot are in
+                    // flight, and a watcher from the retired session must
+                    // not land in the replacement's registry (it would
+                    // poll and notify for a subscription the replacement
+                    // never made).
+                    let generation = engine.watch_host_state().generation;
                     let Some((child_id, child_name, active_session_id)) =
                         engine.resolve_watch_child(target).await
                     else {
@@ -282,6 +309,7 @@ impl AgentSessionEngine {
                     // preserving the active subscription when the lifetime
                     // limit rejects the replacement.
                     engine.register_agent_watch(
+                        generation,
                         &id,
                         &active_session_id,
                         &child_name,
@@ -412,14 +440,25 @@ impl AgentSessionEngine {
     /// first, TS `registerAgentWatch`). The lifetime-capacity check runs
     /// BEFORE the cancel, so a rejected replacement never silently drops
     /// the active subscription.
-    fn register_agent_watch(
+    ///
+    /// `generation` is the session generation the registration captured
+    /// BEFORE its pre-registration awaits (the child resolution and the
+    /// snapshot): a session replacement's
+    /// [`Self::clear_agent_watches`] bumps it, and a registration from
+    /// the retired session must not land in the replacement's registry.
+    /// The check rides the same registry hold as the registration.
+    pub(crate) fn register_agent_watch(
         &self,
+        generation: u64,
         id: &str,
         active_session_id: &str,
         child_name: &str,
         initial: AgentWatchSnapshot,
     ) -> anyhow::Result<()> {
         let mut state = self.watch_host_state();
+        if state.generation != generation {
+            anyhow::bail!("watch registration failed: session was replaced");
+        }
         if !state.registry.can_register() {
             anyhow::bail!("Agent watch total limit reached ({AGENT_WATCH_MAX_TOTAL})");
         }
@@ -505,7 +544,7 @@ impl AgentSessionEngine {
                 let mut events: Vec<String> = Vec::new();
                 {
                     let mut state = engine.watch_host_state();
-                    if !state.poll_if_current(generation, &snapshots, &mut events) {
+                    if !state.poll_if_current(generation, &subscriptions, &snapshots, &mut events) {
                         // The pass snapshotted the retired session's
                         // registry: drop its results instead of polling
                         // the replacement's registry with the stale child

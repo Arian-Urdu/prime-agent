@@ -26,6 +26,8 @@ pub(crate) use connection::{AuthOutcome, ConnectionSink, EventPump, OutboundFram
 mod digest;
 
 pub(crate) use digest::AgentMessageDigest;
+#[cfg(test)]
+pub(crate) use digest::AGENT_MESSAGE_INBOX_ENTRY_CUSTOM_TYPE;
 
 mod queue;
 

@@ -33,6 +33,12 @@ pub struct AgentWatchSubscription {
     pub child_name: String,
     pub last_seen_messages: u64,
     pub last_status: String,
+    /// The registration sequence: every (re-)registration assigns a fresh
+    /// one, so a poll pass can discard snapshots captured before the
+    /// subscription it snapshotted was replaced (a re-registration
+    /// re-baselined it with a fresher count; a stale lower count must not
+    /// masquerade as compaction and move the baseline backwards).
+    pub registration_seq: u64,
 }
 
 impl AgentWatchSubscription {
@@ -86,6 +92,10 @@ pub struct AgentWatchRegistry {
     /// subscriptions in the order they registered.
     order: Vec<String>,
     total_registered: usize,
+    /// The next `registration_seq` (every register assigns a fresh one, so
+    /// a re-registration of the same id is distinguishable from its
+    /// previous incarnation).
+    next_registration_seq: u64,
 }
 
 impl AgentWatchRegistry {
@@ -121,12 +131,15 @@ impl AgentWatchRegistry {
         if self.total_registered >= AGENT_WATCH_MAX_TOTAL {
             anyhow::bail!("Agent watch total limit reached ({AGENT_WATCH_MAX_TOTAL})");
         }
+        let registration_seq = self.next_registration_seq;
+        self.next_registration_seq += 1;
         let subscription = AgentWatchSubscription {
             id: id.to_string(),
             active_session_id: active_session_id.to_string(),
             child_name: child_name.to_string(),
             last_seen_messages: initial.message_count,
             last_status: initial.status,
+            registration_seq,
         };
         self.subscriptions
             .insert(id.to_string(), subscription.clone());
@@ -155,6 +168,17 @@ impl AgentWatchRegistry {
             .filter_map(|id| self.subscriptions.get(id))
             .cloned()
             .collect()
+    }
+
+    /// One subscription's registration sequence, when it is still the
+    /// incarnation the poll pass snapshotted: `cancel` + `register`
+    /// assigns a fresh one, so a poll pass can tell a replaced
+    /// subscription from the one it captured its snapshots against.
+    #[must_use]
+    pub fn registration_seq(&self, id: &str) -> Option<u64> {
+        self.subscriptions
+            .get(id)
+            .map(|subscription| subscription.registration_seq)
     }
 
     #[must_use]

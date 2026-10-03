@@ -587,7 +587,13 @@ async fn session_replacement_resets_the_lane_and_counters() {
         let mut core = worker.core.lock().unwrap();
         core.agent_message_digest_mode = true;
     }
-    worker.agent_digest.reset_session_state();
+    // The replacement's reset section (the navigation's store swap runs
+    // the lane reset in its own core hold, then the counters reset).
+    {
+        let mut core = worker.core.lock().unwrap();
+        AgentMessageDigest::reset_lane_state_locked(&mut core);
+    }
+    worker.agent_digest.reset_counters();
     assert_eq!(
         worker.agent_digest.configure_pin("auto").unwrap()["digest"],
         json!(false)

@@ -40,13 +40,17 @@ Prime Agent is an open-source coding and research agent for general and long-run
 
 ## Install
 
-Install the latest build with the one-command installer (every push to the `rust` branch publishes a fresh rolling beta; the stable channel ships on release):
+Install the latest stable version with the one-command installer:
 
 ```bash
 curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh
 ```
 
-The served installer and everything it downloads — the version pointers, the platform tarballs, the checksums — come from the same domain: no GitHub URL is on the user path.
+On Windows, install from PowerShell:
+
+```powershell
+irm https://app.primeintellect.ai/prime-agent/install.ps1 | iex
+```
 
 ## Why Prime Agent
 

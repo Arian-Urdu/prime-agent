@@ -34,6 +34,8 @@ mod supervision;
 #[cfg(test)]
 mod handshake_tests;
 #[cfg(test)]
+mod spawn_record_tests;
+#[cfg(test)]
 mod tests;
 
 // STABLE_LIFETIME_MS is read only by this facade's in-file test modules (via the module's
@@ -87,7 +89,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use crate::backpressure::RouteAdmission;
 use crate::descriptor::{
     create_command_payload, load_descriptors, persist_supervisor_config, persist_worker,
-    PersistedSupervisorConfig, SUPERVISOR_CONFIG_FILE_NAME,
+    persist_worker_at, PersistedSupervisorConfig, TempSync, SUPERVISOR_CONFIG_FILE_NAME,
 };
 use crate::engine::EngineModelSelection;
 use crate::framing::{write_frame, PrivateFrameReader, DEFAULT_PRIVATE_FRAME_LIMITS};
@@ -121,6 +123,20 @@ use crate::{socket, util};
 pub struct Supervisor {
     pub(crate) options: SupervisorOptions,
     descriptor_dir: PathBuf,
+    /// The bind-time filesystem identity of this supervisor's socket file
+    /// (TS `DaemonSupervisor` captures `socketIdentity` right after
+    /// `listen`, daemon-supervisor.ts:879): the exit cleanup passes it as
+    /// the unlink's expected identity, so a file REPLACED at the path
+    /// after this bind - an external sweep plus a successor's bind - is
+    /// never unlinked by this process. `None` until `run` binds (named
+    /// pipes keep `None`: there is no file to stat).
+    bound_socket_identity: std::sync::Mutex<Option<socket::SocketIdentity>>,
+    /// The per-supervisor launch-probe budget override: `None` rides the
+    /// process-wide env seam (`PA_DAEMON_WORKER_CONNECT_TIMEOUT_MS`),
+    /// a pinned budget keeps a launch oracle's probe immediate without
+    /// mutating that env var (a set value would leak into every
+    /// parallel test's launch).
+    worker_connect_budget: std::sync::Mutex<Option<Duration>>,
     /// The durable session-binding table (the stale-active-id rebind
     /// surface): every active id the supervisor has routed stays
     /// addressable through its session's durable identity, so a client
@@ -137,6 +153,10 @@ pub struct Supervisor {
     /// Daemon-lifecycle telemetry (`daemon event` schema v1), resolved at
     /// run start (None = opted out); never blocks supervision paths.
     telemetry: std::sync::Mutex<Option<pa_telemetry::TelemetryClient>>,
+    /// The frequent supervision events (attach/detach, worker exits and
+    /// restarts, overloads, saved-session listings), counted and sent as
+    /// one `daemon event` summary per window instead of one event each.
+    daemon_event_counts: std::sync::Mutex<notes::DaemonEventCounts>,
     pub(crate) registry: SessionRegistry,
     /// Worker outbound frames, with their client routing. The payload is
     /// shared (`Arc`): every connected client's event arm receives every
@@ -286,9 +306,12 @@ impl Supervisor {
         Ok(Supervisor {
             options,
             descriptor_dir,
+            bound_socket_identity: std::sync::Mutex::new(None),
+            worker_connect_budget: std::sync::Mutex::new(None),
             session_bindings: crate::session_bindings::SessionBindingTable::new(),
             opening_files: std::sync::Mutex::new(std::collections::HashMap::new()),
             telemetry: std::sync::Mutex::new(None),
+            daemon_event_counts: std::sync::Mutex::default(),
             registry: SessionRegistry::new(),
             events,
             session_subscribers: subscribers::SessionSubscribers::new(),
@@ -334,17 +357,20 @@ impl Supervisor {
         // inherit the raised limit.
         let open_file_limit = pa_core::platform::process::raise_open_file_limit();
         // Daemon telemetry: same env/settings posture as the sessions
-        // (the supervisor is the `daemon` execution mode).
+        // (the supervisor is the `daemon` execution mode). Only an
+        // environment opt-out skips the client: a settings opt-out is the
+        // client's live switch, so `/telemetry on` resumes without a
+        // daemon restart.
         {
             let settings = pa_core::settings::SettingsManager::create(
                 std::env::current_dir().unwrap_or_default(),
                 &self.options.agent_dir,
             );
-            let disabled = match pa_telemetry::env_telemetry_override() {
-                Some(enabled) => !enabled,
-                None => !settings.get_telemetry_enabled(),
-            };
-            *self.telemetry.lock().unwrap() = (!disabled).then(|| {
+            let env_forced_off = matches!(
+                pa_core::session_engine::telemetry::telemetry_switch(&settings),
+                pa_core::session_engine::telemetry::TelemetrySwitch::Env { enabled: false, .. }
+            );
+            *self.telemetry.lock().unwrap() = (!env_forced_off).then(|| {
                 pa_core::session_engine::telemetry::build_client(&settings, &self.options.agent_dir)
             });
         }
@@ -391,6 +417,13 @@ impl Supervisor {
                     self.options.socket_path.display()
                 )
             })?;
+        // Capture the bound file's identity before anything can replace
+        // it (TS daemon-supervisor.ts:879, between `listen` and
+        // `restrictDaemonSocketPath`): the exit cleanup below compares
+        // against THIS value, never a fresh read, so a successor's file
+        // at the same path survives this supervisor's exit.
+        *self.bound_socket_identity.lock().unwrap() =
+            socket::socket_identity(&self.options.socket_path);
         socket::restrict_socket_path(&self.options.socket_path);
         self.log
             .append(&format!("supervisor started pid {}", std::process::id()));
@@ -486,8 +519,9 @@ impl Supervisor {
         accept_loop::serve(&self, &*listener).await?;
         socket::cleanup_socket_path(
             &self.options.socket_path,
-            socket::socket_identity(&self.options.socket_path),
+            self.bound_socket_identity.lock().unwrap().clone(),
         );
+        self.flush_telemetry_on_exit().await;
         Ok(())
     }
 }

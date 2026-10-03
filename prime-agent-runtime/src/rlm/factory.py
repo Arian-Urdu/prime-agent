@@ -24,6 +24,18 @@ supervisor owns the children; the executor owns the run state in kernel
 memory. Runs do not survive a kernel restart (the registry lives in this
 module's state); children are supervisor-owned and keep running, so
 ``rlm.list_subagents`` can still see them after a restart.
+
+The full agent-facing reference — authoring rules, guards/joins/cycles,
+foreach, budgets, stall detectors, and the ``rlm.factory`` API with worked
+examples — is embedded in this module as ``FACTORY_HELP``;
+``rlm.factory.help()`` returns it with no filesystem resolution, so
+packaged kernels (where the repo layout is not adjacent) see the same
+guide.
+
+The namespace is opt-in: while the ``factory.enabled`` setting is off (the
+default; the user turns it on with ``/factory on``), every ``rlm.factory``
+call except ``help()`` and every factory harness write refuses with one
+clean message (``FACTORY_DISABLED_MESSAGE``), never a crash.
 """
 
 from __future__ import annotations
@@ -51,13 +63,20 @@ MAX_PARALLEL_MAX = 64
 FOREACH_MAX_MIN = 1
 FOREACH_MAX_MAX = 256
 MAX_TRANSITIONS_CAP = 10_000
+MAX_CHILDREN_CAP = 1_000_000
 TRANSITIONS_PER_STATE_DEFAULT = 10
 RUN_FAILURE_POLICY_DEFAULT = "escalate"
 RUN_MAX_PARALLEL_DEFAULT = 8
+RUN_MAX_CHILDREN_DEFAULT = 10_000
 NODE_LIFECYCLE_DEFAULT = "task"
 NODE_RETRIES_DEFAULT = 0
 STATE_ENTRY_DEFAULT = False
 STATE_MAX_ENTRIES_DEFAULT = 1
+#: An inline subagent ``name`` labels the spawned children; the host caps
+#: subagent session names at 64 characters (the same limit the generated
+#: label stays under), so a longer configured name is rejected at write
+#: time instead of failing every spawn admission.
+SUBAGENT_NAME_MAX_LENGTH = 64
 
 _NODE_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 
@@ -161,6 +180,11 @@ def _validate_run_fields(run: Any, errors: list[str]) -> int | None:
         _is_positive_int(max_transitions) and max_transitions <= MAX_TRANSITIONS_CAP
     ):
         errors.append(f"run max_transitions must be a positive integer no greater than {MAX_TRANSITIONS_CAP}")
+    max_children = run.get("max_children")
+    if "max_children" in run and not (
+        _is_positive_int(max_children) and max_children <= MAX_CHILDREN_CAP
+    ):
+        errors.append(f"run max_children must be a positive integer no greater than {MAX_CHILDREN_CAP}")
     return run_budget
 
 
@@ -196,12 +220,21 @@ def _validate_state_fields(
     if _is_nonempty_str(subagent):
         pass  # Harness subagent entry id or title; resolved at run time.
     elif isinstance(subagent, dict):
-        if not _is_nonempty_str(subagent.get("prompt")):
+        # Runtime resolution strips these fields (_resolve_subagents /
+        # _validate_spawn_settings), so whitespace-only values are rejected
+        # here too: a persistable factory must be spawnable.
+        if not isinstance(subagent.get("prompt"), str) or not subagent.get("prompt").strip():
             errors.append(f"{noun} {ref} inline subagent requires a non-empty prompt")
         for key in ("name", "model", "thinking"):
             value = subagent.get(key)
-            if value is not None and not _is_nonempty_str(value):
+            if value is not None and (not isinstance(value, str) or not value.strip()):
                 errors.append(f"{noun} {ref} inline subagent {key} must be a non-empty string when provided")
+        configured_name = subagent.get("name")
+        if isinstance(configured_name, str) and len(configured_name.strip()) > SUBAGENT_NAME_MAX_LENGTH:
+            errors.append(
+                f"{noun} {ref} inline subagent name must be at most "
+                f"{SUBAGENT_NAME_MAX_LENGTH} characters, got {len(configured_name.strip())}"
+            )
     else:
         errors.append(
             f"{noun} {ref} requires a subagent: a harness subagent id/title string "
@@ -426,10 +459,59 @@ def validate_factory_machine(machine: Any) -> list[str]:
             seen_ids.add(state_id)
             states_by_id[state_id] = state
 
+    # Configured inline subagent names label the spawned children verbatim,
+    # so two states sharing one name would collide on the supervisor's
+    # unique sibling-name requirement at spawn time; reject the duplicate at
+    # write time instead (the same reason duplicate state ids are rejected).
+    seen_subagent_names: dict[str, str] = {}
     for state_id, state in states_by_id.items():
         _validate_state_fields(
             state, run_budget=run_budget, states_by_id=states_by_id, noun="state", errors=errors
         )
+        subagent = state.get("subagent")
+        if isinstance(subagent, dict) and _is_nonempty_str(subagent.get("name")):
+            configured_name = subagent["name"].strip()
+            base_seen = next(
+                (seen for seen in seen_subagent_names if _suffixed_spawn_form(seen, configured_name)),
+                None,
+            )
+            base_current = (
+                None
+                if base_seen is not None
+                else next(
+                    (seen for seen in seen_subagent_names if _suffixed_spawn_form(configured_name, seen)),
+                    None,
+                )
+            )
+            if configured_name in seen_subagent_names:
+                errors.append(
+                    f"state {state_id} subagent name {configured_name!r} is already configured "
+                    f"by state {seen_subagent_names[configured_name]!r}"
+                )
+            elif base_seen is not None:
+                # One state's suffixed labels are another state's verbatim
+                # name (foo vs foo-i1): the supervisor would reject the
+                # duplicate sibling name at spawn time, so reject the
+                # shadowing name at write time. The seen name generates the
+                # labels here.
+                errors.append(
+                    f"state {state_id} subagent name {configured_name!r} collides with the "
+                    f"suffixed spawn labels of state {seen_subagent_names[base_seen]!r} "
+                    f"(configured {base_seen!r}): re-entry, foreach, and retries name children "
+                    f"{base_seen!r}-i<n> and {base_seen!r}-a<n>"
+                )
+            elif base_current is not None:
+                # The reverse direction: THIS state's name generates the
+                # suffixed labels, and an earlier state's name is one of
+                # them.
+                errors.append(
+                    f"state {state_id} subagent name {configured_name!r} suffixed by re-entry, "
+                    f"foreach, and retries ({configured_name!r}-i<n>, {configured_name!r}-a<n>) "
+                    f"collides with state {seen_subagent_names[base_current]!r} "
+                    f"(configured {base_current!r})"
+                )
+            else:
+                seen_subagent_names[configured_name] = state_id
         if "entry" in state and not isinstance(state.get("entry"), bool):
             errors.append(f"state {state_id} entry must be a boolean")
         if "max_entries" in state and not (
@@ -669,9 +751,10 @@ def _canonicalize_machine(machine: dict[str, Any]) -> dict[str, Any]:
     """Apply defaults to a validated machine and normalize it into a clean dict.
 
     Defaults: run failure_policy 'escalate', run max_parallel 8, run
-    max_transitions 10 per state capped at 10000, state entry False, state
-    max_entries 1, state lifecycle 'task', state retries 0, state
-    failure_policy copied from the run policy, and transition on 'settled'.
+    max_transitions 10 per state capped at 10000, run max_children 10000,
+    state entry False, state max_entries 1, state lifecycle 'task', state
+    retries 0, state failure_policy copied from the run policy, and
+    transition on 'settled'.
     """
     run_in = machine.get("run") if isinstance(machine.get("run"), dict) else {}
     run_policy = run_in.get("failure_policy", RUN_FAILURE_POLICY_DEFAULT)
@@ -683,6 +766,7 @@ def _canonicalize_machine(machine: dict[str, Any]) -> dict[str, Any]:
             "max_transitions",
             min(TRANSITIONS_PER_STATE_DEFAULT * states_count, MAX_TRANSITIONS_CAP),
         ),
+        "max_children": run_in.get("max_children", RUN_MAX_CHILDREN_DEFAULT),
     }
     if "budget_ms" in run_in:
         run["budget_ms"] = run_in["budget_ms"]
@@ -810,11 +894,15 @@ def topological_order(nodes: list[dict[str, Any]]) -> list[str]:
 
 
 __all__ = [
+    "FACTORY_DISABLED_MESSAGE",
+    "FACTORY_HELP",
     "FactoryExecutor",
     "FactoryRun",
     "canonicalize_factory_spec",
     "compile_factory_dag",
     "default_factory_executor",
+    "factory_enabled",
+    "require_factory_enabled",
     "resume_factory",
     "run_factory",
     "status_factory",
@@ -897,6 +985,66 @@ def _child_name(run_id: str, state_id: str, instance_index: int, attempt: int) -
     if attempt > 1:
         parts.append(f"a{attempt}")
     return "-".join(parts)
+
+
+def _spawn_label(
+    configured: str | None, run_id: str, state_id: str, instance_index: int, attempt: int
+) -> str:
+    """Sibling label for one spawned instance: the state's configured inline
+    subagent ``name`` when it has one, else the generated label.
+
+    The configured name is used verbatim for the state's first instance on
+    its first attempt (agents message the child by exactly this label); the
+    SAME disambiguation suffixes as the generated label -- ``i<n>`` for
+    later instances (re-entry, foreach fan-out), ``a<n>`` for retries --
+    keep every admission unique: the supervisor rejects duplicate sibling
+    names, and one state's settled children stay registered for the
+    run's life, so a re-entering state (``max_entries`` > 1) would collide
+    with its own earlier child on a verbatim name.
+
+    A suffixed label never exceeds the host's 64-character spawn-name cap:
+    an overflowing base shrinks to a digest-suffixed token of the full
+    name, exactly like the generated label's state-id token.
+    """
+    if configured is None:
+        return _child_name(run_id, state_id, instance_index, attempt)
+    suffix_parts = [f"i{instance_index}"] if instance_index > 0 else []
+    if attempt > 1:
+        suffix_parts.append(f"a{attempt}")
+    suffix = "".join(f"-{part}" for part in suffix_parts)
+    base = configured
+    if len(base) + len(suffix) > SUBAGENT_NAME_MAX_LENGTH:
+        # The host caps spawn names at 64 characters, so a suffixed label
+        # that would exceed it shrinks its base first -- and a bare
+        # truncation could collide (two long configured names sharing the
+        # truncated prefix), so the base keeps a digest of the full name
+        # exactly like the generated label's state-id token: distinct
+        # names stay distinct, and every admission fits the cap.
+        digest = hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
+        room = max(SUBAGENT_NAME_MAX_LENGTH - len(suffix) - len(digest) - 1, 0)
+        base = f"{base[:room]}-{digest}"
+    return base + suffix
+
+
+def _suffixed_spawn_form(base: str, candidate: str) -> bool:
+    """True when ``candidate`` is a spawn label ``base`` can produce.
+
+    A state configured as ``base`` names its later children ``base-i<n>``
+    (re-entry, foreach fan-out) and ``base-a<n>`` (retries, ``n`` >= 2);
+    the never-generated ``-i0`` and ``-a1`` do not count, so a candidate
+    carrying them cannot collide and stays valid.
+    """
+    if not candidate.startswith(base + "-"):
+        return False
+    remainder = candidate[len(base) + 1 :]
+    for part in remainder.split("-"):
+        if len(part) < 2 or part[0] not in "ia" or not part[1:].isdigit():
+            return False
+        if part[0] == "i" and int(part[1:]) < 1:
+            return False
+        if part[0] == "a" and int(part[1:]) < 2:
+            return False
+    return True
 
 
 def _parse_json_output(answer: str, output_name: str) -> tuple[Any, str | None]:
@@ -1080,6 +1228,7 @@ class _StateRun:
     spec: dict[str, Any]  # canonical state spec
     position: int  # stable list position for deterministic ordering
     prompt_template: str | None = None
+    name: str | None = None  # configured inline subagent name; labels children
     model: str | None = None
     thinking: str | None = None
     max_entries: int = STATE_MAX_ENTRIES_DEFAULT
@@ -1118,7 +1267,9 @@ class FactoryRun:
     started_at: float = 0.0
     max_parallel: int = RUN_MAX_PARALLEL_DEFAULT
     max_transitions: int = MAX_TRANSITIONS_CAP
+    max_children: int = RUN_MAX_CHILDREN_DEFAULT
     max_transitions_reported: bool = False
+    max_children_reported: bool = False
     run_budget_ms: int | None = None
     budget_reported: bool = False
     pause_reason: str | None = None
@@ -1306,6 +1457,7 @@ class FactoryExecutor:
                 "settled": run.settle_count,
                 "tool_uses": run.tool_use_total,
                 "max_parallel": run.max_parallel,
+                "max_children": run.max_children,
                 "running": self._running_instance_count(run),
                 "transitions_fired": run.transitions_fired,
             },
@@ -1386,20 +1538,24 @@ class FactoryExecutor:
 
     def _resolve_subagents(
         self, harness: Any, canonical: dict[str, Any]
-    ) -> tuple[dict[str, tuple[str, str | None, str | None]], list[str]]:
+    ) -> tuple[dict[str, tuple[str, str | None, str | None, str | None]], list[str]]:
         """Resolve every state's subagent reference; collect ALL failures.
 
         A string reference is a harness subagent entry id or title: its
         content is the prompt template and ``metadata.model``/``metadata.thinking``
-        carry optional spawn settings. An inline object uses its own fields.
+        carry optional spawn settings. An inline object uses its own fields;
+        its ``name`` (stripped the way the host strips spawn names) labels
+        the spawned children.
         """
-        resolved: dict[str, tuple[str, str | None, str | None]] = {}
+        resolved: dict[str, tuple[str, str | None, str | None, str | None]] = {}
         errors: list[str] = []
         for state_spec in canonical["states"]:
             state_id = state_spec["id"]
             reference = state_spec["subagent"]
             if isinstance(reference, dict):
                 prompt = reference.get("prompt")
+                raw_name = reference.get("name")
+                name = raw_name.strip() if isinstance(raw_name, str) else None
                 model = reference.get("model")
                 thinking = reference.get("thinking")
             else:
@@ -1410,6 +1566,7 @@ class FactoryExecutor:
                     errors.append(f"state {state_id!r} references unknown subagent {reference!r}")
                     continue
                 prompt = entry.content
+                name = None
                 metadata = entry.metadata if isinstance(entry.metadata, dict) else {}
                 model = metadata.get("model")
                 thinking = metadata.get("thinking")
@@ -1420,14 +1577,14 @@ class FactoryExecutor:
             if settings_error is not None:
                 errors.append(f"state {state_id!r} {settings_error}")
                 continue
-            resolved[state_id] = (prompt, model, thinking)
+            resolved[state_id] = (prompt, name or None, model, thinking)
         return resolved, errors
 
     def _create_run(
         self,
         spec_id: str,
         canonical: dict[str, Any],
-        resolved: dict[str, tuple[str, str | None, str | None]],
+        resolved: dict[str, tuple[str, str | None, str | None, str | None]],
         *,
         name: str | None,
     ) -> FactoryRun:
@@ -1439,18 +1596,20 @@ class FactoryExecutor:
             started_at=self._now_fn(),
             max_parallel=run_spec["max_parallel"],
             max_transitions=run_spec["max_transitions"],
+            max_children=run_spec["max_children"],
             run_budget_ms=run_spec.get("budget_ms"),
         )
         position_of: dict[str, int] = {}
         for position, state_spec in enumerate(canonical["states"]):
             position_of[state_spec["id"]] = position
             state_id = state_spec["id"]
-            prompt, model, thinking = resolved.get(state_id, (None, None, None))
+            prompt, name, model, thinking = resolved.get(state_id, (None, None, None, None))
             run.states[state_id] = _StateRun(
                 state_id=state_id,
                 spec=state_spec,
                 position=position,
                 prompt_template=prompt,
+                name=name,
                 model=model,
                 thinking=thinking,
                 max_entries=state_spec.get("max_entries", STATE_MAX_ENTRIES_DEFAULT),
@@ -1648,7 +1807,11 @@ class FactoryExecutor:
         The run budget is enforced BEFORE each admission (this phase runs
         from run() and resume() too, not only the control loop): a slow
         initial admission must not keep launching instances after
-        run_budget_ms expired. Admission is also skipped while a
+        run_budget_ms expired. The run-wide child budget (max_children:
+        every admission over the run's life, foreach expansions and retry
+        re-spawns included) is enforced the same way — the next admission
+        over it pauses the run instead of launching the child.
+        Admission is also skipped while a
         rate-limit backoff deadline is outstanding. Returns the state ids
         that had at least one instance admitted here.
         """
@@ -1666,6 +1829,9 @@ class FactoryExecutor:
                 break
             pair = self._next_pending_instance(run)
             if pair is None:
+                break
+            if self._children_budget_exceeded(run):
+                await self._pause_for_children(run)
                 break
             state, entry, instance = pair
             outcome = await self._admit(run, state, entry, instance, allow_backoff=allow_backoff)
@@ -1706,6 +1872,31 @@ class FactoryExecutor:
             "budget_exceeded",
             f"run budget_ms {run.run_budget_ms} exceeded after {int(elapsed_ms)}ms; no new spawns; "
             f"resume with await rlm.factory.resume('{run.run_id}')",
+        )
+
+    def _children_budget_exceeded(self, run: FactoryRun) -> bool:
+        if run.max_children_reported:
+            return False
+        return run.spawn_count >= run.max_children
+
+    async def _pause_for_children(self, run: FactoryRun) -> None:
+        """Pause the run at the child-budget boundary (milestone fires once).
+
+        max_children is the TOTAL-admission budget over the run's life:
+        spawn_count counts every admission, foreach expansions and retry
+        re-spawns included (max_parallel bounds concurrency only, and
+        max_transitions bounds transitions — neither bounds children).
+        Children already in flight keep running. Resuming after the
+        milestone is an explicit operator decision, so no further
+        child-budget pauses fire (max_children_reported)."""
+        run.state = "paused"
+        run.pause_reason = "max_children exceeded"
+        run.max_children_reported = True
+        await self._milestone(
+            run,
+            "max_children_exceeded",
+            f"run max_children {run.max_children} exceeded after {run.spawn_count} children; "
+            f"no new spawns; resume with await rlm.factory.resume('{run.run_id}')",
         )
 
     async def _prepare_ready_entries(self, run: FactoryRun) -> None:
@@ -1758,35 +1949,56 @@ class FactoryExecutor:
             src_id, _, src_output = source.partition(".")
             source_state = run.states.get(src_id)
             latest = source_state.latest_settle() if source_state is not None else None
-            if latest is None:
+            value: Any = None
+            failure: str | None = None
+            if latest is not None:
+                # One settled source classifies into a captured value or a
+                # binding failure. An errored settle, a port whose JSON
+                # capture failed, and a declared port the settle captured
+                # no value for are all no-value conditions of a source
+                # that HAS settled -- the dependent sees none of them as a
+                # value.
+                if latest.status == "error":
+                    failure = f"input {name!r} from state {src_id!r} is unavailable (latest settle status 'error')"
+                else:
+                    outputs = latest.outputs or {}
+                    output_errors = latest.output_errors or {}
+                    if src_output in output_errors:
+                        failure = f"input {name!r}: {output_errors[src_output]}"
+                    elif src_output not in outputs:
+                        failure = f"input {name!r} from state {src_id!r} has no captured output {src_output!r}"
+                    else:
+                        value = outputs[src_output]
+            if latest is None or failure is not None:
                 if inp.get("optional"):
-                    # Optional inputs bind a null sentinel when their source
-                    # never settled, so loop states can re-enter before their
-                    # upstream partner has run (a compiled dag never sets
-                    # optional: its input edges are transitions, so the
-                    # wait-for-the-source semantics stay V1-exact). The
-                    # foreach.over input is the one optional that cannot
-                    # bind a sentinel: expansion would hit "did not resolve
-                    # its over input" -- a hard failure where the required
-                    # form only waits -- so an unsettled optional over
-                    # expands to zero items (the same done-with-no-instances
-                    # path as a settled empty list) and a later re-entry
-                    # binds the real list.
+                    # Optional inputs bind a null sentinel whenever their
+                    # source offers no value -- never settled, errored
+                    # settle, or a settled source that captured nothing
+                    # for the port -- so loop states can re-enter before
+                    # their upstream partner has run and after it failed
+                    # or produced nothing usable (a compiled dag never
+                    # sets optional: its input edges are transitions, so
+                    # the wait-for-the-source semantics stay V1-exact).
+                    # Only a REQUIRED input over a settled-but-valueless
+                    # source fails the dependent: the guard-less
+                    # transition still fires from the error settle, and
+                    # the authoring reference pins the required form as
+                    # the failing one. The foreach.over input is the one
+                    # optional that cannot bind a sentinel: expansion
+                    # would hit "did not resolve its over input" -- a
+                    # hard failure where the required form only waits --
+                    # so a value-less optional over expands to zero items
+                    # (the same done-with-no-instances path as a settled
+                    # empty list) and a later re-entry binds the real
+                    # list.
                     if foreach is not None and foreach.get("over") == name:
                         items = []
                         continue
                     values[name] = "null" if port_type == "json" else "None"
                     continue
-                return None, None  # wait for the source's first settle
-            if latest.status == "error":
-                return None, f"input {name!r} from state {src_id!r} is unavailable (latest settle status 'error')"
-            outputs = latest.outputs or {}
-            output_errors = latest.output_errors or {}
-            if src_output in output_errors:
-                return None, f"input {name!r}: {output_errors[src_output]}"
-            if src_output not in outputs:
-                return None, f"input {name!r} from state {src_id!r} has no captured output {src_output!r}"
-            value = outputs[src_output]
+                if latest is None:
+                    return None, None  # wait for the source's first settle
+                return None, failure
             if port_type == "text":
                 values[name] = value if isinstance(value, str) else json.dumps(value)
                 continue
@@ -1857,7 +2069,7 @@ class FactoryExecutor:
         from . import spawn
 
         instance.attempt += 1
-        child_name = _child_name(run.run_id, state.state_id, instance.index, instance.attempt)
+        child_name = _spawn_label(state.name, run.run_id, state.state_id, instance.index, instance.attempt)
         try:
             handle = await spawn(
                 instance.prompt, name=child_name, model=state.model, thinking=state.thinking
@@ -2294,15 +2506,13 @@ class FactoryExecutor:
     # -- control loop --------------------------------------------------------
 
     def _start_loop(self, run: FactoryRun) -> None:
+        # Called only from run()/resume(), both awaited inside a running
+        # asyncio loop, so get_running_loop() always finds it.
         import asyncio
 
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            run.state = "failed"
-            self._event(run, "executor_error", error="no running asyncio loop; the factory control loop needs one")
-            return
-        run.task = loop.create_task(self._control_loop(run, run.loop_generation))
+        run.task = asyncio.get_running_loop().create_task(
+            self._control_loop(run, run.loop_generation)
+        )
 
     async def _control_loop(self, run: FactoryRun, generation: int) -> None:
         import asyncio
@@ -2491,6 +2701,61 @@ class FactoryExecutor:
         return [state_id for state_id in run.order if run.states[state_id].status == "pending"]
 
 
+# ---------------------------------------------------------------------------
+# The opt-in gate: `factory.enabled` in the agent-dir settings file.
+# ---------------------------------------------------------------------------
+
+#: The single refusal every gated factory call raises while the setting is
+#: off. One exact message, so agents and tests can pin the refusal.
+FACTORY_DISABLED_MESSAGE = "the factory is disabled; run /factory on to enable it"
+
+_SETTINGS_FILE_NAME = "settings.json"
+
+
+def factory_enabled() -> bool:
+    """Read the ``factory.enabled`` opt-in setting (default off).
+
+    The factory is opt-in: it ships disabled, and the user turns it on with
+    ``/factory on`` (the persisted setting is ``factory.enabled`` in the
+    agent dir's ``settings.json`` -- the same nested-camelCase document the
+    daemon and TUI settings surface write, e.g. ``{"factory": {"enabled":
+    true}}`` beside ``compaction``/``agentTraces``). The read mirrors the
+    lenient settings loading on the Rust side: a missing file or key, a
+    wrong-typed value, or a corrupt document all read as unset, and unset
+    means disabled -- the opt-in default is fail-closed, so an unreadable
+    settings file refuses the factory instead of silently enabling it.
+    """
+    # One home for the agent-dir resolution (harness.py owns it); imported
+    # lazily because harness imports this module at its own top.
+    from .harness import _agent_dir
+
+    path = _agent_dir() / _SETTINGS_FILE_NAME
+    try:
+        with open(path, encoding="utf-8") as handle:
+            document = json.load(handle)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(document, dict):
+        return False
+    factory = document.get("factory")
+    if not isinstance(factory, dict):
+        return False
+    return factory.get("enabled") is True
+
+
+def require_factory_enabled() -> None:
+    """Refuse with one clean error while the factory is disabled.
+
+    Every gated surface funnels through here -- the ``rlm.factory``
+    namespace calls (``run``/``status``/``stop``/``resume``, and the later
+    ``graph``/``watch``) and the factory harness writes -- so the refusal is
+    one message at every seam. ``help()`` is deliberately exempt: the
+    authoring reference must stay readable before opting in.
+    """
+    if not factory_enabled():
+        raise ValueError(FACTORY_DISABLED_MESSAGE)
+
+
 _DEFAULT_EXECUTOR: FactoryExecutor | None = None
 
 
@@ -2509,19 +2774,338 @@ def default_factory_executor() -> FactoryExecutor:
 
 async def run_factory(spec_id: str, *, name: str | None = None) -> dict[str, Any]:
     """Validate a stored factory spec and start a nonblocking run of it."""
+    require_factory_enabled()
     return await default_factory_executor().run(spec_id, name=name)
 
 
 async def status_factory(run_id: str) -> dict[str, Any]:
     """Return state states, the event window, elapsed time, and usage."""
+    require_factory_enabled()
     return await default_factory_executor().status(run_id)
 
 
 async def stop_factory(run_id: str) -> dict[str, Any]:
     """Cancel every running child of the run and mark it stopped."""
+    require_factory_enabled()
     return await default_factory_executor().stop(run_id)
 
 
 async def resume_factory(run_id: str) -> dict[str, Any]:
     """Resume a paused run (escalate, budget, or max_transitions pause)."""
+    require_factory_enabled()
     return await default_factory_executor().resume(run_id)
+
+
+FACTORY_HELP: str = r"""# Factory
+
+The factory runs state-machine workflows of spawned child agents. A stored
+factory entry declares the machine — states, each backed by a subagent
+spec, plus guarded transitions between them. `await rlm.factory.run('<spec_id>')`
+spawns each state's subagent as an ordinary child, feeds captured outputs
+into the successors' prompts, and drives the run to quiescence in a
+background kernel task; the call returns immediately and the run continues
+after the model turn ends. Use it when a workflow needs shape: fan-out,
+bounded loops (review/fix until a verdict approves), joins, or one child
+per list item.
+
+The factory is opt-in: it ships disabled, and the user turns it on with
+`/factory on` (`/factory off` disables it again, `/factory status` reports
+it; the persisted setting is `factory.enabled` in the agent dir's
+settings.json). While it is disabled, every `rlm.factory` call except
+`help()` — run, status, stop, and resume — plus every factory harness
+write (`create_factory` and updates of factory entries) refuses with one
+clean error:
+"the factory is disabled; run /factory on to enable it". `help()` answers
+while disabled, so this guide stays readable before opting in.
+
+## Store the spec
+
+A factory spec is a continual-harness entry of kind `factory`.
+`rlm.harness.create_factory(...)` validates at write time; an invalid spec
+is never stored (generic `create`/`update` funnel through the same check).
+The spec rides `machine=` (the native form) or `dag=` (sugar that compiles
+to machine form) — pass exactly one. This review/fix loop is the shipped
+pr-manager shape:
+
+```python
+rlm.harness.create_factory(
+    "pr-manager",
+    "Drive a PR through review/fix cycles, then keep a resident watcher on it.",
+    id="pr-manager",
+    machine={
+        "run": {"budget_ms": 1_800_000, "max_parallel": 8, "max_transitions": 24},
+        "states": [
+            {
+                "id": "entry", "entry": True,
+                "subagent": {"prompt": (
+                    "Identify the pull request for the current branch with "
+                    "`gh pr view --json url`. Return a fenced json block of the form "
+                    '{"pr_url": "https://github.com/owner/repo/pull/N"}. '
+                    "Output only the json block.")},
+                "outputs": [{"name": "pr_url", "type": "json"}],
+            },
+            {
+                "id": "reviewing",
+                "subagent": {"prompt": (
+                    "Review the pull request at {pr_url} for merge-blocking "
+                    "defects with `gh pr diff`. When a fix report is bound below, "
+                    "verify the described fixes landed. Return a fenced json block "
+                    'of the form {"verdict": {"approved": <true|false>, '
+                    '"findings": ["at most three one-line findings"]}}. '
+                    "Output only the json block.")},
+                "inputs": [
+                    {"name": "pr_url", "type": "json", "from": "entry.pr_url"},
+                    {"name": "fix_report", "type": "json", "from": "fixing.fix_report", "optional": True},
+                ],
+                "outputs": [{"name": "verdict", "type": "json"}],
+                "max_entries": 4,
+            },
+            {
+                "id": "fixing",
+                "subagent": {"prompt": (
+                    "Address the review findings in the verdict below. Make the "
+                    "smallest targeted fixes, run the relevant tests, and return a "
+                    "fenced json block of the form "
+                    '{"fix_report": {"fixed": ["finding that was addressed"], '
+                    '"skipped": ["finding left alone and why"]}}. '
+                    "Output only the json block.\n\n{verdict}")},
+                "inputs": [{"name": "verdict", "type": "json", "from": "reviewing.verdict"}],
+                "outputs": [{"name": "fix_report", "type": "json"}],
+                "max_entries": 3,
+            },
+            {
+                "id": "monitoring",
+                "subagent": {"prompt": "Stay resident as the watcher for {pr_url}: "
+                    "report the `gh pr checks` state once, then remain available for "
+                    "follow-up questions."},
+                "inputs": [{"name": "pr_url", "type": "json", "from": "entry.pr_url"}],
+                "lifecycle": "resident",
+            },
+        ],
+        "transitions": [
+            {"from": "entry", "to": "reviewing"},
+            {"from": "reviewing", "to": "fixing",
+             "when": {"output": "verdict", "path": "approved", "op": "eq", "value": False}},
+            {"from": "reviewing", "to": "monitoring",
+             "when": {"output": "verdict", "path": "approved", "op": "eq", "value": True}},
+            {"from": "fixing", "to": "reviewing"},
+        ],
+    },
+)
+```
+
+The example exercises the core forms: `entry` is an entry state; the two
+guards select the next state from the reviewer's `verdict`; `fix_report` is
+optional, so the reviewer's first entry binds a null sentinel before the
+fixer ever runs and its re-entry re-binds the real report; `max_entries`
+bounds the loop; `monitoring` is a `resident` that stays alive under the
+parent session after the run ends. Both worked examples bound their
+emitted payloads in the prompt — a capped findings list here, a capped
+file list in the review-sweep example — because captured answers are
+capped previews: an unbounded payload truncates at the cap and fails to
+bind.
+
+## Authoring reference
+
+- **States**: 1 to 1024, unique ids matching `^[a-z0-9][a-z0-9-]{0,63}$`; at
+  least one state carries `"entry": true`, and entry states declare no
+  inputs. A state's `subagent` is a harness subagent entry id or title (its
+  content is the prompt template; `metadata.model`/`metadata.thinking` are
+  spawn settings) or an inline `{"prompt": ...}` object with optional
+  `name`/`model`/`thinking`. The optional `name` labels the spawned
+  children (at most 64 characters, unique across the machine's states —
+  a name another state's name can suffix onto, `foo` vs `foo-i1`, is
+  rejected at write time): the first instance is named exactly `name` —
+  the label to message the child by — and re-entries, foreach fan-out,
+  and retries disambiguate with the same `-i<n>`/`-a<n>` suffixes the
+  generated labels use; a suffixed label that would pass the host's
+  64-character cap shrinks its base with a digest of the full name, like
+  the generated labels do.
+- **Ports**: inputs and outputs of type `text` or `json`. An input binds
+  `"from": "<state_id>.<output_name>"`; types must match, duplicates are
+  rejected, and nothing can read from a resident. Bound values render into
+  `{input_name}` placeholders (one pass; inputs without a placeholder are
+  appended in a trailing `## Inputs` section). A required input whose source
+  has not settled yet keeps the entry pending; over a settled source that
+  offers no value (an errored settle, a port the settle captured no value
+  for, or a JSON capture failure) it fails the dependent entry, while
+  `"optional": true` binds a null sentinel in every no-value case (a
+  source that offers no value is not a value, so the dependent that
+  declared the input optional proceeds). A required self-input is
+  rejected at validation —
+  `state X input 'name' cannot require itself: mark the self-input optional
+  - a required one can never bind on the state's first entry` — while an
+  optional self-input is the designed self-loop form (first entry binds
+  null, re-entries bind the previous settle).
+- **Transitions**: `{"from": ..., "to": ..., "on": "settled", "when": ...}`.
+  Each settle is evaluated exactly once and every guard that passes fires
+  (fan-out is legal); a fire onto a state at `max_entries` is recorded as a
+  blocked transition. `from` may be a list of states: a join that fires
+  once every source settled — once per source-settle combination — and may
+  not carry a guard. Guards are `{"output": ..., "path": ..., "op": ...,
+  "value": ...}` over the from-state's latest settle: `op` is one of `eq`,
+  `ne`, `gt`, `gte`, `lt`, `lte`, `exists`, `contains`; `path` drills a
+  dotted path into a `json` output; `eq`/`ne` compare JSON-strictly (a
+  boolean never equals a number), comparison ops need a numeric value,
+  `contains` a non-empty list, `exists` no value, and a missing or
+  unparseable port fails every op except `exists`. A failed settle still
+  fires guard-less transitions, so dependents under `continue` run; their
+  required input over the failed source then fails the dependent entry,
+  while an optional input over the failed source binds the null sentinel
+  and the dependent proceeds.
+- **Cycles are legal**: there is no acyclicity requirement — self-loops and
+  back edges validate. The one rule is an entry state somewhere; a dag
+  whose every node depends on another compiles to no entry states and is
+  rejected.
+- **foreach**: `{"over": "<input>", "max": 1..256}` expands one entry into
+  one child per item of the named `json` input (clamped at `max`), each
+  child rendered with its item bound as that input; an empty list settles
+  the entry with no children.
+- **Residents**: `"lifecycle": "resident"` states declare no outputs, no
+  foreach, and no outgoing transitions, nothing reads from them, and their
+  instance stays alive under the parent session after the run completes
+  (stop the run to retire it).
+- **Bounds and policies**: `run.max_parallel` (1..64, default 8) is the
+  run's global budget of simultaneously running instances — not a
+  per-node limit. `run.max_children` (default 10,000, capped at
+  1,000,000) is the run's global budget of total admissions over its
+  life — foreach expansions and retry re-spawns included (neither
+  `max_parallel` nor `max_transitions` bounds children); reaching it
+  pauses the run once, and `resume` continues past it as an explicit
+  operator decision. `run.max_transitions` (default 10 per state, capped
+  at 10,000) pauses the run once at the boundary, mid-settle; `resume`
+  continues after the transitions that already fired without re-firing
+  them. `run.budget_ms` pauses the run once when exceeded (in-flight
+  children keep running). Per state: `max_entries` (default 1), `retries`
+  (0..10, same rendered prompt), `budget_ms` (admission to settlement;
+  exceeding it fails the attempt without a retry), and `failure_policy` —
+  `fail_fast` (cancel every child, run failed), `continue` (entry stays
+  errored; the run finishes and reports failed if any state errored), or
+  `escalate` (the default: pause the run; resuming is the operator's
+  decision).
+- **Dead configurations fail loudly, never wedge**: a pending entry whose
+  input source never settled, a `max_parallel` cap held entirely by
+  never-settling residents with work queued, or nothing in flight and
+  nothing pending each end the run as failed with the reason in the
+  ledger. `wait` blocks on states are rejected at validation (not
+  supported yet).
+
+## Dag form
+
+Sugar, not a second semantics: each node becomes a state entered once, a
+node with no effective dependencies becomes an entry state, and the full
+dependency set — `depends_on` plus every `inputs[].from` source — compiles
+to ONE join transition, so a fan-in node waits for every parent. The
+shipped review-sweep shape:
+
+```python
+rlm.harness.create_factory(
+    "review-sweep",
+    "Sweep the branch's changed files for findings, then merge them into one list.",
+    id="review-sweep",
+    dag={
+        "run": {"budget_ms": 900_000, "max_parallel": 8},
+        "nodes": [
+            {
+                "id": "files",
+                "subagent": {"prompt": (
+                    "List the files the current branch changes relative to the "
+                    "base branch, capped at the eight most relevant. Return "
+                    'a fenced json block of the form {"files": ["path/to/file", ...]}. '
+                    "Output only the json block.")},
+                "outputs": [{"name": "files", "type": "json"}],
+            },
+            {
+                "id": "review",
+                "subagent": {"prompt": (
+                    "Review the changed file {files} for merge-blocking defects: "
+                    "correctness bugs, regressions, unhandled error paths, missing "
+                    "tests. Reply one short line: `<path>: <the most serious "
+                    "problem, or 'clean'>`.")},
+                "inputs": [{"name": "files", "type": "json", "from": "files.files"}],
+                "outputs": [{"name": "found", "type": "text"}],
+                "foreach": {"over": "files", "max": 8},
+            },
+            {
+                "id": "report",
+                "subagent": {"prompt": (
+                    "Merge the review lines below into one fenced json block of "
+                    'the form {"issues": [{"file": "path", "finding": "..."}]} '
+                    "listing every file that is not clean. Output only the json "
+                    "block.\n\n{found}")},
+                "inputs": [{"name": "found", "type": "text", "from": "review.found"}],
+            },
+        ],
+    },
+)
+```
+
+## Run and steer
+
+```python
+result = await rlm.factory.run("pr-manager")
+# {"run_id": "...", "spec_id": "pr-manager", "nodes": 4, "max_parallel": 8,
+#  "started": ["entry"], "pending": []}  — returns immediately.
+
+status = await rlm.factory.status(result["run_id"])
+status["state"]    # running | stopping | paused | done | failed | stopped
+status["nodes"]    # per state: status, entries_used/max_entries, instances,
+                   # latest answer_preview, error
+status["events"]   # trailing ledger: spawned, settled, answer_captured,
+                   # transition_fired, node_error, milestone, ...
+status["usage"]    # spawns, settled, tool_uses, max_parallel, max_children, running,
+                    # transitions_fired
+```
+
+The live monitoring views (`graph()` and a bounded `watch()`) arrive
+with the stacked live-view PR; `status()` covers the run state, node
+detail, and the event ledger until then.
+
+- `run` re-validates the spec and resolves every subagent reference first,
+  reporting all failures in one `ValueError` and starting nothing on any
+  failure; `name=` labels the run in status and the TUI.
+- Pause and failure milestones (escalate, budget, max_transitions,
+  max_children, failed, finished) are recorded in the run's event
+  ledger, every repeat included, the pause milestones with the resume
+  call spelled out — read `status()`'s trailing events to see them.
+  Quiet conversation notices for the milestones (one per kind per run)
+  arrive with the stacked live-view PR, which adds the host side that
+  renders them.
+- `stop(run_id)` cancels every running child of the run (idempotent);
+  `resume(run_id)` continues a paused run and raises on a non-paused one.
+- The activity lane the daemon and TUI speak arrives with the stacked
+  live-view PR, camelCase on the wire (`runId`, `specId`, `timeoutMs`);
+  the kernel API here (`rlm.factory.*`) is snake_case.
+
+## Discovering machines
+
+- The machine library (arriving on the stacked machine-library PR):
+  machines are `MACHINE.md` files, one directory per machine under the
+  repository's `machines/` and a personal `machines/` library under the
+  agent dir; `prime-agent factory list | import | export` manages them. The
+  seeds are `builder`, `pr-manager`, and `review-sweep`; the worked
+  examples above derive from their shapes.
+- The TUI factory page: the activity dock's `⚙ N factory` group (Enter or
+  click) opens one live diagram per run, newest run first. `j`/`k` move the
+  selection, `s` stops the selected run, `r` resumes it, `m` copies it as
+  Mermaid source, Esc closes.
+
+## Safety
+
+- Every state spawns real children that spend budget. Bound loops with
+  `max_entries`, `max_transitions`, and `run.max_children` (total
+  admissions); the default `escalate` policy pauses
+  instead of failing, so read `status` (or the notice) before resuming.
+- Captured answers are capped previews (about 160 characters) and outputs
+  bind from them: keep declared outputs compact — a small fenced json
+  block or one short line — and let the full answer live in the child's
+  session.
+- Run registries live in kernel memory: a kernel restart loses `status`
+  for old runs, but the children keep running under the supervisor
+  (`rlm.list_subagents` sees them). Stop runs before restarting, or
+  delete the children by hand afterwards.
+- Residents outlive their run; stop the run (or tear down the session) to
+  retire them. Prefer `rlm.factory.stop(run_id)` over deleting a factory
+  child by hand — the executor claims and cancels children itself, and a
+  hand deletion surfaces as a child failure through the state's policy.
+"""

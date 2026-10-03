@@ -298,8 +298,14 @@ mod tests {
             let assert = || Ok(());
             let mut stopped: Vec<(String, String)> = Vec::new();
             let mut failed: Vec<(String, String)> = Vec::new();
-            terminate_verified_residuals(&root, &mut stopped, &mut failed, &HashSet::new(), &assert)
-                .expect("the sweep never fails on the never-touch dirs");
+            terminate_verified_residuals(
+                &root,
+                &mut stopped,
+                &mut failed,
+                &HashSet::new(),
+                &assert,
+            )
+            .expect("the sweep never fails on the never-touch dirs");
             assert!(
                 stopped.is_empty(),
                 "sweep rooted at {dir} must stop nothing"

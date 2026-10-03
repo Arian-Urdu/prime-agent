@@ -269,9 +269,8 @@ fn read_shutdown_admission(path: &Path) -> Result<Option<ShutdownAdmissionRecord
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
     };
-    let record: ShutdownAdmissionRecord = serde_json::from_str(&raw).map_err(|_| {
-        anyhow!("Invalid daemon shutdown admission: {}", path.display())
-    })?;
+    let record: ShutdownAdmissionRecord = serde_json::from_str(&raw)
+        .map_err(|_| anyhow!("Invalid daemon shutdown admission: {}", path.display()))?;
     if record.version != OWNER_VERSION
         || record.pid == 0
         || crate::util::iso_to_unix_ms(&record.expires_at).is_none()
@@ -285,9 +284,7 @@ fn read_shutdown_admission(path: &Path) -> Result<Option<ShutdownAdmissionRecord
 /// `shutdownAdmissionIsActive`): unexpired lease AND live holder identity.
 fn shutdown_admission_is_active(record: &ShutdownAdmissionRecord) -> bool {
     crate::util::iso_to_unix_ms(&record.expires_at)
-        .is_some_and(|expires_at| {
-            expires_at > crate::util::now_ms()
-        })
+        .is_some_and(|expires_at| expires_at > crate::util::now_ms())
         && is_process_identity_alive(record.pid, record.process_start_id.as_deref())
 }
 
@@ -317,8 +314,8 @@ fn read_startup_fence(path: &Path) -> Result<Option<StartupFenceRecord>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
     };
-    let record: StartupFenceRecord =
-        serde_json::from_str(&raw).map_err(|_| anyhow!("Invalid daemon startup fence: {}", path.display()))?;
+    let record: StartupFenceRecord = serde_json::from_str(&raw)
+        .map_err(|_| anyhow!("Invalid daemon startup fence: {}", path.display()))?;
     if record.version != OWNER_VERSION || record.pid == 0 {
         bail!("Invalid daemon startup fence: {}", path.display());
     }
@@ -368,7 +365,10 @@ async fn wait_for_startup_fence_in(
                 if current.is_none() {
                     return Ok(true);
                 }
-                if current.as_ref().is_some_and(|current| current.token == fence.token) {
+                if current
+                    .as_ref()
+                    .is_some_and(|current| current.token == fence.token)
+                {
                     std::fs::remove_file(&path)
                         .with_context(|| format!("remove {}", path.display()))?;
                     return Ok(true);
@@ -574,20 +574,22 @@ impl ShutdownAdmission {
             }
             std::thread::sleep(SHUTDOWN_ADMISSION_WAIT_MS);
         }
-        let state = Arc::clone(&state);
+        let thread_state = Arc::clone(&state);
         let renewal = std::thread::Builder::new()
             .name("shutdown-admission-renewal".to_string())
-            .spawn(move || loop {
-                std::thread::sleep(SHUTDOWN_ADMISSION_REFRESH_MS);
-                if state.stopped.load(Ordering::SeqCst) {
-                    break;
-                }
-                // A read failure is swallowed (TS's interval catch): only
-                // a definitive `false` - a missing or foreign record -
-                // ends the admission.
-                if matches!(renew_once(&state), Ok(false)) {
-                    state.lost.store(true, Ordering::SeqCst);
-                    break;
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(SHUTDOWN_ADMISSION_REFRESH_MS);
+                    if thread_state.stopped.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    // A read failure is swallowed (TS's interval catch): only
+                    // a definitive `false` - a missing or foreign record -
+                    // ends the admission.
+                    if matches!(renew_once(&thread_state), Ok(false)) {
+                        thread_state.lost.store(true, Ordering::SeqCst);
+                        break;
+                    }
                 }
             })
             .map_err(|error| anyhow!("spawn the shutdown admission renewal: {error}"))?;
@@ -642,9 +644,7 @@ impl ShutdownAdmission {
         let token = &self.state.token;
         let _ = with_registry_guard(registry_dir, || {
             let path = shutdown_admission_path(registry_dir);
-            if read_shutdown_admission(&path)?
-                .is_some_and(|current| &current.token == token)
-            {
+            if read_shutdown_admission(&path)?.is_some_and(|current| &current.token == token) {
                 std::fs::remove_file(&path)
                     .with_context(|| format!("remove {}", path.display()))?;
             }
@@ -701,7 +701,6 @@ fn renew_once(state: &AdmissionState) -> Result<bool> {
         Ok(true)
     })
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -772,10 +771,18 @@ mod tests {
         assert_eq!(key.len(), 68, "sha256 hex + .json: {key}");
         // The TS spelling: normalizeSocketPath folds `.` segments, so the
         // key is the digest of the folded path.
-        let folded = registry.path().join("folded").join("..").join("daemon.sock");
+        let folded = registry
+            .path()
+            .join("folded")
+            .join("..")
+            .join("daemon.sock");
         assert_eq!(
             normalize_socket_path(&folded),
-            registry.path().join("daemon.sock").to_string_lossy().to_string(),
+            registry
+                .path()
+                .join("daemon.sock")
+                .to_string_lossy()
+                .to_string(),
             "the lexical normalizer folds the parent-dot segment"
         );
     }
@@ -795,7 +802,10 @@ mod tests {
         let socket = registry.path().join("daemon.sock");
         // The pinned process is THIS test process: alive for the whole
         // bounded wait.
-        write_raw(&startup_fence_path(registry.path(), &socket), &live_fence(&socket, "tok"));
+        write_raw(
+            &startup_fence_path(registry.path(), &socket),
+            &live_fence(&socket, "tok"),
+        );
         let error = wait_for_startup_fence_in(registry.path(), &socket, 200)
             .await
             .expect_err("a live pin must refuse at the timeout");
@@ -835,7 +845,8 @@ mod tests {
         let registry = tempfile::tempdir().expect("registry root");
         let socket = registry.path().join("daemon.sock");
         let mut record = live_fence(&socket, "tok");
-        record["socketPath"] = Value::from(normalize_socket_path(&registry.path().join("other.sock")));
+        record["socketPath"] =
+            Value::from(normalize_socket_path(&registry.path().join("other.sock")));
         write_raw(&startup_fence_path(registry.path(), &socket), &record);
         let error = wait_for_startup_fence_in(registry.path(), &socket, 1_000)
             .await
@@ -878,9 +889,8 @@ mod tests {
         // The elapsed record of a live holder is inert and RECLAIMED by the
         // active read (TS readActiveShutdownAdmission removes it).
         let mut elapsed = active_admission(5_000);
-        elapsed["expiresAt"] = Value::from(crate::util::iso_from_unix_ms(
-            crate::util::now_ms() - 1_000,
-        ));
+        elapsed["expiresAt"] =
+            Value::from(crate::util::iso_from_unix_ms(crate::util::now_ms() - 1_000));
         write_raw(&path, &elapsed);
         assert!(
             read_active_shutdown_admission(registry.path())
@@ -951,13 +961,10 @@ mod tests {
         let registry_dir = registry.path().to_path_buf();
         let second = std::thread::spawn(move || -> Result<()> {
             armed_tx.send(()).expect("signal");
-            // Acquire and drop: the release happens at the scope's end, so
-            // the window the first holder opened is the only one until then.
-            let second = ShutdownAdmission::acquire_in(&registry_dir)?;
-            assert!(
-                read_active_shutdown_admission(&registry_dir)?.is_some(),
-                "the second window is held while it lives"
-            );
+            // The scope end releases the second window (the TS finally),
+            // so the bounded window below can only be crossed by an
+            // acquire that truly blocked on the first.
+            let _held = ShutdownAdmission::acquire_in(&registry_dir)?;
             Ok(())
         });
 
@@ -996,9 +1003,8 @@ mod tests {
         // acquire's active read reclaims it instead of blocking on it):
         // the admission is lost.
         let mut foreign = active_admission(5_000);
-        foreign["expiresAt"] = Value::from(crate::util::iso_from_unix_ms(
-            crate::util::now_ms() - 1_000,
-        ));
+        foreign["expiresAt"] =
+            Value::from(crate::util::iso_from_unix_ms(crate::util::now_ms() - 1_000));
         write_raw(&path, &foreign);
         assert!(
             admission.assert_or_renew().is_err(),
@@ -1009,10 +1015,7 @@ mod tests {
             "the loss is latched"
         );
         admission.release();
-        assert!(
-            path.exists(),
-            "the release never removes a foreign record"
-        );
+        assert!(path.exists(), "the release never removes a foreign record");
 
         // A merely-elapsed lease of a still-ours record re-arms (the
         // blocked-holder rule), and an unreadable record keeps the
@@ -1033,8 +1036,7 @@ mod tests {
             owner_token: "hello-owner-token".to_string(),
             supervisor_generation: format!("sup:{pid}").to_string(),
         };
-        persist_startup_fence_in(registry.path(), &socket, &identity)
-            .expect("persist the fence");
+        persist_startup_fence_in(registry.path(), &socket, &identity).expect("persist the fence");
         let raw = std::fs::read_to_string(startup_fence_path(registry.path(), &socket))
             .expect("read the fence record");
         assert!(

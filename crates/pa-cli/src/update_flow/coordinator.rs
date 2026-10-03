@@ -174,11 +174,8 @@ async fn drive(
             &options.socket_path,
             hello_socket_path,
         ) {
-            pa_daemon::supervisor_ownership::persist_startup_fence(
-                &options.socket_path,
-                &fence,
-            )
-            .map_err(PhaseFailure::before_stop)?;
+            pa_daemon::supervisor_ownership::persist_startup_fence(&options.socket_path, &fence)
+                .map_err(PhaseFailure::before_stop)?;
         }
         // The roster artifact is the successor's input (consumed from the
         // env at its boot, spec §6 step 2); the coordinator never parses it.

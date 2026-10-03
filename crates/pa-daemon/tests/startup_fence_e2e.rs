@@ -321,7 +321,10 @@ fn a_crashed_admission_holder_does_not_wedge_the_boot() {
     // readActiveShutdownAdmission).
     let (pinned_pid, pinned_start) = spawn_dead_process();
     let admission = admission_path(&registry);
-    write_record(&admission, &admission_record(pinned_pid, &pinned_start, 60_000));
+    write_record(
+        &admission,
+        &admission_record(pinned_pid, &pinned_start, 60_000),
+    );
 
     let mut successor = spawn_supervisor(&socket, &agent_dir, &registry);
     wait_socket_ready(&socket);

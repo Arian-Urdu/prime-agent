@@ -303,7 +303,8 @@ fn run_shutdown_converging(
                 } else {
                     assert().map_err(|error| error.to_string())?;
                     if remove_socket_file(&action.daemon.socket_path) {
-                        stopped.push((socket_path.clone(), "removed stale socket file".to_string()));
+                        stopped
+                            .push((socket_path.clone(), "removed stale socket file".to_string()));
                     } else {
                         failed.push((
                             socket_path.clone(),
@@ -338,12 +339,7 @@ fn run_shutdown_converging(
                         &mut handled_pids,
                     );
                     assert().map_err(|error| error.to_string())?;
-                    apply_stop(
-                        outcome,
-                        &socket_path,
-                        &mut stopped,
-                        &mut failed,
-                    );
+                    apply_stop(outcome, &socket_path, &mut stopped, &mut failed);
                 } else {
                     assert().map_err(|error| error.to_string())?;
                     remove_socket_file(&action.daemon.socket_path);
@@ -427,7 +423,9 @@ fn stop_background_service(
     }
     if !probe_daemon(socket_path).reachable {
         remove_socket_file(socket_path);
-        return Ok(StopOutcome::Reaped("background service already stopped".to_string()));
+        return Ok(StopOutcome::Reaped(
+            "background service already stopped".to_string(),
+        ));
     }
     let Some(pid) = pid else {
         return Ok(StopOutcome::Skipped(

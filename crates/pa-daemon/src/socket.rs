@@ -219,6 +219,26 @@ pub fn restrict_socket_path(path: &Path) {
     let _ = pa_core::platform::perms::restrict_file(path);
 }
 
+/// The bind-capture gap seam (the `PA_DAEMON_EVENT_LOG` seam family): a
+/// replacement landing between the bind and the bind-time identity capture
+/// poisons the captured identity - the exact residual the
+/// close-listener exit cleanup exists to survive. Production leaves the
+/// gap unset, so the bind and the capture stay back-to-back; the
+/// poisoned-capture oracle sets the gap so the replacement provably lands
+/// in the window instead of racing microseconds.
+pub const BIND_CAPTURE_GAP_ENV: &str = "PA_DAEMON_BIND_CAPTURE_GAP_MS";
+
+/// Sleep the harness-set bind-capture gap ([`BIND_CAPTURE_GAP_ENV`]), a
+/// no-op in production (unset or unparsable values skip the wait).
+pub async fn bind_capture_gap() {
+    let Ok(raw) = std::env::var(BIND_CAPTURE_GAP_ENV) else {
+        return;
+    };
+    if let Ok(ms) = raw.parse::<u64>() {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

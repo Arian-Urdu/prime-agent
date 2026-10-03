@@ -417,6 +417,7 @@ impl Supervisor {
                     self.options.socket_path.display()
                 )
             })?;
+        socket::bind_capture_gap().await;
         // Capture the bound file's identity before anything can replace
         // it (TS daemon-supervisor.ts:879, between `listen` and
         // `restrictDaemonSocketPath`): the exit cleanup below compares

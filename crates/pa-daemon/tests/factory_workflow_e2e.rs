@@ -631,6 +631,16 @@ fn harness(label: &str, kernel: Option<&pa_core::factory_eval::FactoryKernelPyth
     std::fs::create_dir_all(&root).expect("temp root");
     let agent_dir = root.join("agent");
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    // The factory namespace is opt-in on the kernel side (`factory.enabled`
+    // in the agent dir's settings.json, default off -- the refusal every
+    // factory write raises while it is off). Exercising the namespace is
+    // this suite's whole purpose, so the sandbox opts in itself: the
+    // hermetic agent dir the supervisor exports carries the setting.
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        json!({ "factory": { "enabled": true } }).to_string(),
+    )
+    .expect("opt the sandbox into the factory");
     let harness_dir = root.join("harness");
     std::fs::create_dir_all(&harness_dir).expect("harness dir");
     std::fs::write(

@@ -1015,7 +1015,7 @@ fn an_already_settled_child_never_re_scores_as_an_unreachable_error() {
 async fn collect_recaptures_the_answer_of_a_settled_child_whose_capture_raced() {
     let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
     let (sessions, _kill_rx) =
-        sessions_with_fake_supervisor(follow_up_tx, 0, FakeKill::Success, false).await;
+        sessions_with_fake_supervisor(follow_up_tx, 0, FakeKill::Success, FakeChild::Healthy).await;
     sessions
         .push_test_settled_child(
             RlmChildIdentity {

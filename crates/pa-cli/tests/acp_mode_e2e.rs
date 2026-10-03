@@ -761,6 +761,118 @@ fn acp_mcp_long_names_fail_at_tool_derivation_with_internal_error() {
 }
 
 #[test]
+fn acp_daemon_attached_close_clears_the_connection_mcp_servers() {
+    let script = json!({ "engine": "faux", "responses": ["unused"] });
+    let mut client = AcpChild::spawn(&["--mode", "acp", "--no-session"], &script);
+    let socket = client.socket.clone();
+    let init = client.request("initialize", &initialize_params());
+    let _ = client.wait_response(init, TIMEOUT);
+    let new = client.request(
+        "session/new",
+        &json!({ "mcpServers": [
+            { "name": "close-clear", "type": "http", "url": "https://mcp.invalid/close-clear", "headers": [] },
+        ]}),
+    );
+    let (new_response, _) = client.wait_response(new, TIMEOUT);
+    let session_id = new_response["result"]["sessionId"]
+        .as_str()
+        .expect("admission succeeds")
+        .to_string();
+    let active_session_id = wait_live_session(&socket)["activeSessionId"]
+        .as_str()
+        .expect("the daemon session id")
+        .to_string();
+    let owned = probe_acp_mcp_servers(&socket, &active_session_id);
+    assert_eq!(
+        owned["success"], false,
+        "the open session owns its admitted servers: {owned}"
+    );
+    assert_eq!(
+        owned["error"],
+        "ACP MCP configuration is owned by another client"
+    );
+    let close = client.request("session/close", &json!({ "sessionId": session_id }));
+    let (close_response, _) = client.wait_response(close, TIMEOUT);
+    assert_eq!(close_response["result"], json!({}));
+    let released = probe_acp_mcp_servers(&socket, &active_session_id);
+    assert_eq!(
+        released["success"], true,
+        "session/close released the connection's servers: {released}"
+    );
+}
+
+#[test]
+fn acp_daemon_attached_eof_teardown_clears_the_connection_mcp_servers() {
+    let script = json!({ "engine": "faux", "responses": ["unused"] });
+    let mut client = AcpChild::spawn(&["--mode", "acp"], &script);
+    let socket = client.socket.clone();
+    let init = client.request("initialize", &initialize_params());
+    let _ = client.wait_response(init, TIMEOUT);
+    let new = client.request(
+        "session/new",
+        &json!({ "mcpServers": [
+            { "name": "eof-clear", "type": "http", "url": "https://mcp.invalid/eof-clear", "headers": [] },
+        ]}),
+    );
+    let (new_response, _) = client.wait_response(new, TIMEOUT);
+    assert!(
+        new_response["result"]["sessionId"].is_string(),
+        "admission succeeds: {new_response}"
+    );
+    let active_session_id = wait_live_session(&socket)["activeSessionId"]
+        .as_str()
+        .expect("the daemon session id")
+        .to_string();
+    let owned = probe_acp_mcp_servers(&socket, &active_session_id);
+    assert_eq!(
+        owned["success"], false,
+        "the open session owns its admitted servers: {owned}"
+    );
+    client.close_stdin();
+    assert!(client.child.wait().expect("the ACP child exits").success());
+    let released = probe_acp_mcp_servers(&socket, &active_session_id);
+    assert_eq!(
+        released["success"], true,
+        "the EOF teardown released the connection's servers: {released}"
+    );
+}
+
+#[test]
+fn acp_mode_daemon_unreachable_exits_1_without_fallback() {
+    let home = tempfile::TempDir::new().unwrap();
+    let socket = home.path().join("daemon.sock");
+    std::fs::write(&socket, "not a socket").unwrap();
+    std::fs::write(
+        home.path().join("worker-script.json"),
+        json!({ "engine": "faux", "responses": ["unused"] }).to_string(),
+    )
+    .unwrap();
+    let output = daemon_attached_command(home.path(), &socket, &["--mode", "acp", "--no-session"])
+        .output()
+        .expect("binary present");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "exit 1: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "no ACP frames on stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Error: "),
+        "the startup failure is an error line: {stderr}"
+    );
+    assert!(
+        stderr.contains("Timed out waiting for the Prime Agent daemon to start"),
+        "the daemon never became reachable: {stderr}"
+    );
+}
+
+#[test]
 fn acp_daemon_attached_cancels_mid_turn() {
     // A scripted worker with a slow turn: the cancel lands while the
     // turn runs, and the prompt resolves `{stopReason: "cancelled"}`
@@ -934,6 +1046,41 @@ fn live_sessions(socket: &std::path::Path) -> Vec<Value> {
         .as_array()
         .unwrap_or_else(|| panic!("a session list: {list}"))
         .clone()
+}
+
+fn probe_acp_mcp_servers(socket: &std::path::Path, active_session_id: &str) -> Value {
+    daemon_request(
+        socket,
+        "acp-mcp-replace",
+        &json!({
+            "type": "replace_acp_mcp_servers",
+            "activeSessionId": active_session_id,
+            "ownerId": "acp-e2e-probe",
+            "servers": [{
+                "type": "http",
+                "name": "probe",
+                "url": "https://mcp.invalid/probe",
+                "headers": {},
+            }],
+        }),
+    )
+}
+
+fn wait_live_session(socket: &std::path::Path) -> Value {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let sessions = live_sessions(socket);
+        if let Some(session) = sessions.first() {
+            return session.clone();
+        }
+        let timeout_left = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !timeout_left.is_zero(),
+            "no daemon session ever registered on {}",
+            socket.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[test]

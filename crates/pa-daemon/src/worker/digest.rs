@@ -984,22 +984,23 @@ impl AgentMessageDigest {
             .inbox
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let wanted = ids.map(|ids| ids.into_iter().collect::<std::collections::HashSet<_>>());
+        let mut entries: Vec<Value> = Vec::new();
         {
-            let core = self
+            // ONE inbox+core hold across the load and the marker writes:
+            // the load reads the store's records and the writes persist
+            // read markers into the store, and a session replacement
+            // (which swaps `core.store` without ever taking the inbox
+            // lock) could land in a gap between two holds — the retired
+            // session's markers would append into the replacement's file
+            // and the retired store would never record the read.
+            let mut core = self
                 .core
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(store) = core.store.as_ref() {
                 inbox.load_from(store);
             }
-        }
-        let wanted = ids.map(|ids| ids.into_iter().collect::<std::collections::HashSet<_>>());
-        let mut entries: Vec<Value> = Vec::new();
-        {
-            let mut core = self
-                .core
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for record in &mut inbox.records {
                 let matches = match &wanted {
                     Some(wanted) => wanted.contains(&record.id),

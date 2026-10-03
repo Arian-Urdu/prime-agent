@@ -40,28 +40,41 @@
 //!   [--width N] [--trials N] [--timeout-minutes M] [--out DIR] [--replay FILE]
 //! ```
 
-use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
+// The live sweep is unix-only end to end (the supervisor socket is a unix
+// domain socket): the live-mode helpers and their imports compile only
+// there. The windows cross-check still builds the bin: its offline
+// `--replay` mode is pure ledger analysis, and the live entry point
+// refuses cleanly at startup.
+#[cfg(unix)]
 use pa_core::factory_eval::{
     build_baseline_prompt, build_factory_parent_prompt, build_harness_state_file,
     build_reference_factories, check_replay_ledger, check_task_success, find_reference_factory,
-    parse_answer_line, parse_eval_args, render_markdown_report, run_replay_checks,
-    serialize_eval_report, EvalArgsError, EvalArm, FactoryEvalConfig, FactoryEvalTrialResult,
-    ReferenceFactoryKind, TrialVerdict, FACTORY_KERNEL_VENV_RECIPE,
+    parse_answer_line, render_markdown_report, serialize_eval_report, EvalArm,
+    FactoryEvalTrialResult, ReferenceFactoryKind, TrialVerdict, FACTORY_KERNEL_VENV_RECIPE,
 };
-use serde_json::{json, Value};
+use pa_core::factory_eval::{parse_eval_args, run_replay_checks, EvalArgsError, FactoryEvalConfig};
+#[cfg(unix)]
+use serde_json::json;
+use serde_json::Value;
+use std::fs;
+#[cfg(unix)]
+use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::{Child, Command, Stdio};
+#[cfg(unix)]
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// A blocking JSONL client for the eval's dedicated supervisor socket.
+#[cfg(unix)]
 struct Client {
     reader: BufReader<std::os::unix::net::UnixStream>,
     writer: std::os::unix::net::UnixStream,
     request_id: u64,
 }
 
+#[cfg(unix)]
 impl Client {
     fn connect(socket: &Path) -> Result<Self, String> {
         let stream = std::os::unix::net::UnixStream::connect(socket).map_err(|error| {
@@ -162,6 +175,7 @@ impl Client {
 
 /// The per-run scratch root: the process id plus the start time keeps two
 /// harness runs launched in the same millisecond from sharing directories.
+#[cfg(unix)]
 fn runs_root_path() -> PathBuf {
     std::env::temp_dir().join(format!(
         "factory-eval-{}-{}",
@@ -175,6 +189,7 @@ fn runs_root_path() -> PathBuf {
 
 /// Locate the sibling `pa-daemon` binary (the driver spawns its own
 /// dedicated supervisor — the product binary, real child sessions).
+#[cfg(unix)]
 fn supervisor_binary() -> Result<PathBuf, String> {
     let profile_dir = std::env::current_exe()
         .ok()
@@ -194,16 +209,19 @@ fn supervisor_binary() -> Result<PathBuf, String> {
 /// The user's real agent dir: the eval resolves real models through it
 /// (auth.json + models.json), exactly like the TS-era harness built its
 /// model registry from the default agent dir.
+#[cfg(unix)]
 fn real_agent_dir() -> Result<PathBuf, String> {
     pa_daemon::paths::agent_dir().map_err(|error| format!("resolve the agent dir: {error}"))
 }
 
+#[cfg(unix)]
 struct Supervisor {
     child: Child,
     #[allow(dead_code)]
     socket: PathBuf,
 }
 
+#[cfg(unix)]
 impl Drop for Supervisor {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -215,6 +233,7 @@ impl Drop for Supervisor {
 /// harness store is the seeded eval dir (`RLM_HARNESS_STATE_DIR` flows to
 /// every worker and kernel), and a pinned kernel python keeps a dev
 /// checkout from rebuilding the shared kernel venv live sessions use.
+#[cfg(unix)]
 fn spawn_supervisor(
     socket: &Path,
     agent_dir: &Path,
@@ -271,10 +290,12 @@ fn spawn_supervisor(
     );
 }
 
+#[cfg(unix)]
 fn now_iso() -> String {
     pa_daemon::util::now_iso()
 }
 
+#[cfg(unix)]
 fn read_json_file(path: &Path) -> Option<Value> {
     let content = fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
@@ -283,6 +304,7 @@ fn read_json_file(path: &Path) -> Option<Value> {
 /// The model must resolve before any token is spent: a probe create with
 /// the configured model fails fast when the daemon cannot resolve it (a
 /// bad --model used to surface as a per-trial failure).
+#[cfg(unix)]
 fn probe_model(client: &mut Client, config: &FactoryEvalConfig, root: &Path) -> Result<(), String> {
     let Some((provider, model_id)) = config.model.split_once('/') else {
         return Err(format!("model must be provider/id, got {}", config.model));
@@ -318,6 +340,7 @@ fn probe_model(client: &mut Client, config: &FactoryEvalConfig, root: &Path) -> 
 
 /// What one driven trial captured before its cleanup: the session to kill,
 /// the parsed ANSWER, and the session's context/total token counts.
+#[cfg(unix)]
 struct TrialCaptured {
     session_id: String,
     answer: Option<pa_core::factory_eval::ParsedAnswer>,
@@ -329,6 +352,7 @@ struct TrialCaptured {
 /// exists — the cleanup kills that session instead of leaking it (a failed
 /// trial must never leave a live session spending tokens after its row is
 /// recorded).
+#[cfg(unix)]
 struct TrialDriveError {
     message: String,
     session_id: Option<String>,
@@ -339,6 +363,7 @@ struct TrialDriveError {
 /// (`run_trial` kills the session and removes the trial dir on every
 /// path).
 #[allow(clippy::too_many_arguments)]
+#[cfg(unix)]
 fn drive_trial(
     client: &mut Client,
     config: &FactoryEvalConfig,
@@ -452,6 +477,7 @@ fn drive_trial(
 /// drive the parent prompt to completion, score the answer against the
 /// ledger the parent saved, and clean up on every path.
 #[allow(clippy::too_many_arguments)]
+#[cfg(unix)]
 fn run_trial(
     client: &mut Client,
     config: &FactoryEvalConfig,
@@ -628,6 +654,7 @@ fn main() {
 /// counting every trial (a thrown trial stays in the sweep as its own
 /// failed row — the report can never cover a subset of the planned
 /// trials).
+#[cfg(unix)]
 fn run_sweep(
     client: &mut Client,
     config: &FactoryEvalConfig,
@@ -693,6 +720,7 @@ fn run_sweep(
     results
 }
 
+#[cfg(unix)]
 fn run(config: &FactoryEvalConfig) -> Result<(), String> {
     let runs_root = runs_root_path();
     fs::create_dir_all(&runs_root).map_err(|error| format!("create the runs root: {error}"))?;
@@ -763,4 +791,16 @@ fn run(config: &FactoryEvalConfig) -> Result<(), String> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// The live sweep refuses on a platform without unix domain sockets: the
+/// windows cross-check keeps the bin compiling (and its offline `--replay`
+/// mode working); a real sweep needs a unix supervisor socket.
+#[cfg(not(unix))]
+fn run(_config: &FactoryEvalConfig) -> Result<(), String> {
+    Err(
+        "the factory-eval live sweep drives a unix domain socket supervisor; this platform \
+         has none (the offline --replay mode still works)"
+            .to_string(),
+    )
 }

@@ -39,6 +39,8 @@ const REGISTRY_ENV: &str = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR"
 
 struct Daemon {
     child: Child,
+    // The socket field is carried for teardown symmetry with the other
+    // e2e harnesses; the kill/wait below addresses the child directly.
     #[allow(dead_code)]
     socket: PathBuf,
 }

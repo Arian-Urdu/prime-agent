@@ -39,8 +39,8 @@
 //! module doc of `crate::supervisor` points): the owner records the fence
 //! is validated against (`persistDaemonStartupFenceFromOwner`'s
 //! hello-vs-owner checks reduce to the observed process-identity check
-//! here), the legacy pre-move registry scan (this tree never had the old
-//! location), and the read-only admission probe of the worker-side
+//! here), the TS pre-move registry-location scan (this tree's registry
+//! has always lived at the current location), and the read-only admission probe of the worker-side
 //! replacement monitor (this tree's `supervisor_lost` has no replacement
 //! launch to gate - a documented divergence there).
 //!
@@ -230,8 +230,8 @@ struct StartupFenceRecord {
 }
 
 /// Whether a pinned process identity is still that process (TS
-/// `isProcessIdentityAlive`): a dead pid is dead, and a start id that can
-/// no longer be observed (the platform exposes none) keeps the pin alive.
+/// `isProcessIdentityAlive`): a dead pid is dead, and a start id the
+/// platform does not expose keeps the pin alive.
 fn is_process_identity_alive(pid: u32, process_start_id: Option<&str>) -> bool {
     if !crate::lease::is_process_alive(pid).unwrap_or(false) {
         return false;
@@ -239,8 +239,8 @@ fn is_process_identity_alive(pid: u32, process_start_id: Option<&str>) -> bool {
     match process_start_id {
         None | Some("") => true,
         Some(expected) => match crate::lease::get_process_start_id(pid) {
-            // An identity the platform can no longer observe keeps the pin
-            // alive (TS: `observed === undefined`).
+            // A start id the platform does not expose keeps the pin alive
+            // (TS: `observed === undefined`).
             None => true,
             Some(observed) => observed == expected,
         },
@@ -737,8 +737,8 @@ mod tests {
 
     fn admission_dead_holder(expires_at_ms: u64) -> Value {
         let (pid, start_id) = own_identity();
-        // A dead holder pins a pid that no longer exists with a start id
-        // that never matched anything (a real crashed-coordinator record).
+        // A dead holder's record: a pid that is not in the process table
+        // and a start id that matches nothing - the crashed-coordinator shape.
         let now = crate::util::now_ms();
         serde_json::json!({
             "version": 1,
@@ -1087,7 +1087,8 @@ mod tests {
 
     #[test]
     fn the_fence_identity_gate_requires_a_fixed_hello_for_this_socket() {
-        let socket = std::path::Path::new("/tmp/d3-gate.sock");
+        let registry = tempfile::tempdir().expect("registry root");
+        let socket = registry.path().join("gate.sock");
         let (pid, start_id) = own_identity();
         let identity = |pid: Option<u64>, start: Option<&str>| {
             pa_types::daemon::update_flow::UpdateProcessIdentity {

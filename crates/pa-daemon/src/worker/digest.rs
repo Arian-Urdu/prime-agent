@@ -817,14 +817,28 @@ impl AgentMessageDigest {
                         // the digested delivery (TS: accepted once its
                         // entry reached the session file) — accept it so
                         // the sender never retries a duplicate.
-                        if let Some(id) = core
+                        if let Some(row) = core
                             .store
                             .as_ref()
                             .filter(|store| !store.path.as_os_str().is_empty())
                             .and_then(|store| {
-                                Self::durable_inbox_row_id(&store.path, &data.message_id)
+                                Self::durable_inbox_row(&store.path, &data.message_id)
                             })
                         {
+                            // Adopt the durable row into the store's index
+                            // (the index-after-append step never ran): a
+                            // later cache invalidation reloads from the
+                            // index, and a session rewrite serializes it —
+                            // without the adoption either one would drop
+                            // or erase the row the receipt just accepted.
+                            if let Some(store) = core.store.as_mut() {
+                                let _ = store.index_durable_row(&row);
+                            }
+                            let id = row
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
                             inbox.records.push(InboxRecord {
                                 id,
                                 data: data.clone(),
@@ -860,10 +874,10 @@ impl AgentMessageDigest {
     /// in-memory index (built only on a successful append) lacks it.
     /// Scan the file itself for the row this append minted and answer
     /// its entry id.
-    fn durable_inbox_row_id(store_path: &PathBuf, message_id: &str) -> Option<String> {
+    fn durable_inbox_row(store_path: &PathBuf, message_id: &str) -> Option<Value> {
         let content = std::fs::read_to_string(store_path).ok()?;
         crate::session_store::parse_session_entries(&content)
-            .iter()
+            .into_iter()
             .find(|entry| {
                 entry.get("type").and_then(Value::as_str) == Some("custom")
                     && entry.get("customType").and_then(Value::as_str)
@@ -874,7 +888,6 @@ impl AgentMessageDigest {
                         .and_then(Value::as_str)
                         == Some(message_id)
             })
-            .and_then(|entry| entry.get("id").and_then(Value::as_str).map(str::to_string))
     }
 
     /// Store one watch event (agent or job) on the digest lane (PR E):
@@ -1958,9 +1971,39 @@ mod tests {
             "the reconciled row keeps its durable id: {snapshot}"
         );
         assert_eq!(snapshot["unread"], json!(1));
-        // The read-only file restores for the temp-dir cleanup.
+        // The accepted row must ALSO live in the store's index (the
+        // index-after-append step never ran): a later cache invalidation
+        // reloads from the index — without the adoption that reload drops
+        // the row the receipt just accepted.
+        digest.inbox.lock().unwrap().loaded_key = None; // force the reload
+        let snapshot = digest.inbox_snapshot();
+        assert_eq!(
+            snapshot["total"],
+            json!(1),
+            "the reloaded inbox dropped the accepted row: {snapshot}"
+        );
+        assert_eq!(
+            snapshot["entries"][0]["id"],
+            json!("row-postwrite"),
+            "{snapshot}"
+        );
+        // And a rewrite (which serializes the index) must keep the row in
+        // the file: without the adoption the rewrite erases it after the
+        // sender already received the digest receipt.
         let mut permissions = std::fs::metadata(&store_path).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o644);
         std::fs::set_permissions(&store_path, permissions).unwrap();
+        {
+            let mut core = digest
+                .core
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            core.store.as_mut().expect("the store").rewrite().unwrap();
+        }
+        let content = std::fs::read_to_string(&store_path).unwrap();
+        assert!(
+            content.contains("row-postwrite"),
+            "the rewrite erased the accepted durable row"
+        );
     }
 }

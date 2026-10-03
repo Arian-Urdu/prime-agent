@@ -832,8 +832,7 @@ impl Worker {
                 == Some(
                     pa_core::session_engine::agent_messaging::AgentFamilyRelationship::Parent
                         .as_str(),
-                )
-            {
+                ) {
                 format!("Session renamed `{previous}` -> `{name}` by parent")
             } else {
                 format!("Session renamed `{previous}` -> `{name}`")

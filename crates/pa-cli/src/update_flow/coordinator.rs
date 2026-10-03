@@ -148,7 +148,7 @@ async fn drive(
             .await
             .set_predecessor(identity.clone())
             .map_err(PhaseFailure::before_stop)?;
-        predecessor = Some(identity);
+        predecessor = Some(identity.clone());
         writer
             .lock()
             .await

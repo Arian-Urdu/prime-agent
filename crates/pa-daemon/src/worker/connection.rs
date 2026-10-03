@@ -274,7 +274,7 @@ impl Worker {
         // loop iteration consumes it.
         self.listener_bound
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        loop {
+        let accept_error = loop {
             let stream = tokio::select! {
                 accepted = listener.accept() => match accepted {
                     Ok(accepted) => {
@@ -283,9 +283,9 @@ impl Worker {
                         }
                         accepted
                     }
-                    Err(error) => return Err(anyhow!("worker accept: {error}")),
+                    Err(error) => break Some(anyhow!("worker accept: {error}")),
                 },
-                () = self.listener_close_requested.notified() => break,
+                () = self.listener_close_requested.notified() => break None,
             };
             let worker = Arc::clone(&self);
             tokio::spawn(async move {
@@ -293,7 +293,7 @@ impl Worker {
                     eprintln!("pa-daemon worker connection error: {error:#}");
                 }
             });
-        }
+        };
         // The graceful close: drop the bound listener so the bind
         // releases, confirm to the exiting path, and park forever (the
         // parked task keeps the runtime - and so the in-flight
@@ -301,6 +301,9 @@ impl Worker {
         // ends them all).
         drop(listener);
         self.listener_closed.notify_one();
+        if let Some(error) = accept_error {
+            return Err(error);
+        }
         std::future::pending::<Result<()>>().await
     }
 

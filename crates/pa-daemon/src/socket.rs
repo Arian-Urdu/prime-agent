@@ -267,14 +267,14 @@ pub fn restrict_socket_path(path: &Path) {
 /// in the window instead of racing microseconds.
 pub const BIND_CAPTURE_GAP_ENV: &str = "PA_DAEMON_BIND_CAPTURE_GAP_MS";
 
-/// Sleep the harness-set bind-capture gap ([`BIND_CAPTURE_GAP_ENV`]), a
-/// no-op in production (unset or unparsable values skip the wait).
+/// Sleep the bounded bind-capture fault-injection gap in debug builds only.
+/// Production binaries never pause startup between bind and identity capture.
 pub async fn bind_capture_gap() {
-    let Ok(raw) = std::env::var(BIND_CAPTURE_GAP_ENV) else {
-        return;
-    };
-    if let Ok(ms) = raw.parse::<u64>() {
-        tokio::time::sleep(Duration::from_millis(ms)).await;
+    #[cfg(debug_assertions)]
+    if let Ok(raw) = std::env::var(BIND_CAPTURE_GAP_ENV) {
+        if let Ok(ms @ 1..=2_000) = raw.parse::<u64>() {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
     }
 }
 

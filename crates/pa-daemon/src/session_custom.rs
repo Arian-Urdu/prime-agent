@@ -381,6 +381,12 @@ mod tests {
     use std::sync::Arc;
 
     async fn created_worker() -> Arc<Worker> {
+        created_worker_named(Some("custom")).await
+    }
+
+    /// The worker fixture over an optional create name: a `None` create
+    /// leaves the session without a `session_info` name row.
+    async fn created_worker_named(name: Option<&str>) -> Arc<Worker> {
         let dir = std::env::temp_dir().join(format!("pa-worker-sc-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = crate::worker::WorkerConfig {
@@ -395,12 +401,11 @@ mod tests {
             script: Some(json!({ "responses": ["ack"] })),
         };
         let worker = Arc::new(Worker::new(config, None));
-        let created = worker
-            .dispatch(
-                "create",
-                &json!({ "noSession": true, "cwd": "/tmp", "name": "custom" }),
-            )
-            .await;
+        let mut create = json!({ "noSession": true, "cwd": "/tmp" });
+        if let Some(name) = name {
+            create["name"] = json!(name);
+        }
+        let created = worker.dispatch("create", &create).await;
         assert!(created.success, "create failed: {created:?}");
         worker
     }
@@ -471,7 +476,7 @@ mod tests {
     /// name, or a rename that keeps the name, leaves none.
     #[tokio::test]
     async fn rename_leaves_a_displayed_notice_only_when_a_name_changed() {
-        let worker = created_worker().await;
+        let worker = created_worker_named(None).await;
         // A first name leaves no notice (there was no previous name).
         let response = worker.handle_rename("rename", &json!({ "name": "first" }));
         assert!(response.success, "rename failed: {response:?}");

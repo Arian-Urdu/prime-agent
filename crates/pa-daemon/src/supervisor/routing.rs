@@ -729,10 +729,9 @@ impl Supervisor {
                     Err(error) => Err(anyhow!(error)),
                 }
             }
-            _ => {
-                self.route_command_ready(&resident, worker_command, payload, timeout, admission)
-                    .await
-            }
+            _ => Ok(self
+                .route_command_ready(&resident, worker_command, payload, timeout, admission)
+                .await),
         };
         // The byte relay: a routed response the supervisor neither edits nor
         // inspects goes to the client as the worker's own payload bytes with
@@ -947,8 +946,8 @@ impl Supervisor {
                         }
                     }
                 }
-                if let (DaemonCommand::Rename { name, .. }
-                | DaemonCommand::SetSessionName { name, .. }) = command
+                if let DaemonCommand::Rename { name, .. }
+                    | DaemonCommand::SetSessionName { name, .. } = command
                 {
                     // A subagent rename is durable in the ledger, so the
                     // passive roster keeps the new name after passivation.

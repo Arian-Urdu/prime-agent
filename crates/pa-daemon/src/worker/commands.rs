@@ -827,7 +827,7 @@ impl Worker {
         // existing name leaves the renamed session a displayed transcript
         // notice (" by parent" when the rename arrived from the parent
         // session); a first name leaves none.
-        if let Some(previous) = previous.as_deref().filter(|previous| previous != name) {
+        if let Some(previous) = previous.as_deref().filter(|previous| *previous != name) {
             let content = if payload.get("renamedBy").and_then(Value::as_str)
                 == Some(pa_types::daemon::RENAMED_BY_PARENT)
             {

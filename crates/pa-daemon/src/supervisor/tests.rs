@@ -1954,11 +1954,11 @@ async fn a_live_rename_conflicting_with_a_sibling_fails_with_the_unavailability_
     .expect("descriptor");
     supervisor
         .registry
-        .insert(Arc::new(ResidentWorker::new(
+        .insert(ResidentWorker::new(
             "b-live".to_string(),
             descriptor,
             sessions_dir.join("b.descriptor.json"),
-        )))
+        ))
         .await;
 
     let (queue_tx, _queue_rx) = tokio::sync::mpsc::channel(4);

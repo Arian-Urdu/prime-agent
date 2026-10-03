@@ -743,13 +743,15 @@ mod tests {
     /// A host recording every call, answering with fixed handles.
     /// One recorded collect call: its targets and timeout.
     type CollectCall = (Vec<String>, u64);
+    /// One recorded rename: the normalized name and the optional child id.
+    type RecordedRename = (String, Option<String>);
 
     struct RecordingHost {
         spawn_requests: Arc<Mutex<Vec<RlmSpawnRequest>>>,
         create_requests: Arc<Mutex<Vec<RlmCreateSessionRequest>>>,
         targets: Arc<Mutex<Vec<String>>>,
         collects: Arc<Mutex<Vec<CollectCall>>>,
-        renames: Arc<Mutex<Vec<(String, Option<String>)>>>,
+        renames: Arc<Mutex<Vec<RecordedRename>>>,
     }
 
     impl RecordingHost {

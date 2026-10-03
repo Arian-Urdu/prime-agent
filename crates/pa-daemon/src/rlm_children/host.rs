@@ -553,7 +553,10 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     }
                 }
                 match by_ids {
-                    Some(record) => (record.lock().await.active_session_id.clone(), Some(record)),
+                    Some(record) => {
+                        let active_session_id = record.lock().await.active_session_id.clone();
+                        (active_session_id, Some(record))
+                    }
                     None if by_name => bail!(
                         "rlm.rename session_id \"{target}\" must be the full session id or a child handle, not a session name or id suffix"
                     ),

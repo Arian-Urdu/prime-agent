@@ -5886,8 +5886,8 @@ async fn tui_refused_submit_restores_the_draft_after_the_round_trip() {
 
 /// A prompt accepted before the worker is killed must surface the TS
 /// connection-closed error row, not a quiet status note. The killer waits
-/// for the persisted user turn (an external admission condition), so I/O
-/// stalls cannot move a fixed submit/kill clock across the admission edge.
+/// for the worker's `isStreaming` state (an external admission condition),
+/// so I/O stalls cannot move a fixed submit/kill clock across the edge.
 #[tokio::test]
 async fn tui_accepted_then_killed_turn_renders_closed_error() {
     let dir = tempfile::TempDir::new().expect("temp dir");
@@ -5931,7 +5931,6 @@ async fn tui_accepted_then_killed_turn_renders_closed_error() {
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        eprintln!("[accepted-turn-test] worker streaming; sending kill");
         client
             .request_ok(DaemonCommand::Kill {
                 id: None,
@@ -5940,7 +5939,6 @@ async fn tui_accepted_then_killed_turn_renders_closed_error() {
             })
             .await
             .expect("kill admitted session");
-        eprintln!("[accepted-turn-test] kill ack");
         client.close();
     });
     let options = pa_tui::interactive::InteractiveOptions {
@@ -5997,25 +5995,17 @@ async fn tui_accepted_then_killed_turn_renders_closed_error() {
     let rendered = outcome.frames.join("\n");
     assert!(
         rendered.contains(error_row),
-        "killed turn had {} frames; close_info={}; user_row={}; waiting={}; final={}",
+        "killed turn had {} frames without the TS error row; old_info={}; final={}",
         outcome.frames.len(),
         rendered.contains("session closed (killed)"),
-        rendered.contains("held accepted prompt"),
-        rendered.contains("Waiting"),
-        outcome
-            .frames
-            .last()
-            .unwrap_or(&String::new())
-            .lines()
-            .filter(|row| !row.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join(" | ")
+        outcome.frames.last().expect("final frame")
     );
     assert!(
         !rendered.contains("reply must not arrive"),
         "held response leaked:\n{rendered}"
     );
     let last = outcome.frames.last().expect("final frame");
+    assert!(last.contains(error_row), "close error row must persist:\n{last}");
     assert!(
         !last.contains("session closed (killed)"),
         "info downgrade remains:\n{last}"

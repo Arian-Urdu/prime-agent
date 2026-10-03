@@ -309,12 +309,17 @@ impl SessionUi {
                 active_session_id,
                 reason,
             } => {
-                eprintln!("[diagnostic apply-close] id={active_session_id} current={} reason={reason}", self.active_session_id);
                 if active_session_id == self.active_session_id {
                     self.turn_active = false;
                     view.working = None;
-                    self.note(&format!("session closed ({reason})"), view);
-                    eprintln!("[diagnostic applied] entries={} dirty={}", view.chat_len(), self.dirty);
+                    if reason == "killed" {
+                        self.error_row(
+                            "The daemon stopped this agent session. Its transcript remains saved and can be reopened from Agents View.",
+                            view,
+                        );
+                    } else {
+                        self.note(&format!("session closed ({reason})"), view);
+                    }
                 }
             }
             DaemonClientEvent::DirectLinkLost { active_session_id } => {

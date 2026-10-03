@@ -429,9 +429,6 @@ impl DaemonClient {
                     }
                     _ => {
                         if let Some(event) = client_event_from_value(&value) {
-                            if matches!(event, DaemonClientEvent::SessionClosed { .. }) {
-                                eprintln!("[diagnostic supervisor-recv] {event:?}");
-                            }
                             let _ = event_tx.send(event);
                         }
                     }

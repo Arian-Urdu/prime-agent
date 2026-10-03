@@ -286,9 +286,6 @@ pub(crate) async fn connect_direct(
                         shared.resolve(&request_id, response);
                     }
                 } else if let Some(event) = client_event_from_value(&payload) {
-                    if matches!(event, DaemonClientEvent::SessionClosed { .. }) {
-                        eprintln!("[diagnostic direct-recv] {event:?}");
-                    }
                     let _ = event_tx.send(event);
                 }
             }

@@ -496,6 +496,9 @@ impl Renderer {
             return;
         };
         let text = crate::app::render_frame_text(view, *width, *height).join("\n");
+        if text.contains("session closed") {
+            eprintln!("[diagnostic frame] has_close=true entries={}", view.chat_len());
+        }
         if std::env::var("PA_TUI_DEBUG_EVENTS").is_ok() {
             eprintln!(
                 "[tui-frame] len={} has_second={} has_again={}",

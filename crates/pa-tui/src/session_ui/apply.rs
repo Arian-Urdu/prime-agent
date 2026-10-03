@@ -314,6 +314,7 @@ impl SessionUi {
                     self.turn_active = false;
                     view.working = None;
                     self.note(&format!("session closed ({reason})"), view);
+                    eprintln!("[diagnostic applied] entries={} dirty={}", view.chat_len(), self.dirty);
                 }
             }
             DaemonClientEvent::DirectLinkLost { active_session_id } => {

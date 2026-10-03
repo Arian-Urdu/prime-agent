@@ -153,7 +153,7 @@ fn admission_path(registry: &Path) -> PathBuf {
 /// A live pinned stand-in for the dying predecessor: a real process with a
 /// real `/proc` start identity, exactly what the fence pins.
 fn spawn_pinned_process() -> (Child, u32, String) {
-    let mut child = Command::new("sleep")
+    let child = Command::new("sleep")
         .arg("30")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -175,8 +175,8 @@ fn spawn_dead_process() -> (u32, String) {
         .spawn()
         .expect("spawn the short-lived stand-in");
     let pid = u32::from(child.id());
-    let start_id =
-        pa_daemon::lease::get_process_start_id(pid).expect("the short-lived process has a start id");
+    let start_id = pa_daemon::lease::get_process_start_id(pid)
+        .expect("the short-lived process has a start id");
     let _ = child.wait();
     (pid, start_id)
 }
@@ -294,7 +294,7 @@ fn a_dead_pinned_fence_self_clears_at_boot() {
     // A crashed stop leaves a fence behind; the pinned process is already
     // gone. The next boot must not deadlock on the dead record: it clears
     // it and proceeds (the crash-oracle).
-    let successor = spawn_supervisor(&socket, &agent_dir, &registry);
+    let mut successor = spawn_supervisor(&socket, &agent_dir, &registry);
     wait_socket_ready(&socket);
     let _ = successor.child.kill();
     let _ = successor.child.wait();
@@ -321,7 +321,7 @@ fn a_crashed_admission_holder_does_not_wedge_the_boot() {
         &admission_record(pinned_pid, &pinned_start, 60_000),
     );
 
-    let successor = spawn_supervisor(&socket, &agent_dir, &registry);
+    let mut successor = spawn_supervisor(&socket, &agent_dir, &registry);
     wait_socket_ready(&socket);
     let _ = successor.child.kill();
     let _ = successor.child.wait();
@@ -342,7 +342,7 @@ fn an_elapsed_admission_lease_stays_on_disk_and_does_not_block() {
     let admission = admission_path(&registry);
     write_record(&admission, &admission_record(pid, &start_id, 0));
 
-    let successor = spawn_supervisor(&socket, &agent_dir, &registry);
+    let mut successor = spawn_supervisor(&socket, &agent_dir, &registry);
     wait_socket_ready(&socket);
     let _ = successor.child.kill();
     let _ = successor.child.wait();

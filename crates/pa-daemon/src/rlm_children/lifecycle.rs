@@ -446,42 +446,7 @@ impl SupervisorChildSessionsInner {
                     continue;
                 }
                 self.refresh_record(record).await;
-                // The run's final rows are attributed before the terminal
-                // notice rides the parent's follow-up route (TS: the run
-                // task's `finally` flushes pending usage at settlement).
-                self.emit_child_usage(record).await;
-                // TS records the return before delivering the notice: the
-                // pending edge must be on the parent's ledger before the
-                // notice's follow-up turn mints its own request.
-                self.record_child_return(record).await;
-                // Only a successful run completes the display (TS
-                // `completeRlmSubagentRuntime`); a cancelled or failed run
-                // stays `running`, which a restart relists as `error`.
-                let completed = {
-                    let record = record.lock().await;
-                    (record.settled_status == Some("done"))
-                        .then(|| (record.session_dir.clone(), record.rlm_child_id.clone()))
-                };
-                if let Some((session_dir, child_id)) = completed {
-                    if let Err(error) = tokio::task::spawn_blocking(move || {
-                        let Some(mut display) =
-                            crate::rlm_ledger::read_rlm_subagent_display(Path::new(&session_dir))
-                        else {
-                            return Ok(());
-                        };
-                        if display.child_id != child_id || display.status != "running" {
-                            return Ok(());
-                        }
-                        display.status = "completed".to_string();
-                        crate::rlm_ledger::write_rlm_subagent_display(&display).map(|_| ())
-                    })
-                    .await
-                    .unwrap_or_else(|error| Err(anyhow!(error)))
-                    {
-                        eprintln!("pa-daemon: RLM child display completion failed: {error:#}");
-                    }
-                }
-                if !self.deliver_settle_notice(record).await {
+                if !self.run_settle_tail(record).await {
                     // The verdict was re-cleared while this tail ran its
                     // round trips (a collect's grace found the child busy
                     // again: a follow-up turn is running): the watcher
@@ -489,10 +454,6 @@ impl SupervisorChildSessionsInner {
                     // retiring on a verdict nobody owns.
                     continue;
                 }
-                // A settled child releases an owed goal continuation (TS
-                // `_maybeResumeGoalContinuationAfterRlmWork` at the child
-                // settle sites).
-                self.fire_settle_hook(record).await;
                 return;
             }
             // Still running (a timed-out slice or a re-queued continuation):
@@ -531,6 +492,69 @@ impl SupervisorChildSessionsInner {
             }
             tokio::time::sleep(Duration::from_millis(WATCH_POLL_INTERVAL_MS)).await;
         }
+    }
+
+    /// The watcher's settle tail: the run-settle effects in TS order —
+    /// the final usage flush, the child's return on the parent's
+    /// semantic-edge ledger, the notice claim, the display completion,
+    /// and the settle funnel. The claim is the funnel's commit AND the
+    /// verdict's commit: every effect that marks the run durably
+    /// complete lands only after it. Returns whether the watcher may
+    /// retire (`false`: a collect's grace re-cleared the verdict while
+    /// this tail ran its round trips; the watcher keeps watching the
+    /// follow-up turn).
+    pub(super) async fn run_settle_tail(&self, record: &Arc<Mutex<ChildRecord>>) -> bool {
+        // The run's final rows are attributed before the terminal notice
+        // rides the parent's follow-up route (TS: the run task's
+        // `finally` flushes pending usage at settlement).
+        self.emit_child_usage(record).await;
+        // TS records the return before delivering the notice: the pending
+        // edge must be on the parent's ledger before the notice's
+        // follow-up turn mints its own request. A re-clear cannot undo
+        // it: the misread case (the child never ran) finds nothing
+        // committed, and a genuine prior settle keeps the return its run
+        // really owes the ledger.
+        self.record_child_return(record).await;
+        if !self.deliver_settle_notice(record).await {
+            return false;
+        }
+        // Only a successful run completes the display (TS
+        // `completeRlmSubagentRuntime`); a cancelled or failed run stays
+        // `running`, which a restart relists as `error`. The write sits
+        // AFTER the claim: a display marked completed before the commit
+        // could outlive a re-cleared verdict — the record would read
+        // `running` while the durable display said `completed`, and the
+        // restart reseed (`ledger_child_records`) trusts the display, so
+        // a live child would relist as `done` with no notice owed.
+        let completed = {
+            let record = record.lock().await;
+            (record.settled_status == Some("done"))
+                .then(|| (record.session_dir.clone(), record.rlm_child_id.clone()))
+        };
+        if let Some((session_dir, child_id)) = completed {
+            if let Err(error) = tokio::task::spawn_blocking(move || {
+                let Some(mut display) =
+                    crate::rlm_ledger::read_rlm_subagent_display(Path::new(&session_dir))
+                else {
+                    return Ok(());
+                };
+                if display.child_id != child_id || display.status != "running" {
+                    return Ok(());
+                }
+                display.status = "completed".to_string();
+                crate::rlm_ledger::write_rlm_subagent_display(&display).map(|_| ())
+            })
+            .await
+            .unwrap_or_else(|error| Err(anyhow!(error)))
+            {
+                eprintln!("pa-daemon: RLM child display completion failed: {error:#}");
+            }
+        }
+        // A settled child releases an owed goal continuation (TS
+        // `_maybeResumeGoalContinuationAfterRlmWork` at the child settle
+        // sites).
+        self.fire_settle_hook(record).await;
+        true
     }
 
     /// Record a settled child's return in the parent's semantic-edge ledger

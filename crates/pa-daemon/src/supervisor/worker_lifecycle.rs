@@ -46,25 +46,23 @@ impl Supervisor {
             // auth and cannot bound a silent listener in the auth phase.
             let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
             if matches!(
-                tokio::time::timeout_at(deadline, self.connect_worker(resident, deadline)).await,
-                Ok(Ok(()))
+                self.connect_worker_for_stop(resident, deadline).await,
+                Ok(())
             ) {
                 let command = if kill_stop { "kill" } else { "shutdown" };
                 let remaining_ms = deadline
                     .saturating_duration_since(tokio::time::Instant::now())
                     .as_millis() as u64;
                 if remaining_ms > 0 {
-                    let _ = tokio::time::timeout_at(
-                        deadline,
-                        self.route_command_typed(
+                    let _ = self
+                        .route_command_typed(
                             resident,
                             command,
                             json!({}),
                             remaining_ms,
                             RouteAdmission::SupervisorInternal,
-                        ),
-                    )
-                    .await;
+                        )
+                        .await;
                 }
             }
         }

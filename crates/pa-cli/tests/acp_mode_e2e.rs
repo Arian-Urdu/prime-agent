@@ -1895,16 +1895,10 @@ fn acp_threshold_auto_compaction_publishes_the_compaction_meta() {
 }
 
 /// A settled turn's response implies the next prompt is admissible: the
-/// turn releases the session's single-prompt slot BEFORE its reply
+/// turn releases the session's single-prompt slot before its reply
 /// leaves, so a client that prompts again the instant it reads the
-/// response must never hit the still-set slot's "A prompt turn is
-/// already running" refusal — the load-window race behind the flaky
-/// threshold-compaction test's second prompt (registered
-/// red-acp-auto-compaction-20261002-1, CI-wave stopReason null at the
-/// e2e's turn-two assert; the in-process settle that raced its slot
-/// clear behind the response is gone with the single-daemon-path
-/// migration, and this test pins the admission contract on every one of
-/// its sequential prompts where the compaction test opens it once).
+/// response is admitted. Twenty back-to-back prompts keep every
+/// settle-to-next-admission window covered.
 #[test]
 fn acp_settled_prompt_immediately_admits_the_next_prompt() {
     let script = json!({

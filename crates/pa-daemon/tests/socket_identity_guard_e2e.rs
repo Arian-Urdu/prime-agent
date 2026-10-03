@@ -459,7 +459,14 @@ fn live_supervisor_lease_prevents_rebind_after_external_socket_rename() {
         "successor bound while original supervisor still held its lease"
     );
     assert!(original.child.try_wait().unwrap().is_none());
-    assert!(rival.child.try_wait().unwrap().is_none());
+    // TS's contender test accepts failed rivals (ENG-4600:579-585), not
+    // only ones still waiting. A rival may wait or fail, but must not bind.
+    if let Some(status) = rival.child.try_wait().unwrap() {
+        assert!(
+            !status.success(),
+            "a rival that exits must have refused the bind"
+        );
+    }
 }
 
 /// After a stopped holder loses its lock, it must fence itself on resume;
@@ -518,8 +525,14 @@ fn resumed_displaced_supervisor_fences_before_successor_binds() {
     assert!(lock.is_dir(), "old holder must leave successor lock intact");
     std::fs::remove_dir(&lock).expect("release simulated successor lock");
     let mut successor = spawn_supervisor(&socket, &dir.path().join("successor-agent"));
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // The replacement can wait behind a stale 5s lease under CI load;
+    // TS's replacement connect helper also allows 30s (ENG-4600:287-302).
+    let deadline = Instant::now() + Duration::from_secs(30);
     while UnixStream::connect(&socket).is_err() || socket_identity(&socket) == original_socket {
+        assert!(
+            successor.child.try_wait().unwrap().is_none(),
+            "successor exited instead of binding after the old holder fenced"
+        );
         assert!(
             Instant::now() < deadline,
             "successor did not bind after old holder fenced"

@@ -51,6 +51,11 @@ pub(crate) const TMUX_CLIPBOARD_BLOCKED: &str =
     "tmux cannot forward this copy to a clipboard. Check its attached client's Ms capability and each outer tmux hop.";
 pub(crate) const CLIPBOARD_REQUESTED: &str =
     "Clipboard request sent; paste in the local terminal to verify delivery";
+/// The oversized remote fallback: a helper wrote the machine the TUI runs
+/// on, which the user's local terminal cannot paste from, so the copy
+/// reports where the text landed instead of claiming confirmed delivery.
+const OVERSIZED_REMOTE_COPIED: &str =
+    "Payload too large for terminal forwarding; copied to the remote machine's clipboard instead";
 
 fn tmux_output(args: &[&str]) -> Option<String> {
     let mut child = Command::new("tmux")
@@ -315,6 +320,13 @@ fn copy_with_env(text: &str, sink: &mut OscSink, env: &Env) -> Result<CopyOutcom
         }
     };
     if copied {
+        if remote {
+            // The helper wrote the remote machine's clipboard, which the
+            // user's local terminal cannot paste from, and the oversized
+            // payload cannot ride OSC 52: report where the copy landed
+            // instead of claiming confirmed delivery.
+            return Err(OVERSIZED_REMOTE_COPIED.to_string());
+        }
         return Ok(CopyOutcome::Confirmed);
     }
     if matches!(sink, OscSink::Stdout) && std::env::var_os("TMUX").is_some() {
@@ -332,11 +344,7 @@ fn copy_with_env(text: &str, sink: &mut OscSink, env: &Env) -> Result<CopyOutcom
             .map_err(|error| format!("Failed to write clipboard request: {error}"))?;
         return Ok(CopyOutcome::Requested);
     }
-    if copied {
-        Ok(CopyOutcome::Confirmed)
-    } else {
-        Err("Failed to copy to clipboard".to_string())
-    }
+    Err("Failed to copy to clipboard".to_string())
 }
 
 #[cfg(test)]
@@ -385,6 +393,29 @@ mod tests {
             }
             OscSink::Stdout => panic!("the buffer sink captured nothing"),
         }
+    }
+
+    #[test]
+    fn a_remote_oversized_payload_falls_through_without_a_confirmed_copy() {
+        // The helper fallback writes the remote machine's clipboard, which
+        // can never confirm the user's local delivery; with no helper to
+        // run (the headless sink's shape) the copy simply fails.
+        let mut sink = OscSink::Buffer(Vec::new());
+        let env = Env::scripted([
+            ("SSH_CONNECTION", Some("1.2.3.4")),
+            ("SSH_CLIENT", None),
+            ("MOSH_CONNECTION", None),
+            ("TERMUX_VERSION", None),
+            ("WAYLAND_DISPLAY", None),
+            ("XDG_SESSION_TYPE", None),
+            ("DISPLAY", None),
+        ]);
+        let big = "a".repeat(200_001);
+        assert_eq!(
+            copy_with_env(&big, &mut sink, &env),
+            Err("Failed to copy to clipboard".to_string())
+        );
+        assert!(matches!(sink, OscSink::Buffer(buffer) if buffer.is_empty()));
     }
 
     #[test]

@@ -1102,6 +1102,18 @@ if [ "$WINDOWS" = "yes" ]; then
 else
   PREFIX="$("$UVPY" -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$PREFIX")"
 fi
+# The rollback's generations record is newline-delimited (one path per
+# line), so a prefix containing a newline can never be recorded or read
+# back — the rollback would silently misreport "nothing to roll back".
+# The check rides AFTER the full resolution above: a clean lexical
+# spelling through a symlinked ancestor can resolve to a real path that
+# contains a newline, and the record stores the RESOLVED path — the
+# refusal names the resolved spelling, before anything is created under
+# it (the same boundary discipline as the absolute-path check).
+case "$PREFIX" in
+  *'
+'*) die "PRIME_AGENT_RUST_PREFIX must not contain a newline: the rollback record is newline-delimited (resolved: ${PREFIX})" ;;
+esac
 guard_preserved "$PREFIX" "${PREFIX}/share" "${PREFIX}/bin"
 mkdir -p "${PREFIX}/share" "${PREFIX}/bin"
 # The guard must also see THROUGH symlinked child roots: a ${PREFIX}/share or
@@ -1138,6 +1150,22 @@ guard_preserved "$share_dir" "$launcher" "$old_layout_dir" "$legacy_dir" "$lock_
 # into place and keeps the replaced payload as the new generation.
 rollback_from=""
 if [ "$MODE" = rollback ]; then
+  # The marker as this script's ASCII text: this script writes plain bytes,
+  # but install.ps1's Set-Content follows $PSDefaultParameters
+  # ['*:Encoding'] — an existing ps1-published payload's marker can be
+  # UTF-16 (NUL-interleaved) or BOM-prefixed. The read flattens the NULs
+  # and strips a leading BOM (UTF-8 and both UTF-16 orders); a plain
+  # marker passes through byte-identical. Only the ps1 slot's marker needs
+  # it — the record's entries are always this script's own ASCII writes.
+  marker_text() {
+    text="$(tr -d '\0' < "$1" 2>/dev/null || true)"
+    case "$text" in
+      "$(printf '\357\273\277')"*) text="${text#"$(printf '\357\273\277')"}" ;;
+      "$(printf '\377\376')"*) text="${text#"$(printf '\377\376')"}" ;;
+      "$(printf '\376\377')"*) text="${text#"$(printf '\376\377')"}" ;;
+    esac
+    printf '%s' "$text"
+  }
   if [ -f "$generations_record" ]; then
     while IFS= read -r recorded; do
       case "$recorded" in
@@ -1171,8 +1199,11 @@ if [ "$MODE" = rollback ]; then
   ps1_slot="${PREFIX}/share/prime-agent.old"
   if [ -z "$rollback_from" ] \
      && [ -d "$ps1_slot" ] && [ -x "${ps1_slot}/${BINARY_NAME}" ] \
-     && head -n 1 "${ps1_slot}/.prime-agent-install" 2>/dev/null \
-        | grep -q '^install-rust.sh channel '; then
+     && case "$(marker_text "${ps1_slot}/.prime-agent-install" \
+                 | head -n 1)" in
+          "install-rust.sh channel "*) true ;;
+          *) false ;;
+        esac; then
     rollback_from="$ps1_slot"
   fi
   [ -n "$rollback_from" ] || die "nothing to roll back: no previous version is kept under ${PREFIX}/share
@@ -1190,8 +1221,12 @@ if [ "$MODE" = rollback ]; then
     printf '%s\n' "$rollback_from"
     exit 0
   fi
-  CHANNEL="$(sed -n '1s/^install-rust.sh channel //p' "${rollback_from}/.prime-agent-install")"
-  VERSION="$(sed -n '2s/^version //p' "${rollback_from}/.prime-agent-install")"
+  # The channel/version lines come from the normalized marker: the slot's
+  # marker can be a ps1-encoded write (see marker_text); a record entry's
+  # marker is this script's own ASCII, so the normalization is a no-op.
+  marker="$(marker_text "${rollback_from}/.prime-agent-install")"
+  CHANNEL="$(printf '%s\n' "$marker" | sed -n '1s/^install-rust.sh channel //p')"
+  VERSION="$(printf '%s\n' "$marker" | sed -n '2s/^version //p')"
   say "rolling back to prime-agent ${VERSION} (${rollback_from})"
   title "${VERSION} (rollback)"
   step_ok "Found the previous version" "${VERSION}"

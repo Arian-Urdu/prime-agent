@@ -69,7 +69,7 @@ fn tmux_output(args: &[&str]) -> Option<String> {
 
 /// One bounded probe's output, or `None` when the child fails or misses
 /// the deadline: the pipe drains from its own thread for the whole life
-/// of the child (the pipe_to writer-thread shape), so a probe writing
+/// of the child (the `pipe_to` writer-thread shape), so a probe writing
 /// past the pipe buffer still exits.
 fn probe_output(child: &mut std::process::Child) -> Option<String> {
     let stdout = child.stdout.take();

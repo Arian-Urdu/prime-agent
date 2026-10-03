@@ -12,16 +12,16 @@ pub(crate) const MAX_ENCODED_LENGTH: usize = 100_000;
 /// without building the encoding — a local helper takes the raw
 /// payload, and the encoding belongs to the OSC 52 write alone.
 pub(crate) fn carries(text: &str) -> bool {
-    (text.len() + 2) / 3 * 4 <= MAX_ENCODED_LENGTH
+    text.len().div_ceil(3) * 4 <= MAX_ENCODED_LENGTH
 }
 
 /// The OSC 52 clipboard sequence for `text` (clipboard selection `c`),
 /// or `None` when the encoded payload exceeds the cap.
 pub(crate) fn sequence(text: &str) -> Option<String> {
+    use base64::Engine;
     if !carries(text) {
         return None;
     }
-    use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(text);
     Some(format!("\x1b]52;c;{encoded}\x07"))
 }

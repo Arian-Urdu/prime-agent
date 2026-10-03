@@ -108,7 +108,11 @@ pub(crate) fn copy_via_tmux(text: &str) -> bool {
     let Ok(pane) = std::env::var("TMUX_PANE") else {
         return false;
     };
-    if tmux_output(&["show-options", "-gv", "set-clipboard"])
+    // `set-clipboard` is a server option on every tmux since 2.6; tmux
+    // before 3.0 picks the probe's option tree from the flags alone, so
+    // without `-s` the session tree rejects the name and forwarding is
+    // silently skipped.
+    if tmux_output(&["show-options", "-s", "-gv", "set-clipboard"])
         .is_none_or(|value| value.trim() == "off")
     {
         return false;

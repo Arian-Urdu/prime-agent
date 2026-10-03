@@ -947,7 +947,7 @@ impl Supervisor {
                     }
                 }
                 if let DaemonCommand::Rename { name, .. }
-                    | DaemonCommand::SetSessionName { name, .. } = command
+                | DaemonCommand::SetSessionName { name, .. } = command
                 {
                     // A subagent rename is durable in the ledger, so the
                     // passive roster keeps the new name after passivation.

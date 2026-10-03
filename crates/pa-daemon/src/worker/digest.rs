@@ -809,14 +809,36 @@ impl AgentMessageDigest {
                 match store.persist_entry("custom", entry) {
                     Ok(id) => id,
                     Err(error) => {
-                        // The failed append can be pre- OR post-write (the
-                        // lease append reaches the file before its flush
-                        // errors), so the in-memory records must not keep
-                        // trusting the pre-append load: invalidate the
-                        // loaded key so the next inbox access reloads the
-                        // store's truth — a post-write failure's row
-                        // reappears (a retry's duplicate stays visible with
-                        // it) instead of hiding until a restart.
+                        // The failed append can be pre- OR post-write: the
+                        // lease append's fsync errors AFTER the bytes
+                        // reached the session file, while the store's
+                        // in-memory index only records a successful
+                        // append. A row that verifiably reached the file IS
+                        // the digested delivery (TS: accepted once its
+                        // entry reached the session file) — accept it so
+                        // the sender never retries a duplicate.
+                        if let Some(id) = core
+                            .store
+                            .as_ref()
+                            .filter(|store| !store.path.as_os_str().is_empty())
+                            .and_then(|store| {
+                                Self::durable_inbox_row_id(&store.path, &data.message_id)
+                            })
+                        {
+                            inbox.records.push(InboxRecord {
+                                id,
+                                data: data.clone(),
+                                read: false,
+                            });
+                            return Ok(());
+                        }
+                        // No durable row (a pre-write failure): the
+                        // in-memory records must not keep trusting the
+                        // pre-append load either — invalidate the loaded
+                        // key so the next inbox access reloads the store's
+                        // index (whatever it knows; a reload from the file
+                        // happens at the next worker restart, which opens
+                        // and indexes the durable rows).
                         inbox.loaded_key = None;
                         return Err(error);
                     }
@@ -830,6 +852,29 @@ impl AgentMessageDigest {
             read: false,
         });
         Ok(())
+    }
+
+    /// The durable reconciliation for a failed append (the post-write
+    /// class): the lease append's fsync errors AFTER the bytes reached
+    /// the session file, so the row may be durable while the store's
+    /// in-memory index (built only on a successful append) lacks it.
+    /// Scan the file itself for the row this append minted and answer
+    /// its entry id.
+    fn durable_inbox_row_id(store_path: &PathBuf, message_id: &str) -> Option<String> {
+        let content = std::fs::read_to_string(store_path).ok()?;
+        crate::session_store::parse_session_entries(&content)
+            .iter()
+            .find(|entry| {
+                entry.get("type").and_then(Value::as_str) == Some("custom")
+                    && entry.get("customType").and_then(Value::as_str)
+                        == Some(AGENT_MESSAGE_INBOX_ENTRY_CUSTOM_TYPE)
+                    && entry
+                        .get("data")
+                        .and_then(|data| data.get("messageId"))
+                        .and_then(Value::as_str)
+                        == Some(message_id)
+            })
+            .and_then(|entry| entry.get("id").and_then(Value::as_str).map(str::to_string))
     }
 
     /// Store one watch event (agent or job) on the digest lane (PR E):
@@ -1836,5 +1881,86 @@ mod tests {
             snapshot["entries"][0]["content"],
             json!("must not silently digest")
         );
+    }
+
+    /// The post-write failure class: the lease append's fsync errors after
+    /// the bytes reached the file, so the row is durable while the append
+    /// reports failure. The digest reconciles against the file and
+    /// ACCEPTS the delivery (the sender never retries a duplicate), while
+    /// a pre-write failure keeps refusing — no durable row, nothing
+    /// counted (the TS `appendCustomEntryWithRollback` contract). Unix
+    /// only: the append failure is forced with a read-only session file.
+    #[cfg(unix)]
+    #[test]
+    fn a_post_write_failure_is_reconciled_against_the_durable_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store_path = dir.path().join("session.jsonl");
+        let mut store = crate::session_store::SessionFile::create("/tmp", None, 0);
+        let session_id = store.session_id().to_string();
+        store.set_path(store_path.clone());
+        store.rewrite().unwrap();
+        // The row the append would write reached the file (the post-write
+        // class): seeded exactly as the lease append leaves it.
+        let header = json!({
+            "type": "session",
+            "version": 3,
+            "id": session_id,
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "cwd": "/tmp",
+        });
+        let row = json!({
+            "type": "custom",
+            "id": "row-postwrite",
+            "timestamp": "2026-01-01T00:00:03.000Z",
+            "customType": AGENT_MESSAGE_INBOX_ENTRY_CUSTOM_TYPE,
+            "data": {
+                "messageId": "agentmsg_postwrite",
+                "content": "REPORT 481",
+                "from": { "activeSessionId": "sender", "sessionName": "sender" },
+                "fromRelationship": "sibling",
+                "target": { "activeSessionId": "target", "sessionId": "target" },
+                "receivedAt": "2026-01-01T00:00:03.000Z",
+                "kind": "agent_message",
+            },
+        });
+        std::fs::write(&store_path, format!("{header}\n{row}\n")).unwrap();
+        // Every append now fails (the file is read-only) — but the durable
+        // row is present, so the delivery must reconcile and accept.
+        let mut permissions = std::fs::metadata(&store_path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o444);
+        std::fs::set_permissions(&store_path, permissions).unwrap();
+        let digest = AgentMessageDigest::new(
+            std::sync::Arc::new(std::sync::Mutex::new(SessionCore::test_core(
+                Some(store),
+                "/tmp".to_string(),
+            ))),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        );
+        digest.configure_pin("digest").unwrap();
+        let receipt = digest
+            .route_inbound_message(
+                "agentmsg_postwrite",
+                "REPORT 481",
+                &sibling_sender(),
+                Some("sibling"),
+            )
+            .expect("route failed");
+        assert!(
+            receipt.is_some(),
+            "the durable row was not accepted: {receipt:?}"
+        );
+        let snapshot = digest.inbox_snapshot();
+        assert_eq!(snapshot["total"], json!(1), "{snapshot}");
+        assert_eq!(
+            snapshot["entries"][0]["id"],
+            json!("row-postwrite"),
+            "the reconciled row keeps its durable id: {snapshot}"
+        );
+        assert_eq!(snapshot["unread"], json!(1));
+        // The read-only file restores for the temp-dir cleanup.
+        let mut permissions = std::fs::metadata(&store_path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o644);
+        std::fs::set_permissions(&store_path, permissions).unwrap();
     }
 }

@@ -262,15 +262,30 @@ impl Worker {
         *self.bound_socket_identity.lock().unwrap() =
             crate::socket::socket_identity(&self.config.socket_path);
         crate::socket::restrict_socket_path(&self.config.socket_path);
+        // This loop owns the bound listener and hands its close to the
+        // exit paths (TS daemon-mode.ts:8011-8018 awaits `server.close()`
+        // FIRST and cleans the socket path after): an exiting path
+        // requests the close, the loop drops the listener - releasing
+        // the bind while every already-accepted connection keeps its own
+        // socket - confirms, and parks; the exiting path owns the
+        // process from its confirmation on. The arm order is safe
+        // against wake loss: a close request that fires while an accept
+        // is being handed off leaves its permit stored, and the next
+        // loop iteration consumes it.
+        self.listener_bound
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         loop {
-            let stream = match listener.accept().await {
-                Ok(accepted) => {
-                    if std::env::var("PA_DAEMON_DEBUG").is_ok() {
-                        eprintln!("[worker {}] accepted connection", std::process::id());
+            let stream = tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok(accepted) => {
+                        if std::env::var("PA_DAEMON_DEBUG").is_ok() {
+                            eprintln!("[worker {}] accepted connection", std::process::id());
+                        }
+                        accepted
                     }
-                    accepted
-                }
-                Err(error) => return Err(anyhow!("worker accept: {error}")),
+                    Err(error) => return Err(anyhow!("worker accept: {error}")),
+                },
+                () = self.listener_close_requested.notified() => break,
             };
             let worker = Arc::clone(&self);
             tokio::spawn(async move {
@@ -279,6 +294,14 @@ impl Worker {
                 }
             });
         }
+        // The graceful close: drop the bound listener so the bind
+        // releases, confirm to the exiting path, and park forever (the
+        // parked task keeps the runtime - and so the in-flight
+        // connections - alive until the exiting path's `process::exit`
+        // ends them all).
+        drop(listener);
+        self.listener_closed.notify_one();
+        std::future::pending::<Result<()>>().await
     }
 
     async fn handle_connection(self: Arc<Self>, stream: Box<dyn TransportStream>) -> Result<()> {
@@ -491,7 +514,7 @@ impl Worker {
                         self.write_response_frame(&sink, &request_id, response)
                             .await;
                         if success {
-                            self.exit_after_close();
+                            self.exit_after_close().await;
                         }
                         continue;
                     }

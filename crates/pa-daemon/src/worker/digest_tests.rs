@@ -661,3 +661,53 @@ async fn a_reloaded_worker_re_arms_the_notice_for_unread_inbox_entries() {
         "the reload did not re-arm the digest notice"
     );
 }
+/// The push lane's coalescing bound on a busy session: the 5-second
+/// poller can emit faster than the runner drains, and one queued
+/// notice per event would pile onto the steering lane unbounded. One
+/// UNDELIVERED notice per watch — the newest event supersedes the
+/// pending row's content; other watches keep their own row.
+#[tokio::test]
+async fn a_busy_session_holds_one_pending_watch_notice_per_watch() {
+    let worker = created_worker().await;
+    park_runner(&worker).await;
+    {
+        let mut core = worker.core.lock().unwrap();
+        core.busy = true;
+    }
+    for index in 0..3 {
+        worker.agent_digest.emit_watch_notice(
+            "agent",
+            &format!("[watch-agent child:c1] messages {index}..{}", index + 1),
+        );
+    }
+    worker
+        .agent_digest
+        .emit_watch_notice("job", "[watch-job pid:1] output +10 bytes (0..10)");
+    worker
+        .agent_digest
+        .emit_watch_notice("job", "[watch-job pid:1] output +20 bytes (0..20)");
+    let texts = {
+        let core = worker.core.lock().unwrap();
+        core_lane_items(&core, Lane::Steering)
+            .iter()
+            .map(|item| item.message.clone())
+            .collect::<Vec<_>>()
+    };
+    let types = lane_custom_types(&worker.core, Lane::Steering);
+    assert_eq!(
+        texts,
+        vec![
+            "[watch-agent child:c1] messages 2..3".to_string(),
+            "[watch-job pid:1] output +20 bytes (0..20)".to_string(),
+        ],
+        "one pending notice per watch, superseded by the newest: {texts:?}"
+    );
+    assert_eq!(
+        types,
+        vec![
+            "agent_watch_notice".to_string(),
+            "agent_watch_notice".to_string()
+        ],
+        "{types:?}"
+    );
+}

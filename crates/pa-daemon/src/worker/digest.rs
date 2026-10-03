@@ -43,6 +43,12 @@ const DIGEST_NOTICE_MAX_SENDERS: usize = 5;
 /// The trailing-5-minute window the controller's pending pressure reads
 /// (TS `MessagingStats.arrivals.last5m`).
 const ARRIVALS_WINDOW_MS: u64 = 5 * 60 * 1000;
+/// The arrivals ring's bucket width: arrivals landing inside the same
+/// second share one counted row, so the ring holds at most one row per
+/// second of window however hot the push path runs (the controller reads
+/// only the trailing count; a per-arrival row grew one entry per
+/// delivery for the window's whole span).
+const ARRIVALS_BUCKET_MS: u64 = 1_000;
 /// The chars-per-token heuristic of the ingestion share (TS
 /// `estimateMessagingTokens`: chars / 4 over the working context).
 const CONTEXT_TOKENS_PER_CHAR: f64 = 4.0;
@@ -408,6 +414,16 @@ impl DigestLaneController {
 // Per-session counters (the controller's trigger inputs)
 // ---------------------------------------------------------------------------
 
+/// One counted slice of the arrivals ring: every arrival landing inside
+/// the same [`ARRIVALS_BUCKET_MS`]-wide slice shares this row, so the
+/// ring stays bounded at one row per slice of window under sustained
+/// traffic (the count is all the controller reads).
+#[derive(Debug, Default)]
+struct ArrivalsBucket {
+    start_ms: u64,
+    count: u64,
+}
+
 /// The receiving worker's trigger counters. The TS controller read the
 /// instrumentation counters of PR A (`messaging_stats`); that
 /// instrumentation is not part of this port, so the digest lane owns the
@@ -416,29 +432,37 @@ impl DigestLaneController {
 /// of the TS assistant-step counters), and the controller state itself.
 #[derive(Debug, Default)]
 struct DigestCounters {
-    arrivals: VecDeque<u64>,
+    arrivals: VecDeque<ArrivalsBucket>,
     controller: DigestLaneController,
 }
 
 impl DigestCounters {
     fn record_arrival(&mut self, now_ms: u64) {
-        self.arrivals.push_back(now_ms);
+        let start_ms = now_ms / ARRIVALS_BUCKET_MS * ARRIVALS_BUCKET_MS;
         self.prune_arrivals(now_ms);
+        match self.arrivals.back_mut() {
+            Some(bucket) if bucket.start_ms == start_ms => bucket.count += 1,
+            _ => self
+                .arrivals
+                .push_back(ArrivalsBucket { start_ms, count: 1 }),
+        }
     }
 
     fn prune_arrivals(&mut self, now_ms: u64) {
-        while self
-            .arrivals
-            .front()
-            .is_some_and(|stamp| now_ms.saturating_sub(*stamp) > ARRIVALS_WINDOW_MS)
-        {
+        // A bucket's last arrival sits at start_ms + bucket width; the
+        // bucket leaves the window once even that newest arrival is older
+        // than the trailing window (the same edge the per-arrival stamps
+        // pruned on, applied at bucket granularity).
+        while self.arrivals.front().is_some_and(|bucket| {
+            now_ms.saturating_sub(bucket.start_ms + ARRIVALS_BUCKET_MS) >= ARRIVALS_WINDOW_MS
+        }) {
             self.arrivals.pop_front();
         }
     }
 
     fn arrivals_last_5m(&mut self, now_ms: u64) -> u64 {
         self.prune_arrivals(now_ms);
-        self.arrivals.len() as u64
+        self.arrivals.iter().map(|bucket| bucket.count).sum()
     }
 }
 
@@ -1182,6 +1206,25 @@ impl AgentMessageDigest {
         if core.shutdown_requested {
             return;
         }
+        // The coalescing bound on a busy session: the 5-second poller can
+        // emit faster than the runner drains, and one queued notice per
+        // event would pile onto the steering lane unbounded (up to 64
+        // watches x 12 polls/minute for the busy turn's whole duration).
+        // One UNDELIVERED push-lane notice per watch: the newest event
+        // supersedes the pending row's content (the ranges are advisory;
+        // the newest one always reflects the child's latest state).
+        if let Some(pending) = core
+            .steering
+            .iter_mut()
+            .find(|item| is_push_watch_notice_for(item, watch))
+        {
+            pending.message = content.to_string();
+            if let Some(row) = pending.custom_message.as_mut() {
+                row["content"] = json!(content);
+                row["timestamp"] = json!(crate::util::now_ms());
+            }
+            return;
+        }
         let row = json!({
             "role": "custom",
             "customType": crate::agent_watch::AGENT_WATCH_NOTICE_CUSTOM_TYPE,
@@ -1219,6 +1262,23 @@ impl AgentMessageDigest {
         );
         self.work_notify.notify_one();
     }
+}
+
+/// Whether one queued item is an UNDELIVERED push-lane watch notice for
+/// the given watch (the coalescing key: one pending row per watch).
+fn is_push_watch_notice_for(item: &QueuedItem, watch: &str) -> bool {
+    item.custom_message
+        .as_ref()
+        .and_then(|row| row.get("customType"))
+        .and_then(Value::as_str)
+        == Some(crate::agent_watch::AGENT_WATCH_NOTICE_CUSTOM_TYPE)
+        && item
+            .custom_message
+            .as_ref()
+            .and_then(|row| row.get("details"))
+            .and_then(|details| details.get("watch"))
+            .and_then(Value::as_str)
+            == Some(watch)
 }
 
 /// Whether one queued item is an undelivered digest notice.
@@ -1615,6 +1675,43 @@ mod tests {
             .expect("route failed");
         assert!(routed.is_none(), "a push-pinned route digested");
         assert_eq!(ring(&digest), 0, "the push route pre-recorded an arrival");
+    }
+
+    /// The arrivals ring is count-aggregated (the bounded form): sustained
+    /// traffic spread across the whole window preserves the
+    /// trailing-window count exactly, while the ring itself never grows
+    /// past one counted row per bucket of window — the per-arrival row of
+    /// the first cut held one entry per delivery for the window's whole
+    /// span, so a hot push path grew the worker's memory without bound.
+    #[test]
+    fn the_arrivals_ring_stays_bounded_under_sustained_traffic() {
+        let mut counters = DigestCounters::default();
+        let now = 100 * ARRIVALS_WINDOW_MS;
+        // 30_000 arrivals spread across the window (100 per second).
+        for index in 0..30_000u64 {
+            counters.record_arrival(now - ARRIVALS_WINDOW_MS + index / 100);
+        }
+        assert_eq!(
+            counters.arrivals_last_5m(now),
+            30_000,
+            "the bucketed ring lost trailing-window arrivals"
+        );
+        assert!(
+            counters.arrivals.len() <= (ARRIVALS_WINDOW_MS / ARRIVALS_BUCKET_MS) as usize + 1,
+            "the ring grew past its per-bucket bound: {}",
+            counters.arrivals.len()
+        );
+        // The window slides: aged-out buckets leave the ring entirely.
+        assert_eq!(
+            counters.arrivals_last_5m(now + ARRIVALS_WINDOW_MS),
+            0,
+            "an aged-out bucket survived the window"
+        );
+        assert!(
+            counters.arrivals.is_empty(),
+            "the pruned ring kept {} stale buckets",
+            counters.arrivals.len()
+        );
     }
 
     /// A test digest over a real store (the burst tests need the durable

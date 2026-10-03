@@ -51,9 +51,8 @@ pub(crate) const TMUX_CLIPBOARD_BLOCKED: &str =
     "tmux cannot forward this copy to a clipboard. Check its attached client's Ms capability and each outer tmux hop.";
 pub(crate) const CLIPBOARD_REQUESTED: &str =
     "Clipboard request sent; paste in the local terminal to verify delivery";
-/// The oversized remote fallback: a helper wrote the machine the TUI runs
-/// on, which the user's local terminal cannot paste from, so the copy
-/// reports where the text landed instead of claiming confirmed delivery.
+/// The oversized remote fallback's report: the helper wrote the machine
+/// the TUI runs on, not the user's local clipboard.
 const OVERSIZED_REMOTE_COPIED: &str =
     "Payload too large for terminal forwarding; copied to the remote machine's clipboard instead";
 
@@ -300,6 +299,19 @@ pub(crate) enum CopyOutcome {
     Requested,
 }
 
+/// A platform helper's success: a local session's helper wrote the user's
+/// own clipboard, while a remote session's helper wrote the machine the
+/// TUI runs on — the user's local terminal cannot paste from it, and the
+/// payload is too large for OSC 52 — so the copy reports where the text
+/// landed instead of confirming delivery.
+fn helper_outcome(remote: bool) -> Result<CopyOutcome, String> {
+    if remote {
+        Err(OVERSIZED_REMOTE_COPIED.to_string())
+    } else {
+        Ok(CopyOutcome::Confirmed)
+    }
+}
+
 pub(crate) fn copy_to_clipboard(text: &str, sink: &mut OscSink) -> Result<CopyOutcome, String> {
     copy_with_env(text, sink, &Env::process())
 }
@@ -320,14 +332,7 @@ fn copy_with_env(text: &str, sink: &mut OscSink, env: &Env) -> Result<CopyOutcom
         }
     };
     if copied {
-        if remote {
-            // The helper wrote the remote machine's clipboard, which the
-            // user's local terminal cannot paste from, and the oversized
-            // payload cannot ride OSC 52: report where the copy landed
-            // instead of claiming confirmed delivery.
-            return Err(OVERSIZED_REMOTE_COPIED.to_string());
-        }
-        return Ok(CopyOutcome::Confirmed);
+        return helper_outcome(remote);
     }
     if matches!(sink, OscSink::Stdout) && std::env::var_os("TMUX").is_some() {
         // The containing tmux originates this copy even with its default
@@ -393,6 +398,18 @@ mod tests {
             }
             OscSink::Stdout => panic!("the buffer sink captured nothing"),
         }
+    }
+
+    #[test]
+    fn a_remote_helper_success_never_confirms_local_delivery() {
+        // The pre-fix arm returned Confirmed for a remote helper's write,
+        // which landed on the machine the TUI runs on, not the user's
+        // local clipboard.
+        assert_eq!(
+            helper_outcome(true),
+            Err(OVERSIZED_REMOTE_COPIED.to_string())
+        );
+        assert_eq!(helper_outcome(false), Ok(CopyOutcome::Confirmed));
     }
 
     #[test]

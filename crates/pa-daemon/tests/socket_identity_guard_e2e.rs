@@ -392,3 +392,72 @@ fn a_drained_supervisor_never_unlinks_a_replaced_socket_file() {
     wait_clean_exit(&mut daemon.child, Duration::from_secs(10));
     assert_replacement_serves(&socket, replacement_identity);
 }
+
+/// TS daemon-socket.ts:77-102 and daemon-supervisor.ts:852-865: the
+/// supervisor owns a renewable socket-path lease from before bind to exit.
+/// A killed holder leaves the directory, but a successor reclaims it after
+/// the five-second stale window without touching a live successor's socket.
+#[test]
+fn supervisor_renews_lifetime_socket_lease_and_reclaims_a_dead_holder() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("daemon.sock");
+    let agent_dir = dir.path().join("agent");
+    let mut original = spawn_supervisor(&socket, &agent_dir);
+    wait_socket_ready(&socket);
+    let lock = PathBuf::from(format!("{}.lock", socket.display()));
+    assert!(lock.is_dir(), "serving supervisor must hold socket lease");
+    let before = std::fs::metadata(&lock).unwrap().modified().unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    let after = std::fs::metadata(&lock).unwrap().modified().unwrap();
+    assert!(
+        after > before,
+        "live holder must refresh lock directory mtime"
+    );
+    let mut second = spawn_supervisor(&socket, &dir.path().join("rival-agent"));
+    assert!(
+        second.child.try_wait().unwrap().is_none(),
+        "live lease must block rival startup"
+    );
+    drop(second);
+    original.child.kill().expect("kill original holder");
+    original.child.wait().expect("reap original holder");
+    // The old, unaccepted socket path and the abandoned lock both remain.
+    assert!(socket.exists());
+    assert!(lock.exists());
+    let mut successor = spawn_supervisor(&socket, &dir.path().join("successor-agent"));
+    let deadline = Instant::now() + Duration::from_secs(18);
+    while UnixStream::connect(&socket).is_err()
+        || std::fs::metadata(&lock).unwrap().modified().unwrap() <= after
+    {
+        assert!(
+            Instant::now() < deadline,
+            "dead holder lease was not reclaimed"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(successor.child.try_wait().unwrap().is_none());
+}
+
+/// A live supervisor's lease must keep the socket path exclusive even if a
+/// tmpfiles sweep renames its listener away (TS daemon-supervisor.ts:852-865).
+/// D1's bind-time identity guard alone protects the eventual exit unlink,
+/// but it does not stop another process binding a fresh file meanwhile.
+#[test]
+fn live_supervisor_lease_prevents_rebind_after_external_socket_rename() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("daemon.sock");
+    let mut original = spawn_supervisor(&socket, &dir.path().join("original-agent"));
+    wait_socket_ready(&socket);
+    let aside = dir.path().join("original.sock");
+    std::fs::rename(&socket, &aside).expect("keep original inode alive");
+    let mut rival = spawn_supervisor(&socket, &dir.path().join("rival-agent"));
+    // TS's lifetime lease queues this startup until the 600x25ms retry
+    // budget expires. Rust without a lease binds immediately: fail RED.
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        !socket.exists(),
+        "successor bound while original supervisor still held its lease"
+    );
+    assert!(original.child.try_wait().unwrap().is_none());
+    assert!(rival.child.try_wait().unwrap().is_none());
+}

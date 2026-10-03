@@ -295,7 +295,8 @@ fn run_shutdown_converging(
                             &mut handled_pids,
                             force,
                             assert,
-                        )?,
+                        )
+                        .map_err(|error| error.to_string())?,
                         &socket_path,
                         &mut stopped,
                         &mut failed,
@@ -322,7 +323,8 @@ fn run_shutdown_converging(
                             &mut handled_pids,
                             force,
                             assert,
-                        )?,
+                        )
+                        .map_err(|error| error.to_string())?,
                         &socket_path,
                         &mut stopped,
                         &mut failed,
@@ -357,7 +359,8 @@ fn run_shutdown_converging(
                         &mut handled_pids,
                         force,
                         assert,
-                    )?,
+                    )
+                    .map_err(|error| error.to_string())?,
                     &socket_path,
                     &mut stopped,
                     &mut failed,

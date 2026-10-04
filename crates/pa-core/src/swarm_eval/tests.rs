@@ -377,13 +377,27 @@ fn rejects_a_sweep_that_overflows_the_derived_trial_seed() {
 }
 
 #[test]
-fn default_out_dir_is_stamped_when_omitted() {
+fn default_out_dir_is_stamped_and_process_unique_when_omitted() {
+    let before = crate::session::manager::format_iso_now().replace([':', '.'], "-");
     let config = parse_eval_args(&args(&["--model", "m"])).expect("parses");
+    let after = crate::session::manager::format_iso_now().replace([':', '.'], "-");
+
+    // `swarm-eval-reports/<ISO start stamp>-<pid>`: the pid beside the
+    // stamp is what keeps two evals launched in the same millisecond from
+    // writing each other's `report.md`/`report.json`.
+    let prefix = "swarm-eval-reports/";
+    let pid_suffix = format!("-{}", std::process::id());
     assert!(
-        config.out_dir.starts_with("swarm-eval-reports/"),
+        config.out_dir.starts_with(prefix) && config.out_dir.ends_with(&pid_suffix),
         "{}",
         config.out_dir
     );
+    let stamp = &config.out_dir[prefix.len()..config.out_dir.len() - pid_suffix.len()];
+    assert!(
+        stamp >= before.as_str() && stamp <= after.as_str(),
+        "stamp {stamp} fell outside [{before}, {after}]"
+    );
+
     let explicit = parse_eval_args(&args(&["--model", "m", "--out", "./reports"])).expect("parses");
     assert_eq!(explicit.out_dir, "./reports");
 }

@@ -446,9 +446,17 @@ pub fn trial_deadline(timeout_minutes: f64) -> Option<Instant> {
         .and_then(|timeout| Instant::now().checked_add(timeout))
 }
 
+/// The default report directory: the run's start stamp plus the process id.
+///
+/// The stamp alone cannot tell two evals launched in the same millisecond
+/// apart — their sweeps would write each other's `report.md` and
+/// `report.json`. The pid beside it makes the directory unique per
+/// concurrent process (two live processes never share one), matching the
+/// per-run uniqueness the driver's scratch root and session names already
+/// carry, without moving the default out of the shared parser.
 fn default_out_dir() -> String {
     let stamp = crate::session::manager::format_iso_now().replace([':', '.'], "-");
-    format!("swarm-eval-reports/{stamp}")
+    format!("swarm-eval-reports/{stamp}-{}", std::process::id())
 }
 
 /// Deterministic 3-digit secrets from a SHA-256 hash chain, so evals are

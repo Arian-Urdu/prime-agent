@@ -335,6 +335,64 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         # spelling proves the process was killed, never completed.
         self.assertTrue(result.exit_code < 0 or result.exit_code >= 128)
 
+    async def _refused_handle(self, build) -> None:
+        try:
+            handle = build()
+        except DestructiveChmodRefusalError:
+            return
+        # The refusal is synchronous: a refused construction raises before
+        # anything spawns. If the guard missed and the constructor ran the
+        # command: kill and reap that process before the failure aborts
+        # the test, so a missed refusal can never leave a live recursive
+        # chmod behind on the direct-construction seam either.
+        handle.kill()
+        await asyncio.wait_for(handle, AWAIT_TIMEOUT)
+        self.fail("expected the direct construction to be refused; BashHandle ran it")
+
+    async def test_a_direct_handle_miss_fails_and_reaps_the_spawned_process(self):
+        # The constructor's guard can miss like bash()'s: the containment
+        # must kill and reap the recursive chmod the constructor spawned
+        # before failing, so a live chmod can never outlive the test that
+        # meant to catch it.
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        Path(home.name, "target").mkdir()
+        Path(home.name, "target", "keep.txt").write_text("keep\n")
+        spawned = []
+        real_handle = bash_module.BashHandle
+
+        def spying_handle(*args, **kwargs):
+            handle = real_handle(*args, **kwargs)
+            spawned.append(handle)
+            return handle
+
+        with mock.patch.dict(os.environ, {"HOME": home.name}):
+            with (
+                mock.patch.object(bash_module, "_guard_destructive_chmod"),
+                mock.patch.object(bash_module, "BashHandle", spying_handle),
+            ):
+                with self.assertRaises(AssertionError) as caught:
+                    await self._refused_handle(
+                        lambda: bash_module.BashHandle("chmod -R 755 ~/target && sleep 30")
+                    )
+        self.assertIn("to be refused", str(caught.exception))
+        [handle] = spawned
+        # `await handle` only proves the result was delivered; the watch
+        # thread sets the reaped flag right after, so wait for the reap
+        # instead of sampling it once. It must land inside the kill's
+        # window: a live group here means the helper leaked the process.
+        deadline = time.monotonic() + AWAIT_TIMEOUT
+        while handle.running and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        self.assertFalse(handle.running)
+        result = handle.poll()
+        self.assertIsNotNone(result)
+        # `sleep 30` cannot finish inside the kill window, so the wrapper
+        # died by a signal: wait() spells that negative, while a shell that
+        # first observed its child's death exits 128+signal. Either
+        # spelling proves the process was killed, never completed.
+        self.assertTrue(result.exit_code < 0 or result.exit_code >= 128)
+
     async def test_refuses_escapes_to_home_root_and_outside_trees(self):
         home = tempfile.TemporaryDirectory()
         self.addCleanup(home.cleanup)
@@ -1828,16 +1886,19 @@ class RecursiveChmodGuardTest(unittest.IsolatedAsyncioTestCase):
         # A handle built directly is guarded at construction, whether the
         # text comes from `command` or a caller-supplied `script` (which has
         # no trusted prefix region, so an armed prefix cannot hide words).
+        # _refused_handle keeps the raise assertion and contains the miss:
+        # a construction the guard fails to refuse is killed and reaped
+        # before the test fails, never left running.
         home = tempfile.TemporaryDirectory()
         self.addCleanup(home.cleanup)
         with mock.patch.dict(os.environ, {"HOME": home.name}):
-            with self.assertRaises(DestructiveChmodRefusalError):
-                bash_module.BashHandle("chmod -R 755 ~")
+            await self._refused_handle(lambda: bash_module.BashHandle("chmod -R 755 ~"))
         with mock.patch.dict(
             os.environ, {"HOME": home.name, "PRIME_AGENT_BASH_COMMAND_PREFIX": "cd /tmp"}
         ):
-            with self.assertRaises(DestructiveChmodRefusalError):
-                bash_module.BashHandle("echo ok", script="chmod -R 755 ~")
+            await self._refused_handle(
+                lambda: bash_module.BashHandle("echo ok", script="chmod -R 755 ~")
+            )
 
 
 class FrozenBypassEnvLaunchTest(unittest.TestCase):

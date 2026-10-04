@@ -28,6 +28,7 @@ class System2Tests(unittest.IsolatedAsyncioTestCase):
         self.sent = []
         self.children = []
         self.deleted = []
+        self.goals = {}
         self.loop = decision_api.Loop(
             self.observations.get,
             lambda _action: None,
@@ -44,11 +45,21 @@ class System2Tests(unittest.IsolatedAsyncioTestCase):
         async def send(text, **_kwargs):
             self.sent.append(text)
 
+        async def receive(_kind, payload):
+            name = payload["name"]
+            if payload.get("close"):
+                self.goals.pop(name, None)
+                return None
+            reply = self.goals.get(name)
+            self.goals[name] = None
+            return reply
+
         async def delete(name):
             self.deleted.append(name)
 
         for owner, name, replacement in (
             (decision_api.rlm, "spawn", spawn),
+            (decision_api.rlm, "host_request", receive),
             (decision_api.agent_message, "send", send),
             (decision_api.rlm, "delete_subagent", delete),
         ):
@@ -65,6 +76,11 @@ class System2Tests(unittest.IsolatedAsyncioTestCase):
     async def step(self):
         self.observations.put_nowait({"n": self.loop.step})
         return await asyncio.wait_for(self.completed.get(), 2)
+
+    async def reply(self, data):
+        self.goals[self.children[-1]] = data
+        self.loop._system2_ready.set()
+        await until(lambda: self.goals.get(self.children[-1]) is None)
 
     async def test_hanging_send_does_not_block_actions_and_is_cancelled_on_stop(self):
         entered = asyncio.Event()
@@ -89,7 +105,24 @@ class System2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["running"])
         self.assertTrue(cancelled.is_set())
         self.assertEqual(self.deleted, self.children)
-        self.assertFalse(self.loop._goal_file.parent.exists())
+        self.assertEqual(self.goals, {})
+
+    async def test_hanging_goal_transport_does_not_block_actions(self):
+        entered = asyncio.Event()
+
+        async def receive(_kind, payload):
+            if not payload.get("close"):
+                entered.set()
+                await asyncio.Event().wait()
+
+        with patch.object(decision_api.rlm, "host_request", receive):
+            await self.step()
+            await asyncio.wait_for(entered.wait(), 2)
+            for _ in range(20):
+                await self.step()
+            self.assertEqual(self.loop.step, 21)
+            self.observations.put_nowait(None)
+            await asyncio.wait_for(self.loop.wait(), 2)
 
     async def test_hanging_spawn_is_cancelled_and_its_named_child_is_cleaned(self):
         entered = asyncio.Event()
@@ -146,54 +179,42 @@ class System2Tests(unittest.IsolatedAsyncioTestCase):
     async def test_stale_and_duplicate_responses_cannot_roll_guidance_back(self):
         await self.step()
         await until(lambda: self.loop._sent == 0)
-        self.loop._goal_file.write_text(json.dumps({"seq": 0, "goal": "new strategy"}))
+        await self.reply({"seq": 0, "goal": "new strategy"})
         await self.step()
         await until(lambda: self.loop._sent == 1)
-        self.loop._goal_file.write_text(json.dumps({"seq": 0, "goal": "stale strategy"}))
+        await self.reply({"seq": 0, "goal": "stale strategy"})
         await self.step()
         self.assertEqual(self.loop.goal, "new strategy")
-        self.loop._goal_file.write_text(json.dumps({"seq": 1, "goal": "newest strategy"}))
+        await self.reply({"seq": 1, "goal": "newest strategy"})
         await self.step()
-        self.loop._goal_file.write_text(json.dumps({"seq": 1, "goal": "duplicate strategy"}))
+        await self.reply({"seq": 1, "goal": "duplicate strategy"})
         await self.step()
         self.assertEqual([update["goal"] for update in self.loop.goal_updates], ["new strategy", "newest strategy"])
 
-    async def test_replaced_child_writes_to_a_different_goal_file(self):
+    async def test_replaced_child_cannot_update_the_new_goal(self):
         await self.step()
         await until(lambda: self.loop._sent == 0)
-        old_file = self.loop._goal_file
         old_name = self.children[-1]
         self.loop.system2 = decision_api.System2(model="different")
         await self.step()
         await until(lambda: self.loop._sent == 1)
-        old_file.write_text(json.dumps({"seq": 1, "goal": "retired child strategy"}))
+        self.goals[old_name] = {"seq": 1, "goal": "retired child strategy"}
         await self.step()
         self.assertEqual(self.loop.goal, "catch")
-        self.assertNotEqual(old_file, self.loop._goal_file)
+        self.assertNotEqual(old_name, self.children[-1])
         self.assertIn(old_name, self.deleted)
-
-    async def test_partial_response_can_be_replaced_by_atomic_publication(self):
-        await self.step()
-        await until(lambda: self.loop._sent == 0)
-        self.loop._goal_file.write_text('{"seq":')
-        await self.step()
-        temporary = self.loop._goal_file.with_suffix(".tmp")
-        temporary.write_text(json.dumps({"seq": 0, "goal": "complete strategy"}))
-        temporary.replace(self.loop._goal_file)
-        await self.step()
-        self.assertEqual(self.loop.goal, "complete strategy")
 
     async def test_system2_action_is_consumed_once_and_named_action_goal_is_rejected(self):
         await self.step()
         await until(lambda: self.loop._sent == 0)
-        self.loop._goal_file.write_text(json.dumps({"seq": 0, "goal": "left"}))
+        await self.reply({"seq": 0, "goal": "left"})
         self.assertEqual((await self.step())["action"], "left")
         self.assertTrue(any("ignored goal" in error["error"] for error in self.loop.errors))
         await until(lambda: self.loop._sent == 1)
         self.loop.system2 = decision_api.System2(can_act=True)
         await self.step()
         await until(lambda: self.loop._sent == 2)
-        self.loop._goal_file.write_text(json.dumps({"seq": 2, "goal": "hold the line", "action": "right"}))
+        await self.reply({"seq": 2, "goal": "hold the line", "action": "right"})
         record = await self.step()
         self.assertEqual((record["action"], record["source"]), ("right", "system2"))
         self.assertEqual((await self.step())["action"], "left")
@@ -223,12 +244,12 @@ class System2Tests(unittest.IsolatedAsyncioTestCase):
         self.loop.system2 = decision_api.System2(can_act=True)
         await self.step()
         await until(lambda: self.loop._sent == 0)
-        self.loop._goal_file.write_bytes(b"\xff")
+        await self.reply({"seq": "invalid"})
         self.assertEqual((await self.step())["action"], "left")
-        self.loop._goal_file.write_text(json.dumps({"seq": 0, "action": ["right"]}))
+        await self.reply({"seq": 0, "action": ["right"]})
         self.assertEqual((await self.step())["action"], "left")
         self.assertEqual(self.loop.step, 3)
-        self.assertTrue(any("unreadable goal" in error["error"] for error in self.loop.errors))
+        self.assertTrue(any("invalid goal" in error["error"] for error in self.loop.errors))
         self.assertTrue(any("ignored action" in error["error"] for error in self.loop.errors))
 
     async def test_hanging_cleanup_is_bounded_and_reported(self):

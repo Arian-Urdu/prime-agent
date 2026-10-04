@@ -14,10 +14,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-import tempfile
 import time
+import uuid
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable
 
 import agent_message
@@ -35,24 +34,21 @@ with `seq`, the operator's `objective`, the newest `observation`, the current
 `current_goal`.
 
 For every message, judge whether System 1 is making progress toward the
-objective and answer in one Python cell by writing GOAL_FILE:
+objective and answer in one Python cell by messaging your parent:
 
-    import json, pathlib
-    goal_file = pathlib.Path("GOAL_FILE")
-    temporary = goal_file.with_suffix(".tmp")
-    temporary.write_text(json.dumps({"seq": <seq>, "goal": "..."}))
-    temporary.replace(goal_file)
+    import json, agent_message
+    await agent_message.send(json.dumps({"type": "decision_api.goal", "seq": <seq>, "goal": "..."}), receiver_role="parent")
 
 Use the `seq` of the message you answered. Write a new `goal` only when
 System 1 needs a decision from you: it has no goal yet, it is stuck or
 repeating itself, it drifts from the objective, or the situation changed and
-needs a new direction. Otherwise leave `goal` out (`{"seq": <seq>}`) and
-System 1 keeps its current goal.
+needs a new direction. Otherwise leave `goal` out
+(`{"type": "decision_api.goal", "seq": <seq>}`) and System 1 keeps its current goal.
 
 You make high-level decisions only and never give direct actions: a goal is
 one or two sentences of strategy or guidance, never an action name, a key, a
-move, or a step-by-step command, and never an `action` field. The file is your
-only channel: never message any agent (including your parent) and keep replies
+move, or a step-by-step command, and never an `action` field. Parent messages
+route directly into the loop; keep final replies
 empty. Keep turns short; the loop keeps acting while you think. Act only on
 JSON messages that carry a `seq`; if these instructions arrive without one, do
 nothing.
@@ -156,14 +152,14 @@ class System2:
     schedules a replacement System 2; `interval` and `message` apply at once.
     Transport runs in the background with one newest pending observation.
 
-    - `prompt`: System 2's instructions; `GOAL_FILE` is replaced with the goal
-      file path. They are sent with the first message.
+    - `prompt`: System 2's instructions, sent with the first message.
+      Replies use tagged JSON parent messages as in DEFAULT_SYSTEM2_PROMPT.
     - `model`: subagent model (None inherits the calling agent's model).
     - `interval`: None sends the newest observation once System 2 answered its
       previous message; a number of seconds sends on that fixed interval instead.
     - `message`: `(observation, history, goal, objective, actions) -> dict`.
     - `can_act`: False (default) ignores any action from System 2, including a
-      goal that only names an action; True lets an "action" in the goal file
+      goal that only names an action; True lets an "action" in the goal message
       replace System 1's next decision once.
     - `timeout`: maximum seconds for child creation or message delivery.
       Transient failures retry with capped exponential backoff while System 1
@@ -239,10 +235,8 @@ class Loop:
         self.errors: list[dict[str, Any]] = []
         self.error: str | None = None
         self.step = 0
-        self._goal_directory = tempfile.TemporaryDirectory(prefix="decision-api-")
-        self._goal_file = Path(self._goal_directory.name) / "goal-0.json"
+        self._loop_id = uuid.uuid4().hex
         self._goal: str | None = None
-        self._goal_text: str | None = None
         self._system2_action: str | None = None
         self._answered = -1
         self._live: tuple[System2, str | None, tuple[str, str | None, bool]] | None = None
@@ -348,20 +342,19 @@ class Loop:
         except Exception as error:
             self.error = f"{type(error).__name__}: {error}"
         finally:
+            self._stopping = True
             if self._system2_task is not None:
                 self._system2_task.cancel()
                 try:
                     await self._system2_task
                 except asyncio.CancelledError:
                     pass
-            self._goal_directory.cleanup()
 
     async def _step(self) -> str | None:
         observation = await _call(self.observe)
         if observation is None:
             return "stop"
         actions = self.actions(observation) if callable(self.actions) else self.actions
-        self._read_goal(actions)
         history = self.history[-self.history_size :]
         try:
             if self._system2_action is not None:
@@ -414,34 +407,21 @@ class Loop:
         decision.setdefault("latency_ms", round((time.perf_counter() - started) * 1000, 1))
         return decision
 
-    def _read_goal(self, actions: dict[str, str]) -> None:
+    def _read_goal(self, data: dict[str, Any], actions: dict[str, str]) -> None:
         if self._live is None or self.system2 is not self._live[0]:
             return
         if (self.system2.prompt, self.system2.model, self.system2.can_act) != self._live[2]:
             return
         try:
-            text = self._goal_file.read_text()
-        except OSError:
-            return
-        except UnicodeError as error:
-            self._record_error("system2", ValueError(f"unreadable goal file: {error!r}"))
-            return
-        if text == self._goal_text:
-            return
-        try:
-            data = json.loads(text)
             seq = data["seq"]
             if type(seq) is not int:
                 raise ValueError("seq must be an integer")
         except (ValueError, KeyError, TypeError) as error:
-            self._goal_text = text
-            self._record_error("system2", ValueError(f"unreadable goal file: {error!r}"))
+            self._record_error("system2", ValueError(f"invalid goal message: {error!r}"))
             return
-        # A reply can appear before send() completes; try it again once _sent advances.
-        # Each child has a unique file, and only its latest delivered message can update guidance.
+        # Only the live child's latest delivered observation can update guidance.
         if seq != self._sent or seq <= self._answered or seq < self._spawn_seq:
             return
-        self._goal_text = text
         self._answered = seq
         can_act = self.system2 is not None and self.system2.can_act
         action = data.get("action")
@@ -462,7 +442,7 @@ class Loop:
     async def _drive_system2(self) -> None:
         failures = 0
         try:
-            while True:
+            while not self._stopping:
                 await self._system2_ready.wait()
                 self._system2_ready.clear()
                 wanted = self.system2
@@ -472,31 +452,36 @@ class Loop:
                     failures = 0
                 if wanted is None or config is None or self._pending_observation is None:
                     continue
-                if self._live is not None and self._sent >= self._spawn_seq:
-                    # Instructions must be acknowledged before further observations arrive.
-                    if self._answered < self._spawn_seq:
-                        continue
-                    due = (
-                        self._answered >= self._sent if wanted.interval is None
-                        else time.monotonic() - self._sent_at >= wanted.interval
-                    )
-                    if not due:
-                        continue
                 try:
                     if wanted.timeout <= 0:
                         raise ValueError("System2.timeout must be positive")
+                    if self._live is not None:
+                        data = await asyncio.wait_for(
+                            rlm.host_request("decision_api.goal", {"name": self._live[1]}), wanted.timeout
+                        )
+                        if data is not None:
+                            self._read_goal(data, self._pending_observation[2])
+                        if self._sent >= self._spawn_seq:
+                            # Instructions must be acknowledged before further observations arrive.
+                            if self._answered < self._spawn_seq:
+                                continue
+                            due = (
+                                self._answered >= self._sent if wanted.interval is None
+                                else time.monotonic() - self._sent_at >= wanted.interval
+                            )
+                            if not due:
+                                continue
                     if self._live is None:
                         self._spawns += 1
-                        self._goal_file = Path(self._goal_directory.name) / f"goal-{self._spawns}.json"
-                        self._goal_text = None
                         self._answered = self._sent = -1
                         self._system2_action = None
-                        name = f"system-2-{self._goal_file.parent.name[-8:]}-{self._spawns}"
-                        self._instructions = wanted.prompt.replace("GOAL_FILE", str(self._goal_file))
+                        name = f"system-2-{self._loop_id}-{self._spawns}"
+                        self._instructions = wanted.prompt
                         if wanted.can_act:
                             self._instructions += _CAN_ACT_NOTE
                         # Track the name before awaiting so cancellation also attempts cleanup.
                         self._spawning_name = name
+                        await asyncio.wait_for(rlm.host_request("decision_api.goal", {"name": name}), wanted.timeout)
                         handle = await asyncio.wait_for(
                             rlm.spawn(self._instructions, name=name, model=wanted.model), wanted.timeout
                         )
@@ -536,6 +521,12 @@ class Loop:
         self._retiring_name = name
         self._system2_action = None
         if name is not None:
+            try:
+                await asyncio.wait_for(
+                    rlm.host_request("decision_api.goal", {"name": name, "close": True}), _SYSTEM2_CLEANUP_TIMEOUT
+                )
+            except Exception as error:
+                self._record_error("system2", error)
             try:
                 await asyncio.wait_for(rlm.delete_subagent(name), _SYSTEM2_CLEANUP_TIMEOUT)
             except Exception as error:

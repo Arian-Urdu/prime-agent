@@ -297,6 +297,7 @@ async fn decision_api_real_runtime_loop_routes_decisions_and_child_delivery_then
         Decide,
         Spawn,
         Send,
+        Goal,
         Delete,
         AwaitChild,
     }
@@ -321,22 +322,23 @@ async fn decision_api_real_runtime_loop_routes_decisions_and_child_delivery_then
         return;
     };
     let events = Arc::new(Mutex::new(Vec::new()));
-    let goal_file = Arc::new(Mutex::new(None::<std::path::PathBuf>));
+    let goal_message = Arc::new(Mutex::new(serde_json::Value::Null));
     let child_ready = Arc::new(tokio::sync::Notify::new());
     let mut handlers = HostRequestHandlers::new();
     for (name, kind) in [
         ("decision_api.decide", FixtureRequest::Decide),
         ("rlm.run", FixtureRequest::Spawn),
         ("agent_message.send", FixtureRequest::Send),
+        ("decision_api.goal", FixtureRequest::Goal),
         ("rlm.delete_subagent", FixtureRequest::Delete),
         ("fixture.child_ready", FixtureRequest::AwaitChild),
     ] {
         let events = Arc::clone(&events);
-        let goal_file = Arc::clone(&goal_file);
+        let goal_message = Arc::clone(&goal_message);
         let child_ready = Arc::clone(&child_ready);
         handlers.register(name, host_handler(move |payload| {
             let events = Arc::clone(&events);
-            let goal_file = Arc::clone(&goal_file);
+            let goal_message = Arc::clone(&goal_message);
             let child_ready = Arc::clone(&child_ready);
             Box::pin(async move {
                 events.lock().unwrap().push((kind, payload.data.clone()));
@@ -346,19 +348,13 @@ async fn decision_api_real_runtime_loop_routes_decisions_and_child_delivery_then
                         "answers":{"action":{"choice":"left","confidence":0.9,"probabilities":{"left":0.9,"right":0.1}}}
                     })),
                     FixtureRequest::Spawn => {
-                        *goal_file.lock().unwrap() = Some(std::path::PathBuf::from(
-                            payload.data["prompt"].as_str().unwrap(),
-                        ));
                         Ok(json!({"rlm_child_id":"fixture-child","name":payload.data["kwargs"]["name"],"session_dir":"/tmp/fixture-child","model":"synthetic/child"}))
                     }
                     FixtureRequest::Send => {
                         let text = payload.data["message"].as_str().unwrap();
                         let observation: serde_json::Value = serde_json::from_str(text.split_once("First message:\n").unwrap().1)?;
                         assert_eq!(observation["seq"], 0);
-                        let path = goal_file.lock().unwrap().clone().unwrap();
-                        let temporary = path.with_extension("tmp");
-                        tokio::fs::write(&temporary, json!({"seq":0,"goal":"follow fixture strategy"}).to_string()).await?;
-                        tokio::task::spawn_blocking(move || crate::platform::rename_onto(&temporary, &path)).await??;
+                        *goal_message.lock().unwrap() = json!({"seq":0,"goal":"follow fixture strategy"});
                         child_ready.notify_one();
                         Ok(json!({"deliveryStatus":"sent"}))
                     }
@@ -366,6 +362,7 @@ async fn decision_api_real_runtime_loop_routes_decisions_and_child_delivery_then
                         "rlm_child_id":"fixture-child","session_name":payload.data["target"],
                         "session_dir":"/tmp/fixture-child","status":"completed"
                     },"outcome":"deleted"})),
+                    FixtureRequest::Goal => Ok(goal_message.lock().unwrap().take()),
                     FixtureRequest::AwaitChild => {
                         child_ready.notified().await;
                         Ok(json!({"ready":true}))
@@ -405,19 +402,19 @@ async def observe_fixture():
     observations_seen += 1
     if observations_seen == 2:
         await decision_api.rlm.host_request("fixture.child_ready")
-        while loop._sent < 0:
+        loop._system2_ready.set()
+        while not loop.goal_updates:
             await asyncio.sleep(0)
     if observations_seen > 2:
         return None
     return {{"frame": observations_seen}}
 loop = decision_api.Loop(observe_fixture, actions_taken.append, {{"left":"go left", "right":"go right"}},
-    objective="fixture objective", system2=decision_api.System2(prompt="GOAL_FILE", interval=3600))
+    objective="fixture objective", system2=decision_api.System2(interval=3600))
 status = await asyncio.wait_for(loop.run(), 10)
 assert actions_taken == ["left", "left"], actions_taken
 assert loop.goal == "follow fixture strategy", loop.status()
 assert loop.errors == [], loop.errors
 assert not status["running"]
-assert not loop._goal_file.parent.exists()
 print("fixture passed")
 "#
     );
@@ -484,13 +481,6 @@ print("fixture passed")
             spawned.1["kwargs"]["name"].clone()
         )
     );
-    assert!(!goal_file
-        .lock()
-        .unwrap()
-        .as_ref()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .exists());
+    assert_eq!(*goal_message.lock().unwrap(), serde_json::Value::Null);
     println!("DECISION_API_REAL_FIXTURE_EXECUTED: decision_api_real_runtime_loop_routes_decisions_and_child_delivery_then_cleans_up");
 }

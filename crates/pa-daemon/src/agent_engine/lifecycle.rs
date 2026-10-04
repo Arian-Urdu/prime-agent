@@ -148,6 +148,7 @@ impl AgentSessionEngine {
         // create writes the settings modes — steering "all" by default).
         let queue_modes = std::sync::Mutex::new((None, None));
         Ok(Self {
+            decision_goals: Arc::default(),
             runtime,
             config,
             mcp,
@@ -857,6 +858,31 @@ impl AgentSessionEngine {
             self.children.clone(),
         ));
         let mut handlers = HostRequestHandlers::default();
+        let goals = Arc::clone(&self.decision_goals);
+        handlers.register(
+            "decision_api.goal",
+            pa_core::kernel::shared::host_handler(move |payload| {
+                let goals = Arc::clone(&goals);
+                Box::pin(async move {
+                    let name = payload.data["name"].as_str().ok_or_else(|| {
+                        anyhow::anyhow!("decision_api.goal requires a child name")
+                    })?;
+                    let mut goals = goals
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if payload.data["close"] == true {
+                        goals.remove(name);
+                        Ok(Value::Null)
+                    } else {
+                        Ok(goals
+                            .entry(name.to_string())
+                            .or_default()
+                            .take()
+                            .unwrap_or(Value::Null))
+                    }
+                })
+            }),
+        );
         register_agent_message_host_handlers(sender, &mut handlers);
         register_agent_observe_host_handlers(observer, &mut handlers);
         self.register_bash_notice_host_handlers(&mut handlers);
@@ -1145,5 +1171,85 @@ impl AgentSessionEngine {
                 engine.session.agent().set_follow_up_mode(mode);
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod decision_goal_tests {
+    use super::*;
+    use crate::worker::{Worker, WorkerConfig};
+    use pa_core::kernel::shared::HostRequestPayload;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn child_goals_reach_the_loop_without_queuing_a_parent_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker = Worker::new(
+            WorkerConfig {
+                socket_path: dir.path().join("worker.sock"),
+                supervisor_socket_path: dir.path().join("supervisor.sock"),
+                token: "token".into(),
+                worker_instance_id: String::new(),
+                active_session_id: "parent".into(),
+                agent_dir: dir.path().join("agent"),
+                recovery_journal_path: dir.path().join("recovery.jsonl"),
+                telemetry_disabled: Some(true),
+                script: None,
+            },
+            /*registration*/ None,
+        );
+        let created = worker
+            .dispatch("create", &json!({"noSession":true,"cwd":dir.path()}))
+            .await;
+        assert!(created.success);
+        let handlers = worker
+            .agent_engine
+            .as_ref()
+            .unwrap()
+            .extra_host_handlers()
+            .unwrap();
+        let receive = handlers
+            .get("decision_api.goal")
+            .expect("goal route registered");
+        let poll = |data| {
+            receive(HostRequestPayload {
+                data,
+                cell_source_code: None,
+            })
+        };
+        assert_eq!(
+            poll(json!({"name":"system-2-test"})).await.unwrap(),
+            Value::Null
+        );
+        let goal = json!({"type":"decision_api.goal","seq":0,"goal":"follow the target"});
+        let mut delivery = json!({"message":goal.to_string(),"sender":{
+            "activeSessionId":"child","sessionName":"system-2-test",
+            "parentActiveSessionId":"parent","runtimeKind":"subagent"
+        }});
+        worker.core.lock().unwrap().busy = true;
+        assert!(worker.handle_worker_deliver_message(&delivery).success);
+        assert_eq!(poll(json!({"name":"system-2-test"})).await.unwrap(), goal);
+        assert_eq!(
+            poll(json!({"name":"system-2-test"})).await.unwrap(),
+            Value::Null
+        );
+        assert!(worker.core.lock().unwrap().steering.is_empty());
+        assert!(worker.core.lock().unwrap().follow_up.is_empty());
+        worker.core.lock().unwrap().busy = false;
+        poll(json!({"name":"system-2-test","close":true}))
+            .await
+            .unwrap();
+        assert!(worker.handle_worker_deliver_message(&delivery).success);
+        assert!(
+            worker.core.lock().unwrap().steering.is_empty(),
+            "retired child must not wake the parent"
+        );
+        delivery["sender"]["parentActiveSessionId"] = json!("another-parent");
+        assert!(worker.handle_worker_deliver_message(&delivery).success);
+        assert_eq!(
+            worker.core.lock().unwrap().steering.len(),
+            1,
+            "other agents retain normal routing"
+        );
     }
 }

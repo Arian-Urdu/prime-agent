@@ -53,9 +53,9 @@ subagents.
 
 You never steer the live loop by hand:
 - Do not choose actions or goals from observations yourself.
-- Do not write System 2's goal file or message System 2. `loop.goal` is
+- Do not send goal replies yourself or message System 2. `loop.goal` is
   read-only for this reason.
-- If System 2 messages you, do not act on or forward it; fix its prompt
+- If System 2 sends an ordinary chat message, do not act on or forward it; fix its prompt
   instead.
 
 System 2 never sends actions: by default the loop ignores any action it
@@ -102,7 +102,7 @@ loop.images = lambda observation: [png_data_url]                # Clef only: up 
 loop.on_error = "skip"            # "stop" (default), "skip", or (error, observation) -> action
 loop.on_step = lambda record, observation: ...                  # log or render; return "stop" to end
 loop.objective = "..."            # System 2 sees it in its next message
-loop.system2.prompt = "..."       # schedules replacement; GOAL_FILE marks its unique goal file path
+loop.system2.prompt = "..."       # schedules replacement; keep the tagged parent-message reply format
 loop.system2.model = "..."        # respawns too
 loop.system2.interval = 2.0       # send every 2 s instead of once System 2 answered
 loop.system2.timeout = 30.0       # bound spawn/message transport; failures retry in the background
@@ -122,8 +122,9 @@ does not create an unbounded message queue or block System 1. Startup and
 delivery failures appear in `loop.errors` and retry with backoff capped at
 five seconds. Changing the child settings schedules retirement and replacement;
 an in-flight operation is bounded by `timeout`. Stopping cancels transport and
-attempts child cleanup with a five-second bound. Goal files are unique per
-child and published atomically; stale or duplicate replies cannot update the
+attempts child cleanup with a five-second bound. System 2 sends JSON parent
+messages with `type="decision_api.goal"`, `seq`, and optional `goal`;
+these route into the loop without starting a parent turn. Stale or duplicate replies cannot update the
 current goal. Python 3.11 or newer is required.
 
 Stay in your turn while a loop runs: poll with `loop.wait(timeout=...)`, read

@@ -12,6 +12,23 @@ use super::{
 };
 
 impl SessionEngine for AgentSessionEngine {
+    fn route_decision_api_goal(&self, sender_name: &str, message: &str) -> bool {
+        let Ok(goal) = serde_json::from_str::<Value>(message) else {
+            return false;
+        };
+        if goal["type"] != "decision_api.goal" {
+            return false;
+        }
+        if let Some(slot) = self
+            .decision_goals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(sender_name)
+        {
+            *slot = Some(goal);
+        }
+        true
+    }
     /// TS `_clearQueuedGoalContexts`: the worker-installed purge withdraws
     /// the queued minted goal-context turns (pause/clear/start must not
     /// leave a stale continuation to run after the state change).

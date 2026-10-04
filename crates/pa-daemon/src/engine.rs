@@ -42,6 +42,11 @@ mod scripted;
 
 /// The turn behavior a worker session runs.
 pub trait SessionEngine: Send + Sync {
+    /// Consume tagged System 2 replies without starting a parent turn. Retired
+    /// children are consumed too; engines without decision loops use normal routing.
+    fn route_decision_api_goal(&self, _sender_name: &str, _message: &str) -> bool {
+        false
+    }
     /// The session's shared MCP manager, when the engine owns one (the
     /// real agent engine does; scripted harness engines do not). The
     /// `replace_acp_mcp_servers` command writes through it so

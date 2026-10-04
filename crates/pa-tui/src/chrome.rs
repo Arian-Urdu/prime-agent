@@ -95,7 +95,7 @@ pub struct ChromeState {
     /// (TS renders nothing when enabled without text).
     pub speed_text: Option<String>,
     /// The session's Decision API provider while it is on (`/decision-api`):
-    /// the dock renders the magenta `Decision API enabled` row naming it.
+    /// the dock renders the accent-colored `Decision API enabled` row naming it.
     pub decision_api: Option<pa_types::slash_commands::DecisionApiProvider>,
     /// Hide the splash `cwd` line (TS `getSplashCwd` returns `undefined`
     /// for the scoped agents view, so its metadata rows stay centered
@@ -911,7 +911,7 @@ pub fn render_decision_api_footer(
 ) -> Line {
     let text = format!("Decision API enabled: {}", provider.label());
     let text = truncate_to_width(&text, width, "");
-    vec![Span::styled(text, theme.decision_api_style())]
+    vec![Span::styled(text, theme.fg_style(ThemeColor::Accent))]
 }
 
 /// The editor surface background: `userMessageBg` (TS `getEditorTheme`).

@@ -234,6 +234,25 @@ VERBOSE="${PRIME_AGENT_RUST_VERBOSE:-0}"
 FORCE=0
 MODE="channel"
 ARCHIVE=""
+# THE HANDOFF PARENT WAIT: the Windows update command spawns THIS script
+# and exits precisely so its own payload image stops locking
+# <prefix>/share/prime-agent for the publish below — but a fast child
+# could reach that rename while the parent still lives. The handoff sets
+# the parent's pid here; the payload touch happens many steps below, and
+# this bounded wait (the parent is normally gone in milliseconds) makes
+# the release-before-publish ordering explicit instead of incidental.
+# tasklist carries the liveness question to Windows the same way the
+# publication lock does (the MSYS kill cannot see a native pid).
+if [ -n "${PRIME_AGENT_INSTALLER_PARENT_PID:-}" ]; then
+  parent_waits=0
+  while MSYS2_ARG_CONV_EXCL='*' tasklist.exe \
+          /FI "PID eq ${PRIME_AGENT_INSTALLER_PARENT_PID}" 2>/dev/null \
+        | grep -qw "${PRIME_AGENT_INSTALLER_PARENT_PID}"; do
+    parent_waits=$((parent_waits + 1))
+    [ "$parent_waits" -gt 300 ] && die "the prime-agent process that started this installer (pid ${PRIME_AGENT_INSTALLER_PARENT_PID}) is still running after 30s; the payload it holds cannot be replaced while it lives — stop that process and re-run"
+    sleep 0.1 2>/dev/null || sleep 1
+  done
+fi
 # Every argument is scanned (no positionals exist): the flags compose, so
 # `--update --verbose` sets both effects instead of silently dropping one.
 while [ $# -gt 0 ]; do
@@ -863,6 +882,10 @@ elif [ "$MODE" = archive ]; then
   esac
   VERSION="${archive_name#prime-agent-}"
   VERSION="${VERSION%-"${CHANNEL_PLATFORM}".tar.gz}"
+  # A leading v is the pin's accepted spelling too (`--rollback`'s marker
+  # versions carry none; the exact payload match below compares the bare
+  # version the binary reports).
+  VERSION="${VERSION#v}"
   case "$VERSION" in
     *[!0-9A-Za-z.-]*) die "invalid version in the archive name ${archive_name}: ${VERSION}" ;;
   esac
@@ -2190,10 +2213,10 @@ if [ -n "$probe_timed_out" ]; then
   rm -rf "$stage"
   die "the archive names ${VERSION} but its payload did not answer --version within 10s; refusing an unresponsive payload"
 fi
-# tr -d '' strips the trailing CR Git Bash text-mode redirection can
+# tr -d '\r' strips the trailing CR Git Bash text-mode redirection can
 # append (the lock-pid reader's precedent): a CR would make every exact
 # case arm miss and refuse a correctly named archive.
-reported_version="$(head -n 1 "$probe_out" 2>/dev/null | tr -d '')"
+reported_version="$(head -n 1 "$probe_out" 2>/dev/null | tr -d '\r')"
 probe_exit_status="$(cat "$probe_status" 2>/dev/null || true)"
 rm -f "$probe_out" "$probe_done" "$probe_pid_file" "$probe_status"
 if [ "$probe_exit_status" != "0" ]; then

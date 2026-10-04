@@ -309,6 +309,15 @@ pub async fn run_bundled_installer(
         // handles keep the installer's own steps printing to the
         // caller's window for as long as that window lives.
         crate::platform::process::set_new_process_group(command.as_std_mut());
+        // THE PARENT EXIT: the payload unlock this whole handoff exists
+        // for happens only when THIS process dies — the child gets the
+        // pid and the script's head waits for it (bounded) before any
+        // step touches the payload, so the release-before-publish
+        // ordering is explicit instead of a spawn-timing coincidence.
+        command.env(
+            "PRIME_AGENT_INSTALLER_PARENT_PID",
+            std::process::id().to_string(),
+        );
         let spawned = command.spawn();
         let _ = std::fs::remove_file(&script);
         spawned.map_err(|error| UpdateFailure {

@@ -228,6 +228,7 @@ async fn fork_at(
             .rebuild_branch_context(branch_entries)
             .await
             .map_err(|error| format!("{error:#}"))?;
+        engine.sync_decision_api_from_session().await;
         let mut data = json!({ "cancelled": false });
         if let Some(text) = selected_text {
             data["text"] = json!(text);
@@ -488,7 +489,7 @@ async fn export_html(state: &Arc<RpcState>, payload: &Value) -> Result<ResponseD
             let manager = persistence.lock().await;
             manager.get_leaf_id().map(str::to_string)
         },
-        system_prompt: Some(handle.engine.system_prompt.clone()),
+        system_prompt: Some(handle.engine.system_prompt().to_string()),
         tools: Some(tools),
         rendered_tools: None,
     };

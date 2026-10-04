@@ -182,7 +182,13 @@ pub enum AuthPanelRequest {
         outcome: ProviderAuthOutcome,
     },
     /// A `/mcp` view auth command settled: its status line applies.
-    McpSettled { note: String },
+    McpSettled { note: String, generation: u64 },
+    /// A background Decision API credential resolution completed. A stale
+    /// generation never changes the currently mounted panel or session.
+    DecisionApiReady {
+        generation: u64,
+        result: anyhow::Result<bool>,
+    },
     /// The `/traces` login settled: the login's outcome applies (the
     /// enable intent continues in the session). `gen` is the login
     /// run's generation: the arm matches it against the run loop's

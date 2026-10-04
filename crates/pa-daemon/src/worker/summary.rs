@@ -117,6 +117,9 @@ impl Worker {
             scoped_models: core.scoped_models.clone(),
             active_tool_names: Vec::new(),
             context_usage: None,
+            decision_api: store
+                .and_then(crate::session_store::SessionFile::decision_api_provider)
+                .map(|provider| provider.id().to_string()),
         }
     }
 
@@ -528,3 +531,7 @@ pub(crate) fn compact_action_label(text: &str) -> String {
     let kept: String = compact.chars().take(MAX_CHARS - 3).collect();
     format!("{}...", kept.trim_end())
 }
+
+#[cfg(test)]
+#[path = "decision_api_snapshot_tests.rs"]
+mod decision_api_snapshot_tests;

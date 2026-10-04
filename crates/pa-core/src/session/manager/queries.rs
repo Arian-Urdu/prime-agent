@@ -201,6 +201,31 @@ impl SessionManager {
         branch
     }
 
+    /// The selected branch's durable decision provider, including status
+    /// rows before the compaction boundary without hydrating message bodies.
+    pub(crate) fn decision_api_provider(
+        &self,
+    ) -> Option<pa_types::slash_commands::DecisionApiProvider> {
+        let status = self
+            .active_branch_entries()
+            .into_iter()
+            .rev()
+            .find_map(decision_api_state);
+        if let Some(status) = status {
+            return status.provider();
+        }
+        self.window
+            .as_ref()?
+            .metadata_entries()
+            .iter()
+            .rev()
+            .find_map(|line| {
+                let entry = serde_json::from_str::<FileEntry>(line).ok()?;
+                decision_api_state(&entry)
+            })
+            .and_then(RecordedDecisionApiState::provider)
+    }
+
     #[must_use]
     pub fn active_goal_state(&self) -> Option<crate::goals::GoalState> {
         if let Some(window) = &self.window {
@@ -532,4 +557,33 @@ impl SessionManager {
         );
         self.label_timestamps_by_id.get(target_id).cloned()
     }
+}
+
+enum RecordedDecisionApiState {
+    Off,
+    Enabled(pa_types::slash_commands::DecisionApiProvider),
+}
+
+impl RecordedDecisionApiState {
+    fn provider(self) -> Option<pa_types::slash_commands::DecisionApiProvider> {
+        match self {
+            Self::Off => None,
+            Self::Enabled(provider) => Some(provider),
+        }
+    }
+}
+
+fn decision_api_state(entry: &FileEntry) -> Option<RecordedDecisionApiState> {
+    use pa_types::slash_commands::{DecisionApiProvider, DECISION_API_STATUS_CUSTOM_TYPE};
+    let FileEntry::CustomMessage { payload, .. } = entry else {
+        return None;
+    };
+    if payload.custom_type != DECISION_API_STATUS_CUSTOM_TYPE {
+        return None;
+    }
+    let provider = DecisionApiProvider::from_status_details(payload.details.as_ref());
+    Some(provider.map_or(
+        RecordedDecisionApiState::Off,
+        RecordedDecisionApiState::Enabled,
+    ))
 }

@@ -134,7 +134,9 @@ pub struct SessionEngine {
     pub skill_diagnostics: Vec<crate::skills::ResourceDiagnostic>,
     pub prompt_templates: Vec<PromptTemplate>,
     pub agents_files: Vec<crate::resources::ContextFile>,
-    pub system_prompt: String,
+    /// The Decision API switch and the two system prompts it selects
+    /// between ([`SessionEngine::system_prompt`]).
+    pub(crate) decision_api: super::decision_api::DecisionApiSession,
     /// The session's goal driver: the same instance the kernel `goal.*`
     /// host handlers reach, so `/goal` and `goal.complete()` in the kernel
     /// observe one state machine.
@@ -234,6 +236,10 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     let session_manager = config
         .session_manager
         .unwrap_or_else(|| SessionManager::in_memory(&cwd));
+    let owns_resume_settings =
+        session_manager.is_persisted() || config.conversation_log_path.is_none();
+    let decision_api =
+        super::decision_api::DecisionApiSwitch::new(session_manager.decision_api_provider());
     let conversation_log = {
         let session = &session_manager;
         session
@@ -374,6 +380,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // state dir, i.e. exactly the sessions the refine skill targets).
     let turn_boundary = Arc::new(super::turn_boundary::TurnBoundaryRequests::new());
     turn_boundary.register_model_info_handler(&mut handlers, model_info.clone());
+    super::decision_api::register_decision_api_handler(
+        &mut handlers,
+        decision_api.clone(),
+        config.agent_dir.clone(),
+    );
     let keep_recent_tokens = compaction_settings
         .keep_recent_tokens
         .unwrap_or(super::compaction::DEFAULT_KEEP_RECENT_TOKENS);
@@ -473,10 +484,17 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         )
             as crate::kernel::provisioner::UnavailableSkillsCallback)
     };
+    let preimport_filter = {
+        let decision_api = decision_api.clone();
+        std::sync::Arc::new(move |skill: &crate::kernel::bootstrap::KernelPythonSkill| {
+            skill.name != super::decision_api::DECISION_API_SKILL_NAME || decision_api.is_enabled()
+        })
+    };
     let provisioner = super::runtime_wiring::kernel_provisioner(
         session_id,
         handlers,
         python_skills,
+        preimport_filter,
         cwd.clone(),
         &config.agent_dir,
         session_artifact_dir,
@@ -525,36 +543,55 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // captured before `model_info` moves into the turn-boundary handler.
     let prompt_model_selector = Some(format!("{}/{}", model_info.provider, model_info.id));
     let prompt_vision_capable = Some(model_info.input.contains(&pa_types::ai::ModelInput::Image));
-    let system_prompt = crate::prompts::system_prompt::build_system_prompt(
-        &crate::prompts::system_prompt::BuildSystemPromptOptions {
-            custom_prompt: resources.system_prompt.clone(),
-            model: prompt_model_selector.as_deref(),
-            vision_capable: prompt_vision_capable,
-            cwd: cwd.display().to_string(),
-            messages_path: conversation_log.clone(),
-            context_files: resources
-                .agents_files
+    // Two prompts, selected by the session's Decision API switch: only the
+    // switched-on one lists the decision-api skill.
+    let mut prompt_options = crate::prompts::system_prompt::BuildSystemPromptOptions {
+        custom_prompt: resources.system_prompt.clone(),
+        model: prompt_model_selector.as_deref(),
+        vision_capable: prompt_vision_capable,
+        cwd: cwd.display().to_string(),
+        messages_path: conversation_log.clone(),
+        context_files: resources
+            .agents_files
+            .iter()
+            .map(|file| (file.path.display().to_string(), file.content.clone()))
+            .collect(),
+        skills: resources.skills.clone(),
+        selected_tools: Some(
+            active_tool_names
                 .iter()
-                .map(|file| (file.path.display().to_string(), file.content.clone()))
-                .collect(),
-            skills: resources.skills.clone(),
-            selected_tools: Some(
-                active_tool_names
-                    .iter()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>(),
-            ),
-            allow_recursion: config.allow_recursion,
-            // The session's recursion depth rides the dynamic tail's
-            // session-role section: a spawned child's prompt must read
-            // "depth: N (not root)" with the child-agent reply doctrine,
-            // never the root identity.
-            rlm_depth: config.rlm_depth,
-            generic_mcp_servers,
-            prompt_guidelines: Some(prompt_guidelines),
-            ..Default::default()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        ),
+        allow_recursion: config.allow_recursion,
+        // The session's recursion depth rides the dynamic tail's
+        // session-role section: a spawned child's prompt must read
+        // "depth: N (not root)" with the child-agent reply doctrine,
+        // never the root identity.
+        rlm_depth: config.rlm_depth,
+        generic_mcp_servers,
+        prompt_guidelines: Some(prompt_guidelines),
+        ..Default::default()
+    };
+    let decision_api = super::decision_api::DecisionApiSession {
+        switch: decision_api,
+        agent_dir: config.agent_dir.clone(),
+        prompt_on: crate::prompts::system_prompt::build_system_prompt(&prompt_options),
+        prompt_off: {
+            prompt_options
+                .skills
+                .retain(|skill| skill.name != super::decision_api::DECISION_API_SKILL_NAME);
+            crate::prompts::system_prompt::build_system_prompt(&prompt_options)
         },
-    );
+    };
+    // The gated skill is reachable only through the switched-on prompt, never
+    // as a `/skill:` command.
+    let session_skills: Vec<crate::skills::Skill> = resources
+        .skills
+        .iter()
+        .filter(|skill| skill.name != super::decision_api::DECISION_API_SKILL_NAME)
+        .cloned()
+        .collect();
 
     // Captured before the digest context moves the local harness dir and
     // the loop wiring moves the session model: the factory host bridge's
@@ -577,9 +614,9 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // sdk.ts `createAgentSession` parity: a session manager that already
     // holds messages is a resume — the loop starts from the persisted
     // context. Fresh sessions record the creation prefix (model_change +
-    // thinking_level_change + service_tier_change); resumed sessions record
-    // the thinking level and service tier only when no earlier entry set
-    // them.
+    // thinking_level_change + service_tier_change). Locally owned resumes
+    // record missing settings; externally persisted resumes preserve the
+    // caller's setting timeline.
     let (existing_messages, has_thinking_entry, has_service_tier_entry) = {
         let session = wiring.session.lock().await;
         let messages = super::compact_session::rebuilt_context_after_compaction(&session);
@@ -593,10 +630,10 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         if existing_messages.is_empty() {
             session.append_model_change(&model.provider, &model.id)?;
             session.append_thinking_level_change(&format!("{thinking_level:?}").to_lowercase())?;
-        } else if !has_thinking_entry {
+        } else if owns_resume_settings && !has_thinking_entry {
             session.append_thinking_level_change(&format!("{thinking_level:?}").to_lowercase())?;
         }
-        if existing_messages.is_empty() || !has_service_tier_entry {
+        if existing_messages.is_empty() || (owns_resume_settings && !has_service_tier_entry) {
             session.append_service_tier_change(Some(service_tier_preference))?;
         }
     }
@@ -657,7 +694,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     };
     let agent = Agent::new(AgentOptions {
         initial_state: AgentInitialState {
-            system_prompt: Some(system_prompt.clone()),
+            system_prompt: Some(if decision_api.switch.is_enabled() {
+                decision_api.prompt_on.clone()
+            } else {
+                decision_api.prompt_off.clone()
+            }),
             model: Some(model),
             thinking_level: Some(thinking_level),
             tools: Some(tools),
@@ -766,7 +807,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     // The skill inventory `/skill:<name>` submissions expand against (TS
     // reads the resource loader at expansion time; the session snapshots
     // the engine's loaded list).
-    session.set_skills(resources.skills.clone());
+    session.set_skills(session_skills.clone());
     // The embedding's image-model routing seam (the headless surfaces
     // install theirs; the daemon worker's turn dispatch owns routing).
     session.set_image_model_router(config.image_model_router.clone());
@@ -871,11 +912,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         });
     Ok(SessionEngine {
         session,
-        skills: resources.skills,
+        skills: session_skills,
         skill_diagnostics: resources.skill_diagnostics,
         prompt_templates: resources.prompts,
         agents_files: resources.agents_files,
-        system_prompt,
+        decision_api,
         goal_driver,
         queued_goal_context_purge: config.queued_goal_context_purge.clone(),
         mcp_manager,

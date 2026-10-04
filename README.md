@@ -90,6 +90,11 @@ prime-agent update [--force]         # Update Prime Agent
 prime-agent shutdown [--force]       # Stop every agent, worker, and background service
 ```
 
+The experimental `/decision-api` command enables a per-session decision model
+for real-time control tasks. See [Decision API setup and smoke checks](docs/decision-api.md)
+for TypeSafe Jev and Cloudflare Clef credentials, account configuration, and
+verification in the persistent Python REPL.
+
 ## Built for Long-Running Work
 Prime Agent is built for long-running work, especially for evaluations in research. These features are available in the TUI, and when run autonomously.
 

@@ -87,6 +87,11 @@ impl SessionUi {
             show_images: options.show_images,
             fullscreen_mouse: options.fullscreen_mouse,
             service_tier: None,
+            decision_api: None,
+            decision_api_pending: None,
+            decision_api_picker_behavior: None,
+            mcp_auth_generation: 0,
+            mcp_auth_cancel: None,
             speed_display_enabled: false,
             speed_stats: None,
             client_settings: options.client_settings.clone(),
@@ -440,6 +445,15 @@ impl SessionUi {
         self.resync_bash = Some(resync_bash);
         let reconstructed = reconstruct(&attach);
         let mounted_session_changes = previous != attach.active_session_id;
+        if mounted_session_changes {
+            if let Some(cancel) = self.mcp_auth_cancel.take() {
+                cancel.mark();
+            }
+            self.mcp_auth_generation += 1;
+            self.decision_api_pending = None;
+            self.decision_api_picker_behavior = None;
+            self.pending_mcp_auth = None;
+        }
         self.active_session_id = attach.active_session_id;
         // The new attachment exists (the snapshot above rebuilt from it):
         // retire the superseded id's subscription now, addressed by the
@@ -473,6 +487,7 @@ impl SessionUi {
         self.daemon_closing_notice = None;
         self.session_name.clone_from(&reconstructed.session_name);
         self.service_tier.clone_from(&reconstructed.service_tier);
+        self.decision_api = reconstructed.decision_api;
         self.session_file = attach
             .snapshot
             .get("state")
@@ -685,6 +700,7 @@ impl SessionUi {
             self.speed_stats = None;
             view.chrome.speed_text = None;
         }
+        view.chrome.decision_api = self.decision_api;
         view.clear_chat();
         // The rebuilt transcript invalidates the tracked status row and
         // a pending click's entry index.

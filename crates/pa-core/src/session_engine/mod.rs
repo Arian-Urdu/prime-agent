@@ -17,6 +17,7 @@ pub mod compaction;
 pub mod compaction_exec;
 pub mod compaction_trace;
 pub mod compaction_utils;
+pub mod decision_api;
 pub mod engine;
 pub mod error_classify;
 pub mod factory_host;
@@ -321,26 +322,6 @@ impl AgentSession {
         self.session.lock().await.get_session_id().to_string()
     }
 
-    /// Restore a verified retained context without loading older transcript bodies.
-    pub async fn restore_windowed_context(
-        &self,
-        window: crate::session::window::WindowedSessionStore,
-    ) {
-        let messages = {
-            let mut session = self.session.lock().await;
-            session.adopt_window(window);
-            session.active_context().messages
-        };
-        self.agent
-            .set_messages(
-                messages
-                    .iter()
-                    .filter_map(session_message_to_loop)
-                    .collect(),
-            )
-            .await;
-    }
-
     /// Persisted entries (for UI resume and inspection).
     pub async fn entries(&self) -> Vec<FileEntry> {
         self.session
@@ -546,3 +527,6 @@ mod slash_session_tests;
 
 #[cfg(test)]
 mod compaction_outcome_tests;
+
+#[cfg(test)]
+mod decision_restore_tests;

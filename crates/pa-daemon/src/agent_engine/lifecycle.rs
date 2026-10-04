@@ -479,105 +479,22 @@ impl AgentSessionEngine {
                 self.flush_pending_max_depth(&mut manager);
             }
         }
-        // A branch move that landed before the first turn built the
-        // session (tree navigation/fork/replacement with no turn yet)
-        // re-seeds the session onto the moved branch.
-        let pending_branch = self
-            .pending_branch
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        // Rehydrate the goal driver from the durable store (TS
-        // constructor: `this._goalState = this._loadPersistedGoalState()`
-        // reads the same session rows `_persistGoalState` wrote). A moved
-        // branch's own latest entry wins (faithful branch semantics); the
-        // worker-owned session file answers otherwise. The seed also sets
-        // the published baseline so the rehydrated state never announces
-        // itself (TS loads at construction without emitting).
-        // The goal seed and the retained-context adoption read the SAME
-        // session file through ONE windowed open below (the old flow
-        // opened the store twice back-to-back: `persisted_goal_state`'s
-        // open for the seed, then an identical open for the adoption -
-        // each re-reading and re-parsing the retained suffix; on a
-        // no-boundary session the whole file pays that twice). The seed
-        // reads the shared window's snapshot goal BEFORE the adoption
-        // moves the window's trees in.
-        let seed;
-        let mut shared_window = None;
-        let mut shared_branch = None;
-        {
-            let path = self
-                .session_file
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            if let Some(entries) = &pending_branch {
-                seed = crate::goal_state_persist::goal_state_in_branch(entries);
-            } else {
-                let (goal, window, branch) = tokio::task::spawn_blocking(move || {
-                    // Mirrors `persisted_goal_state` (the window's
-                    // snapshot goal; the full reader's branch scan
-                    // fallback) and the adoption open (window present ->
-                    // adopt; the full reader's branch entries otherwise)
-                    // over one read of each artifact instead of two.
-                    let Some(path) = path else {
-                        return (None, None, None);
-                    };
-                    if let Ok(Some(window)) =
-                        pa_core::session::window::WindowedSessionStore::open(&path)
-                    {
-                        let goal = window.goal_state().cloned();
-                        (goal, Some(window), None)
-                    } else {
-                        let store = crate::session_store::SessionFile::open(&path).ok();
-                        let goal = store
-                            .as_ref()
-                            .and_then(crate::goal_state_persist::goal_state_in_session_file);
-                        let branch = store.map(|store| store.branch_file_entries());
-                        (goal, None, branch)
-                    }
-                })
-                .await?;
-                seed = goal;
-                shared_window = window;
-                shared_branch = branch;
-            }
-        }
+        // Construction already adopted the selected branch before prompt and
+        // kernel setup. Goal restoration reads that same metadata authority.
+        let (seed, stale_error) = {
+            let session = built.session.shared_persistence();
+            let manager = session.lock().await;
+            let seed = manager.active_goal_state();
+            let stale_error = seed
+                .as_ref()
+                .filter(|state| state.status == pa_core::goals::GoalStatus::Active)
+                .and_then(|_| manager.stale_active_goal_failure());
+            (seed, stale_error)
+        };
         if let Some(state) = seed {
-            // The restore-resurrection guard (the 402 diagnosis's (d)):
-            // an active seed whose trailing turn settled as a terminal
-            // provider failure adopts the failure as the goal's terminal
-            // state. The failed turn's own error-finish never persisted
-            // (a worker death or restart interrupted the settle), so the
-            // newest goal row is still the mint's active row — adopting
-            // it would resurrect the goal and the resume sites would
-            // keep delivering continuations into the dead provider (the
-            // operator's ~84s restart cadence, 64 cycles in 1.5h). The
-            // scan reads the SAME artifact the seed came from.
-            let mut stale_error = None;
-            if state.status == pa_core::goals::GoalStatus::Active {
-                let scan: Option<Vec<pa_types::session::FileEntry>> = pending_branch
-                    .clone()
-                    .or_else(|| shared_branch.clone())
-                    .or_else(|| {
-                        shared_window
-                            .as_ref()
-                            .map(|window| window.entries().to_vec())
-                    });
-                if let Some(entries) = scan {
-                    if let Some(error) = pa_core::goals::stale_active_goal_failure(&entries) {
-                        stale_error = Some(error);
-                    }
-                }
-            }
             if let Some(error) = stale_error {
-                // The stale-row guard's adoption: the IN-MEMORY driver and
-                // the published baseline take the terminal verdict directly
-                // (a mint consult can never resurrect the loop), and the
-                // DURABLE row is DEFERRED to the post-adoption flush — a
-                // write here would precede `rebuild_branch_context`/
-                // `restore_windowed_context` and be replaced with the
-                // adopted entries (the review round's ordering finding).
+                // Restore the terminal verdict before continuations can run;
+                // its durable row follows the driver's restoration.
                 let terminal = pa_core::goals::GoalState {
                     active: false,
                     status: pa_core::goals::GoalStatus::Error,
@@ -614,43 +531,7 @@ impl AgentSessionEngine {
                 *self.published_goal.lock().expect("published goal lock") = Some(state);
             }
         }
-        if let Some(entries) = pending_branch {
-            built.session.rebuild_branch_context(entries).await?;
-            // A moved branch restores its own park (the early return
-            // would otherwise skip the build-tail restore and leave the
-            // previous branch's park — or none — armed).
-            self.restore_quota_park(built).await;
-            // The context adoption replaced the manager contents: the
-            // stale-row guard's deferred terminal row lands now.
-            self.flush_pending_stale_goal_terminal().await;
-            return Ok(());
-        }
-        // Restore the retained context and certified metadata without loading
-        // discarded message bodies. Unsupported files use the ordinary
-        // reader. The window (or the fallback branch entries) came from the
-        // shared open above - the second back-to-back open is gone.
-        if let Some(window) = shared_window {
-            built.session.restore_windowed_context(window).await;
-            // This worker holds the session's runtime lease for the
-            // engine's lifetime: its durable appends may certify the
-            // window cache incrementally (exactly one writer per
-            // lease), and the lease's release flushes the certified
-            // snapshot to the sidecar for the next warm open.
-            built
-                .session
-                .shared_persistence()
-                .lock()
-                .await
-                .set_append_ownership(pa_core::session::window::AppendOwnership::SessionLeaseHeld);
-            // The context adoption replaced the manager contents: the
-            // stale-row guard's deferred terminal row lands now.
-            self.flush_pending_stale_goal_terminal().await;
-        } else if let Some(entries) = shared_branch.take().filter(|entries| !entries.is_empty()) {
-            built.session.rebuild_branch_context(entries).await?;
-            // The context adoption replaced the manager contents: the
-            // stale-row guard's deferred terminal row lands now.
-            self.flush_pending_stale_goal_terminal().await;
-        }
+        self.flush_pending_stale_goal_terminal().await;
         // Restore the quota park this branch ended on (TS
         // `_restoreQuotaPark`, at construction): the newest
         // `provider_quota_park` entry not followed by a
@@ -1017,7 +898,7 @@ impl AgentSessionEngine {
         })
     }
 
-    async fn build_session(&self, model: &Model) -> anyhow::Result<CoreSessionEngine> {
+    pub(super) async fn build_session(&self, model: &Model) -> anyhow::Result<CoreSessionEngine> {
         let agent_model =
             json_round_trip(model).ok_or_else(|| anyhow::anyhow!("model conversion failed"))?;
         // The live queue-delivery modes (seeded from the start config or
@@ -1067,7 +948,7 @@ impl AgentSessionEngine {
         // session dir leads; the session file's parent (the create
         // command's sessionDir) is the daemon's own fallback — the
         // engine config itself is built without one.
-        let session_manager = match self
+        let mut session_manager = match self
             .config
             .session_dir
             .as_deref()
@@ -1081,6 +962,35 @@ impl AgentSessionEngine {
             }
             None => pa_core::session::manager::SessionManager::in_memory(&cwd),
         };
+        let pending_branch = self
+            .pending_branch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(entries) = pending_branch {
+            session_manager.adopt_entries(entries);
+        } else if let Some(path) = session_file.clone() {
+            session_manager = tokio::task::spawn_blocking(move || {
+                match std::fs::metadata(&path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(session_manager);
+                    }
+                    Err(error) => return Err(error.into()),
+                    Ok(_) => {}
+                }
+                if let Some(window) = pa_core::session::window::WindowedSessionStore::open(&path)? {
+                    session_manager.adopt_window(window);
+                    session_manager.set_append_ownership(
+                        pa_core::session::window::AppendOwnership::SessionLeaseHeld,
+                    );
+                } else {
+                    let store = crate::session_store::SessionFile::open(&path)?;
+                    session_manager.adopt_entries(store.branch_file_entries());
+                }
+                Ok::<_, anyhow::Error>(session_manager)
+            })
+            .await??;
+        }
         // Children inherit the parent model selector; the engine resolves
         // the model here, after the create command set the rest of the
         // parent identity.

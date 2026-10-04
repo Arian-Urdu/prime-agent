@@ -60,10 +60,11 @@ use crate::chat::{
     ChatEntry, CompactionReason, CompactionState, MessageBlock, RetryState, StatusKind,
     ToolResultView, WorkingState,
 };
+use crate::choice_picker::{ChoicePickerAction, ChoicePurpose};
 use crate::click_dispatch::PressedClick;
 use crate::daemon_client::{DaemonClient, DaemonClientEvent};
 use crate::daemon_reconnect::RecoveryKind;
-use crate::effort_picker::{self, EffortPickerAction};
+use crate::effort_picker;
 use crate::export_share::{self, GhAuthStatus, GistOutcome};
 use crate::goal_surface::{format_goal_status, tray_goal_label, GoalPanel, GoalView};
 use crate::heartbeats_picker::{
@@ -216,6 +217,15 @@ pub(crate) struct SessionUi {
     /// seeded from the attach state and kept live by `service_tier_changed`
     /// events; the `/fast` toggle reads it.
     service_tier: Option<String>,
+    /// The session's Decision API provider while it is on, seeded from the
+    /// attach state and kept live by its `decision_api_status` rows.
+    decision_api: Option<pa_types::slash_commands::DecisionApiProvider>,
+    /// `/decision-api` opened this provider's key panel: a saved key turns
+    /// the Decision API on with it once the panel settles.
+    decision_api_pending: Option<auth::PendingDecisionApi>,
+    decision_api_picker_behavior: Option<prompt::SubmitBehavior>,
+    mcp_auth_generation: u64,
+    mcp_auth_cancel: Option<crate::auth_panel::FlowCancel>,
     /// The current model's provider (TS `getCurrentModel()` keeps the full
     /// model): the eligibility lookups over the TUI-side catalog disambiguate
     /// same-id entries across providers with it.

@@ -34,8 +34,9 @@ pub(crate) enum ClickAction {
     },
     /// Move the `/model` picker's selection to the clicked filtered row.
     SelectModelRow(usize),
-    /// Move the `/effort` picker's selection to the clicked filtered row.
-    SelectEffortRow(usize),
+    /// Move the `/effort` or `/decision-api` picker's selection to the
+    /// clicked filtered row.
+    SelectChoiceRow(usize),
     /// Open the activity dock group the click landed on (the dock's
     /// Enter route — the click is an explicit user choice: it moves
     /// the dock's selection to the group, takes the focus, and opens
@@ -112,7 +113,7 @@ pub(crate) struct PickerClickSurface {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PickerKind {
     Model,
-    Effort,
+    Choice,
 }
 
 /// The `/model` picker's chrome rows above its item rows: the bordered
@@ -120,10 +121,10 @@ pub(crate) enum PickerKind {
 /// exactly three rows).
 pub(crate) const MODEL_PICKER_CHROME_ROWS: usize = 3;
 
-/// The `/effort` picker's chrome rows above its item rows: the config
+/// The `/effort` and `/decision-api` picker's chrome rows above its item rows: the config
 /// selector's header block (blank, title, blank) plus the bordered search
 /// field.
-pub(crate) const EFFORT_PICKER_CHROME_ROWS: usize = 6;
+pub(crate) const CHOICE_PICKER_CHROME_ROWS: usize = 6;
 
 /// The last composed frame's clickable geometry (TS `frameClickTargets`).
 /// Every field is recorded during a frame composition; the inline compose
@@ -243,7 +244,7 @@ impl AgentView {
                 .filter(|item| *item < visible)?;
             return Some(match picker.kind {
                 PickerKind::Model => ClickAction::SelectModelRow(picker.items.0 + item),
-                PickerKind::Effort => ClickAction::SelectEffortRow(picker.items.0 + item),
+                PickerKind::Choice => ClickAction::SelectChoiceRow(picker.items.0 + item),
             });
         }
         // The dock's clickable chrome rows — the tray's `← manage` hint

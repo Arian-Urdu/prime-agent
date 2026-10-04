@@ -272,10 +272,20 @@ pub const AUTH_CATEGORIES: &[&str] = &[
     "unknown",
 ];
 
-/// The #2117 feature names.
+/// The #2117 feature names, plus later product features (`decision_api`).
 pub const FEATURE_NAMES: &[&str] = &[
-    "model", "login", "logout", "effort", "goal", "new", "resume", "fork", "clone", "tree",
+    "model",
+    "login",
+    "logout",
+    "effort",
+    "goal",
+    "new",
+    "resume",
+    "fork",
+    "clone",
+    "tree",
     "feedback",
+    "decision_api",
 ];
 
 /// The #2117 feature outcomes.
@@ -788,6 +798,11 @@ const AGENT_SESSION_ENDED: EventRule = EventRule {
         ("feature_feedback_failed_count", optional(count())),
         ("feature_feedback_canceled_count", optional(count())),
         ("feature_feedback_unavailable_count", optional(count())),
+        ("feature_decision_api_initiated_count", optional(count())),
+        ("feature_decision_api_completed_count", optional(count())),
+        ("feature_decision_api_failed_count", optional(count())),
+        ("feature_decision_api_canceled_count", optional(count())),
+        ("feature_decision_api_unavailable_count", optional(count())),
     ],
 };
 
@@ -1110,6 +1125,11 @@ const TUI_EXIT: EventRule = EventRule {
         ("feature_feedback_failed_count", optional(count())),
         ("feature_feedback_canceled_count", optional(count())),
         ("feature_feedback_unavailable_count", optional(count())),
+        ("feature_decision_api_initiated_count", optional(count())),
+        ("feature_decision_api_completed_count", optional(count())),
+        ("feature_decision_api_failed_count", optional(count())),
+        ("feature_decision_api_canceled_count", optional(count())),
+        ("feature_decision_api_unavailable_count", optional(count())),
         ("input_received_count", optional(count())),
         ("input_queued_count", optional(count())),
         ("input_preparation_count", optional(count())),

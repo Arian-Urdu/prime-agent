@@ -382,6 +382,16 @@ impl WindowedSessionStore {
             }
             let on_path = expected.as_deref() == Some(id);
             if on_path {
+                if window_done
+                    && meta.kind == "custom_message"
+                    && meta.custom_type.as_deref()
+                        == Some(pa_types::slash_commands::DECISION_API_STATUS_CUSTOM_TYPE)
+                {
+                    metadata_entries.push(
+                        String::from_utf8(line.clone())
+                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+                    );
+                }
                 if window_done && meta.kind == "message" {
                     if let Some(message) = &meta.message {
                         older_path_stats.total_messages += 1;
@@ -524,6 +534,12 @@ impl WindowedSessionStore {
             match kind {
                 "session_info" | "session_state" | "git_state" => {
                     latest.insert(kind.to_owned(), index);
+                }
+                "custom_message"
+                    if value["customType"].as_str()
+                        == Some(pa_types::slash_commands::DECISION_API_STATUS_CUSTOM_TYPE) =>
+                {
+                    latest.insert("decision_api_status".to_owned(), index);
                 }
                 "child_usage_attributed"
                     if value["targetId"]

@@ -91,9 +91,9 @@ async fn engine_runs_tool_loop_and_persists() {
 
     // The system prompt is the layered assembly: static core layer
     // first, dynamic tail after.
-    assert!(engine.system_prompt.starts_with("# prime-agent harness"));
+    assert!(engine.system_prompt().starts_with("# prime-agent harness"));
     assert!(engine
-        .system_prompt
+        .system_prompt()
         .contains("Recursive agent depth: 0 (root)"));
 
     let outcome = engine
@@ -190,9 +190,9 @@ async fn spawned_child_prompt_stamps_its_depth() {
     .unwrap();
 
     assert!(engine
-        .system_prompt
+        .system_prompt()
         .contains("Recursive agent depth: 2 (not root)"));
-    assert!(!engine.system_prompt.contains("depth: 0 (root)"));
+    assert!(!engine.system_prompt().contains("depth: 0 (root)"));
 }
 
 /// The login chain's prompt-gating end to end at the engine level: a
@@ -282,7 +282,7 @@ async fn oauth_creds_unlock_generic_mcp_gating_in_new_sessions() {
     let engine = create_session(config(&cwd, &agent_dir, provider.stream_fn()))
         .await
         .unwrap();
-    assert!(!engine.system_prompt.contains("# Generic MCP Connections"));
+    assert!(!engine.system_prompt().contains("# Generic MCP Connections"));
 
     // The persisted credential begin_login leaves behind (the TS
     // McpCredentials shape, endpoint-bound).
@@ -312,7 +312,7 @@ async fn oauth_creds_unlock_generic_mcp_gating_in_new_sessions() {
     let engine = create_session(config(&cwd, &agent_dir, provider.stream_fn()))
         .await
         .unwrap();
-    assert!(!engine.system_prompt.contains("# Generic MCP Connections"));
+    assert!(!engine.system_prompt().contains("# Generic MCP Connections"));
 
     // The endpoint-bound credential unlocks the prompt guidance in the
     // next session the engine builds.
@@ -320,8 +320,8 @@ async fn oauth_creds_unlock_generic_mcp_gating_in_new_sessions() {
     let engine = create_session(config(&cwd, &agent_dir, provider.stream_fn()))
         .await
         .unwrap();
-    assert!(engine.system_prompt.contains("# Generic MCP Connections"));
-    assert!(engine.system_prompt.contains("`fixture-oauth`"));
+    assert!(engine.system_prompt().contains("# Generic MCP Connections"));
+    assert!(engine.system_prompt().contains("`fixture-oauth`"));
 }
 
 #[tokio::test]

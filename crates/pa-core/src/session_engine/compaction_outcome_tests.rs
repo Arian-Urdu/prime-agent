@@ -334,8 +334,7 @@ const APPLIED_PLAN: &str = r#"{"summary":"note it","rationale":"repeated","expec
 const EMPTY_PLAN: &str = r#"{"summary":"bench","edits":[]}"#;
 
 /// A persisted session over two seeded rows, with the live loop context
-/// built the way the resume path builds it (one rebuild:
-/// `restore_windowed_context`'s construction).
+/// rebuilt from the persisted context as on resume.
 async fn refine_test_session() -> (AgentSession, tempfile::TempDir) {
     let provider = Arc::new(ScriptedProvider::new(test_model()));
     let options = AgentOptions {

@@ -207,7 +207,10 @@ impl TerminalMcpAuth {
         if let Some(error) = auth.drain_errors().pop() {
             return Err(anyhow!(error)).context("could not save the API key");
         }
-        Ok(format!("Saved API key for {label}. Web search is ready."))
+        if credential == pa_core::auth::SERPER_CREDENTIAL_ID {
+            return Ok(format!("Saved API key for {label}. Web search is ready."));
+        }
+        Ok(format!("Saved API key for {label}."))
     }
 
     fn logout_inner(&self, server: &str) -> Result<String> {
@@ -242,6 +245,16 @@ impl ClientAuthCommands for TerminalMcpAuth {
     fn api_key(&self, credential: &str, panel: pa_tui::auth_panel::AuthPanelHandle) -> AuthFuture {
         let (auth, credential) = (self.clone(), credential.to_string());
         Box::pin(async move { auth.api_key_inner(&credential, panel).await })
+    }
+
+    fn api_key_ready(&self, credential: &str) -> pa_tui::client_auth::AuthReadinessFuture {
+        let agent_dir = self.agent_dir.clone();
+        let credential = credential.to_string();
+        Box::pin(async move {
+            AuthStorage::resolve_api_key(&agent_dir, &credential)
+                .await
+                .map(|key| key.is_some())
+        })
     }
 
     fn logout(&self, server: &str) -> AuthFuture {
@@ -580,3 +593,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "decision_api_readiness_tests.rs"]
+mod decision_api_readiness_tests;

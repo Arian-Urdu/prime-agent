@@ -80,6 +80,10 @@ use serde_json::{json, Value};
 
 struct Daemon {
     child: Child,
+    // Lint exception, kept narrow (AGENTS.md lint discipline): the
+    // fixture keeps the supervisor's bound socket next to its process,
+    // mirroring the crate's other e2e daemon fixtures; this file's tests
+    // connect through their own copy of the path.
     #[allow(dead_code)]
     socket: PathBuf,
 }
@@ -96,6 +100,10 @@ impl Drop for Daemon {
 struct Harness {
     root: PathBuf,
     agent_dir: PathBuf,
+    // Lint exception, kept narrow (AGENTS.md lint discipline): the
+    // scenario keeps its bound socket next to the supervisor and client
+    // that share it; the tests address the socket through their own copy
+    // of the path.
     #[allow(dead_code)]
     socket: PathBuf,
     daemon: Daemon,
@@ -141,17 +149,29 @@ impl Client {
             .set_read_timeout(Some(Duration::from_millis(100)))
             .expect("set timeout");
         loop {
-            line.clear();
             match self.reader.read_line(&mut line) {
                 Ok(0) => panic!("supervisor closed the connection"),
-                Ok(_) if line.trim().is_empty() => {}
+                // A large supervisor frame can straddle the 100ms read
+                // windows: the buffer keeps a partial frame's bytes across
+                // the poll timeouts and resets only after a complete line
+                // is consumed — the same fragmentation fix the driver's
+                // own client carries.
+                Ok(_) if line.trim().is_empty() => line.clear(),
                 Ok(_) => return serde_json::from_str(line.trim()).expect("parse line"),
-                Err(error) => {
+                // Only the poll timeout (WouldBlock on Unix, TimedOut on
+                // Windows) means "no line yet"; any other read error is
+                // persistent and fails the read instead of busy-looping
+                // to the deadline.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
                     assert!(
                         Instant::now() < deadline,
                         "timed out waiting for a supervisor line: {error}"
                     );
                 }
+                Err(error) => panic!("supervisor socket error: {error}"),
             }
         }
     }
@@ -196,17 +216,29 @@ impl Client {
             .set_read_timeout(Some(Duration::from_millis(100)))
             .expect("set timeout");
         loop {
-            line.clear();
             match self.reader.read_line(&mut line) {
                 Ok(0) => panic!("supervisor closed the connection"),
-                Ok(_) if line.trim().is_empty() => {}
+                // A large supervisor frame can straddle the 100ms read
+                // windows: the buffer keeps a partial frame's bytes across
+                // the poll timeouts and resets only after a complete line
+                // is consumed — the same fragmentation fix the driver's
+                // own client carries.
+                Ok(_) if line.trim().is_empty() => line.clear(),
                 Ok(_) => return serde_json::from_str(line.trim()).expect("parse line"),
-                Err(error) => {
+                // Only the poll timeout (WouldBlock on Unix, TimedOut on
+                // Windows) means "no line yet"; any other read error is
+                // persistent and fails the read instead of busy-looping
+                // to the deadline.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
                     assert!(
                         Instant::now() < deadline,
                         "timed out waiting for a supervisor line: {error}"
                     );
                 }
+                Err(error) => panic!("supervisor socket error: {error}"),
             }
         }
     }
@@ -1555,4 +1587,54 @@ fn factory_run_is_nonblocking_and_completes_in_the_background() {
         milestones[0]["stage"], "shown",
         "the finished milestone stays in the ledger (the notice lane is unported)"
     );
+}
+
+/// The e2e client's read loops must keep a frame's partial bytes across a
+/// read timeout: a supervisor line can straddle the client's 100ms read
+/// window, and dropping the first chunk fails the frame's parse (the same
+/// flake class the driver's own client fixed). No supervisor needed — the
+/// client runs against a scripted socket.
+#[test]
+fn e2e_client_survives_fragmented_supervisor_frames() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("frag.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind socket");
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let mut writer = stream.try_clone().expect("clone stream");
+        let mut reader = BufReader::new(stream);
+        // The greeting straddles the client's 100ms read window: the
+        // hello read must keep the first chunk across its poll timeouts.
+        let hello = r#"{"type":"daemon_hello"}"#;
+        writer
+            .write_all(&hello.as_bytes()[..11])
+            .expect("hello chunk");
+        writer.flush().expect("flush hello chunk");
+        std::thread::sleep(Duration::from_millis(300));
+        writer
+            .write_all(&hello.as_bytes()[11..])
+            .expect("hello rest");
+        writer.write_all(b"\n").expect("hello newline");
+        writer.flush().expect("flush hello");
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+        // The response straddles the window the same way.
+        let response = r#"{"id":"frag-1","type":"response","success":true,"data":{"text":"ok"}}"#;
+        writer
+            .write_all(&response.as_bytes()[..20])
+            .expect("first chunk");
+        writer.flush().expect("flush chunk");
+        std::thread::sleep(Duration::from_millis(300));
+        writer.write_all(&response.as_bytes()[20..]).expect("rest");
+        writer.write_all(b"\n").expect("newline");
+        writer.flush().expect("flush rest");
+    });
+    let (mut client, hello) = Client::connect(&socket);
+    assert_eq!(hello["type"], "daemon_hello");
+    client.send_command(
+        "frag-1",
+        &json!({ "type": "list_sessions", "activeSessionId": "s" }),
+    );
+    let response = client.read_response("frag-1", Duration::from_secs(5));
+    assert_eq!(response["data"]["text"], "ok", "{response}");
 }

@@ -18,8 +18,8 @@ impl Worker {
         // answers with the created summary instead of racing a second init.
         let _create_gate = self.create_gate.lock().await;
         let existing_summary = {
-            let core = self.core.lock().unwrap();
-            core.created.then(|| self.summary_locked(&core))
+            let (core, inputs) = self.summary_inputs();
+            core.created.then(|| self.summary_locked(&core, inputs))
         };
         if let Some(summary) = existing_summary {
             // Idempotent re-create after a supervisor restart or respawn.
@@ -480,7 +480,7 @@ impl Worker {
         // The core lock stays inside this block: everything after it may await,
         // and a std MutexGuard must never ride an await point.
         let (summary, rlm_depth) = {
-            let mut core = self.core.lock().unwrap();
+            let (mut core, inputs) = self.summary_inputs();
             core.cwd = cwd;
             core.steering = steering;
             core.follow_up = follow_up;
@@ -534,7 +534,7 @@ impl Worker {
             core.parent_active_session_id = parent_active_session_id;
             core.parent_session_id = parent_session_id;
             core.child_script.clone_from(&child_script);
-            (self.summary_locked(&core), rlm_depth)
+            (self.summary_locked(&core, inputs), rlm_depth)
         };
         // The engine's agent-level queues drain per the same modes the
         // worker lane delivers by.

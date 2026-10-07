@@ -254,10 +254,7 @@ impl Worker {
     /// runtime call.
     pub(crate) async fn refresh_replaced_session_state(&self) {
         let (rlm_depth, summary, child_script) = {
-            let mut core = self
-                .core
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (mut core, inputs) = self.summary_inputs();
             // The moved-to file's persisted depth wins (the replacement
             // carries no create-config depth).
             let rlm_depth = core
@@ -267,7 +264,7 @@ impl Worker {
                 .unwrap_or(0);
             core.rlm_depth = rlm_depth;
             let child_script = core.child_script.clone();
-            (rlm_depth, self.summary_locked(&core), child_script)
+            (rlm_depth, self.summary_locked(&core, inputs), child_script)
         };
         // No thinking flag rides the rebind (the create command's level is
         // already resolved on the engine), and the TS replacement runtime

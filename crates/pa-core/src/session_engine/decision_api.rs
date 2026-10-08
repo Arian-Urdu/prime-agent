@@ -371,13 +371,22 @@ fn finite_or_none(value: f64) -> Option<f64> {
     value.is_finite().then_some(value)
 }
 
+/// The api identifier of the System One structured-decision protocol: the
+/// decision request body POSTs to the model's baseUrl + /systemone and the
+/// reply envelope carries the answers (Prime Inference's hosted clef).
+const SYSTEMONE_API: &str = "systemone";
+
 /// Serve one decision request with the resolved model through the existing
 /// provider transports: one non-streaming completion, parsed into the
-/// decision envelope.
+/// decision envelope. System One models speak the native structured-decision
+/// protocol; every other model answers the decision prompt.
 async fn serve_decision(
     resolved: &ResolvedDecisionModel,
     request: &DecisionRequest,
 ) -> anyhow::Result<Value> {
+    if resolved.model.api == SYSTEMONE_API {
+        return serve_systemone(resolved, request).await;
+    }
     let context = build_decision_context(request);
     let options = pa_ai::types::SimpleStreamOptions::from_base(pa_ai::types::StreamOptions {
         max_tokens: Some(DECISION_MAX_TOKENS),
@@ -460,6 +469,100 @@ pub async fn serve_decision_request(
         );
     }
     serve_decision(&resolved, &request).await
+}
+
+/// Serve one decision over the System One structured-decision protocol:
+/// the request body rides to the endpoint verbatim and the reply envelope
+/// passes through the same answer validation.
+async fn serve_systemone(
+    resolved: &ResolvedDecisionModel,
+    request: &DecisionRequest,
+) -> anyhow::Result<Value> {
+    let mut criteria = serde_json::Map::new();
+    for (name, applies) in &request.criteria {
+        criteria.insert(name.clone(), json!(applies));
+    }
+    let mut body = json!({
+        "state": request.state,
+        "questions": { "action": {
+            "type": "choice",
+            "instructions": request.instructions,
+            "criteria": Value::Object(criteria),
+        } },
+        "model": resolved.model.id,
+    });
+    if !request.images.is_empty() {
+        let images = request
+            .images
+            .iter()
+            .map(|(mime, data)| json!(format!("data:{mime};base64,{data}")))
+            .collect::<Vec<_>>();
+        body["images"] = Value::Array(images);
+    }
+    let context = pa_types::ai::Context {
+        system_prompt: None,
+        messages: vec![pa_types::ai::Message::User(pa_types::ai::UserMessage {
+            content: pa_types::ai::UserContent::Text(body.to_string()),
+            timestamp: 0,
+            rest: serde_json::Map::default(),
+        })],
+        tools: None,
+    };
+    let options = pa_ai::types::SimpleStreamOptions::from_base(pa_ai::types::StreamOptions {
+        max_tokens: Some(DECISION_MAX_TOKENS),
+        timeout_ms: Some(DECISION_TIMEOUT_MS),
+        api_key: resolved.api_key.clone(),
+        headers: resolved
+            .headers
+            .as_ref()
+            .map(|headers| headers.clone().into_iter().collect()),
+        ..Default::default()
+    });
+    let response = pa_ai::complete_simple(&resolved.model, &context, Some(options))
+        .await
+        .map_err(|error| anyhow!("the decision model request failed: {error:?}"))?;
+    match response.stop_reason {
+        StopReason::Error => bail!(
+            "the decision model call failed: {}",
+            response
+                .error_message
+                .unwrap_or_else(|| "unknown provider error".to_string())
+        ),
+        StopReason::Aborted => bail!("the decision model call was aborted"),
+        _ => {}
+    }
+    let reply = response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            pa_types::ai::AssistantContentBlock::Text(text) => Some(text.text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if reply.trim().is_empty() {
+        bail!("the decision model returned an empty reply");
+    }
+    // The endpoint's envelope: {"model": ..., "answers": {"action": {...}}}.
+    let raw = reply.trim();
+    let candidate = match (raw.find('{'), raw.rfind('}')) {
+        (Some(start), Some(end)) if end > start => &raw[start..=end],
+        _ => raw,
+    };
+    let parsed = pa_ai::parse_json_with_repair(candidate).map_err(|error| {
+        anyhow!("the decision model's reply was not valid JSON ({error}): {raw}")
+    })?;
+    let answers = parsed
+        .get("answers")
+        .cloned()
+        .ok_or_else(|| anyhow!("the decision model's reply has no \"answers\" object: {raw}"))?;
+    let answer = parse_decision_answer(&answers.to_string(), &request.criteria)?;
+    // The envelope reports the resolved model's label (the chat path's
+    // convention), never the endpoint's bare id.
+    Ok(json!({
+        "model": resolved.label(),
+        "answers": { "action": answer },
+    }))
 }
 
 /// Register `decision_api.decide`, resolving the decision model from the
@@ -808,6 +911,84 @@ mod tests {
         );
     }
 
+    /// The fixture registry recipe with the System One decision api pointing
+    /// at one loopback endpoint, plus the settings reference.
+    async fn systemone_fixture(
+        dir: &Path,
+        reply: Value,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String, Value)>>>,
+    ) -> anyhow::Result<String> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut raw = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let (head, body) = loop {
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    assert_ne!(read, 0, "the client closed mid-request");
+                    raw.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&raw).to_string();
+                    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                        continue;
+                    };
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            let line = line.to_ascii_lowercase();
+                            line.strip_prefix("content-length:")?.trim().parse().ok()
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= length {
+                        break (head.to_string(), body.to_string());
+                    }
+                };
+                let authorization = head
+                    .lines()
+                    .find_map(|line| {
+                        let line = line.to_ascii_lowercase();
+                        line.strip_prefix("authorization:")
+                            .map(|v| v.trim().to_string())
+                    })
+                    .unwrap_or_default();
+                let request_line = head.lines().next().unwrap_or_default().split(' ');
+                let path = request_line
+                    .into_iter()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                seen.lock().unwrap().push((
+                    path,
+                    authorization,
+                    serde_json::from_str(&body).unwrap_or(Value::Null),
+                ));
+                let reply = reply.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 Status\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        std::fs::write(
+            dir.join("settings.json"),
+            json!({ "decisionApi": { "systemOneModel": "fixture-decisions/systemone-model" } })
+                .to_string(),
+        )?;
+        std::fs::write(
+            dir.join("models.json"),
+            format!(
+                r#"{{ "providers": {{ "fixture-decisions": {{
+                    "baseUrl": "{base}", "apiKey": "fixture-key", "api": "systemone",
+                    "models": [ {{ "id": "systemone-model", "input": ["text", "image"] }} ]
+                }} }} }}"#
+            ),
+        )?;
+        Ok(base)
+    }
+
     #[test]
     fn decision_answers_parse_leniently_and_validate_the_choice() {
         let criteria = vec![
@@ -838,6 +1019,44 @@ mod tests {
         ] {
             assert!(parse_decision_answer(bad, &criteria).is_err(), "{bad}");
         }
+    }
+
+    /// One decision over the System One protocol, hermetic: the decide
+    /// dispatch builds the protocol request, the endpoint envelope parses
+    /// through the same answer validation, and the merged auth rides.
+    #[tokio::test]
+    async fn decide_serves_the_systemone_protocol_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let envelope = json!({
+            "model": "fixture-decisions/systemone-model",
+            "answers": {"action": {"choice": "left", "confidence": 0.9, "probabilities": {"left": 0.9, "right": 0.1}}}
+        });
+        systemone_fixture(dir.path(), envelope.clone(), std::sync::Arc::clone(&seen))
+            .await
+            .unwrap();
+        let call = decider(dir.path(), dir.path());
+        let request = json!({ "request": { "state": {"observation": 1}, "questions": { "action": {
+            "type": "choice", "criteria": {"left": "go left", "right": "go right"}
+        } }, "images": ["data:image/png;base64,AA=="] } });
+        let answer = call(request).await.unwrap();
+        assert_eq!(answer["model"], "fixture-decisions/systemone-model");
+        assert_eq!(answer["answers"]["action"]["choice"], "left", "{answer}");
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "/systemone");
+        assert_eq!(requests[0].1, "bearer fixture-key");
+        let body = &requests[0].2;
+        assert_eq!(body["model"], "systemone-model");
+        assert_eq!(
+            body["questions"]["action"]["criteria"],
+            json!({"left": "go left", "right": "go right"})
+        );
+        assert_eq!(
+            body["images"],
+            json!(["data:image/png;base64,AA=="]),
+            "the images ride the protocol request"
+        );
     }
 
     #[test]

@@ -34,6 +34,27 @@ call, and it lives exactly as long as the loop. Goals flow to it as tagged
 one), and its answers return to the loop as tagged `decision_api.decision`
 messages.
 
+The decision models ride two transports, chosen by the model's api: the
+System One structured-decision protocol (`"api": "systemone"`, Prime
+Inference's hosted clef — the request body POSTs to the model's baseUrl +
+`/systemone` and the reply envelope carries the answers), or the ordinary
+chat-completion transports, where decide() renders the decision prompt
+and parses the model's JSON answer. The model registry recipe for the
+hosted clef:
+
+```json
+{ "providers": { "prime-inference": {
+    "baseUrl": "https://api.pinference.ai/api/v1",
+    "apiKey": "ENV_VAR_NAME",
+    "api": "systemone",
+    "models": [ { "id": "cloudflare/clef", "input": ["text", "image"] } ]
+} } }
+```
+
+The live round trip is `PA_DECISION_LIVE=1` with
+`PA_DECISION_LIVE_API_KEY` (and `PA_DECISION_LIVE_TEAM_ID`) set:
+`cargo test -p pa-core --test decision_api_live`.
+
 ## Opt-in live smoke checks
 
 These checks make billed provider requests. Run them only when intentionally

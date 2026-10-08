@@ -10,8 +10,9 @@ action set (a game, a device, a UI) and a full agent turn per step is too slow.
 
 - **System 1** is the decision model the user configured: the
   `decisionApi.systemOneModel` setting names it (a registry model reference
-  like `prime-inference/clef`), and a resolvable reference turns the feature
-  on. `Loop` spawns it as a decision child (`rlm.spawn(kind="decision")`)
+  like `prime-inference/clef`, or the hosted structured-decision clef
+  `prime-inference/cloudflare/clef`), and a resolvable reference turns the
+  feature on. `Loop` spawns it as a decision child (`rlm.spawn(kind="decision")`)
   whose every message is one decision request: each observation becomes one
   model call that returns the chosen action and its confidence. The child
   lives exactly as long as the loop. `loop.status()["system1_model"]`

@@ -100,10 +100,14 @@ fn assemble_breakdown(
         system_prompt: None,
         ..ResourceLoaderOptions::new(cwd.to_path_buf(), agent_dir)
     })?;
-    // A session starts with the Decision API off (`/decision-api`).
-    resources.skills.retain(|skill| {
-        skill.name != pa_core::session_engine::decision_api::DECISION_API_SKILL_NAME
-    });
+    // The decision-api skill rides the prompt only while the Decision API is
+    // configured (decisionApi.systemOneModel is set).
+    let settings = pa_core::settings::SettingsManager::create(cwd, &agent_dir);
+    if !pa_core::session_engine::decision_api::decision_api_configured(settings.settings()) {
+        resources.skills.retain(|skill| {
+            skill.name != pa_core::session_engine::decision_api::DECISION_API_SKILL_NAME
+        });
+    }
     Ok(pa_core::prompts::system_prompt::system_prompt_breakdown(
         &pa_core::prompts::BuildSystemPromptOptions {
             cwd: cwd.display().to_string(),

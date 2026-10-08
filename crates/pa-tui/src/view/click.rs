@@ -21,7 +21,7 @@ pub(crate) enum ClickAction {
     },
     /// Move the `/model` picker's selection to the clicked filtered row.
     SelectModelRow(usize),
-    /// Move the `/effort` or `/decision-api` picker's selection to the
+    /// Move the `/effort` picker's selection to the
     /// clicked filtered row.
     SelectChoiceRow(usize),
     /// Open the activity dock group the click landed on (operator
@@ -91,7 +91,7 @@ pub(crate) enum PickerKind {
 /// renders exactly three rows.
 pub(crate) const MODEL_PICKER_CHROME_ROWS: usize = 3;
 
-/// The `/effort` and `/decision-api` picker's chrome rows: the config
+/// The `/effort` picker's chrome rows: the config
 /// selector's header block plus the bordered search field.
 pub(crate) const CHOICE_PICKER_CHROME_ROWS: usize = 6;
 

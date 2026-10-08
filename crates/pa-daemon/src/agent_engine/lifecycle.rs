@@ -497,7 +497,6 @@ impl AgentSessionEngine {
             // The Decision API follows the adopted context: the provider
             // row the restored branch carries becomes the session's switch
             // before the engine is installed and any turn runs.
-            built.sync_decision_api_from_session().await;
             // A moved branch restores its own park (the early return would leave the previous
             // branch's park armed).
             self.restore_quota_park(built).await;
@@ -516,11 +515,9 @@ impl AgentSessionEngine {
                 .lock()
                 .await
                 .set_append_ownership(pa_core::session::window::AppendOwnership::SessionLeaseHeld);
-            built.sync_decision_api_from_session().await;
             self.flush_pending_stale_goal_terminal().await;
         } else if let Some(entries) = shared_branch.take().filter(|entries| !entries.is_empty()) {
             built.session.rebuild_branch_context(entries).await?;
-            built.sync_decision_api_from_session().await;
             self.flush_pending_stale_goal_terminal().await;
         }
         self.restore_quota_park(built).await;

@@ -400,11 +400,6 @@ impl SessionUi {
                 view.chrome.service_tier.clone_from(&self.service_tier);
                 self.dirty = true;
             }
-            TurnUpdate::DecisionApiChanged { enabled } => {
-                self.decision_api = enabled;
-                view.chrome.decision_api = enabled;
-                self.dirty = true;
-            }
             TurnUpdate::CustomRow(entry) => {
                 view.push_entry(entry);
             }

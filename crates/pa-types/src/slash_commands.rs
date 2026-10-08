@@ -5,27 +5,12 @@
 use std::collections::HashMap;
 
 /// Session-executed commands (their behavior lives in the session engine).
-pub const SESSION_SLASH_COMMAND_NAMES: [&str; 5] =
-    ["compact", "refine", "goal", "autonomous", "decision-api"];
+pub const SESSION_SLASH_COMMAND_NAMES: [&str; 4] = ["compact", "refine", "goal", "autonomous"];
 
 /// Durable row custom types (TS `messages.ts`): the command echo and its
 /// result, persisted in sessions and rendered by every surface.
 pub const SESSION_SLASH_COMMAND_CUSTOM_TYPE: &str = "session_slash_command";
 pub const SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE: &str = "session_slash_command_result";
-/// The durable `/decision-api` state row (`details.enabled`): the newest
-/// one on the selected branch is the session's Decision API state.
-pub const DECISION_API_STATUS_CUSTOM_TYPE: &str = "decision_api_status";
-
-/// Decode a durable status row's enabled flag. Missing, null, or malformed
-/// details read as off rather than reviving older state.
-#[must_use]
-pub fn decision_api_enabled_from_status_details(details: Option<&serde_json::Value>) -> bool {
-    details
-        .and_then(|details| details.get("enabled"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-}
-
 #[must_use]
 pub fn is_session_slash_command_name(value: &str) -> bool {
     SESSION_SLASH_COMMAND_NAMES.contains(&value)
@@ -93,7 +78,6 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: &[BuiltinSlashCommand] = &[
     BuiltinSlashCommand { name: "factory", description: "Show or set the agent factory opt-in gate (off by default)", execution: SlashCommandExecution::Client, argument_hint: Some("[on|off|status]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "resume", description: "Open the agents view, or resume a session by id or path", execution: SlashCommandExecution::Client, argument_hint: Some("[id|path]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "reload", description: "Reload keybindings, skills, prompts, and themes", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
-    BuiltinSlashCommand { name: "decision-api", description: "Turn this session's Decision API on or off (the model comes from decisionApi.systemOneModel)", execution: SlashCommandExecution::Session, argument_hint: Some("[on|off]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "speed", description: "Toggle footer readout of model output tok/sec (latest response and session average)", execution: SlashCommandExecution::Client, argument_hint: Some("[on|off]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "quit", description: "Quit Prime Agent", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
 ];

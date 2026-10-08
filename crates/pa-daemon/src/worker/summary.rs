@@ -136,9 +136,6 @@ impl Worker {
             context_usage: store.and_then(|store| {
                 crate::session_stats::store_context_usage(store, inputs.model_context_window)
             }),
-            decision_api: store
-                .and_then(crate::session_store::SessionFile::decision_api_enabled)
-                .filter(|enabled| *enabled),
         }
     }
 
@@ -660,7 +657,3 @@ pub(crate) fn compact_action_label(text: &str) -> String {
     let kept: String = compact.chars().take(MAX_CHARS - 3).collect();
     format!("{}...", kept.trim_end())
 }
-
-#[cfg(test)]
-#[path = "decision_api_snapshot_tests.rs"]
-mod decision_api_snapshot_tests;

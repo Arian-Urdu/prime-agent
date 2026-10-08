@@ -336,9 +336,9 @@ fn python_skill_functions(package_path: &Path) -> Vec<String> {
 }
 
 /// Bundled skills that are gated: the auth-gated builtin MCP integrations
-/// (disabled when the user is not logged in) and the Decision API (off
-/// until `/decision-api`). The prompt documents them only through the
-/// dynamic skills inventory, not as API surface.
+/// (disabled when the user is not logged in) and the Decision API (hidden
+/// while decisionApi.systemOneModel is unset). The prompt documents them only
+/// through the dynamic skills inventory, not as API surface.
 fn gated_bundled_skills() -> BTreeSet<String> {
     pa_core::mcp::BUILTIN_MCP_CATALOG
         .iter()

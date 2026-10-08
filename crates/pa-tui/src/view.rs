@@ -85,7 +85,7 @@ pub struct AgentView {
     pub provider_auth: Option<crate::provider_auth::ProviderAuthSelector>,
     pub auth_panel: Option<crate::auth_panel::AuthPanel>,
     pub fork_selector: Option<crate::user_message_selector::UserMessageSelector>,
-    /// The `/effort` and `/decision-api` inline picker (TS
+    /// The `/effort` inline picker (TS
     /// `ThinkingSelectorComponent` seam): while set, it owns the whole frame
     /// like the model picker.
     pub(crate) choice_picker: Option<crate::choice_picker::ChoicePicker>,

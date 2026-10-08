@@ -490,4 +490,4 @@ mod compaction_outcome_tests;
 #[cfg(test)]
 mod compaction_unblocked_tests;
 #[cfg(test)]
-mod decision_restore_tests;
+mod decision_runtime_tests;

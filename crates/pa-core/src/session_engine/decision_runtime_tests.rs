@@ -1,34 +1,13 @@
-//! Decision-API state is branch metadata, independent of the prompt window.
+//! The Decision API's real-runtime fixtures: the kernel's settings-gated
+//! skill pre-import and the real skill loop over the host bridge.
 
 use std::path::Path;
 
-use pa_types::session::FileEntry;
-use pa_types::slash_commands::DECISION_API_STATUS_CUSTOM_TYPE;
 use serde_json::json;
 
 use super::engine::{create_session, SessionEngine, SessionEngineConfig};
-use crate::session::manager::SessionManager;
 
-fn compacted_history(enabled: bool) -> String {
-    let mut rows = vec![
-        json!({"type":"session","id":"s","version":3,"cwd":"/tmp","timestamp":"2026-01-01T00:00:00Z"}),
-        json!({"type":"custom_message","id":"older","parentId":null,"customType":DECISION_API_STATUS_CUSTOM_TYPE,"content":"enabled","display":false,"details":{"provider":"jev"}}),
-        json!({"type":"custom_message","id":"state","parentId":"older","customType":DECISION_API_STATUS_CUSTOM_TYPE,"content":"selected","display":false,"details":{"enabled":enabled}}),
-        // A physically newer sibling must not override the selected branch.
-        json!({"type":"custom_message","id":"sibling","parentId":"older","customType":DECISION_API_STATUS_CUSTOM_TYPE,"content":"sibling","display":false,"details":{"provider":"jev"}}),
-    ];
-    let mut parent = "state".to_string();
-    for i in 0..220 {
-        let id = format!("u{i}");
-        rows.push(json!({"type":"message","id":id,"parentId":parent,"message":{"role":"user","content":format!("message {i}"),"timestamp":0}}));
-        parent = id;
-    }
-    rows.push(json!({"type":"compaction","id":"compact","parentId":parent,"summary":"summary","firstKeptEntryId":"u210","tokensBefore":999}));
-    rows.push(json!({"type":"message","id":"leaf","parentId":"compact","message":{"role":"user","content":"latest","timestamp":0}}));
-    rows.into_iter().map(|row| row.to_string() + "\n").collect()
-}
-
-async fn build_session(root: &Path, manager: SessionManager) -> SessionEngine {
+async fn build_session(root: &Path, agent_dir: &std::path::Path) -> SessionEngine {
     let model = pa_agent::types::Model {
         id: "m".into(),
         name: "m".into(),
@@ -42,12 +21,9 @@ async fn build_session(root: &Path, manager: SessionManager) -> SessionEngine {
         max_tokens_explicit: false,
     };
     let provider = std::sync::Arc::new(pa_agent::scripted::ScriptedProvider::new(model.clone()));
-    let conversation_log_path = manager.get_session_file().map(Path::to_path_buf);
     create_session(SessionEngineConfig {
         cwd: root.to_path_buf(),
-        agent_dir: root.join("agent"),
-        session_manager: Some(manager),
-        conversation_log_path,
+        agent_dir: agent_dir.to_path_buf(),
         model: Some(model),
         stream_fn: Some(provider.stream_fn()),
         ..Default::default()
@@ -56,119 +32,11 @@ async fn build_session(root: &Path, manager: SessionManager) -> SessionEngine {
     .unwrap()
 }
 
-#[tokio::test]
-async fn decision_api_constructor_restores_compacted_windowed_restarted_and_forked_sessions() {
-    for enabled in [true, false] {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("source.jsonl");
-        let session_dir = dir.path().join("sessions");
-        std::fs::create_dir(&session_dir).unwrap();
-        std::fs::write(&path, compacted_history(enabled)).unwrap();
-        let full = SessionManager::open(dir.path(), &session_dir, &path);
-        let window = SessionManager::open_windowed(dir.path(), &session_dir, &path)
-            .await
-            .unwrap();
-        assert!(!window.is_full_history());
-        // Reopening exercises the cached window metadata as well as its cold walk.
-        let restarted = SessionManager::open_windowed(dir.path(), &session_dir, &path)
-            .await
-            .unwrap();
-        let forked =
-            SessionManager::fork_from(&path, dir.path(), &dir.path().join("forks")).unwrap();
-        for manager in [full, window, restarted, forked] {
-            assert_eq!(manager.decision_api_enabled(), enabled);
-            assert!(manager.active_context().messages.iter().all(|message| {
-                !matches!(message, pa_types::session::AgentMessage::Custom(custom)
-                    if custom.custom_type == DECISION_API_STATUS_CUSTOM_TYPE)
-            }));
-            let engine = build_session(dir.path(), manager).await;
-            assert_eq!(engine.decision_api_switch().is_enabled(), enabled);
-            assert_eq!(
-                engine.system_prompt().contains("<name>decision-api</name>"),
-                enabled
-            );
-            assert_eq!(
-                engine.session.agent().state().await.system_prompt,
-                engine.system_prompt()
-            );
-            {
-                let persistence = engine.session.shared_persistence();
-                let manager = persistence.lock().await;
-                assert_eq!(
-                    (manager.has_thinking_level(), manager.has_service_tier()),
-                    (true, true),
-                );
-            }
-            engine.dispose_kernel().await;
-        }
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let manager = SessionManager::in_memory(dir.path());
-    assert_eq!(
-        (
-            manager.active_context().model,
-            manager.has_thinking_level(),
-            manager.has_service_tier()
-        ),
-        (None, false, false),
-    );
-    let fresh = build_session(dir.path(), manager).await;
-    {
-        let persistence = fresh.session.shared_persistence();
-        let manager = persistence.lock().await;
-        assert_eq!(
-            (
-                manager.active_context().model,
-                manager.has_thinking_level(),
-                manager.has_service_tier()
-            ),
-            (Some(("test".to_string(), "m".to_string())), true, true),
-        );
-    }
-    fresh.dispose_kernel().await;
-}
-
-#[tokio::test]
-async fn decision_api_branch_navigation_restores_metadata_before_the_compaction_boundary() {
-    let dir = tempfile::tempdir().unwrap();
-    let entries = crate::session::parse_session_entries(&compacted_history(true));
-    let mut manager = SessionManager::in_memory(dir.path());
-    manager.adopt_entries(entries.clone());
-    let engine = build_session(dir.path(), manager).await;
-    let mut sibling = SessionManager::in_memory(dir.path());
-    sibling.adopt_entries(entries.clone());
-    sibling.branch("sibling");
-    let sibling_entries: Vec<FileEntry> = sibling.get_branch(None).into_iter().cloned().collect();
-    engine
-        .session
-        .rebuild_branch_context(sibling_entries)
-        .await
-        .unwrap();
-    engine.sync_decision_api_from_session().await;
-    assert!(!engine.decision_api_switch().is_enabled());
-    engine
-        .session
-        .rebuild_branch_context(entries)
-        .await
-        .unwrap();
-    engine.sync_decision_api_from_session().await;
-    assert!(engine.decision_api_switch().is_enabled());
-    engine
-        .session
-        .rebuild_branch_context(Vec::new())
-        .await
-        .unwrap();
-    engine.sync_decision_api_from_session().await;
-    assert!(!engine.decision_api_switch().is_enabled());
-    assert!(!engine.system_prompt().contains("<name>decision-api</name>"));
-    engine.dispose_kernel().await;
-}
-
 // Real fixtures own their process-wide kernel registry and environment.
 #[tracing::instrument]
 async fn run_runtime_fixture_in_child(name: &str) -> bool {
     const CHILD_FIXTURE: &str = "PA_DECISION_API_RUNTIME_FIXTURE_CHILD";
-    let test = format!("session_engine::decision_restore_tests::{name}");
+    let test = format!("session_engine::decision_runtime_tests::{name}");
     if std::env::var(CHILD_FIXTURE).as_deref() == Ok(test.as_str()) {
         return false;
     }
@@ -205,10 +73,10 @@ async fn run_runtime_fixture_in_child(name: &str) -> bool {
 }
 
 #[tokio::test]
-async fn decision_api_real_kernel_restores_the_switch_and_changes_preimports_on_and_off() {
+async fn decision_api_preimports_the_skill_only_while_the_setting_is_set() {
     use crate::kernel::shared::{ExecuteOptions, ExecuteStatus};
     if run_runtime_fixture_in_child(
-        "decision_api_real_kernel_restores_the_switch_and_changes_preimports_on_and_off",
+        "decision_api_preimports_the_skill_only_while_the_setting_is_set",
     )
     .await
     {
@@ -227,18 +95,19 @@ async fn decision_api_real_kernel_restores_the_switch_and_changes_preimports_on_
         eprintln!("skipping decision API real-kernel verifier: no installed kernel Python");
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("source.jsonl");
-    let session_dir = dir.path().join("sessions");
-    std::fs::create_dir(&session_dir).unwrap();
-    std::fs::write(&path, compacted_history(true)).unwrap();
-    let manager = SessionManager::open(dir.path(), &session_dir, &path);
-    let engine = build_session(dir.path(), manager).await;
-    for (turn, (enabled, available)) in [(true, true), (false, false), (true, true)]
-        .into_iter()
-        .enumerate()
-    {
-        engine.set_decision_api(enabled).await;
+    for (configured, expected) in [(true, "True"), (false, "False")] {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let settings = if configured {
+            json!({ "decisionApi": { "systemOneModel": "fixture/model" } })
+        } else {
+            json!({})
+        };
+        std::fs::write(agent_dir.join("settings.json"), settings.to_string()).unwrap();
+        let engine = build_session(dir.path(), &agent_dir).await;
+        let skill_entry = "<name>decision-api</name>";
+        assert_eq!(engine.system_prompt.contains(skill_entry), configured);
         let kernel = tokio::time::timeout(
             std::time::Duration::from_secs(60),
             engine.provisioner.ensure(None, None),
@@ -246,12 +115,7 @@ async fn decision_api_real_kernel_restores_the_switch_and_changes_preimports_on_
         .await
         .expect("kernel bootstrap deadline")
         .expect("real kernel must start");
-        let code = format!(
-            "assert ('decision_api' in globals()) == {available}\n\
-             answer = globals().get('answer', 41) + 1\n\
-             print(answer)",
-            available = if available { "True" } else { "False" },
-        );
+        let code = format!("assert ('decision_api' in globals()) == {expected}\nprint('ok')");
         let result = kernel
             .execute(&code, ExecuteOptions::default())
             .await
@@ -264,17 +128,9 @@ async fn decision_api_real_kernel_restores_the_switch_and_changes_preimports_on_
             result.stdout,
             result.stderr
         );
-        // The counter's value carries across kernel restarts (the revived
-        // namespace), so each boot adds one to the previous run's answer.
-        let expected = match turn {
-            0 => "42\n",
-            1 => "43\n",
-            _ => "44\n",
-        };
-        assert_eq!(result.stdout, expected);
+        engine.dispose_kernel().await;
     }
-    engine.dispose_kernel().await;
-    println!("DECISION_API_REAL_FIXTURE_EXECUTED: decision_api_real_kernel_restores_the_switch_and_changes_preimports_on_and_off");
+    println!("DECISION_API_REAL_FIXTURE_EXECUTED: decision_api_preimports_the_skill_only_while_the_setting_is_set");
 }
 
 #[tokio::test]

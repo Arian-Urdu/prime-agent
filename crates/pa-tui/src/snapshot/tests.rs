@@ -2142,6 +2142,3 @@ fn elided_image_tool_results_render_their_marker_metadata() {
 }
 
 mod thinking_pins;
-
-/// The `/decision-api` state pins: the attach state and the status rows.
-mod decision_api;

@@ -1,8 +1,8 @@
 """Prime Agent decision-api skill: an experimental System 1 / System 2 loop.
 
 System 1 is the session's decision model: the model the user named in the
-decisionApi.systemOneModel setting, switched on per session with
-/decision-api on. One call per observation picks the next action. System 2 is
+decisionApi.systemOneModel setting. One call per observation picks the next
+action. System 2 is
 a Prime Agent subagent that
 reads the newest observation plus System 1's action history and writes the
 sub-goal System 1 follows. The calling agent operates the loop: it starts it,

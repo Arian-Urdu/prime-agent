@@ -95,9 +95,7 @@ pub struct SessionEngine {
     pub skill_diagnostics: Vec<crate::skills::ResourceDiagnostic>,
     pub prompt_templates: Vec<PromptTemplate>,
     pub agents_files: Vec<crate::resources::ContextFile>,
-    /// The Decision API switch and the two system prompts it selects
-    /// between ([`SessionEngine::system_prompt`]).
-    pub(crate) decision_api: super::decision_api::DecisionApiSession,
+    pub system_prompt: String,
     /// The same instance the kernel `goal.*` host handlers reach, so `/goal`
     /// and `goal.complete()` observe one state machine.
     pub goal_driver: std::sync::Arc<tokio::sync::Mutex<super::goal_driver::GoalDriver>>,
@@ -181,8 +179,6 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         .unwrap_or_else(|| SessionManager::in_memory(&cwd));
     let owns_resume_settings =
         session_manager.is_persisted() || config.conversation_log_path.is_none();
-    let decision_api =
-        super::decision_api::DecisionApiSwitch::new(session_manager.decision_api_enabled());
     let conversation_log = {
         let session = &session_manager;
         session
@@ -208,6 +204,10 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
 
     let settings = crate::settings::SettingsManager::create(&cwd, &config.agent_dir);
     let service_tier_preference = settings.get_default_service_tier();
+    // Captured before `settings` moves into the resource loader: whether the
+    // decision-api skill's settings gate is set (the prompt and the kernel's
+    // pre-import filter read it below).
+    let decision_api_configured = super::decision_api::decision_api_configured(settings.settings());
     // Captured before `settings` moves into the resource loader: the
     // compaction budget and the auto-refine gates.
     let compaction_settings = settings.settings().compaction.clone().unwrap_or_default();
@@ -313,7 +313,6 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     turn_boundary.register_model_info_handler(&mut handlers, model_info.clone());
     super::decision_api::register_decision_api_handler(
         &mut handlers,
-        decision_api.clone(),
         cwd.clone(),
         config.agent_dir.clone(),
     );
@@ -400,12 +399,8 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         )
             as crate::kernel::provisioner::UnavailableSkillsCallback)
     };
-    let preimport_filter = {
-        let decision_api = decision_api.clone();
-        std::sync::Arc::new(move |skill: &crate::kernel::bootstrap::KernelPythonSkill| {
-            skill.name != super::decision_api::DECISION_API_SKILL_NAME || decision_api.is_enabled()
-        })
-    };
+    let preimport_filter =
+        super::decision_api::decision_api_preimport_filter(decision_api_configured);
     let provisioner = super::runtime_wiring::kernel_provisioner(
         session_id,
         handlers,
@@ -469,8 +464,8 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
 
     let prompt_model_selector = Some(format!("{}/{}", model_info.provider, model_info.id));
     let prompt_vision_capable = Some(model_info.input.contains(&pa_types::ai::ModelInput::Image));
-    // Two prompts, selected by the session's Decision API switch: only the
-    // switched-on one lists the decision-api skill.
+    // The settings gate decides the prompt's decision-api skill: the skill
+    // rides the prompt only while decisionApi.systemOneModel is set.
     let mut prompt_options = crate::prompts::system_prompt::BuildSystemPromptOptions {
         custom_prompt: resources.system_prompt.clone(),
         model: prompt_model_selector.as_deref(),
@@ -497,24 +492,21 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         prompt_guidelines: Some(prompt_guidelines),
         ..Default::default()
     };
-    let decision_api = super::decision_api::DecisionApiSession {
-        switch: decision_api,
-        cwd: cwd.clone(),
-        agent_dir: config.agent_dir.clone(),
-        prompt_on: crate::prompts::system_prompt::build_system_prompt(&prompt_options),
-        prompt_off: {
-            prompt_options
-                .skills
-                .retain(|skill| skill.name != super::decision_api::DECISION_API_SKILL_NAME);
-            crate::prompts::system_prompt::build_system_prompt(&prompt_options)
-        },
-    };
-    // The gated skill is reachable only through the switched-on prompt, never
-    // as a `/skill:` command.
+    if !decision_api_configured {
+        prompt_options
+            .skills
+            .retain(|skill| skill.name != super::decision_api::DECISION_API_SKILL_NAME);
+    }
+    let system_prompt = crate::prompts::system_prompt::build_system_prompt(&prompt_options);
+    // While the gate is off the skill is unreachable: the prompt omits it
+    // and `/skill:` cannot invoke it; while it is on, the skill is an
+    // ordinary session skill.
     let session_skills: Vec<crate::skills::Skill> = resources
         .skills
         .iter()
-        .filter(|skill| skill.name != super::decision_api::DECISION_API_SKILL_NAME)
+        .filter(|skill| {
+            decision_api_configured || skill.name != super::decision_api::DECISION_API_SKILL_NAME
+        })
         .cloned()
         .collect();
 
@@ -607,11 +599,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     };
     let agent = Agent::new(AgentOptions {
         initial_state: AgentInitialState {
-            system_prompt: Some(if decision_api.switch.is_enabled() {
-                decision_api.prompt_on.clone()
-            } else {
-                decision_api.prompt_off.clone()
-            }),
+            system_prompt: Some(system_prompt.clone()),
             model: Some(model),
             thinking_level: Some(thinking_level),
             tools: Some(tools),
@@ -794,7 +782,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         skill_diagnostics: resources.skill_diagnostics,
         prompt_templates: resources.prompts,
         agents_files: resources.agents_files,
-        decision_api,
+        system_prompt,
         goal_driver,
         queued_goal_context_purge: config.queued_goal_context_purge.clone(),
         mcp_manager,

@@ -82,9 +82,6 @@ pub struct ChromeState {
     /// The footer's tok/sec readout: the dim bottom row's text; `None`
     /// renders no row (kept until the first completed response).
     pub speed_text: Option<String>,
-    /// The session's Decision API while it is on (`/decision-api on`): the
-    /// dock renders the accent-colored `Decision API enabled` row.
-    pub decision_api: bool,
     /// Hide the splash `cwd` line (the scoped agents view keeps its
     /// metadata rows centered against the logo).
     pub splash_hide_cwd: bool,
@@ -846,14 +843,6 @@ pub fn render_speed_footer(text: &str, theme: &Theme, width: usize) -> Line {
     let dim = theme.fg_style(ThemeColor::Dim);
     let text = truncate_to_width(text, width, "");
     vec![Span::styled(text, dim)]
-}
-
-/// The footer row shown while the session has the Decision API on.
-#[must_use]
-pub(crate) fn render_decision_api_footer(theme: &Theme, width: usize) -> Line {
-    let text = "Decision API enabled";
-    let text = truncate_to_width(text, width, "");
-    vec![Span::styled(text, theme.fg_style(ThemeColor::Accent))]
 }
 
 /// The editor surface background: `userMessageBg` (TS `getEditorTheme`).

@@ -1,30 +1,25 @@
-//! The experimental Decision API: off by default and switched per session by
-//! `/decision-api on|off`. While a session's switch is off, its prompt omits
-//! the decision-api skill, the kernel does not pre-import `decision_api`,
-//! and the host refuses `decision_api.decide`. The newest durable
-//! `decision_api_status` row in the selected session branch is the session's
-//! state, so a rebuilt or resumed session adopts it again.
-//!
-//! The host side of the skill: the kernel sends a decision request body
-//! (`state`, `questions`, and `images` for vision-capable models) and the
-//! host serves it with the model named by `settings.decisionApi.systemOneModel`
-//! — the same registry resolution and provider transports as any other model
-//! call (`find_exact_model_reference_match` + `get_api_key_and_headers`), so
-//! the resolved key never enters the kernel process.
+//! The experimental Decision API host: the `decision_api.decide` handler the
+//! bundled decision-api skill calls, and the settings gate that controls the
+//! skill's availability. The decision model is the `decisionApi.systemOneModel`
+//! settings reference — resolved through the model registry exactly like
+//! `imageModel` — and requests ride the ordinary provider transports, so the
+//! Decision API has no transport, envelope, or credential store of its own.
+//! The setting is the feature gate: unset (or unresolvable) and the skill
+//! stays out of the prompt and every `decide()` refuses with an actionable
+//! message naming the setting.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{anyhow, bail};
 use pa_types::ai::{ModelInput, StopReason};
 use serde_json::{json, Value};
+use std::sync::Arc;
 
-use super::engine::SessionEngine;
 use crate::kernel::shared::{host_handler, HostRequestHandlers};
 use crate::models::{find_exact_model_reference_match, ModelRegistry};
 
-/// The bundled skill the switch gates.
+/// The bundled skill the setting gates.
 pub const DECISION_API_SKILL_NAME: &str = "decision-api";
 /// The default decision instructions (the skill's `DEFAULT_INSTRUCTIONS`).
 const DEFAULT_INSTRUCTIONS: &str =
@@ -35,57 +30,6 @@ const DECISION_MAX_TOKENS: u64 = 512;
 const DECISION_TIMEOUT_MS: u64 = 30_000;
 /// The request's image cap (the skill mirrors it client-side).
 const MAX_IMAGES: usize = 4;
-
-/// One session's Decision API switch: off by default. Clones share the
-/// state: the host handler, the kernel's pre-import filter, and the prompt
-/// selection read one switch.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct DecisionApiSwitch(Arc<Mutex<bool>>);
-
-impl DecisionApiSwitch {
-    pub(crate) fn new(enabled: bool) -> Self {
-        Self(Arc::new(Mutex::new(enabled)))
-    }
-
-    #[must_use]
-    pub(crate) fn is_enabled(&self) -> bool {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Returns the previous state.
-    fn replace(&self, enabled: bool) -> bool {
-        std::mem::replace(
-            &mut *self.0.lock().unwrap_or_else(PoisonError::into_inner),
-            enabled,
-        )
-    }
-}
-
-/// A session's Decision API wiring: the switch plus the two system prompts
-/// it selects between.
-pub(crate) struct DecisionApiSession {
-    pub(crate) switch: DecisionApiSwitch,
-    pub(crate) cwd: PathBuf,
-    pub(crate) agent_dir: PathBuf,
-    pub(crate) prompt_on: String,
-    pub(crate) prompt_off: String,
-}
-
-/// The status row's content: what the model learns about the switch.
-pub(crate) fn status_note(enabled: bool, model: Option<&str>) -> String {
-    if !enabled {
-        return "[decision-api: off] The user turned the Decision API off for this session: \
-                the decision-api skill and the `decision_api` module are no longer available."
-            .to_string();
-    }
-    let model = model.unwrap_or("the decisionApi.systemOneModel setting's model");
-    format!(
-        "[decision-api: on] The user enabled the Decision API for this session: the decision-api \
-         skill is in your skills list and `decision_api` is pre-imported in the Python kernel. \
-         Decision requests use {model} from the decisionApi.systemOneModel setting; a \
-         vision-capable model there also accepts decision images."
-    )
-}
 
 /// One parsed decision request: what System 1 is asked.
 #[derive(Debug, Clone)]
@@ -225,13 +169,39 @@ fn unconfigured_message() -> String {
         .to_string()
 }
 
+/// Whether the Decision API is configured: `decisionApi.systemOneModel` is
+/// set to a non-empty reference. This gates the skill's prompt inclusion and
+/// kernel pre-import; `decide()` resolves the reference at call time.
+#[must_use]
+pub fn decision_api_configured(settings: &crate::settings::types::Settings) -> bool {
+    settings
+        .decision_api
+        .as_ref()
+        .and_then(|decision| decision.system_one_model.as_deref())
+        .is_some_and(|reference| !reference.trim().is_empty())
+}
+
+/// The pre-import filter that withholds the decision-api skill while it is
+/// unconfigured; a configured gate pre-imports every skill.
+#[must_use]
+pub fn decision_api_preimport_filter(
+    configured: bool,
+) -> crate::kernel::provisioner::PythonSkillPreimportFilter {
+    if configured {
+        return Arc::new(|_| true);
+    }
+    Arc::new(|skill: &crate::kernel::bootstrap::KernelPythonSkill| {
+        skill.name != DECISION_API_SKILL_NAME
+    })
+}
+
 /// The actionable refusal when the configured reference does not resolve to
 /// an available, authenticated model (the `imageModel` refusal shape).
 fn unusable_message(reference: &str) -> String {
     format!(
         "decisionApi.systemOneModel \"{reference}\" could not be resolved to an available, \
          authenticated model.\n\nFix the decisionApi.systemOneModel setting (settings.json) or \
-         authenticate the provider, then run /decision-api on."
+         authenticate the provider, then retry the decision."
     )
 }
 
@@ -451,27 +421,19 @@ async fn serve_decision(
     }))
 }
 
-/// Register `decision_api.decide`, gated by `switch`, resolving the decision
-/// model from the settings under `agent_dir`.
+/// Register `decision_api.decide`, resolving the decision model from the
+/// settings under `agent_dir` on every call.
 pub(crate) fn register_decision_api_handler(
     handlers: &mut HostRequestHandlers,
-    switch: DecisionApiSwitch,
     cwd: PathBuf,
     agent_dir: PathBuf,
 ) {
     handlers.register(
         "decision_api.decide",
         host_handler(move |payload| {
-            let switch = switch.clone();
             let cwd = cwd.clone();
             let agent_dir = agent_dir.clone();
             Box::pin(async move {
-                if !switch.is_enabled() {
-                    bail!(
-                        "The Decision API is off for this session. Ask the user to run \
-                         /decision-api on."
-                    );
-                }
                 let Some(Value::Object(request)) = payload.data.get("request").cloned() else {
                     bail!("decision_api.decide needs a request object");
                 };
@@ -492,64 +454,6 @@ pub(crate) fn register_decision_api_handler(
     );
 }
 
-impl SessionEngine {
-    /// The system prompt the session runs with now.
-    #[must_use]
-    pub fn system_prompt(&self) -> &str {
-        if self.decision_api.switch.is_enabled() {
-            &self.decision_api.prompt_on
-        } else {
-            &self.decision_api.prompt_off
-        }
-    }
-
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn decision_api_switch(&self) -> DecisionApiSwitch {
-        self.decision_api.switch.clone()
-    }
-
-    /// Whether `/decision-api on` can succeed: the settings reference must
-    /// resolve to an available, authenticated model. Returns its label for
-    /// the status note.
-    #[tracing::instrument(skip(self))]
-    pub(crate) fn decision_api_model_ready(&self) -> Result<String, String> {
-        resolve_decision_model(&self.decision_api.cwd, &self.decision_api.agent_dir)
-            .map(|r| r.label())
-    }
-
-    /// Turn the session's Decision API on or off. Switching swaps the system
-    /// prompt and restarts the kernel (its namespace revives from the stop's
-    /// snapshot), so the new kernel pre-imports `decision_api` only while it
-    /// is on.
-    #[tracing::instrument(skip(self))]
-    pub(crate) async fn set_decision_api(&self, enabled: bool) {
-        let previous = self.decision_api.switch.replace(enabled);
-        if previous == enabled {
-            return;
-        }
-        self.session
-            .agent()
-            .set_system_prompt(self.system_prompt())
-            .await;
-        self.stop_kernel_snapshot().await;
-        self.provisioner.prewarm();
-    }
-
-    /// Adopt the selected branch's newest durable `/decision-api` state,
-    /// including rows before its compacted transcript. Hosts call this after
-    /// moving a session between branches.
-    #[tracing::instrument(skip(self))]
-    pub async fn sync_decision_api_from_session(&self) {
-        let enabled = {
-            let session = self.session.session_handle().clone();
-            let session = session.lock().await;
-            session.decision_api_enabled()
-        };
-        self.set_decision_api(enabled).await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,18 +461,9 @@ mod tests {
     use std::path::Path;
 
     /// The registered `decision_api.decide`, called with a payload's data.
-    fn decider(
-        switch: &DecisionApiSwitch,
-        cwd: &Path,
-        agent_dir: &Path,
-    ) -> impl Fn(Value) -> HostHandlerFuture {
+    fn decider(cwd: &Path, agent_dir: &Path) -> impl Fn(Value) -> HostHandlerFuture {
         let mut handlers = HostRequestHandlers::default();
-        register_decision_api_handler(
-            &mut handlers,
-            switch.clone(),
-            cwd.to_path_buf(),
-            agent_dir.to_path_buf(),
-        );
+        register_decision_api_handler(&mut handlers, cwd.to_path_buf(), agent_dir.to_path_buf());
         let decide = handlers
             .get("decision_api.decide")
             .expect("registered")
@@ -608,7 +503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decide_refuses_while_the_switch_is_off_or_the_setting_is_unusable() {
+    async fn decide_refuses_while_the_setting_is_missing_or_unusable() {
         let dir = tempfile::tempdir().unwrap();
         fixture_agent_dir(
             dir.path(),
@@ -616,18 +511,11 @@ mod tests {
             r#"["text"]"#,
         )
         .unwrap();
-        let switch = DecisionApiSwitch::default();
-        let call = decider(&switch, dir.path(), dir.path());
+        let call = decider(dir.path(), dir.path());
         let request = json!({ "request": { "state": {}, "questions": { "action": {
             "type": "choice",
             "criteria": { "left": "go left" }
         } } } });
-        // The switch gates before anything else: no settings read runs.
-        assert_eq!(
-            call(request.clone()).await.unwrap_err().to_string(),
-            "The Decision API is off for this session. Ask the user to run /decision-api on."
-        );
-        switch.replace(true);
         let error = |data| async { call(data).await.unwrap_err().to_string() };
         // An unset reference and an unresolvable one name the setting.
         fixture_agent_dir(dir.path(), None, r#"["text"]"#).unwrap();
@@ -646,7 +534,7 @@ mod tests {
             "{refusal}"
         );
         assert!(
-            refusal.contains("run /decision-api on"),
+            refusal.contains("or authenticate the provider"),
             "the refusal names the recovery: {refusal}"
         );
         // A configured but unauthenticated reference is unusable too: the
@@ -679,8 +567,7 @@ mod tests {
             r#"["text"]"#,
         )
         .unwrap();
-        let switch = DecisionApiSwitch::new(true);
-        let call = decider(&switch, dir.path(), dir.path());
+        let call = decider(dir.path(), dir.path());
         let error = |data| async { call(data).await.unwrap_err().to_string() };
         let base = |request: Value| json!({ "request": request });
         assert_eq!(
@@ -760,8 +647,7 @@ mod tests {
             r#"["text"]"#,
         )
         .unwrap();
-        let switch = DecisionApiSwitch::new(true);
-        let call = decider(&switch, dir.path(), dir.path());
+        let call = decider(dir.path(), dir.path());
         let request = json!({ "request": { "state": {}, "questions": { "action": {
             "type": "choice", "criteria": { "left": "go left", "right": "go right" }
         } }, "images": [ "data:image/png;base64,AA==" ] } });
@@ -798,8 +684,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         fixture_agent_dir(dir.path(), Some("decision-model"), r#"["text", "image"]"#).unwrap();
-        let switch = DecisionApiSwitch::new(true);
-        let call = decider(&switch, dir.path(), dir.path());
+        let call = decider(dir.path(), dir.path());
 
         // The served reply names an unrequested action: the refusal proves
         // the criteria reached the parse and the choice check is enforced.
@@ -889,8 +774,7 @@ mod tests {
                 && received
                     .iter()
                     .all(|key| key.as_deref() == Some("fixture-key")),
-            "the registry-resolved key reaches the provider on every call: {:?}",
-            received
+            "the registry-resolved key reaches the provider on every call: {received:?}"
         );
     }
 

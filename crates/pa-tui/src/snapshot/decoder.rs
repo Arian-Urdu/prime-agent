@@ -16,9 +16,6 @@ pub enum TurnUpdate {
     SessionInfoChanged { name: Option<String> },
     /// `service_tier_changed`: the session's effective service tier.
     ServiceTierChanged { tier: String },
-    /// A `decision_api_status` row: `/decision-api` switched the session's
-    /// Decision API on or off.
-    DecisionApiChanged { enabled: bool },
     /// `message_start` with a user message.
     UserMessage(String),
     /// An assistant message; `streaming` distinguishes in-flight from
@@ -431,20 +428,8 @@ pub fn working_message_from_update(partial: &Value) -> Option<String> {
 
 /// Decode one `custom`-role wire message into its transcript update: the
 /// session-command echo/result rows render; an invalid payload renders
-/// the malformed notice; a `decision_api_status` row switches the footer;
-/// everything else renders nothing.
+/// the malformed notice; everything else renders nothing.
 fn custom_row_update(message: &Value) -> Option<TurnUpdate> {
-    if message.get("customType").and_then(Value::as_str)
-        == Some(pa_types::slash_commands::DECISION_API_STATUS_CUSTOM_TYPE)
-    {
-        if let Some(enabled) = message
-            .get("details")
-            .and_then(|details| details.get("enabled"))
-            .and_then(Value::as_bool)
-        {
-            return Some(TurnUpdate::DecisionApiChanged { enabled });
-        }
-    }
     let entries = custom_message_entries(message);
     match entries.first() {
         Some(entry) => Some(TurnUpdate::CustomRow(entry.clone())),

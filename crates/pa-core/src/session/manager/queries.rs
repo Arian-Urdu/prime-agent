@@ -205,30 +205,6 @@ impl SessionManager {
         false
     }
 
-    /// The selected branch's durable Decision API state, including status
-    /// rows before the compaction boundary without hydrating message bodies.
-    pub(crate) fn decision_api_enabled(&self) -> bool {
-        let status = self
-            .active_branch_entries()
-            .into_iter()
-            .rev()
-            .find_map(decision_api_state);
-        if let Some(status) = status {
-            return status;
-        }
-        self.window.as_ref().is_some_and(|window| {
-            window
-                .metadata_entries()
-                .iter()
-                .rev()
-                .find_map(|line| {
-                    let entry = serde_json::from_str::<FileEntry>(line).ok()?;
-                    decision_api_state(&entry)
-                })
-                .unwrap_or(false)
-        })
-    }
-
     #[must_use]
     pub fn active_goal_state(&self) -> Option<crate::goals::GoalState> {
         if let Some(window) = &self.window {
@@ -548,20 +524,4 @@ impl SessionManager {
         );
         self.label_timestamps_by_id.get(target_id).cloned()
     }
-}
-
-fn decision_api_state(entry: &FileEntry) -> Option<bool> {
-    use pa_types::slash_commands::{
-        decision_api_enabled_from_status_details, DECISION_API_STATUS_CUSTOM_TYPE,
-    };
-    let FileEntry::CustomMessage { payload, .. } = entry else {
-        return None;
-    };
-    if payload.custom_type != DECISION_API_STATUS_CUSTOM_TYPE {
-        return None;
-    }
-    // Missing, null, or malformed details read as off, never older state.
-    Some(decision_api_enabled_from_status_details(
-        payload.details.as_ref(),
-    ))
 }

@@ -79,8 +79,6 @@ pub struct Reconstructed {
     /// The session's effective service tier (`state.serviceTier`), the
     /// `/fast` toggle's baseline.
     pub service_tier: Option<String>,
-    /// The session's Decision API while it is on (`state.decisionApi`).
-    pub decision_api: bool,
 }
 
 impl Reconstructed {
@@ -388,10 +386,6 @@ pub fn reconstruct(attach: &AttachData) -> Reconstructed {
         .and_then(|state| state.get("serviceTier"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    let decision_api = state
-        .and_then(|state| state.get("decisionApi"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let last_user_prompt_ms =
         snapshot
             .get("messages")
@@ -421,7 +415,6 @@ pub fn reconstruct(attach: &AttachData) -> Reconstructed {
         queued,
         service_tier,
         last_user_prompt_ms,
-        decision_api,
     }
 }
 

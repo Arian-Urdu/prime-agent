@@ -473,9 +473,7 @@ impl SessionEngine for AgentSessionEngine {
     /// The built session's assembled prompt (the export embeds it); best-effort.
     fn export_system_prompt(&self) -> Option<String> {
         let session = self.session.try_lock().ok()?;
-        session
-            .as_deref()
-            .map(|core| core.system_prompt().to_string())
+        session.as_deref().map(|core| core.system_prompt.clone())
     }
 
     /// The built session's live tool registry mapped to the export's tools
@@ -771,7 +769,6 @@ impl SessionEngine for AgentSessionEngine {
                 .session
                 .rebuild_branch_context(branch_entries)
                 .await?;
-            engine.sync_decision_api_from_session().await;
             // The rebuilt context reads the moved branch's own latest goal
             // entry; the announcement publishes while the driver lock is held.
             let mut driver = engine.goal_driver.lock().await;
@@ -1160,7 +1157,7 @@ impl SessionEngine for AgentSessionEngine {
             self.ensure_core_session_async(&model).await?;
             let guard = self.session.lock().await;
             let engine = guard.as_deref().expect("session built above");
-            Ok(engine.system_prompt().to_string())
+            Ok(engine.system_prompt.clone())
         })
     }
 

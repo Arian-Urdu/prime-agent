@@ -59,12 +59,6 @@ impl AgentView {
             }
             lines.extend(frame);
         }
-        if self.chrome.decision_api {
-            lines.push(crate::chrome::render_decision_api_footer(
-                &self.theme,
-                width,
-            ));
-        }
         // The `/speed` footer (TS `footerSlot`): a dim row only while
         // the display is on with a sample.
         if let Some(speed) = &self.chrome.speed_text {

@@ -1,6 +1,6 @@
 ---
 name: decision-api
-description: Experimental System 1 / System 2 loop for real-time, low-latency tasks. System 1 is the model named by the decisionApi.systemOneModel setting, choosing every action from observations; the optional System 2 is a subagent for slower, longer-horizon goals. You design, measure, and optimize the whole loop. Requires /decision-api.
+description: Experimental System 1 / System 2 loop for real-time, low-latency tasks. System 1 is the model named by the decisionApi.systemOneModel setting, choosing every action from observations; the optional System 2 is a subagent for slower, longer-horizon goals. You design, measure, and optimize the whole loop. Requires the decisionApi.systemOneModel setting.
 ---
 
 # Decision API (System 1 / System 2)
@@ -10,13 +10,13 @@ action set (a game, a device, a UI) and a full agent turn per step is too slow.
 
 - **System 1** is the decision model the user configured: the
   `decisionApi.systemOneModel` setting names it (a registry model reference
-  like `prime-inference/clef`), and `/decision-api on` switches the session
+  like `prime-inference/clef`), and a resolvable reference turns the feature
   on. Each observation becomes one call that returns the chosen action and
   its confidence. It is an API call, not a subagent: it knows only what one
   request carries (`state`, `images` with a vision-capable model,
-  `instructions`, the action descriptions), so that is how you tune it. The
-  session's status note says which model is active;
-  `loop.status()["system1_model"]` reports it too.
+  `instructions`, the action descriptions), so that is how you tune it.
+  `loop.status()["system1_model"]` reports the model that served each
+  decision.
 - **System 2** (optional, on by default) is one subagent (`rlm.spawn`, your
   model unless set) for longer-horizon decisions. It gets the newest
   observation, System 1's recent actions, and the objective, and writes a new
@@ -65,14 +65,13 @@ writes (see `loop.errors`).
 
 ## Setup
 
-The Decision API is off by default and switched per session: the user sets
+The Decision API is off until configured: the user sets
 `decisionApi.systemOneModel` in settings.json to a registry model reference
-(`"provider/model-id"` or a bare id), then runs `/decision-api on`;
-`/decision-api off` turns it off. The host resolves the model and its
-credentials through the model registry — the same path any other model call
-takes — and makes every provider call. If a call reports that the Decision
-API is off or the setting is not configured, ask the user to fix the setting
-and run `/decision-api`. Do not ask for keys yourself.
+(`"provider/model-id"` or a bare id) and restarts the session or kernel. The
+host resolves the model and its credentials through the model registry — the
+same path any other model call takes — and makes every provider call. If a
+call reports the setting is unset or unresolvable, ask the user to fix the
+setting. Do not ask for keys yourself.
 
 ## Usage
 

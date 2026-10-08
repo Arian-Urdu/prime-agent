@@ -18,27 +18,24 @@ credentials the registry resolves for it — the Decision API has no transport
 or credential store of its own. A vision-capable model there also serves
 decision images.
 
-Run `/decision-api on` to enable the feature for a session and
-`/decision-api off` to disable it. Turning it on requires the configured
-reference to resolve; the failure names the setting and the fix. The switch
-persists with the session's branch, including across compaction and worker
-restart. Forks inherit the configuration at their branch point; switching
-branches restores that branch's selection. Enabling the API adds the bundled
-`decision-api` skill to the system prompt and pre-imports its Python module
-when the kernel boots. Changing between on and off restarts the kernel with
-its saved namespace; stop an active control loop before switching.
+While the setting is unset, the feature stays off: the system prompt omits
+the `decision-api` skill and every decision request refuses with a message
+naming the setting. Setting it to a resolvable reference turns the feature
+on for new sessions and kernels (the prompt inclusion and the kernel's
+pre-import of the `decision_api` module are gated at session and kernel
+start; an existing kernel pre-imports it only after a restart). Stopping an
+active control loop before changing the setting avoids half-learned state.
 
 ## Opt-in live smoke checks
 
 These checks make billed provider requests. Run them only when intentionally
 verifying live access with your own credentials. Normal Rust and Python tests
 use synthetic fixtures and do not establish current production availability or
-latency. No live call is required merely to store the setting or switch the
-session on.
+latency. No live call is required merely to store the setting.
 
-In a Prime Agent session, configure a decision model, run `/decision-api on`,
-and wait for a Python cell to run in the persistent REPL. Execute one text
-decision:
+In a Prime Agent session with the setting configured, wait for a Python cell
+to run in the persistent REPL (restart the kernel if it predates the
+configuration change). Execute one text decision:
 
 ```python
 result = await decision_api.decide(
@@ -58,11 +55,9 @@ single-pixel images. Keep the request synthetic and record the returned
 `model`, action, confidence, and `latency_ms` without credentials. Do not
 demand an exact probability or latency from a nondeterministic live service.
 
-Finally run `/decision-api off`. Confirm the skill disappears from the system
-prompt (`/system-prompt`) and the new kernel does not pre-import
-`decision_api`. If you explicitly import it, `decide` must return the host's
-off-state error before contacting any provider. Re-enable the switch, resume
-after a restart, and confirm the state is retained.
+Clearing the setting hides the skill again on the next session build. If you
+explicitly import it in an unconfigured session, `decide` must refuse with
+the host's message naming the setting before contacting any provider.
 
 The [skill guide](../skills/decision-api/SKILL.md) covers loop design and
 System 2 operation. A provider smoke check verifies a single host call; it

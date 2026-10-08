@@ -171,9 +171,6 @@ pub(crate) struct SessionUi {
     /// `None` until the first sample, a rebind restarts it.
     speed_stats: Option<SpeedStats>,
     service_tier: Option<String>,
-    /// The session's Decision API while it is on, seeded from the attach
-    /// state and kept live by its `decision_api_status` rows.
-    decision_api: bool,
     client_settings: Option<std::sync::Arc<dyn crate::client_settings::ClientSettings>>,
     /// The ban-risk warning's view-local dedup (TS
     /// `anthropicSubscriptionWarningShown`): this VIEW's own

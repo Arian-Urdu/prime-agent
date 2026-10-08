@@ -53,8 +53,7 @@ impl Generation {
 /// version (any other version is rebuilt by the full walk). A served
 /// snapshot's `WindowStats` already folds the child usage attributions,
 /// and unread keys are ignored on load (no `deny_unknown_fields`).
-// Older snapshots omit decision-provider status before compaction.
-pub(super) const SNAPSHOT_VERSION: u32 = 8;
+pub(super) const SNAPSHOT_VERSION: u32 = 7;
 // `retained_whole_file` is `#[serde(default)]` false: older sidecars
 // deserialize it as false and skip the full-history fast paths until the
 // next walk rewrites the sidecar (a version bump would force a re-walk).

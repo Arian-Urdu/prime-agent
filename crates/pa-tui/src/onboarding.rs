@@ -260,7 +260,6 @@ impl OnboardingScreen {
             }
             AuthPanelRequest::ProviderSettled { .. }
             | AuthPanelRequest::McpSettled { .. }
-            | AuthPanelRequest::DecisionApiReady { .. }
             | AuthPanelRequest::TracesSettled { .. } => {}
         }
     }

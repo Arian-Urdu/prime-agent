@@ -1,19 +1,19 @@
-//! Decision-provider state is branch metadata, independent of the prompt window.
+//! Decision-API state is branch metadata, independent of the prompt window.
 
 use std::path::Path;
 
 use pa_types::session::FileEntry;
-use pa_types::slash_commands::{DecisionApiProvider, DECISION_API_STATUS_CUSTOM_TYPE};
+use pa_types::slash_commands::DECISION_API_STATUS_CUSTOM_TYPE;
 use serde_json::json;
 
 use super::engine::{create_session, SessionEngine, SessionEngineConfig};
 use crate::session::manager::SessionManager;
 
-fn compacted_history(provider: Option<DecisionApiProvider>) -> String {
+fn compacted_history(enabled: bool) -> String {
     let mut rows = vec![
         json!({"type":"session","id":"s","version":3,"cwd":"/tmp","timestamp":"2026-01-01T00:00:00Z"}),
         json!({"type":"custom_message","id":"older","parentId":null,"customType":DECISION_API_STATUS_CUSTOM_TYPE,"content":"enabled","display":false,"details":{"provider":"jev"}}),
-        json!({"type":"custom_message","id":"state","parentId":"older","customType":DECISION_API_STATUS_CUSTOM_TYPE,"content":"selected","display":false,"details":{"provider":provider.map(DecisionApiProvider::id)}}),
+        json!({"type":"custom_message","id":"state","parentId":"older","customType":DECISION_API_STATUS_CUSTOM_TYPE,"content":"selected","display":false,"details":{"enabled":enabled}}),
         // A physically newer sibling must not override the selected branch.
         json!({"type":"custom_message","id":"sibling","parentId":"older","customType":DECISION_API_STATUS_CUSTOM_TYPE,"content":"sibling","display":false,"details":{"provider":"jev"}}),
     ];
@@ -58,12 +58,12 @@ async fn build_session(root: &Path, manager: SessionManager) -> SessionEngine {
 
 #[tokio::test]
 async fn decision_api_constructor_restores_compacted_windowed_restarted_and_forked_sessions() {
-    for provider in [Some(DecisionApiProvider::Clef), None] {
+    for enabled in [true, false] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("source.jsonl");
         let session_dir = dir.path().join("sessions");
         std::fs::create_dir(&session_dir).unwrap();
-        std::fs::write(&path, compacted_history(provider)).unwrap();
+        std::fs::write(&path, compacted_history(enabled)).unwrap();
         let full = SessionManager::open(dir.path(), &session_dir, &path);
         let window = SessionManager::open_windowed(dir.path(), &session_dir, &path)
             .await
@@ -76,16 +76,16 @@ async fn decision_api_constructor_restores_compacted_windowed_restarted_and_fork
         let forked =
             SessionManager::fork_from(&path, dir.path(), &dir.path().join("forks")).unwrap();
         for manager in [full, window, restarted, forked] {
-            assert_eq!(manager.decision_api_provider(), provider);
+            assert_eq!(manager.decision_api_enabled(), enabled);
             assert!(manager.active_context().messages.iter().all(|message| {
                 !matches!(message, pa_types::session::AgentMessage::Custom(custom)
                     if custom.custom_type == DECISION_API_STATUS_CUSTOM_TYPE)
             }));
             let engine = build_session(dir.path(), manager).await;
-            assert_eq!(engine.decision_api_switch().provider(), provider);
+            assert_eq!(engine.decision_api_switch().is_enabled(), enabled);
             assert_eq!(
                 engine.system_prompt().contains("<name>decision-api</name>"),
-                provider.is_some()
+                enabled
             );
             assert_eq!(
                 engine.session.agent().state().await.system_prompt,
@@ -131,8 +131,7 @@ async fn decision_api_constructor_restores_compacted_windowed_restarted_and_fork
 #[tokio::test]
 async fn decision_api_branch_navigation_restores_metadata_before_the_compaction_boundary() {
     let dir = tempfile::tempdir().unwrap();
-    let entries =
-        crate::session::parse_session_entries(&compacted_history(Some(DecisionApiProvider::Clef)));
+    let entries = crate::session::parse_session_entries(&compacted_history(true));
     let mut manager = SessionManager::in_memory(dir.path());
     manager.adopt_entries(entries.clone());
     let engine = build_session(dir.path(), manager).await;
@@ -146,27 +145,21 @@ async fn decision_api_branch_navigation_restores_metadata_before_the_compaction_
         .await
         .unwrap();
     engine.sync_decision_api_from_session().await;
-    assert_eq!(
-        engine.decision_api_switch().provider(),
-        Some(DecisionApiProvider::Jev)
-    );
+    assert!(!engine.decision_api_switch().is_enabled());
     engine
         .session
         .rebuild_branch_context(entries)
         .await
         .unwrap();
     engine.sync_decision_api_from_session().await;
-    assert_eq!(
-        engine.decision_api_switch().provider(),
-        Some(DecisionApiProvider::Clef)
-    );
+    assert!(engine.decision_api_switch().is_enabled());
     engine
         .session
         .rebuild_branch_context(Vec::new())
         .await
         .unwrap();
     engine.sync_decision_api_from_session().await;
-    assert_eq!(engine.decision_api_switch().provider(), None);
+    assert!(!engine.decision_api_switch().is_enabled());
     assert!(!engine.system_prompt().contains("<name>decision-api</name>"));
     engine.dispose_kernel().await;
 }
@@ -238,15 +231,14 @@ async fn decision_api_real_kernel_restores_the_switch_and_changes_preimports_on_
     let path = dir.path().join("source.jsonl");
     let session_dir = dir.path().join("sessions");
     std::fs::create_dir(&session_dir).unwrap();
-    std::fs::write(&path, compacted_history(Some(DecisionApiProvider::Clef))).unwrap();
+    std::fs::write(&path, compacted_history(true)).unwrap();
     let manager = SessionManager::open(dir.path(), &session_dir, &path);
     let engine = build_session(dir.path(), manager).await;
-    for (provider, available) in [
-        (Some(DecisionApiProvider::Clef), true),
-        (None, false),
-        (Some(DecisionApiProvider::Jev), true),
-    ] {
-        engine.set_decision_api(provider).await;
+    for (turn, (enabled, available)) in [(true, true), (false, false), (true, true)]
+        .into_iter()
+        .enumerate()
+    {
+        engine.set_decision_api(enabled).await;
         let kernel = tokio::time::timeout(
             std::time::Duration::from_secs(60),
             engine.provisioner.ensure(None, None),
@@ -272,10 +264,12 @@ async fn decision_api_real_kernel_restores_the_switch_and_changes_preimports_on_
             result.stdout,
             result.stderr
         );
-        let expected = match provider {
-            Some(DecisionApiProvider::Clef) => "42\n",
-            None => "43\n",
-            Some(DecisionApiProvider::Jev) => "44\n",
+        // The counter's value carries across kernel restarts (the revived
+        // namespace), so each boot adds one to the previous run's answer.
+        let expected = match turn {
+            0 => "42\n",
+            1 => "43\n",
+            _ => "44\n",
         };
         assert_eq!(result.stdout, expected);
     }

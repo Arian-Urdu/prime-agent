@@ -14,10 +14,6 @@ use std::sync::Arc;
 /// contract the pa-core login UI uses for dyn dispatch across crates).
 pub type AuthFuture = Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>>;
 
-/// Resolved credential readiness, without returning credential material.
-pub type AuthReadinessFuture =
-    Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send>>;
-
 /// `/mcp login` and `/mcp logout`, implemented by the composition root.
 pub trait ClientAuthCommands: Send + Sync {
     /// Run one interactive MCP OAuth login against the inline auth panel
@@ -33,12 +29,6 @@ pub trait ClientAuthCommands: Send + Sync {
     /// it in the credential's auth slot — the slot the runtime reads.
     /// Resolves with the status line to show.
     fn api_key(&self, credential: &str, panel: crate::auth_panel::AuthPanelHandle) -> AuthFuture;
-    /// Resolve the credential using the runtime auth policy. Disk, command,
-    /// and refresh work must run off the input/render thread. An unresolved
-    /// or empty credential returns `false`; errors remain visible to the caller.
-    fn api_key_ready(&self, _credential: &str) -> AuthReadinessFuture {
-        Box::pin(async { Ok(false) })
-    }
     /// Remove a stored MCP credential. Resolves with the status line
     /// (TS: `<name> is not connected.` / `Disconnected <name>.`).
     fn logout(&self, server: &str) -> AuthFuture;

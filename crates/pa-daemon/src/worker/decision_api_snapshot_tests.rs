@@ -40,7 +40,7 @@ fn compacted_file(dir: &Path, statuses: &[Value]) -> SessionFile {
     // A physically newer sibling must never override the selected status.
     file.leaf_id = Some(root);
     file.append_entry("custom_message", json!({
-        "customType":DECISION_API_STATUS_CUSTOM_TYPE, "content":"sibling", "display":false, "details":{"provider":"jev"},
+        "customType":DECISION_API_STATUS_CUSTOM_TYPE, "content":"sibling", "display":false, "details":{"enabled":true},
     }));
     file.leaf_id = Some(selected);
     let mut first_kept = String::new();
@@ -83,29 +83,28 @@ async fn attach_restores_compacted_decision_state_before_building_the_engine() {
         .as_ref()
         .expect("the real lazy faux engine");
     assert!(engine.session.try_lock().unwrap().is_none());
+    // The newest status decides; off, malformed, or absent details read
+    // off (the wire omits the field).
     let cases = [
-        (vec![json!({"provider":"clef"})], json!("clef")),
+        (vec![json!({"enabled":true})], json!(true)),
+        (vec![json!({"enabled":false})], Value::Null),
         (
-            vec![json!({"provider":"clef"}), json!({"provider":null})],
+            vec![json!({"enabled":true}), json!({"enabled":false})],
             Value::Null,
         ),
         (
-            vec![json!({"provider":"clef"}), json!({"provider":"unknown"})],
+            vec![json!({"enabled":true}), json!("malformed")],
             Value::Null,
         ),
-        (
-            vec![json!({"provider":"clef"}), json!("malformed")],
-            Value::Null,
-        ),
-        (vec![json!({"provider":"clef"}), Value::Null], Value::Null),
+        (vec![json!({"enabled":true}), Value::Null], Value::Null),
     ];
     let mut actual = Vec::new();
     let mut expected = Vec::new();
-    for (statuses, provider) in cases {
+    for (statuses, state_value) in cases {
         worker.core.lock().unwrap().store = Some(compacted_file(dir.path(), &statuses));
         let state = attach_state(&worker);
         actual.push(state.get("decisionApi").cloned().unwrap_or(Value::Null));
-        expected.push(provider);
+        expected.push(state_value);
         assert!(engine.session.try_lock().unwrap().is_none());
     }
     assert_eq!(actual, expected);
@@ -115,19 +114,19 @@ async fn attach_restores_compacted_decision_state_before_building_the_engine() {
 async fn branch_replacement_before_engine_build_refreshes_the_attach_provider() {
     let dir = tempfile::tempdir().unwrap();
     let worker = lazy_worker(dir.path());
-    let mut first = compacted_file(dir.path(), &[json!({"provider":"clef"})]);
+    let mut first = compacted_file(dir.path(), &[json!({"enabled":true})]);
     // A newer selected status wins over pre-window metadata, including off.
     first.append_entry("custom_message", json!({
-        "customType":DECISION_API_STATUS_CUSTOM_TYPE, "content":"off", "details":{"provider":null},
+        "customType":DECISION_API_STATUS_CUSTOM_TYPE, "content":"off", "details":{"enabled":false},
     }));
     worker.core.lock().unwrap().store = Some(first);
     let before = attach_state(&worker);
     worker.core.lock().unwrap().store =
-        Some(compacted_file(dir.path(), &[json!({"provider":"clef"})]));
+        Some(compacted_file(dir.path(), &[json!({"enabled":true})]));
     let after = attach_state(&worker);
     assert_eq!(
         (before.get("decisionApi"), after.get("decisionApi")),
-        (None, Some(&json!("clef")))
+        (None, Some(&json!(true)))
     );
     assert!(worker
         .agent_engine
@@ -143,7 +142,7 @@ async fn branch_replacement_before_engine_build_refreshes_the_attach_provider() 
 async fn a_new_rooted_branch_does_not_inherit_discarded_window_status() {
     let dir = tempfile::tempdir().unwrap();
     let worker = lazy_worker(dir.path());
-    let mut file = compacted_file(dir.path(), &[json!({"provider":"clef"})]);
+    let mut file = compacted_file(dir.path(), &[json!({"enabled":true})]);
     file.leaf_id = None;
     file.append_message(&json!({"role":"user", "content":"new root"}));
     worker.core.lock().unwrap().store = Some(file);

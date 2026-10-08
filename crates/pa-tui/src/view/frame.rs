@@ -151,9 +151,8 @@ impl AgentView {
             // The replacement surfaces swap only the editor part; the `/speed` footer stays
             // the dock's last row (TS `footerSlot`).
             Some(mut dock) => {
-                if let Some(provider) = self.chrome.decision_api {
+                if self.chrome.decision_api {
                     dock.push(crate::chrome::render_decision_api_footer(
-                        provider,
                         &self.theme,
                         width,
                     ));

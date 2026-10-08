@@ -1,5 +1,5 @@
-//! The inline single-choice picker the `/effort` and `/decision-api`
-//! commands open: one list rendered through the inline-picker component
+//! The inline single-choice picker the `/effort` command opens: one list
+//! rendered through the inline-picker component
 //! (TS `ThinkingSelectorComponent` reduced to this seam - list, select,
 //! apply; Esc cancels). Enter applies the picked row through the caller,
 //! which dispatches on the picker's purpose; the picker owns only list state.
@@ -9,15 +9,12 @@ use crate::effort_picker::level_description;
 use crate::keybindings::KeybindingsManager;
 use crate::theme::Theme;
 use crate::Line;
-use pa_types::slash_commands::DecisionApiProvider;
 
 /// What the picked row applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChoicePurpose {
     /// `/effort`: the row key is a thinking level.
     Effort,
-    /// `/decision-api`: the row key is a [`DecisionApiProvider`] id.
-    DecisionApi,
 }
 
 /// One key press while the picker is open.
@@ -52,21 +49,6 @@ impl ChoicePicker {
         Self::new(ChoicePurpose::Effort, rows, current)
     }
 
-    /// The `/decision-api` picker: one row per provider, the session's
-    /// current provider checked.
-    #[must_use]
-    pub fn decision_api(current: Option<DecisionApiProvider>) -> Self {
-        let rows = DecisionApiProvider::ALL
-            .into_iter()
-            .map(|provider| (provider.id().to_string(), provider.label(), ""))
-            .collect();
-        Self::new(
-            ChoicePurpose::DecisionApi,
-            rows,
-            current.map(DecisionApiProvider::id),
-        )
-    }
-
     fn new(
         purpose: ChoicePurpose,
         rows: Vec<(String, String, &str)>,
@@ -74,7 +56,6 @@ impl ChoicePicker {
     ) -> Self {
         let kind = match purpose {
             ChoicePurpose::Effort => SelectorKind::Effort,
-            ChoicePurpose::DecisionApi => SelectorKind::DecisionApi,
         };
         let keys: Vec<String> = rows.iter().map(|(key, _, _)| key.clone()).collect();
         let rows = rows
@@ -87,12 +68,7 @@ impl ChoicePicker {
                 path: String::new(),
             })
             .collect();
-        let mut selector = ConfigSelector::with_kind(rows, kind);
-        if purpose == ChoicePurpose::DecisionApi {
-            if let Some(position) = keys.iter().position(|key| Some(key.as_str()) == current) {
-                selector.select_position(position);
-            }
-        }
+        let selector = ConfigSelector::with_kind(rows, kind);
         ChoicePicker {
             selector,
             purpose,
@@ -202,26 +178,5 @@ mod tests {
         let text = frame_text(&ChoicePicker::effort(&levels(), None));
         assert!(text.iter().any(|row| row.contains("Thinking Level")));
         assert!(text.iter().any(|row| row.contains("Moderate reasoning")));
-    }
-
-    #[test]
-    fn the_decision_api_picker_offers_every_provider_with_its_modality() {
-        let mut picker = ChoicePicker::decision_api(Some(DecisionApiProvider::Clef));
-        assert_eq!(picker.checked("clef"), Some(true));
-        let text = frame_text(&picker);
-        assert!(text.iter().any(|row| row.contains("Decision API")));
-        for label in [
-            "Jev from TypeSafe (text-only)",
-            "Clef from Cloudflare (vision-capable)",
-        ] {
-            assert!(text.iter().any(|row| row.contains(label)), "{label}");
-        }
-        assert_eq!(
-            picker.handle_key("enter", &kb()),
-            ChoicePickerAction::Apply {
-                purpose: ChoicePurpose::DecisionApi,
-                key: "clef".to_string()
-            }
-        );
     }
 }

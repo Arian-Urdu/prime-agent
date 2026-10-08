@@ -90,9 +90,6 @@ impl SessionUi {
         // canonical name, before the command runs.
         self.track_command_used(resolved.name);
         match command.execution {
-            SlashCommandExecution::Session if resolved.name == "decision-api" => {
-                self.handle_decision_api_command(&resolved.args, text, behavior, view)
-            }
             SlashCommandExecution::Session => self.send_prompt(text, behavior, view),
             SlashCommandExecution::Client => {
                 self.dispatch_client_command(&resolved, text, view).await

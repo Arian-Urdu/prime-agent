@@ -1,23 +1,19 @@
 //! The Decision API footer state: the attach snapshot seeds the session's
-//! provider and live `decision_api_status` rows switch it.
+//! switch and live `decision_api_status` rows switch it.
 
 use super::*;
-use pa_types::slash_commands::DecisionApiProvider;
 
 /// The Decision API footer follows the session: the attach state seeds the
-/// provider (absent reads off) and a live `decision_api_status` row switches it.
+/// switch (absent reads off) and a live `decision_api_status` row switches it.
 #[test]
 fn decision_api_state_reads_from_the_attach_and_the_status_rows() {
     let off = reconstruct(&attach_data_from_response(slim_attach()).unwrap());
     let mut attach = slim_attach();
-    attach["snapshot"]["state"]["decisionApi"] = json!("clef");
+    attach["snapshot"]["state"]["decisionApi"] = json!(true);
     let on = reconstruct(&attach_data_from_response(attach).unwrap());
-    assert_eq!(
-        (off.decision_api, on.decision_api),
-        (None, Some(DecisionApiProvider::Clef))
-    );
+    assert_eq!((off.decision_api, on.decision_api), (false, true));
 
-    let status_row = |provider: Option<&str>| {
+    let status_row = |enabled: bool| {
         event_to_update(&json!({
             "type": "message_start",
             "message": {
@@ -25,18 +21,16 @@ fn decision_api_state_reads_from_the_attach_and_the_status_rows() {
                 "customType": "decision_api_status",
                 "content": "[decision-api]",
                 "display": false,
-                "details": { "provider": provider },
+                "details": { "enabled": enabled },
                 "timestamp": 1,
             },
         }))
     };
     assert_eq!(
-        (status_row(Some("jev")), status_row(None)),
+        (status_row(true), status_row(false)),
         (
-            Some(TurnUpdate::DecisionApiChanged {
-                provider: Some(DecisionApiProvider::Jev)
-            }),
-            Some(TurnUpdate::DecisionApiChanged { provider: None })
+            Some(TurnUpdate::DecisionApiChanged { enabled: true }),
+            Some(TurnUpdate::DecisionApiChanged { enabled: false })
         )
     );
 }

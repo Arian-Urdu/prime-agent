@@ -1,58 +1,62 @@
 //! The experimental Decision API: off by default and switched per session by
-//! `/decision-api`, which picks the decision model the session uses. While a
-//! session's switch is off, its prompt omits the decision-api skill, the
-//! kernel does not pre-import `decision_api`, and the host refuses
-//! `decision_api.decide`. The newest durable `decision_api_status` row in the
-//! selected session branch is the session's state, so a rebuilt or resumed session
-//! adopts it again.
+//! `/decision-api on|off`. While a session's switch is off, its prompt omits
+//! the decision-api skill, the kernel does not pre-import `decision_api`,
+//! and the host refuses `decision_api.decide`. The newest durable
+//! `decision_api_status` row in the selected session branch is the session's
+//! state, so a rebuilt or resumed session adopts it again.
 //!
 //! The host side of the skill: the kernel sends a decision request body
-//! (`model`, `state`, `questions`, and for Clef `images`) and the host routes
-//! it to the session's provider. Keys resolve through [`AuthStorage`] here
-//! (literal, env var, or `!command`), so they never enter the kernel process.
+//! (`state`, `questions`, and `images` for vision-capable models) and the
+//! host serves it with the model named by `settings.decisionApi.systemOneModel`
+//! — the same registry resolution and provider transports as any other model
+//! call (`find_exact_model_reference_match` + `get_api_key_and_headers`), so
+//! the resolved key never enters the kernel process.
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{anyhow, bail};
-use pa_types::slash_commands::DecisionApiProvider;
-use serde_json::Value;
+use pa_types::ai::{ModelInput, StopReason};
+use serde_json::{json, Value};
 
 use super::engine::SessionEngine;
-use crate::auth::AuthStorage;
 use crate::kernel::shared::{host_handler, HostRequestHandlers};
+use crate::models::{find_exact_model_reference_match, ModelRegistry};
 
 /// The bundled skill the switch gates.
 pub const DECISION_API_SKILL_NAME: &str = "decision-api";
+/// The default decision instructions (the skill's `DEFAULT_INSTRUCTIONS`).
+const DEFAULT_INSTRUCTIONS: &str =
+    "Choose the next action that best advances the goal given the observation.";
+/// One decision's output budget: the answer is a single small JSON object.
+const DECISION_MAX_TOKENS: u64 = 512;
+/// One decision call's wall-clock bound.
+const DECISION_TIMEOUT_MS: u64 = 30_000;
+/// The request's image cap (the skill mirrors it client-side).
+const MAX_IMAGES: usize = 4;
 
-const JEV_DEFAULT_MODEL: &str = "jev-latest";
-const CLEF_MODEL: &str = "clef";
-/// One session's Decision API switch: the chosen provider, off by default.
-/// Clones share the state: the host handler, the kernel's pre-import filter,
-/// and the prompt selection read one switch.
+/// One session's Decision API switch: off by default. Clones share the
+/// state: the host handler, the kernel's pre-import filter, and the prompt
+/// selection read one switch.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct DecisionApiSwitch(Arc<Mutex<Option<DecisionApiProvider>>>);
+pub(crate) struct DecisionApiSwitch(Arc<Mutex<bool>>);
 
 impl DecisionApiSwitch {
-    pub(crate) fn new(provider: Option<DecisionApiProvider>) -> Self {
-        Self(Arc::new(Mutex::new(provider)))
-    }
-
-    #[must_use]
-    pub(crate) fn provider(&self) -> Option<DecisionApiProvider> {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    pub(crate) fn new(enabled: bool) -> Self {
+        Self(Arc::new(Mutex::new(enabled)))
     }
 
     #[must_use]
     pub(crate) fn is_enabled(&self) -> bool {
-        self.provider().is_some()
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Returns the previous provider.
-    fn replace(&self, provider: Option<DecisionApiProvider>) -> Option<DecisionApiProvider> {
+    /// Returns the previous state.
+    fn replace(&self, enabled: bool) -> bool {
         std::mem::replace(
             &mut *self.0.lock().unwrap_or_else(PoisonError::into_inner),
-            provider,
+            enabled,
         )
     }
 }
@@ -61,29 +65,431 @@ impl DecisionApiSwitch {
 /// it selects between.
 pub(crate) struct DecisionApiSession {
     pub(crate) switch: DecisionApiSwitch,
+    pub(crate) cwd: PathBuf,
     pub(crate) agent_dir: PathBuf,
     pub(crate) prompt_on: String,
     pub(crate) prompt_off: String,
 }
 
 /// The status row's content: what the model learns about the switch.
-pub(crate) fn status_note(provider: Option<DecisionApiProvider>) -> String {
-    let Some(provider) = provider else {
-        return "[decision-api: off] The user turned the Decision API off for this session: the \
-                decision-api skill and the `decision_api` module are no longer available."
+pub(crate) fn status_note(enabled: bool, model: Option<&str>) -> String {
+    if !enabled {
+        return "[decision-api: off] The user turned the Decision API off for this session: \
+                the decision-api skill and the `decision_api` module are no longer available."
             .to_string();
-    };
-    let images = match provider {
-        DecisionApiProvider::Jev => "It is text-only: decisions cannot carry images.",
-        DecisionApiProvider::Clef => "It is vision-capable: decisions can carry up to 4 images.",
-    };
+    }
+    let model = model.unwrap_or("the decisionApi.systemOneModel setting's model");
     format!(
-        "[decision-api: {id}] The user enabled the Decision API for this session with {label}: \
-         the decision-api skill is in your skills list and `decision_api` is pre-imported in the \
-         Python kernel. {images}",
-        id = provider.id(),
-        label = provider.label(),
+        "[decision-api: on] The user enabled the Decision API for this session: the decision-api \
+         skill is in your skills list and `decision_api` is pre-imported in the Python kernel. \
+         Decision requests use {model} from the decisionApi.systemOneModel setting; a \
+         vision-capable model there also accepts decision images."
     )
+}
+
+/// One parsed decision request: what System 1 is asked.
+#[derive(Debug, Clone)]
+struct DecisionRequest {
+    state: Value,
+    instructions: String,
+    /// (action name, when it applies), in request order.
+    criteria: Vec<(String, String)>,
+    /// (mime type, base64 data) data-URL images, at most [`MAX_IMAGES`].
+    images: Vec<(String, String)>,
+}
+
+/// Validate the kernel's request body into a [`DecisionRequest`].
+fn parse_decision_request(
+    mut request: serde_json::Map<String, Value>,
+) -> anyhow::Result<DecisionRequest> {
+    if let Some(model) = request.remove("model") {
+        if !model.is_null() {
+            bail!(
+                "The decision model comes from the decisionApi.systemOneModel setting; the \
+                 request carries no model (got {model})."
+            );
+        }
+    }
+    let unknown: Vec<String> = request
+        .keys()
+        .filter(|key| !matches!(key.as_str(), "state" | "questions" | "images"))
+        .cloned()
+        .collect();
+    if !unknown.is_empty() {
+        bail!(
+            "decision_api.decide got unsupported request fields: {}. Only \"state\", \
+             \"questions\", and \"images\" are allowed.",
+            unknown
+                .iter()
+                .map(|key| format!("{key:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let state = request
+        .get("state")
+        .cloned()
+        .ok_or_else(|| anyhow!("decision_api.decide needs a \"state\" value"))?;
+    let Some(question) = request
+        .get("questions")
+        .and_then(Value::as_object)
+        .and_then(|questions| questions.get("action"))
+        .cloned()
+    else {
+        bail!("decision_api.decide needs a \"questions\" object with an \"action\" question");
+    };
+    if let Some(kind) = question.get("type") {
+        if kind != "choice" {
+            bail!(
+                "the \"action\" question must have type \"choice\", not {kind}. The Decision API \
+                 serves one action choice per request."
+            );
+        }
+    }
+    let instructions = match question.get("instructions") {
+        None | Some(Value::Null) => DEFAULT_INSTRUCTIONS.to_string(),
+        Some(Value::String(text)) => text.clone(),
+        Some(other) => {
+            bail!("the \"action\" question's instructions must be a string, not {other}.")
+        }
+    };
+    let Some(criteria_value) = question.get("criteria").and_then(Value::as_object) else {
+        bail!(
+            "the \"action\" question needs a \"criteria\" object of action names to descriptions"
+        );
+    };
+    if criteria_value.is_empty() {
+        bail!("the \"action\" question's \"criteria\" object is empty; a decision needs actions to choose from");
+    }
+    let mut criteria = Vec::with_capacity(criteria_value.len());
+    for (name, applies) in criteria_value {
+        let Some(when) = applies.as_str() else {
+            bail!("the \"criteria\" entry {name:?} must be a string describing when the action applies, not {applies}");
+        };
+        if name.is_empty() {
+            bail!("the \"criteria\" object has an empty action name");
+        }
+        criteria.push((name.clone(), when.to_string()));
+    }
+    let mut images = Vec::new();
+    match request.get("images") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(list)) => {
+            if list.len() > MAX_IMAGES {
+                bail!(
+                    "a decision carries at most {MAX_IMAGES} images, got {}",
+                    list.len()
+                );
+            }
+            for image in list {
+                let Some(url) = image.as_str() else {
+                    bail!("decision images must be data URL strings like \"data:image/png;base64,...\", got {image}");
+                };
+                images.push(parse_image_data_url(url)?);
+            }
+        }
+        Some(other) => {
+            bail!("decision \"images\" must be an array of data URL strings, not {other}.")
+        }
+    }
+    Ok(DecisionRequest {
+        state,
+        instructions,
+        criteria,
+        images,
+    })
+}
+
+/// Split one `data:<mime>;base64,<data>` URL into its parts.
+fn parse_image_data_url(url: &str) -> anyhow::Result<(String, String)> {
+    let invalid =
+        || anyhow!("decision images must be data URL strings like \"data:image/png;base64,...\"");
+    let (header, data) = url.split_once(',').ok_or_else(invalid)?;
+    if !header.starts_with("data:image/") || !header.ends_with(";base64") {
+        return Err(invalid());
+    }
+    let mime = header
+        .strip_prefix("data:")
+        .and_then(|rest| rest.strip_suffix(";base64"))
+        .ok_or_else(invalid)?;
+    if mime.is_empty() || data.is_empty() {
+        return Err(invalid());
+    }
+    Ok((mime.to_string(), data.to_string()))
+}
+
+/// The actionable refusal when `decisionApi.systemOneModel` is unset.
+fn unconfigured_message() -> String {
+    "decisionApi.systemOneModel is not set in settings.json. Set it to the decision model \
+     reference (\"provider/model-id\" or a bare id), e.g. \"prime-inference/clef\"."
+        .to_string()
+}
+
+/// The actionable refusal when the configured reference does not resolve to
+/// an available, authenticated model (the `imageModel` refusal shape).
+fn unusable_message(reference: &str) -> String {
+    format!(
+        "decisionApi.systemOneModel \"{reference}\" could not be resolved to an available, \
+         authenticated model.\n\nFix the decisionApi.systemOneModel setting (settings.json) or \
+         authenticate the provider, then run /decision-api on."
+    )
+}
+
+/// The resolved decision model with its request auth: the settings reference
+/// resolved through the registry exactly like `imageModel` routing.
+struct ResolvedDecisionModel {
+    model: pa_types::ai::Model,
+    api_key: Option<String>,
+    headers: Option<BTreeMap<String, String>>,
+}
+
+impl ResolvedDecisionModel {
+    /// The model's full selector, for prompts and status rows.
+    fn label(&self) -> String {
+        format!("{}/{}", self.model.provider, self.model.id)
+    }
+}
+
+/// Resolve `decisionApi.systemOneModel` through the model registry:
+/// the reference must match an available (authenticated) model, and its
+/// request auth comes from the registry's merged resolution.
+fn resolve_decision_model(cwd: &Path, agent_dir: &Path) -> Result<ResolvedDecisionModel, String> {
+    let settings = crate::settings::SettingsManager::create(cwd, agent_dir);
+    let reference = settings
+        .settings()
+        .decision_api
+        .as_ref()
+        .and_then(|decision| decision.system_one_model.clone())
+        .and_then(|reference| {
+            let trimmed = reference.trim().to_string();
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+        .ok_or_else(unconfigured_message)?;
+    let auth = crate::auth::AuthStorage::create(agent_dir);
+    let mut registry = ModelRegistry::create(auth, agent_dir.join("models.json"));
+    let available = registry.get_available();
+    let available: Vec<pa_types::ai::Model> = available.into_iter().cloned().collect();
+    let model = find_exact_model_reference_match(&reference, &available)
+        .ok_or_else(|| unusable_message(&reference))?;
+    let model = model.clone();
+    let resolved = registry.get_api_key_and_headers(&model, None);
+    if !resolved.ok {
+        return Err(unusable_message(&reference));
+    }
+    Ok(ResolvedDecisionModel {
+        model,
+        api_key: resolved.api_key,
+        headers: resolved.headers,
+    })
+}
+
+/// The system prompt every decision request runs with: the answer protocol
+/// (the skill material's decision contract).
+const DECISION_SYSTEM_PROMPT: &str = "You are System 1, the decision model of a real-time control \
+loop. Each request gives one situation (the state) and the actions available. Pick exactly one \
+action and reply with a single JSON object, nothing else:\n\n{\"action\": {\"choice\": \
+\"<one action name>\", \"confidence\": <number 0 to 1>, \"probabilities\": {\"<action name>\": \
+<number>, ...}}}\n\n\"choice\" must be one of the request's action names. \"confidence\" is how \
+confident you are that the choice is best. \"probabilities\" assigns a share to the action names. \
+Reply with JSON only: no prose, no markdown, no code fences.";
+
+/// The user half of one decision request.
+fn decision_user_text(request: &DecisionRequest) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::with_capacity(256);
+    let _ = write!(text, "Instructions: {}", request.instructions);
+    let _ = write!(text, "\n\nActions:");
+    for (name, applies) in &request.criteria {
+        let _ = write!(text, "\n- {name}: {applies}");
+    }
+    let state =
+        serde_json::to_string_pretty(&request.state).unwrap_or_else(|_| request.state.to_string());
+    let _ = write!(
+        text,
+        "\n\nState:\n{state}\n\nReply with one JSON object: {{\"action\": {{\"choice\": one \
+         action name, \"confidence\": 0 to 1, \"probabilities\": {{action name: probability}}}}}}"
+    );
+    text
+}
+
+/// Build the completion context for one decision request: one user message
+/// (text plus image blocks for vision-capable models).
+fn build_decision_context(request: &DecisionRequest) -> pa_types::ai::Context {
+    use pa_types::ai::{TextContent, UserMessage};
+    let content = if request.images.is_empty() {
+        pa_types::ai::UserContent::Text(decision_user_text(request))
+    } else {
+        let mut blocks = vec![pa_types::ai::UserContentBlock::Text(TextContent {
+            text: decision_user_text(request),
+            text_signature: None,
+            rest: serde_json::Map::default(),
+        })];
+        for (mime, data) in &request.images {
+            blocks.push(pa_types::ai::UserContentBlock::Image(
+                pa_types::ai::ImageContent {
+                    data: data.clone(),
+                    mime_type: mime.clone(),
+                    rest: serde_json::Map::default(),
+                },
+            ));
+        }
+        pa_types::ai::UserContent::Blocks(blocks)
+    };
+    pa_types::ai::Context {
+        system_prompt: Some(DECISION_SYSTEM_PROMPT.to_string()),
+        messages: vec![pa_types::ai::Message::User(UserMessage {
+            content,
+            timestamp: 0,
+            rest: serde_json::Map::default(),
+        })],
+        tools: None,
+    }
+}
+
+/// Parse the model's reply into the `answers.action` object: the choice must
+/// name one of the requested actions; confidence clamps to `0..=1`.
+fn parse_decision_answer(reply: &str, criteria: &[(String, String)]) -> anyhow::Result<Value> {
+    let actions: Vec<&str> = criteria.iter().map(|(name, _)| name.as_str()).collect();
+    let raw = reply.trim();
+    // The protocol asks for JSON only; tolerate a fenced or chatty reply by
+    // slicing to the outermost object before repair-parsing.
+    let candidate = match (raw.find('{'), raw.rfind('}')) {
+        (Some(start), Some(end)) if end > start => &raw[start..=end],
+        _ => raw,
+    };
+    let parsed = pa_ai::parse_json_with_repair(candidate).map_err(|error| {
+        anyhow!("the decision model's reply was not valid JSON ({error}): {raw}")
+    })?;
+    let Some(answer) = parsed.get("action").and_then(Value::as_object) else {
+        bail!("the decision model's reply has no \"action\" object: {raw}");
+    };
+    let Some(choice) = answer.get("choice").and_then(Value::as_str) else {
+        bail!("the decision model's reply has no \"action\".\"choice\" string: {raw}");
+    };
+    if !actions.contains(&choice) {
+        bail!(
+            "the decision model chose {choice:?}, which is not one of the requested actions: {}",
+            actions.join(", ")
+        );
+    }
+    let confidence = answer
+        .get("confidence")
+        .and_then(Value::as_f64)
+        .and_then(finite_or_none)
+        .map(|confidence| confidence.clamp(0.0, 1.0));
+    let probabilities = match answer.get("probabilities").and_then(Value::as_object) {
+        Some(entries) => {
+            let mut parsed = serde_json::Map::new();
+            for (name, share) in entries {
+                if let Some(value) = share.as_f64().and_then(finite_or_none) {
+                    parsed.insert(name.clone(), json!(value));
+                }
+            }
+            Value::Object(parsed)
+        }
+        None => Value::Null,
+    };
+    Ok(json!({
+        "choice": choice,
+        "confidence": confidence,
+        "probabilities": probabilities,
+    }))
+}
+
+/// `None` for non-finite numbers, so no `NaN`/`Infinity` crosses the bridge.
+fn finite_or_none(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value)
+}
+
+/// Serve one decision request with the resolved model through the existing
+/// provider transports: one non-streaming completion, parsed into the
+/// decision envelope.
+async fn serve_decision(
+    resolved: &ResolvedDecisionModel,
+    request: &DecisionRequest,
+) -> anyhow::Result<Value> {
+    let context = build_decision_context(request);
+    let options = pa_ai::types::SimpleStreamOptions::from_base(pa_ai::types::StreamOptions {
+        max_tokens: Some(DECISION_MAX_TOKENS),
+        timeout_ms: Some(DECISION_TIMEOUT_MS),
+        api_key: resolved.api_key.clone(),
+        headers: resolved
+            .headers
+            .as_ref()
+            .map(|headers| headers.clone().into_iter().collect()),
+        ..Default::default()
+    });
+    let response = pa_ai::complete_simple(&resolved.model, &context, Some(options))
+        .await
+        .map_err(|error| anyhow!("the decision model request failed: {error:?}"))?;
+    match response.stop_reason {
+        StopReason::Error => bail!(
+            "the decision model call failed: {}",
+            response
+                .error_message
+                .unwrap_or_else(|| "unknown provider error".to_string())
+        ),
+        StopReason::Aborted => bail!("the decision model call was aborted"),
+        _ => {}
+    }
+    let reply = response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            pa_types::ai::AssistantContentBlock::Text(text) => Some(text.text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if reply.trim().is_empty() {
+        bail!("the decision model returned an empty reply");
+    }
+    let answer = parse_decision_answer(&reply, &request.criteria)?;
+    Ok(json!({
+        "model": resolved.label(),
+        "answers": { "action": answer },
+    }))
+}
+
+/// Register `decision_api.decide`, gated by `switch`, resolving the decision
+/// model from the settings under `agent_dir`.
+pub(crate) fn register_decision_api_handler(
+    handlers: &mut HostRequestHandlers,
+    switch: DecisionApiSwitch,
+    cwd: PathBuf,
+    agent_dir: PathBuf,
+) {
+    handlers.register(
+        "decision_api.decide",
+        host_handler(move |payload| {
+            let switch = switch.clone();
+            let cwd = cwd.clone();
+            let agent_dir = agent_dir.clone();
+            Box::pin(async move {
+                if !switch.is_enabled() {
+                    bail!(
+                        "The Decision API is off for this session. Ask the user to run \
+                         /decision-api on."
+                    );
+                }
+                let Some(Value::Object(request)) = payload.data.get("request").cloned() else {
+                    bail!("decision_api.decide needs a request object");
+                };
+                let request = parse_decision_request(request)?;
+                let resolved =
+                    resolve_decision_model(&cwd, &agent_dir).map_err(anyhow::Error::msg)?;
+                if !request.images.is_empty() && !resolved.model.input.contains(&ModelInput::Image)
+                {
+                    bail!(
+                        "{} does not accept image input, so decisions cannot carry images. Drop \
+                         the images, or set decisionApi.systemOneModel to a vision-capable model.",
+                        resolved.label()
+                    );
+                }
+                serve_decision(&resolved, &request).await
+            })
+        }),
+    );
 }
 
 impl SessionEngine {
@@ -103,27 +509,23 @@ impl SessionEngine {
         self.decision_api.switch.clone()
     }
 
-    /// Whether `/decision-api <provider>` can succeed: the user stored its key.
+    /// Whether `/decision-api on` can succeed: the settings reference must
+    /// resolve to an available, authenticated model. Returns its label for
+    /// the status note.
     #[tracing::instrument(skip(self))]
-    pub(crate) async fn decision_api_has_key(
-        &self,
-        provider: DecisionApiProvider,
-    ) -> anyhow::Result<bool> {
-        Ok(
-            AuthStorage::resolve_api_key(&self.decision_api.agent_dir, provider.credential())
-                .await?
-                .is_some(),
-        )
+    pub(crate) fn decision_api_model_ready(&self) -> Result<String, String> {
+        resolve_decision_model(&self.decision_api.cwd, &self.decision_api.agent_dir)
+            .map(|r| r.label())
     }
 
-    /// Pick the session's decision model, or turn the Decision API off.
-    /// Turning it on or off swaps the system prompt and restarts the kernel
-    /// (its namespace revives from the stop's snapshot), so the new kernel
-    /// pre-imports `decision_api` only while it is on.
+    /// Turn the session's Decision API on or off. Switching swaps the system
+    /// prompt and restarts the kernel (its namespace revives from the stop's
+    /// snapshot), so the new kernel pre-imports `decision_api` only while it
+    /// is on.
     #[tracing::instrument(skip(self))]
-    pub(crate) async fn set_decision_api(&self, provider: Option<DecisionApiProvider>) {
-        let previous = self.decision_api.switch.replace(provider);
-        if previous.is_some() == provider.is_some() {
+    pub(crate) async fn set_decision_api(&self, enabled: bool) {
+        let previous = self.decision_api.switch.replace(enabled);
+        if previous == enabled {
             return;
         }
         self.session
@@ -135,107 +537,38 @@ impl SessionEngine {
     }
 
     /// Adopt the selected branch's newest durable `/decision-api` state,
-    /// including configuration before its compacted transcript. Hosts call
-    /// this after moving a session between branches.
+    /// including rows before its compacted transcript. Hosts call this after
+    /// moving a session between branches.
     #[tracing::instrument(skip(self))]
     pub async fn sync_decision_api_from_session(&self) {
-        let provider = {
+        let enabled = {
             let session = self.session.session_handle().clone();
             let session = session.lock().await;
-            session.decision_api_provider()
+            session.decision_api_enabled()
         };
-        self.set_decision_api(provider).await;
+        self.set_decision_api(enabled).await;
     }
-}
-
-/// Register `decision_api.decide`, gated by `switch`, against
-/// the auth store under `agent_dir`.
-pub(crate) fn register_decision_api_handler(
-    handlers: &mut HostRequestHandlers,
-    switch: DecisionApiSwitch,
-    agent_dir: PathBuf,
-) {
-    let client = pa_ai::DecisionApiClient::default();
-    handlers.register(
-        "decision_api.decide",
-        host_handler(move |payload| {
-            let client = client.clone();
-            let switch = switch.clone();
-            let agent_dir = agent_dir.clone();
-            Box::pin(async move {
-                let Some(provider) = switch.provider() else {
-                    bail!(
-                        "The Decision API is off for this session. Ask the user to run \
-                         /decision-api."
-                    );
-                };
-                let Some(Value::Object(mut request)) = payload.data.get("request").cloned() else {
-                    bail!("decision_api.decide needs a request object");
-                };
-                let vendor = provider.vendor();
-                let no_images = request.get("images").is_none_or(|images| {
-                    images.is_null() || images.as_array().is_some_and(Vec::is_empty)
-                });
-                if no_images {
-                    request.remove("images");
-                } else if provider == DecisionApiProvider::Jev {
-                    bail!(
-                        "{} from {vendor} is text-only, so decisions cannot carry images. Drop \
-                         the images, or ask the user to run /decision-api and pick Clef, which \
-                         is vision-capable.",
-                        provider.model()
-                    );
-                }
-                let default_model = match provider {
-                    DecisionApiProvider::Jev => JEV_DEFAULT_MODEL,
-                    DecisionApiProvider::Clef => CLEF_MODEL,
-                };
-                let model = match request.get("model") {
-                    None | Some(Value::Null) => default_model.to_string(),
-                    Some(Value::String(model)) => model.clone(),
-                    Some(other) => bail!("The decision model must be a string, not {other}."),
-                };
-                if (provider == DecisionApiProvider::Clef) != (model == CLEF_MODEL) {
-                    let served = match provider {
-                        DecisionApiProvider::Jev => "Jev models",
-                        DecisionApiProvider::Clef => CLEF_MODEL,
-                    };
-                    bail!(
-                        "{} from {vendor} serves {served}, not {model}. Leave the model unset to \
-                         use {default_model}, or ask the user to run /decision-api and pick \
-                         another model.",
-                        provider.model()
-                    );
-                }
-                request.insert("model".to_string(), Value::from(model.as_str()));
-                let key = AuthStorage::resolve_api_key(&agent_dir, provider.credential())
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "No {vendor} API key is stored. Ask the user to run /decision-api and \
-                         paste their {vendor} API key."
-                        )
-                    })?;
-                client.decide(provider, &key, &Value::Object(request)).await
-            })
-        }),
-    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::AuthCredential;
     use crate::kernel::shared::{HostHandlerFuture, HostRequestPayload};
     use std::path::Path;
 
     /// The registered `decision_api.decide`, called with a payload's data.
     fn decider(
         switch: &DecisionApiSwitch,
+        cwd: &Path,
         agent_dir: &Path,
     ) -> impl Fn(Value) -> HostHandlerFuture {
         let mut handlers = HostRequestHandlers::default();
-        register_decision_api_handler(&mut handlers, switch.clone(), agent_dir.to_path_buf());
+        register_decision_api_handler(
+            &mut handlers,
+            switch.clone(),
+            cwd.to_path_buf(),
+            agent_dir.to_path_buf(),
+        );
         let decide = handlers
             .get("decision_api.decide")
             .expect("registered")
@@ -248,83 +581,349 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn an_empty_stored_key_is_not_ready_for_the_host() {
-        let agent_dir = tempfile::tempdir().unwrap();
-        store_key(agent_dir.path(), "typesafe", "  ");
-        assert_eq!(
-            AuthStorage::resolve_api_key(agent_dir.path(), "typesafe")
-                .await
-                .unwrap(),
-            None
-        );
-        store_key(agent_dir.path(), "typesafe", "fixture-key");
-        assert_eq!(
-            AuthStorage::resolve_api_key(agent_dir.path(), "typesafe")
-                .await
-                .unwrap(),
-            Some("fixture-key".to_string())
-        );
-    }
-
-    fn store_key(agent_dir: &Path, credential: &str, key: &str) {
-        AuthStorage::create(agent_dir).set(
-            credential,
-            AuthCredential::ApiKey {
-                key: key.to_string(),
-                prime_team: None,
-            },
-        );
+    /// A fixture agent dir: settings.json naming the decision model and a
+    /// custom registry provider carrying it (the api rides the faux provider).
+    fn fixture_agent_dir(
+        dir: &Path,
+        decision_api: Option<&str>,
+        model_input: &str,
+    ) -> anyhow::Result<()> {
+        let settings = match decision_api {
+            Some(model) => json!({ "decisionApi": { "systemOneModel": model } }),
+            None => json!({}),
+        };
+        std::fs::write(dir.join("settings.json"), settings.to_string())?;
+        std::fs::write(
+            dir.join("models.json"),
+            format!(
+                r#"{{ "providers": {{ "fixture-decisions": {{
+                    "baseUrl": "https://fixture.example", "apiKey": "fixture-key",
+                    "api": "faux-decision", "models": [
+                        {{ "id": "decision-model", "input": {model_input} }}
+                    ]
+                }} }} }}"#
+            ),
+        )?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn decide_refuses_before_any_network_call() {
-        let agent_dir = tempfile::tempdir().expect("tempdir");
+    async fn decide_refuses_while_the_switch_is_off_or_the_setting_is_unusable() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture_agent_dir(
+            dir.path(),
+            Some("fixture-decisions/decision-model"),
+            r#"["text"]"#,
+        )
+        .unwrap();
         let switch = DecisionApiSwitch::default();
-        let call = decider(&switch, agent_dir.path());
+        let call = decider(&switch, dir.path(), dir.path());
+        let request = json!({ "request": { "state": {}, "questions": { "action": {
+            "type": "choice",
+            "criteria": { "left": "go left" }
+        } } } });
+        // The switch gates before anything else: no settings read runs.
+        assert_eq!(
+            call(request.clone()).await.unwrap_err().to_string(),
+            "The Decision API is off for this session. Ask the user to run /decision-api on."
+        );
+        switch.replace(true);
         let error = |data| async { call(data).await.unwrap_err().to_string() };
-        let request = serde_json::json!({ "request": { "state": {}, "images": [] } });
-        let with_image = serde_json::json!({
-            "request": { "state": {}, "images": ["data:image/png;base64,AA=="] }
-        });
+        // An unset reference and an unresolvable one name the setting.
+        fixture_agent_dir(dir.path(), None, r#"["text"]"#).unwrap();
         assert_eq!(
             error(request.clone()).await,
-            "The Decision API is off for this session. Ask the user to run /decision-api."
+            "decisionApi.systemOneModel is not set in settings.json. Set it to the decision model \
+             reference (\"provider/model-id\" or a bare id), e.g. \"prime-inference/clef\"."
         );
-        switch.replace(Some(DecisionApiProvider::Jev));
+        fixture_agent_dir(dir.path(), Some("no-such/model"), r#"["text"]"#).unwrap();
+        let refusal = error(request.clone()).await;
+        assert!(
+            refusal.starts_with(
+                "decisionApi.systemOneModel \"no-such/model\" could not be resolved to an \
+                 available, authenticated model."
+            ),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("run /decision-api on"),
+            "the refusal names the recovery: {refusal}"
+        );
+        // A configured but unauthenticated reference is unusable too: the
+        // provider has no key, so the model never becomes available.
+        std::fs::write(
+            dir.path().join("models.json"),
+            r#"{ "providers": { "fixture-decisions": {
+                "baseUrl": "https://fixture.example", "api": "faux-decision",
+                "models": [ { "id": "decision-model", "input": ["text"] } ]
+            } } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            json!({ "decisionApi": { "systemOneModel": "decision-model" } }).to_string(),
+        )
+        .unwrap();
+        assert!(
+            error(request).await.contains("could not be resolved"),
+            "an unauthenticated reference must refuse, not call a provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_validates_the_request_before_any_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture_agent_dir(
+            dir.path(),
+            Some("fixture-decisions/decision-model"),
+            r#"["text"]"#,
+        )
+        .unwrap();
+        let switch = DecisionApiSwitch::new(true);
+        let call = decider(&switch, dir.path(), dir.path());
+        let error = |data| async { call(data).await.unwrap_err().to_string() };
+        let base = |request: Value| json!({ "request": request });
         assert_eq!(
-            error(serde_json::json!({})).await,
+            error(json!({})).await,
             "decision_api.decide needs a request object"
         );
+        let good_question = json!({ "type": "choice", "criteria": { "left": "go left" } });
+        let with_question =
+            |question: Value| json!({ "state": {}, "questions": { "action": question } });
         assert_eq!(
-            error(with_image.clone()).await,
-            "Jev from TypeSafe is text-only, so decisions cannot carry images. Drop \
-             the images, or ask the user to run /decision-api and pick Clef, which is \
-             vision-capable."
-        );
-        let with_model =
-            |model: &str| serde_json::json!({ "request": { "state": {}, "model": model } });
-        assert_eq!(
-            error(with_model("clef")).await,
-            "Jev from TypeSafe serves Jev models, not clef. Leave the model unset to use \
-             jev-latest, or ask the user to run /decision-api and pick another model."
+            error(base(
+                json!({ "state": {}, "questions": { "move": good_question } })
+            ))
+            .await,
+            "decision_api.decide needs a \"questions\" object with an \"action\" question"
         );
         assert_eq!(
-            error(request).await,
-            "No TypeSafe API key is stored. Ask the user to run /decision-api and paste their \
-             TypeSafe API key."
-        );
-        switch.replace(Some(DecisionApiProvider::Clef));
-        assert_eq!(
-            error(with_model("jev-latest")).await,
-            "Clef from Cloudflare serves clef, not jev-latest. Leave the model unset to use \
-             clef, or ask the user to run /decision-api and pick another model."
+            error(base(with_question(
+                json!({ "type": "rank", "criteria": {} })
+            )))
+            .await,
+            "the \"action\" question must have type \"choice\", not \"rank\". The Decision API \
+             serves one action choice per request."
         );
         assert_eq!(
-            error(with_image).await,
-            "No Cloudflare API key is stored. Ask the user to run /decision-api and paste their \
-             Cloudflare API key."
+            error(base(with_question(
+                json!({ "type": "choice", "criteria": {} })
+            )))
+            .await,
+            "the \"action\" question's \"criteria\" object is empty; a decision needs actions to \
+             choose from"
         );
+        assert_eq!(
+            error(base(with_question(
+                json!({ "type": "choice", "criteria": { "left": 7 } })
+            )))
+            .await,
+            "the \"criteria\" entry \"left\" must be a string describing when the action applies, \
+             not 7"
+        );
+        assert_eq!(
+            error(base(json!({ "state": {}, "model": "jev-latest" }))).await,
+            "The decision model comes from the decisionApi.systemOneModel setting; the request \
+             carries no model (got \"jev-latest\")."
+        );
+        assert_eq!(
+            error(base(json!({ "state": {}, "hint": true }))).await,
+            "decision_api.decide got unsupported request fields: \"hint\". Only \"state\", \
+             \"questions\", and \"images\" are allowed."
+        );
+        assert_eq!(
+            error(base(json!({ "questions": { "action": good_question } }))).await,
+            "decision_api.decide needs a \"state\" value"
+        );
+        let images = |list: Value| json!({ "state": {}, "questions": { "action": good_question }, "images": list });
+        assert_eq!(
+            error(base(images(json!([
+                "data:image/png;base64,AA==",
+                "not-a-data-url"
+            ]))))
+            .await,
+            "decision images must be data URL strings like \"data:image/png;base64,...\""
+        );
+        let five: Vec<&str> = (0..5).map(|_| "data:image/png;base64,AA==").collect();
+        assert_eq!(
+            error(base(images(json!(five)))).await,
+            "a decision carries at most 4 images, got 5"
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_refuses_images_on_a_text_only_model() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture_agent_dir(
+            dir.path(),
+            Some("fixture-decisions/decision-model"),
+            r#"["text"]"#,
+        )
+        .unwrap();
+        let switch = DecisionApiSwitch::new(true);
+        let call = decider(&switch, dir.path(), dir.path());
+        let request = json!({ "request": { "state": {}, "questions": { "action": {
+            "type": "choice", "criteria": { "left": "go left", "right": "go right" }
+        } }, "images": [ "data:image/png;base64,AA==" ] } });
+        let error = call(request).await.unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "fixture-decisions/decision-model does not accept image input, so decisions cannot \
+             carry images. Drop the images, or set decisionApi.systemOneModel to a \
+             vision-capable model."
+        );
+    }
+
+    /// One decision round trip through the registry resolution and the
+    /// provider transports, with the faux provider standing in for the wire:
+    /// the answer's contract (choice, confidence, probabilities) and the
+    /// request's reach (actions, state, images, key) are pinned.
+    #[tokio::test]
+    async fn decide_serves_one_round_trip_through_the_registry_and_provider() {
+        static FAUX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let registration = {
+            let _guard = FAUX_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
+                api: Some("faux-decision".to_string()),
+                provider: Some("fixture-decisions".to_string()),
+                models: Some(vec![pa_ai::faux::FauxModelDefinition {
+                    id: "decision-model".to_string(),
+                    input: Some(vec![ModelInput::Text, ModelInput::Image]),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            })
+        };
+        let dir = tempfile::tempdir().unwrap();
+        fixture_agent_dir(dir.path(), Some("decision-model"), r#"["text", "image"]"#).unwrap();
+        let switch = DecisionApiSwitch::new(true);
+        let call = decider(&switch, dir.path(), dir.path());
+
+        // The served reply names an unrequested action: the refusal proves
+        // the criteria reached the parse and the choice check is enforced.
+        registration.set_responses(vec![pa_ai::faux::FauxResponseStep::Message(
+            pa_ai::faux::faux_assistant_text_message(
+                r#"{"action": {"choice": "jump", "confidence": 0.9}}"#,
+                pa_ai::faux::FauxAssistantMessageOptions::default(),
+            ),
+        )]);
+        let request = json!({ "request": { "state": { "x": 1 }, "questions": { "action": {
+            "type": "choice", "instructions": "Track the target",
+            "criteria": { "left": "go left", "right": "go right" }
+        } } } });
+        let error = call(request).await.unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "the decision model chose \"jump\", which is not one of the requested actions: left, \
+             right"
+        );
+
+        // The good path: a fenced reply with an out-of-range confidence and
+        // a non-finite share, both normalized by the host.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let seen_writer = std::sync::Arc::clone(&seen);
+        registration.set_responses(vec![pa_ai::faux::FauxResponseStep::Factory(
+            std::sync::Arc::new(
+                move |context: &pa_ai::types::Context,
+                      options: Option<&pa_ai::types::StreamOptions>,
+                      _call: u64,
+                      model: &pa_types::ai::Model| {
+                    let mut text = String::new();
+                    for message in &context.messages {
+                        if let pa_types::ai::Message::User(user) = message {
+                            match &user.content {
+                                pa_types::ai::UserContent::Text(content) => text.push_str(content),
+                                pa_types::ai::UserContent::Blocks(blocks) => {
+                                    for block in blocks {
+                                        match block {
+                                            pa_types::ai::UserContentBlock::Text(block) => {
+                                                text.push_str(&block.text);
+                                            }
+                                            pa_types::ai::UserContentBlock::Image(_) => {
+                                                text.push_str("<image>");
+                                            }
+                                            pa_types::ai::UserContentBlock::Raw(_) => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    *seen_writer.lock().unwrap() = text;
+                    let _ = (options.and_then(|options| options.api_key.clone()), model);
+                    Ok(pa_ai::faux::faux_assistant_text_message(
+                        "```json\n{\"action\": {\"choice\": \"left\", \"confidence\": 1.4, \
+                         \"probabilities\": {\"left\": 0.75, \"right\": 0.25}}}\n```",
+                        pa_ai::faux::FauxAssistantMessageOptions::default(),
+                    ))
+                },
+            ),
+        )]);
+        let request = json!({ "request": { "state": { "x": 1 }, "questions": { "action": {
+            "type": "choice", "instructions": "Track the target",
+            "criteria": { "left": "go left", "right": "go right" }
+        } }, "images": [ "data:image/png;base64,AA==" ] } });
+        let answer = call(request).await.unwrap();
+        assert_eq!(answer["model"], "fixture-decisions/decision-model");
+        assert_eq!(
+            answer["answers"],
+            json!({
+                "action": {
+                    "choice": "left",
+                    "confidence": 1.0,
+                    "probabilities": { "left": 0.75, "right": 0.25 }
+                }
+            })
+        );
+        let seen = seen.lock().unwrap().clone();
+        assert!(seen.contains("Instructions: Track the target"), "{seen}");
+        assert!(seen.contains("- left: go left"), "{seen}");
+        assert!(seen.contains("- right: go right"), "{seen}");
+        assert!(seen.contains("\"x\""), "{seen}");
+        assert!(seen.contains("<image>"), "{seen}");
+        let received = registration.received_api_keys();
+        assert!(
+            received.len() >= 2
+                && received
+                    .iter()
+                    .all(|key| key.as_deref() == Some("fixture-key")),
+            "the registry-resolved key reaches the provider on every call: {:?}",
+            received
+        );
+    }
+
+    #[test]
+    fn decision_answers_parse_leniently_and_validate_the_choice() {
+        let criteria = vec![
+            ("left".to_string(), "go left".to_string()),
+            ("right".to_string(), "go right".to_string()),
+        ];
+        let plain = parse_decision_answer(
+            r#"{"action": {"choice": "right", "confidence": 0.5, "probabilities": {"right": 1}}}"#,
+            &criteria,
+        )
+        .unwrap();
+        assert_eq!(plain["choice"], "right");
+        assert_eq!(plain["confidence"], 0.5);
+        let fenced = parse_decision_answer(
+            "prose\n```json\n{\"action\": {\"choice\": \"left\"}}\n```",
+            &criteria,
+        )
+        .unwrap();
+        assert_eq!(fenced["choice"], "left");
+        assert!(fenced["confidence"].is_null());
+        assert!(fenced["probabilities"].is_null());
+        for bad in [
+            "not json",
+            "{}",
+            "{\"action\": \"left\"}",
+            "{\"action\": {\"choice\": \"up\"}}",
+            "{\"action\": {\"choice\": 3}}",
+        ] {
+            assert!(parse_decision_answer(bad, &criteria).is_err(), "{bad}");
+        }
     }
 
     #[test]

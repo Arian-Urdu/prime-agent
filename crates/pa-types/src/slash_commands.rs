@@ -12,86 +12,18 @@ pub const SESSION_SLASH_COMMAND_NAMES: [&str; 5] =
 /// result, persisted in sessions and rendered by every surface.
 pub const SESSION_SLASH_COMMAND_CUSTOM_TYPE: &str = "session_slash_command";
 pub const SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE: &str = "session_slash_command_result";
-/// The durable `/decision-api` state row (`details.provider`): the newest
+/// The durable `/decision-api` state row (`details.enabled`): the newest
 /// one on the selected branch is the session's Decision API state.
 pub const DECISION_API_STATUS_CUSTOM_TYPE: &str = "decision_api_status";
 
-/// A decision model `/decision-api` can turn on for a session. The id is the
-/// command argument and the wire value; the credential names the stored API key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DecisionApiProvider {
-    Jev,
-    Clef,
-}
-
-impl DecisionApiProvider {
-    pub const ALL: [Self; 2] = [Self::Jev, Self::Clef];
-
-    #[must_use]
-    pub fn from_id(id: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|provider| provider.id() == id)
-    }
-
-    /// Decode a durable status row's provider. Missing, null, unknown, or
-    /// malformed details clear the provider rather than reviving older state.
-    #[must_use]
-    pub fn from_status_details(details: Option<&serde_json::Value>) -> Option<Self> {
-        details
-            .and_then(|details| details.get("provider"))
-            .and_then(serde_json::Value::as_str)
-            .and_then(Self::from_id)
-    }
-
-    #[must_use]
-    pub const fn id(self) -> &'static str {
-        match self {
-            Self::Jev => "jev",
-            Self::Clef => "clef",
-        }
-    }
-
-    #[must_use]
-    pub const fn model(self) -> &'static str {
-        match self {
-            Self::Jev => "Jev",
-            Self::Clef => "Clef",
-        }
-    }
-
-    #[must_use]
-    pub const fn vendor(self) -> &'static str {
-        match self {
-            Self::Jev => "TypeSafe",
-            Self::Clef => "Cloudflare",
-        }
-    }
-
-    #[must_use]
-    pub const fn modality(self) -> &'static str {
-        match self {
-            Self::Jev => "text-only",
-            Self::Clef => "vision-capable",
-        }
-    }
-
-    #[must_use]
-    pub const fn credential(self) -> &'static str {
-        match self {
-            Self::Jev => "typesafe",
-            Self::Clef => "cloudflare",
-        }
-    }
-
-    /// The selector label, e.g. `Clef from Cloudflare (vision-capable)`.
-    #[must_use]
-    pub fn label(self) -> String {
-        format!(
-            "{} from {} ({})",
-            self.model(),
-            self.vendor(),
-            self.modality()
-        )
-    }
+/// Decode a durable status row's enabled flag. Missing, null, or malformed
+/// details read as off rather than reviving older state.
+#[must_use]
+pub fn decision_api_enabled_from_status_details(details: Option<&serde_json::Value>) -> bool {
+    details
+        .and_then(|details| details.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 #[must_use]
@@ -161,7 +93,7 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: &[BuiltinSlashCommand] = &[
     BuiltinSlashCommand { name: "factory", description: "Show or set the agent factory opt-in gate (off by default)", execution: SlashCommandExecution::Client, argument_hint: Some("[on|off|status]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "resume", description: "Open the agents view, or resume a session by id or path", execution: SlashCommandExecution::Client, argument_hint: Some("[id|path]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "reload", description: "Reload keybindings, skills, prompts, and themes", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
-    BuiltinSlashCommand { name: "decision-api", description: "Choose this session's Decision API model (Jev or Clef), or turn it off", execution: SlashCommandExecution::Session, argument_hint: Some("[jev|clef|off]"), aliases: &[], takes_argument: true },
+    BuiltinSlashCommand { name: "decision-api", description: "Turn this session's Decision API on or off (the model comes from decisionApi.systemOneModel)", execution: SlashCommandExecution::Session, argument_hint: Some("[on|off]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "speed", description: "Toggle footer readout of model output tok/sec (latest response and session average)", execution: SlashCommandExecution::Client, argument_hint: Some("[on|off]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "quit", description: "Quit Prime Agent", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
 ];

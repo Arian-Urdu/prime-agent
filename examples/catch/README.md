@@ -6,8 +6,8 @@ the game's declared pygame dependency. Install ffmpeg on PATH to record MP4;
 use `record=False` when recording is unnecessary. `headless=True` runs without
 a display. Each run writes into its own `examples/catch/runs/catch-*` directory.
 
-In Prime Agent, enable `/decision-api jev` for text observations or
-`/decision-api clef` for image-based observations. Run this in the persistent
+In Prime Agent, configure a `decisionApi.systemOneModel` registry model
+(vision-capable for image-based observations) and run `/decision-api on`. Run this in the persistent
 Python REPL with the skill enabled, substituting the repository path:
 
 ```python

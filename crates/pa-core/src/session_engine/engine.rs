@@ -182,7 +182,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     let owns_resume_settings =
         session_manager.is_persisted() || config.conversation_log_path.is_none();
     let decision_api =
-        super::decision_api::DecisionApiSwitch::new(session_manager.decision_api_provider());
+        super::decision_api::DecisionApiSwitch::new(session_manager.decision_api_enabled());
     let conversation_log = {
         let session = &session_manager;
         session
@@ -314,6 +314,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     super::decision_api::register_decision_api_handler(
         &mut handlers,
         decision_api.clone(),
+        cwd.clone(),
         config.agent_dir.clone(),
     );
     let keep_recent_tokens = compaction_settings
@@ -498,6 +499,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     };
     let decision_api = super::decision_api::DecisionApiSession {
         switch: decision_api,
+        cwd: cwd.clone(),
         agent_dir: config.agent_dir.clone(),
         prompt_on: crate::prompts::system_prompt::build_system_prompt(&prompt_options),
         prompt_off: {

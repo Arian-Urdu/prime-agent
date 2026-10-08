@@ -116,13 +116,7 @@ pub enum AuthPanelRequest {
         outcome: ProviderAuthOutcome,
     },
     /// A `/mcp` view auth command settled: its status line applies.
-    McpSettled { note: String, generation: u64 },
-    /// A background Decision API credential resolution completed. A stale
-    /// generation never changes the currently mounted panel or session.
-    DecisionApiReady {
-        generation: u64,
-        result: anyhow::Result<bool>,
-    },
+    McpSettled { note: String },
     /// The `/traces` login settled: the login's outcome applies. `gen` is matched against the
     /// run loop's counter so a superseded run's late settle cannot clear a newer login.
     TracesSettled {

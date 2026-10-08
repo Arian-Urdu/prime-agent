@@ -1,8 +1,8 @@
 """Prime Agent decision-api skill: an experimental System 1 / System 2 loop.
 
-System 1 is the session's decision model, picked by the user with
-/decision-api: TypeSafe's Jev (text-only) or Cloudflare's Clef
-(vision-capable). One call per observation picks the next action. System 2 is
+System 1 is the session's decision model: the model the user named in the
+decisionApi.systemOneModel setting, switched on per session with
+/decision-api on. One call per observation picks the next action. System 2 is
 a Prime Agent subagent that
 reads the newest observation plus System 1's action history and writes the
 sub-goal System 1 follows. The calling agent operates the loop: it starts it,
@@ -22,8 +22,6 @@ from typing import Any, Callable
 import agent_message
 import rlm
 
-# None uses the picked provider's model (jev-latest or clef).
-DEFAULT_MODEL: str | None = None
 DEFAULT_INSTRUCTIONS = "Choose the next action that best advances the goal given the observation."
 DEFAULT_SYSTEM2_PROMPT = """You are System 2 in a real-time control loop.
 
@@ -90,18 +88,16 @@ async def _ask_system1(
     actions: dict[str, str],
     *,
     instructions: str = DEFAULT_INSTRUCTIONS,
-    model: str | None = DEFAULT_MODEL,
     images: list[str] | None = None,
 ) -> dict[str, Any]:
-    """One System 1 decision for an arbitrary `state`. The host calls the
-    session's provider with the key the user saved via /decision-api; the key
-    never enters this kernel. `images` (Clef only, at most 4) are data
-    URL strings (`data:image/png;base64,...`).
+    """One System 1 decision for an arbitrary `state`. The host serves the
+    request with the decisionApi.systemOneModel model through the normal
+    provider transports; no key ever enters this kernel. `images` (vision
+    models only, at most 4) are data URL strings
+    (`data:image/png;base64,...`).
     Returns `action`, `confidence`, `probabilities`, `latency_ms`, and `model`."""
     question = {"type": "choice", "instructions": instructions, "criteria": actions}
     request: dict[str, Any] = {"state": state, "questions": {"action": question}}
-    if model is not None:
-        request["model"] = model
     if images:
         bad = [
             repr(image)[:40] for image in images if not (isinstance(image, str) and image.startswith("data:image/"))
@@ -117,7 +113,7 @@ async def _ask_system1(
         "confidence": answer["confidence"],
         "probabilities": answer["probabilities"],
         "latency_ms": round((time.perf_counter() - started) * 1000, 1),
-        "model": body.get("model", model),
+        "model": body.get("model"),
     }
 
 
@@ -128,7 +124,6 @@ async def decide(
     goal: str = "",
     history: list[dict[str, Any]] | None = None,
     instructions: str = DEFAULT_INSTRUCTIONS,
-    model: str | None = DEFAULT_MODEL,
     images: list[str] | None = None,
 ) -> dict[str, Any]:
     """A single System 1 decision with the default state."""
@@ -136,7 +131,6 @@ async def decide(
         _default_state(observation, goal, history or []),
         actions,
         instructions=instructions,
-        model=model,
         images=images,
     )
 
@@ -187,9 +181,9 @@ class Loop:
     - `objective`: the overall task, sent to System 2 with every message.
     - `state`: `(observation, goal, history) -> Any`, what System 1 sees.
     - `images`: None, or `(observation) -> list` of data URL strings System 1 sees
-      next to `state` (Clef only; see `decide`).
-    - `instructions`, `model`: System 1's question instructions and model
-      (None picks the provider's default).
+      next to `state` (vision-capable models only; see `decide`).
+    - `instructions`: System 1's question instructions (the model comes from
+      the decisionApi.systemOneModel setting).
     - `system1`: None for the session's decision model, or `(observation,
       actions, goal, history) -> action name or dict with "action"` to
       replace System 1.
@@ -219,7 +213,6 @@ class Loop:
         self.state: Callable[..., Any] = _default_state
         self.images: Callable[[Any], list[str] | None] | None = None
         self.instructions = DEFAULT_INSTRUCTIONS
-        self.model: str | None = DEFAULT_MODEL
         self.system1: Callable[..., Any] | None = None
         self.tick: float | None = None
         self.max_steps: int | None = None
@@ -399,7 +392,7 @@ class Loop:
             state = self.state(observation, self.goal, history)
             images = None if self.images is None else await _call(self.images, observation)
             return await _ask_system1(
-                state, actions, instructions=self.instructions, model=self.model, images=images
+                state, actions, instructions=self.instructions, images=images
             )
         started = time.perf_counter()
         choice = await _call(self.system1, observation, actions, self.goal, history)

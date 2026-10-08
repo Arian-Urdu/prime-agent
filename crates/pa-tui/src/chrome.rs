@@ -82,9 +82,9 @@ pub struct ChromeState {
     /// The footer's tok/sec readout: the dim bottom row's text; `None`
     /// renders no row (kept until the first completed response).
     pub speed_text: Option<String>,
-    /// The session's Decision API provider while it is on (`/decision-api`):
-    /// the dock renders the accent-colored `Decision API enabled` row naming it.
-    pub decision_api: Option<pa_types::slash_commands::DecisionApiProvider>,
+    /// The session's Decision API while it is on (`/decision-api on`): the
+    /// dock renders the accent-colored `Decision API enabled` row.
+    pub decision_api: bool,
     /// Hide the splash `cwd` line (the scoped agents view keeps its
     /// metadata rows centered against the logo).
     pub splash_hide_cwd: bool,
@@ -850,13 +850,9 @@ pub fn render_speed_footer(text: &str, theme: &Theme, width: usize) -> Line {
 
 /// The footer row shown while the session has the Decision API on.
 #[must_use]
-pub(crate) fn render_decision_api_footer(
-    provider: pa_types::slash_commands::DecisionApiProvider,
-    theme: &Theme,
-    width: usize,
-) -> Line {
-    let text = format!("Decision API enabled: {}", provider.label());
-    let text = truncate_to_width(&text, width, "");
+pub(crate) fn render_decision_api_footer(theme: &Theme, width: usize) -> Line {
+    let text = "Decision API enabled";
+    let text = truncate_to_width(text, width, "");
     vec![Span::styled(text, theme.fg_style(ThemeColor::Accent))]
 }
 

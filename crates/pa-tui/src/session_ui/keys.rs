@@ -291,8 +291,8 @@ impl SessionUi {
         let _ = view.editor.handle_paste(text);
     }
 
-    /// One key press while the `/effort` or `/decision-api` picker is open:
-    /// Esc/Ctrl+C close it without applying; Enter applies the picked row.
+    /// One key press while the `/effort` picker is open: Esc/Ctrl+C close it
+    /// without applying; Enter applies the picked row.
     async fn handle_choice_picker_key(
         &mut self,
         key: KeyEvent,
@@ -314,9 +314,6 @@ impl SessionUi {
             Some(ChoicePickerAction::None) | None => {}
             Some(ChoicePickerAction::Cancel) => {
                 view.choice_picker = None;
-                if self.decision_api_picker_behavior.take().is_some() {
-                    self.track_feature_outcome("decision_api", "canceled", None);
-                }
                 self.dirty = true;
             }
             Some(ChoicePickerAction::Apply { purpose, key }) => {
@@ -324,18 +321,6 @@ impl SessionUi {
                 self.dirty = true;
                 match purpose {
                     ChoicePurpose::Effort => self.apply_thinking_level(&key, view).await,
-                    ChoicePurpose::DecisionApi => {
-                        let behavior = self
-                            .decision_api_picker_behavior
-                            .take()
-                            .unwrap_or(SubmitBehavior::Steer);
-                        return self.handle_decision_api_command(
-                            &key,
-                            &format!("/decision-api {key}"),
-                            behavior,
-                            view,
-                        );
-                    }
                 }
             }
         }
@@ -358,7 +343,7 @@ impl SessionUi {
         if view.model_picker.is_some() {
             return self.handle_model_picker_key(key, view).await;
         }
-        // The `/effort` and `/decision-api` picker owns the frame the same way.
+        // The `/effort` picker owns the frame the same way.
         if view.choice_picker.is_some() {
             return self.handle_choice_picker_key(key, view).await;
         }

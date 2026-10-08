@@ -19,12 +19,11 @@ Daemon wire mechanics shared by the serving side (pa-daemon) and clients (pa-tui
   CLI suggestion help) plus its pure parse/suggestion helpers — the TS
   product keeps the same single table in core and imports it from its TUI.
   It also carries the `/decision-api` vocabulary every surface reads: the
-  `decision_api_status` row type and `DecisionApiProvider` (Jev, Clef:
-  command id, selector label, modality, auth-store credential).
-  `DecisionApiProvider::from_status_details` is the shared pure decoder for
-  durable status details: missing, null, unknown, and malformed providers clear
-  the state. Core restoration and daemon attach snapshots use the same rule.
-  This is a new public domain helper; it adds no dependency or re-export.
+  `decision_api_status` row type and the shared pure decoder for its durable
+  status details (`decision_api_enabled_from_status_details`): missing, null,
+  and malformed details read as off. Core restoration and daemon attach
+  snapshots use the same rule. This is a new public domain helper; it adds no
+  dependency or re-export.
   `DECISION_API_STATUS_CUSTOM_TYPE` is imported directly from this crate by
   consumers; higher crates do not re-export it. The durable row's
   `details.provider` is `jev`, `clef`, or null (off). Selected-branch metadata,

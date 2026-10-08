@@ -254,10 +254,9 @@ No agent behavior inside workers beyond hosting a pa-core engine; no UI.
 
 Decision API worker wiring adopts the core engine's read-only switch for
 state snapshots. `types::AgentConnectionState::decision_api` extends the existing
-state response with a provider id (omitted while off); selected-branch
-restoration, auth policy, and kernel gating stay in pa-core. Vendor transport
-stays in pa-ai. The daemon supplies the startup environment inherited by its
-workers; see [account setup and restart behavior](../../docs/decision-api.md).
+state response with the enabled flag (omitted while off); selected-branch
+restoration, model resolution, auth policy, and kernel gating stay in
+pa-core, and decision requests ride the ordinary provider transports.
 
 ## Public API
 Supervisor entrypoint, worker entrypoint, `mcp_login::{WorkerMcpLoginUi, wire_worker_mcp_login}` (the worker's browser+callback login behind `mcp.begin_login`; wired by the agent engine before sessions register host handlers), client connection API for pa-tui/pa-cli, `acp::daemon::{run_daemon_attached_acp_mode, DaemonAcpOptions}` (pa-cli dispatches `--mode acp` through it), `agent_messaging::LinkAgentMessageController` + `rlm_children::{SupervisorChildSessions, ParentIdentity, RlmChildIdentity}` (e2e verifiers construct the worker-side family controller and the children registry; the engine wires the same types), `agent_engine::AgentSessionEngine::dispose_kernel` (the session-end kernel teardown the worker invokes at kill/shutdown/orphan exit — the engine outlives the session, so the pa-core engine-drop teardown cannot run there), the worker's `get_mcp_connections` command (`mcp_connections.rs`: the `/mcp` view's roster from the session's MCP manager overlaid with the session kernel's per-server tool listing, plus the api-key credential rows the same response serves — Rust-native session-plane extension; the TS daemon has no counterpart). Supervision internals `pub(crate)`.
@@ -266,7 +265,7 @@ Supervisor entrypoint, worker entrypoint, `mcp_login::{WorkerMcpLoginUi, wire_wo
 ## Depends on
 pa-types, pa-core (one-way).
 
-Attach snapshots derive the Decision API provider from the selected session-store
+Attach snapshots derive the Decision API state from the selected session-store
 branch, including the window's pre-compaction metadata. This private store getter
 runs before the lazy session engine builds and never resolves auth, models, or the
 kernel. Branch replacement changes the next snapshot immediately; explicit off

@@ -205,29 +205,28 @@ impl SessionManager {
         false
     }
 
-    /// The selected branch's durable decision provider, including status
+    /// The selected branch's durable Decision API state, including status
     /// rows before the compaction boundary without hydrating message bodies.
-    pub(crate) fn decision_api_provider(
-        &self,
-    ) -> Option<pa_types::slash_commands::DecisionApiProvider> {
+    pub(crate) fn decision_api_enabled(&self) -> bool {
         let status = self
             .active_branch_entries()
             .into_iter()
             .rev()
             .find_map(decision_api_state);
         if let Some(status) = status {
-            return status.provider();
+            return status;
         }
-        self.window
-            .as_ref()?
-            .metadata_entries()
-            .iter()
-            .rev()
-            .find_map(|line| {
-                let entry = serde_json::from_str::<FileEntry>(line).ok()?;
-                decision_api_state(&entry)
-            })
-            .and_then(RecordedDecisionApiState::provider)
+        self.window.as_ref().is_some_and(|window| {
+            window
+                .metadata_entries()
+                .iter()
+                .rev()
+                .find_map(|line| {
+                    let entry = serde_json::from_str::<FileEntry>(line).ok()?;
+                    decision_api_state(&entry)
+                })
+                .unwrap_or(false)
+        })
     }
 
     #[must_use]
@@ -551,31 +550,18 @@ impl SessionManager {
     }
 }
 
-enum RecordedDecisionApiState {
-    Off,
-    Enabled(pa_types::slash_commands::DecisionApiProvider),
-}
-
-impl RecordedDecisionApiState {
-    fn provider(self) -> Option<pa_types::slash_commands::DecisionApiProvider> {
-        match self {
-            Self::Off => None,
-            Self::Enabled(provider) => Some(provider),
-        }
-    }
-}
-
-fn decision_api_state(entry: &FileEntry) -> Option<RecordedDecisionApiState> {
-    use pa_types::slash_commands::{DecisionApiProvider, DECISION_API_STATUS_CUSTOM_TYPE};
+fn decision_api_state(entry: &FileEntry) -> Option<bool> {
+    use pa_types::slash_commands::{
+        decision_api_enabled_from_status_details, DECISION_API_STATUS_CUSTOM_TYPE,
+    };
     let FileEntry::CustomMessage { payload, .. } = entry else {
         return None;
     };
     if payload.custom_type != DECISION_API_STATUS_CUSTOM_TYPE {
         return None;
     }
-    let provider = DecisionApiProvider::from_status_details(payload.details.as_ref());
-    Some(provider.map_or(
-        RecordedDecisionApiState::Off,
-        RecordedDecisionApiState::Enabled,
+    // Missing, null, or malformed details read as off, never older state.
+    Some(decision_api_enabled_from_status_details(
+        payload.details.as_ref(),
     ))
 }

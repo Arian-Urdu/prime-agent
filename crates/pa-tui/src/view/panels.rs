@@ -59,9 +59,8 @@ impl AgentView {
             }
             lines.extend(frame);
         }
-        if let Some(provider) = self.chrome.decision_api {
+        if self.chrome.decision_api {
             lines.push(crate::chrome::render_decision_api_footer(
-                provider,
                 &self.theme,
                 width,
             ));

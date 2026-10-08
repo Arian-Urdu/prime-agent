@@ -232,10 +232,10 @@ pub struct AgentConnectionState {
     pub active_tool_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_usage: Option<Value>,
-    /// The session's Decision API provider id (`/decision-api`, e.g. `clef`).
+    /// The session's Decision API while it is on (`/decision-api on`).
     /// Prime Agent only: omitted while off, so the TS state shape holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decision_api: Option<String>,
+    pub decision_api: Option<bool>,
 }
 
 #[cfg(test)]

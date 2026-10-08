@@ -137,8 +137,8 @@ impl Worker {
                 crate::session_stats::store_context_usage(store, inputs.model_context_window)
             }),
             decision_api: store
-                .and_then(crate::session_store::SessionFile::decision_api_provider)
-                .map(|provider| provider.id().to_string()),
+                .and_then(crate::session_store::SessionFile::decision_api_enabled)
+                .filter(|enabled| *enabled),
         }
     }
 

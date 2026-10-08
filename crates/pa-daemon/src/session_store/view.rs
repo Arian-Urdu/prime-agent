@@ -155,18 +155,25 @@ impl SessionFile {
 
     /// The newest durable Decision API status on the selected branch. The
     /// window's prefix metadata restores state hidden before compaction.
-    pub(crate) fn decision_api_provider(
-        &self,
-    ) -> Option<pa_types::slash_commands::DecisionApiProvider> {
-        use pa_types::slash_commands::{DecisionApiProvider, DECISION_API_STATUS_CUSTOM_TYPE};
+    /// `None` when no status row exists; `Some(true)` when the newest one
+    /// has the Decision API on.
+    pub(crate) fn decision_api_enabled(&self) -> Option<bool> {
+        use pa_types::slash_commands::{
+            decision_api_enabled_from_status_details, DECISION_API_STATUS_CUSTOM_TYPE,
+        };
         let branch = self.branch();
         let is_status = |entry: &&SessionEntry| {
             entry.type_ == "custom_message"
                 && entry.fields.get("customType").and_then(Value::as_str)
                     == Some(DECISION_API_STATUS_CUSTOM_TYPE)
         };
+        let enabled = |entry: &SessionEntry| {
+            Some(decision_api_enabled_from_status_details(
+                entry.fields.get("details"),
+            ))
+        };
         if let Some(entry) = branch.iter().copied().rev().find(is_status) {
-            return DecisionApiProvider::from_status_details(entry.fields.get("details"));
+            return enabled(entry);
         }
         let window = self.window.as_ref()?;
         // A newly rooted branch has no discarded ancestors to restore.
@@ -183,7 +190,7 @@ impl SessionFile {
             .filter(|entry| !window.retained_ids.contains(&entry.id))
             .rev()
             .find(is_status)
-            .and_then(|entry| DecisionApiProvider::from_status_details(entry.fields.get("details")))
+            .and_then(enabled)
     }
 
     /// The model in effect at the retained-window boundary (the newest

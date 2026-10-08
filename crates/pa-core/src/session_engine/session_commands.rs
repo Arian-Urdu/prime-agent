@@ -7,7 +7,6 @@
 use std::sync::Arc;
 
 use pa_types::session::CustomMessage;
-use pa_types::slash_commands::DecisionApiProvider;
 
 use crate::autonomous::{
     autonomous_status, set_autonomous_enabled, set_autonomous_limits, AutonomousRuntimeState,
@@ -424,8 +423,9 @@ fn execute_autonomous(
     Ok(())
 }
 
-/// `/decision-api jev|clef|off`: pick this session's decision model or turn
-/// the Decision API off. The result row tells the user; the durable
+/// `/decision-api on|off`: switch this session's Decision API. Turning it on
+/// resolves the decision model from the `decisionApi.systemOneModel` setting
+/// through the model registry; the result row tells the user, and the durable
 /// `decision_api_status` row records the state (sessions re-adopt it on
 /// rebuild) and tells the model.
 #[tracing::instrument(skip_all)]
@@ -435,50 +435,43 @@ async fn execute_decision_api(
     execution: &mut SessionCommandExecution,
 ) -> Result<(), String> {
     let outcome = async {
-        let provider = match command.args.trim() {
-            "off" => None,
-            arg => Some(
-                DecisionApiProvider::from_id(arg)
-                    .ok_or_else(|| "Usage: /decision-api [jev|clef|off]".to_string())?,
-            ),
+        let enabled = match command.args.trim() {
+            "on" => true,
+            "off" => false,
+            _ => return Err("Usage: /decision-api [on|off]".to_string()),
         };
-        if let Some(provider) = provider {
-            if !engine
-                .decision_api_has_key(provider)
-                .await
-                .map_err(|error| format!("{error:#}"))?
-            {
-                return Err(format!(
-                    "No {} API key is stored. Run /decision-api in the Prime Agent terminal UI to \
-                     add one.",
-                    provider.vendor()
-                ));
-            }
-        }
-        engine.set_decision_api(provider).await;
-        let result = match provider {
-            Some(provider) => format!(
-                "Decision API enabled for this session: {}.",
-                provider.label()
-            ),
-            None => "Decision API disabled for this session.".to_string(),
+        let model = if enabled {
+            Some(engine.decision_api_model_ready()?)
+        } else {
+            None
+        };
+        engine.set_decision_api(enabled).await;
+        let result = if enabled {
+            format!(
+                "Decision API enabled for this session with {} from decisionApi.systemOneModel.",
+                model.as_deref().unwrap_or_default()
+            )
+        } else {
+            "Decision API disabled for this session.".to_string()
         };
         execution.push_message(slash_command_result(
             command, result, /*success*/ true, "info", None, /*display*/ true,
         ));
         execution.push_message(CustomMessage {
             custom_type: pa_types::slash_commands::DECISION_API_STATUS_CUSTOM_TYPE.to_string(),
-            content: pa_types::ai::UserContent::Text(super::decision_api::status_note(provider)),
+            content: pa_types::ai::UserContent::Text(super::decision_api::status_note(
+                enabled,
+                model.as_deref(),
+            )),
             display: false,
-            details: Some(serde_json::json!({ "provider": provider.map(DecisionApiProvider::id) })),
+            details: Some(serde_json::json!({ "enabled": enabled })),
             timestamp: now_millis(),
             rest: serde_json::Map::default(),
         });
         Ok(())
     }
-    .await;
-    // Adoption rides `agent session ended` (`feature_decision_api_*_count`),
-    // the same seam `/goal` uses. The configuration (which provider) stays out.
+    .await; // Adoption rides `agent session ended` (`feature_decision_api_*_count`),
+            // the same seam `/goal` uses. The configuration (which provider) stays out.
     if let Some(telemetry) = engine.telemetry.as_ref() {
         telemetry.note_feature_outcome(
             "decision_api",
@@ -620,15 +613,30 @@ mod tests {
         assert!(matches!(status.content, UserContent::Text(_)));
     }
 
-    /// `/decision-api` is per session and off by default: picking a provider
-    /// needs its stored key, then lists the skill in the prompt and records
-    /// the state row a rebuilt session adopts again; `off` reverts both.
+    /// `/decision-api` is per session and off by default: `on` needs the
+    /// settings reference to resolve through the registry, then lists the
+    /// skill in the prompt and records the state row a rebuilt session
+    /// adopts again; `off` reverts both.
     #[tokio::test]
     async fn decision_api_switches_the_session_prompt_and_records_its_state() {
         use pa_types::slash_commands::DECISION_API_STATUS_CUSTOM_TYPE;
         let tmp = tempfile::tempdir().unwrap();
         let (cwd, agent_dir) = (tmp.path().join("project"), tmp.path().join("agent"));
         std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            serde_json::json!({}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("models.json"),
+            r#"{ "providers": { "test": {
+                "baseUrl": "http://localhost", "apiKey": "test-key",
+                "api": "openai-completions", "models": [ { "id": "m", "input": ["text"] } ]
+            } } }"#,
+        )
+        .unwrap();
         let model = pa_agent::types::Model {
             id: "m".into(),
             name: "m".into(),
@@ -669,37 +677,34 @@ mod tests {
         };
         assert_eq!(
             run("").await.error.as_deref(),
-            Some("Usage: /decision-api [jev|clef|off]")
+            Some("Usage: /decision-api [on|off]")
         );
         assert_eq!(
             run("jev").await.error.as_deref(),
+            Some("Usage: /decision-api [on|off]")
+        );
+        // The settings reference is unset: `on` names the setting.
+        assert_eq!(
+            run("on").await.error.as_deref(),
             Some(
-                "No TypeSafe API key is stored. Run /decision-api in the Prime Agent terminal UI \
-                 to add one."
+                "decisionApi.systemOneModel is not set in settings.json. Set it to the decision \
+                 model reference (\"provider/model-id\" or a bare id), e.g. \
+                 \"prime-inference/clef\"."
             )
         );
-        assert_eq!(engine.decision_api_switch().provider(), None);
+        assert!(!engine.decision_api_switch().is_enabled());
 
-        let mut auth = crate::auth::AuthStorage::create(&agent_dir);
-        for credential in ["typesafe", "cloudflare"] {
-            auth.set(
-                credential,
-                crate::auth::AuthCredential::ApiKey {
-                    key: "test-key".to_string(),
-                    prime_team: None,
-                },
-            );
-        }
-        assert_eq!(run("jev").await.error, None);
+        // A configured, resolvable reference switches the session on.
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            serde_json::json!({ "decisionApi": { "systemOneModel": "test/m" } }).to_string(),
+        )
+        .unwrap();
+        let enabled = run("on").await;
+        assert_eq!(enabled.error, None);
+        assert!(engine.decision_api_switch().is_enabled());
         assert!(engine.system_prompt().contains(skill_entry));
-        let clef = run("clef").await;
-        assert_eq!(clef.error, None);
-        assert_eq!(
-            engine.decision_api_switch().provider(),
-            Some(DecisionApiProvider::Clef)
-        );
-        assert!(engine.system_prompt().contains(skill_entry));
-        let rows: Vec<(String, String)> = clef
+        let rows: Vec<(String, String)> = enabled
             .messages
             .iter()
             .map(|row| (row.custom_type.clone(), message_text(row)))
@@ -709,31 +714,28 @@ mod tests {
             vec![
                 (
                     "session_slash_command".to_string(),
-                    "/decision-api clef".to_string()
+                    "/decision-api on".to_string()
                 ),
                 (
                     "session_slash_command_result".to_string(),
-                    "Decision API enabled for this session: Clef from Cloudflare \
-                     (vision-capable)."
+                    "Decision API enabled for this session with test/m from \
+                     decisionApi.systemOneModel."
                         .to_string()
                 ),
                 (
                     DECISION_API_STATUS_CUSTOM_TYPE.to_string(),
-                    super::super::decision_api::status_note(Some(DecisionApiProvider::Clef))
+                    super::super::decision_api::status_note(true, Some("test/m"))
                 ),
             ]
         );
 
-        // A rebuilt session adopts the recorded provider.
-        engine.set_decision_api(None).await;
+        // A rebuilt session adopts the recorded state.
+        engine.set_decision_api(false).await;
         engine.sync_decision_api_from_session().await;
-        assert_eq!(
-            engine.decision_api_switch().provider(),
-            Some(DecisionApiProvider::Clef)
-        );
+        assert!(engine.decision_api_switch().is_enabled());
 
         assert_eq!(run("off").await.error, None);
-        assert_eq!(engine.decision_api_switch().provider(), None);
+        assert!(!engine.decision_api_switch().is_enabled());
         assert_eq!(engine.system_prompt(), off_prompt);
     }
 

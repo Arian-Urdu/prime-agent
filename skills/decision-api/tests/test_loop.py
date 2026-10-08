@@ -24,7 +24,7 @@ async def host_request(kind, payload):
                 "probabilities": {"left": 0.9},
             }
         },
-        "model": "jev-latest",
+        "model": "fixture/model",
     }
 
 
@@ -85,7 +85,7 @@ class DecideTests(unittest.TestCase):
             self.assertEqual(result["action"], "left")
             self.assertEqual(result["confidence"], 0.9)
             self.assertEqual(result["probabilities"], {"left": 0.9})
-            self.assertEqual(result["model"], "jev-latest")
+            self.assertEqual(result["model"], "fixture/model")
             self.assertIsInstance(result["latency_ms"], float)
 
             kind, payload = host_calls[0]

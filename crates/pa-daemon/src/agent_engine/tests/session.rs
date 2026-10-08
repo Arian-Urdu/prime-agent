@@ -4,14 +4,14 @@ use crate::engine::PromptBatchRow;
 
 #[test]
 fn decision_api_daemon_build_restores_metadata_before_prompt_and_kernel_setup() {
-    use pa_types::slash_commands::{DecisionApiProvider, DECISION_API_STATUS_CUSTOM_TYPE};
+    use pa_types::slash_commands::DECISION_API_STATUS_CUSTOM_TYPE;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
     let mut store = crate::session_store::SessionFile::create("/tmp", None, 0);
     store.set_path(path.clone());
     store.append_entry(
         "custom_message",
-        json!({"customType":DECISION_API_STATUS_CUSTOM_TYPE,"content":"enabled","display":false,"details":{"provider":"clef"}}),
+        json!({"customType":DECISION_API_STATUS_CUSTOM_TYPE,"content":"enabled","display":false,"details":{"enabled":true}}),
     );
     let mut kept = String::new();
     for i in 0..12 {
@@ -33,19 +33,11 @@ fn decision_api_daemon_build_restores_metadata_before_prompt_and_kernel_setup() 
         "contextWindow":1000,"maxTokens":100,
     }))
     .unwrap();
-    for provider in [DecisionApiProvider::Clef, DecisionApiProvider::Jev] {
+    for enabled in [true, false] {
         let engine = bare_engine(dir.path());
         *engine.session_file.lock().unwrap() = Some(path.clone());
         let mut expected_entries = store.branch_file_entries();
-        if provider == DecisionApiProvider::Jev {
-            let pa_types::session::FileEntry::CustomMessage { payload, .. } =
-                &mut expected_entries[0]
-            else {
-                panic!("first branch entry is the decision status");
-            };
-            payload.details = Some(json!({"provider":"jev"}));
-            *engine.pending_branch.lock().unwrap() = Some(expected_entries.clone());
-        } else {
+        if enabled {
             expected_entries = pa_core::session::window::WindowedSessionStore::open(&path)
                 .unwrap()
                 .unwrap()
@@ -54,6 +46,14 @@ fn decision_api_daemon_build_restores_metadata_before_prompt_and_kernel_setup() 
                 .filter(|entry| !matches!(entry, pa_types::session::FileEntry::Header { .. }))
                 .cloned()
                 .collect();
+        } else {
+            let pa_types::session::FileEntry::CustomMessage { payload, .. } =
+                &mut expected_entries[0]
+            else {
+                panic!("first branch entry is the decision status");
+            };
+            payload.details = Some(json!({"enabled":false}));
+            *engine.pending_branch.lock().unwrap() = Some(expected_entries.clone());
         }
         engine.runtime.block_on(async {
             // The full build path: `ensure_core_session_async` builds the
@@ -93,7 +93,10 @@ fn decision_api_daemon_build_restores_metadata_before_prompt_and_kernel_setup() 
                 .cloned()
                 .collect();
             assert_eq!(actual_entries, expected_entries);
-            assert!(built.system_prompt().contains("<name>decision-api</name>"));
+            assert_eq!(
+                built.system_prompt().contains("<name>decision-api</name>"),
+                enabled
+            );
             assert_eq!(
                 built.session.agent().state().await.system_prompt,
                 built.system_prompt()

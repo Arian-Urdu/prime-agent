@@ -6,8 +6,6 @@ use super::{
     UI_REQUEST_TIMEOUT_MS,
 };
 
-use pa_types::slash_commands::DecisionApiProvider;
-
 /// The outcome of one daemon `set_model` attempt: the switch landed, the provider is not signed in
 /// (the sign-in flow owns the retry), or the switch failed (error row already rendered).
 #[derive(Debug)]
@@ -214,10 +212,6 @@ impl SessionUi {
                 cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             view.auth_panel = None;
-            self.decision_api_pending = None;
-            self.mcp_auth_cancel = None;
-            self.pending_mcp_auth = None;
-            self.mcp_auth_generation += 1;
         }
         self.dirty = true;
         Ok(())
@@ -322,50 +316,9 @@ impl SessionUi {
                     self.maybe_warn_anthropic_subscription_auth(&provider, view);
                 }
             }
-            AuthPanelRequest::McpSettled { note, generation } => {
-                if generation == self.mcp_auth_generation {
-                    view.auth_panel = None;
-                    self.note(&note, view);
-                    if let Some(mut pending) = self.decision_api_pending.take() {
-                        if pending.session_id == self.active_session_id {
-                            pending.stage = DecisionApiAuthStage::Rechecking;
-                            self.start_decision_key_check(pending, view);
-                        }
-                    }
-                }
-            }
-            AuthPanelRequest::DecisionApiReady { generation, result } => {
-                if generation == self.mcp_auth_generation {
-                    if let Some(mut pending) = self.decision_api_pending.take() {
-                        view.auth_panel = None;
-                        if pending.session_id == self.active_session_id {
-                            match result {
-                                Ok(true) => {
-                                    if let Err(error) = self.send_prompt(
-                                        &format!("/decision-api {}", pending.provider.id()),
-                                        pending.behavior,
-                                        view,
-                                    ) {
-                                        self.error_row(&format!("{error:#}"), view);
-                                    }
-                                }
-                                Ok(false) if pending.stage == DecisionApiAuthStage::Checking => {
-                                    self.pending_mcp_auth = Some(McpAuthIntent {
-                                        args: format!("key {}", pending.provider.credential()),
-                                        title: format!("Log in to {}", pending.provider.vendor()),
-                                    });
-                                    pending.stage = DecisionApiAuthStage::Saving;
-                                    self.decision_api_pending = Some(pending);
-                                }
-                                Ok(false) => self.error_row(
-                                    "The saved Decision API credential did not resolve to a usable key. Run /decision-api again to replace it.",
-                                    view,
-                                ),
-                                Err(error) => self.error_row(&format!("{error:#}"), view),
-                            }
-                        }
-                    }
-                }
+            AuthPanelRequest::McpSettled { note } => {
+                view.auth_panel = None;
+                self.note(&note, view);
             }
             AuthPanelRequest::TracesSettled { outcome, gen } => {
                 // A superseded run's late settle cannot clear a newer login: the generation guard.
@@ -409,113 +362,16 @@ impl SessionUi {
             self.note("/mcp is not available in this client yet", view);
             return;
         };
-        if let Some(previous) = self.mcp_auth_cancel.take() {
-            previous.mark();
-        }
-        self.mcp_auth_generation += 1;
-        let generation = self.mcp_auth_generation;
-        if self
-            .decision_api_pending
-            .as_ref()
-            .is_some_and(|pending| intent.args != format!("key {}", pending.provider.credential()))
-        {
-            self.decision_api_pending = None;
-        }
         let panel = crate::auth_panel::AuthPanelHandle::new(self.auth_panel_notes.clone());
         let mut mcp_dialog = crate::auth_panel::AuthPanel::new(intent.title);
         mcp_dialog.set_cancel_signal(panel.cancel_signal());
-        self.mcp_auth_cancel = Some(panel.cancel_signal());
         view.auth_panel = Some(mcp_dialog);
         let args = intent.args;
         tokio::spawn(async move {
             let note =
                 crate::client_auth::run_mcp_auth_command(auth.0.as_ref(), &args, panel.clone())
                     .await;
-            if !panel.cancelled() {
-                panel.send(crate::auth_panel::AuthPanelRequest::McpSettled { note, generation });
-            }
-        });
-    }
-
-    /// `/decision-api [jev|clef|off]` switches the session (the daemon runs
-    /// it); without an argument it opens the provider picker. Picking a
-    /// provider whose key is not stored opens the key panel first; the saved
-    /// key then sends `/decision-api <provider>`.
-    pub(crate) fn handle_decision_api_command(
-        &mut self,
-        args: &str,
-        text: &str,
-        behavior: super::prompt::SubmitBehavior,
-        view: &mut AgentView,
-    ) -> Result<()> {
-        self.decision_api_pending = None;
-        if let Some(previous) = self.mcp_auth_cancel.take() {
-            previous.mark();
-            view.auth_panel = None;
-        }
-        self.mcp_auth_generation += 1;
-        let args = args.trim();
-        if args.is_empty() {
-            view.choice_picker = Some(crate::choice_picker::ChoicePicker::decision_api(
-                self.decision_api,
-            ));
-            self.decision_api_picker_behavior = Some(behavior);
-            self.dirty = true;
-            self.track_feature_outcome("decision_api", "initiated", None);
-            return Ok(());
-        }
-        if let Some(provider) = DecisionApiProvider::from_id(args) {
-            if self.client_auth.is_some() {
-                self.start_decision_key_check(
-                    PendingDecisionApi {
-                        provider,
-                        behavior,
-                        session_id: self.active_session_id.clone(),
-                        stage: DecisionApiAuthStage::Checking,
-                    },
-                    view,
-                );
-                return Ok(());
-            }
-        }
-        self.send_prompt(text, behavior, view)
-    }
-
-    fn start_decision_key_check(&mut self, pending: PendingDecisionApi, view: &mut AgentView) {
-        let auth = self
-            .client_auth
-            .clone()
-            .expect("credential resolution has an auth hook");
-        let panel = crate::auth_panel::AuthPanelHandle::new(self.auth_panel_notes.clone());
-        let mut dialog =
-            crate::auth_panel::AuthPanel::new(format!("Log in to {}", pending.provider.vendor()));
-        dialog.set_cancel_signal(panel.cancel_signal());
-        self.mcp_auth_cancel = Some(panel.cancel_signal());
-        dialog.push_waiting("Checking credentials…");
-        view.auth_panel = Some(dialog);
-        self.mcp_auth_generation += 1;
-        let generation = self.mcp_auth_generation;
-        let provider = pending.provider;
-        self.decision_api_pending = Some(pending);
-        self.dirty = true;
-        tokio::spawn(async move {
-            let result = match tokio::time::timeout(
-                Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
-                auth.0.api_key_ready(provider.credential()),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(anyhow::anyhow!(
-                    "Decision API credential lookup timed out. Run /decision-api again to retry."
-                )),
-            };
-            if !panel.cancelled() {
-                panel.send(crate::auth_panel::AuthPanelRequest::DecisionApiReady {
-                    generation,
-                    result,
-                });
-            }
+            panel.send(crate::auth_panel::AuthPanelRequest::McpSettled { note });
         });
     }
 
@@ -713,21 +569,3 @@ pub(crate) struct McpAuthIntent {
     pub(crate) args: String,
     pub(crate) title: String,
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DecisionApiAuthStage {
-    Checking,
-    Saving,
-    Rechecking,
-}
-
-pub(super) struct PendingDecisionApi {
-    provider: DecisionApiProvider,
-    behavior: super::prompt::SubmitBehavior,
-    session_id: String,
-    stage: DecisionApiAuthStage,
-}
-
-#[cfg(all(test, unix))]
-#[path = "decision_api_tests.rs"]
-mod decision_api_tests;

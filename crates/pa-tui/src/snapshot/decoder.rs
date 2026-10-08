@@ -17,10 +17,8 @@ pub enum TurnUpdate {
     /// `service_tier_changed`: the session's effective service tier.
     ServiceTierChanged { tier: String },
     /// A `decision_api_status` row: `/decision-api` switched the session's
-    /// provider (`None` when it turned the Decision API off).
-    DecisionApiChanged {
-        provider: Option<pa_types::slash_commands::DecisionApiProvider>,
-    },
+    /// Decision API on or off.
+    DecisionApiChanged { enabled: bool },
     /// `message_start` with a user message.
     UserMessage(String),
     /// An assistant message; `streaming` distinguishes in-flight from
@@ -439,15 +437,12 @@ fn custom_row_update(message: &Value) -> Option<TurnUpdate> {
     if message.get("customType").and_then(Value::as_str)
         == Some(pa_types::slash_commands::DECISION_API_STATUS_CUSTOM_TYPE)
     {
-        if let Some(provider) = message
+        if let Some(enabled) = message
             .get("details")
-            .and_then(|details| details.get("provider"))
+            .and_then(|details| details.get("enabled"))
+            .and_then(Value::as_bool)
         {
-            return Some(TurnUpdate::DecisionApiChanged {
-                provider: provider
-                    .as_str()
-                    .and_then(pa_types::slash_commands::DecisionApiProvider::from_id),
-            });
+            return Some(TurnUpdate::DecisionApiChanged { enabled });
         }
     }
     let entries = custom_message_entries(message);

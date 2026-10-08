@@ -171,15 +171,9 @@ pub(crate) struct SessionUi {
     /// `None` until the first sample, a rebind restarts it.
     speed_stats: Option<SpeedStats>,
     service_tier: Option<String>,
-    /// The session's Decision API provider while it is on, seeded from the
-    /// attach state and kept live by its `decision_api_status` rows.
-    decision_api: Option<pa_types::slash_commands::DecisionApiProvider>,
-    /// `/decision-api` opened this provider's key panel: a saved key turns
-    /// the Decision API on with it once the panel settles.
-    decision_api_pending: Option<auth::PendingDecisionApi>,
-    decision_api_picker_behavior: Option<prompt::SubmitBehavior>,
-    mcp_auth_generation: u64,
-    mcp_auth_cancel: Option<crate::auth_panel::FlowCancel>,
+    /// The session's Decision API while it is on, seeded from the attach
+    /// state and kept live by its `decision_api_status` rows.
+    decision_api: bool,
     client_settings: Option<std::sync::Arc<dyn crate::client_settings::ClientSettings>>,
     /// The ban-risk warning's view-local dedup (TS
     /// `anthropicSubscriptionWarningShown`): this VIEW's own

@@ -53,8 +53,6 @@ pub enum SelectorKind {
     ResourceConfig,
     /// The `/effort` picker: single-select semantics, Enter applies.
     Effort,
-    /// The `/decision-api` provider picker: single-select, Enter applies.
-    DecisionApi,
 }
 
 impl SelectorKind {
@@ -69,9 +67,6 @@ impl SelectorKind {
                 "Thinking Level",
                 &[("enter", "select"), ("escape", "close")],
             ),
-            SelectorKind::DecisionApi => {
-                ("Decision API", &[("enter", "select"), ("escape", "close")])
-            }
         }
     }
 }
@@ -95,7 +90,7 @@ impl ConfigSelector {
     }
 
     /// Build the selector for a specific surface (`/effort` uses
-    /// [`SelectorKind::Effort`], `/decision-api` [`SelectorKind::DecisionApi`]).
+    /// [`SelectorKind::Effort`]).
     #[must_use]
     pub fn with_kind(rows: Vec<SelectorRow>, kind: SelectorKind) -> Self {
         let filtered = (0..rows.len()).collect();
@@ -479,7 +474,6 @@ impl ConfigSelector {
         match self.kind {
             SelectorKind::ResourceConfig => "Type to filter resources",
             SelectorKind::Effort => "Type to filter levels",
-            SelectorKind::DecisionApi => "Type to filter models",
         }
     }
 
@@ -488,7 +482,6 @@ impl ConfigSelector {
         match self.kind {
             SelectorKind::ResourceConfig => "No resources found",
             SelectorKind::Effort => "No matching levels",
-            SelectorKind::DecisionApi => "No matching models",
         }
     }
 

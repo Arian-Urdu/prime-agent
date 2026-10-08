@@ -5,6 +5,13 @@
 //! (`model` + `answers`) becomes the assistant text. The host (pa-core)
 //! owns the request and response policy; this is one registered transport
 //! among the provider set, not a bespoke client.
+//!
+//! The body rides verbatim, so the protocol's full contract holds: one
+//! state plus a schema of typed questions, answered with a probability for
+//! every allowed option of every question in a single forward pass (the
+//! clef model card's joint schema head). The host currently composes the
+//! single `action` question; a multi-question schema passes through
+//! unchanged.
 
 use crate::event_stream::{
     create_assistant_message_event_stream, AssistantMessageEventStream, AssistantMessageEventWriter,
@@ -309,6 +316,47 @@ mod tests {
             requests[0].body, request,
             "the decision body rides verbatim"
         );
+    }
+
+    /// Clef's contract (the model card's joint schema head): one state
+    /// plus a schema of typed questions, answered per question in one pass.
+    /// The transport rides the schema verbatim; the host composes one
+    /// question today.
+    #[tokio::test]
+    async fn a_multi_question_schema_rides_verbatim_and_answers_per_question() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let envelope = json!({
+            "model": "cloudflare/clef",
+            "answers": {
+                "action": {"type": "choice", "choice": "left", "confidence": 0.9, "probabilities": {"left": 0.9, "right": 0.1}},
+                "speed": {"type": "choice", "choice": "fast", "confidence": 0.6, "probabilities": {"fast": 0.6, "slow": 0.4}}
+            }
+        });
+        let base = serve(200, envelope.clone(), std::sync::Arc::clone(&seen)).await;
+        let model = fixture_model(&base);
+        let request = json!({
+            "state": {"frame": 1},
+            "questions": {
+                "action": {"type": "choice", "criteria": {"left": "go left", "right": "go right"}},
+                "speed": {"type": "choice", "criteria": {"fast": "run", "slow": "crawl"}}
+            },
+            "model": "cloudflare/clef"
+        });
+        let stream = SystemOneProvider.stream(&model, &decision_context(request.clone()), None);
+        let message = stream.result().await;
+        assert_eq!(message.stop_reason, StopReason::Stop);
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].body, request, "the schema rides verbatim");
+        let text = message
+            .content
+            .iter()
+            .map(|block| match block {
+                AssistantContentBlock::Text(text) => text.text.clone(),
+                _ => String::new(),
+            })
+            .collect::<String>();
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), envelope);
     }
 
     #[tokio::test]

@@ -4,10 +4,12 @@ The Decision API is experimental and off by default. It runs the
 `decision-api` skill's System 1 / System 2 control loop, with System 1
 serving one fast decision per observation.
 
-Configure the decision model in settings.json:
+Configure the decision model in settings.json. The canonical test target
+is Prime Inference's hosted clef (baseUrl
+https://api.pinference.ai/api/v1, the stored login's team header):
 
 ```json
-{ "decisionApi": { "systemOneModel": "prime-inference/clef" } }
+{ "decisionApi": { "systemOneModel": "prime-inference/cloudflare/clef" } }
 ```
 
 The value is a registry model reference (`"provider/model-id"` or a bare id)
@@ -39,8 +41,14 @@ System One structured-decision protocol (`"api": "systemone"`, Prime
 Inference's hosted clef — the request body POSTs to the model's baseUrl +
 `/systemone` and the reply envelope carries the answers), or the ordinary
 chat-completion transports, where decide() renders the decision prompt
-and parses the model's JSON answer. The model registry recipe for the
-hosted clef:
+and parses the model's JSON answer. The systemone transport rides the
+request body verbatim, so the protocol's full contract holds — clef's
+joint schema head: one state plus a schema of typed questions, answered
+with a probability for every allowed option of every question in a single
+forward pass (no free-form generation, no output parsing; images read as
+state). decide() composes the single `action` question today; the
+transport carries a multi-question schema unchanged. The model registry recipe for the
+hosted clef (the pinned Prime Inference deployment):
 
 ```json
 { "providers": { "prime-inference": {

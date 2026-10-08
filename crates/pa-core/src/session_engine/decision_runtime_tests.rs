@@ -248,12 +248,19 @@ async fn decision_api_real_runtime_loop_routes_decisions_and_child_delivery_then
         stderr_log_path: None,
     });
     manager.start(KernelStartOptions::default()).await.unwrap();
-    let source =
+    // The fixture kernel carries no skill set (a bare ReplKernelManager),
+    // so the skill imports resolve from the checkout's skill sources, never
+    // a side-effect skill install some other test raced into the shared venv.
+    let decision_skill =
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../skills/decision-api/src");
-    let source = serde_json::to_string(&source.display().to_string()).unwrap();
+    let messaging_skill =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../skills/agent-message/src");
+    let source = serde_json::to_string(&decision_skill.display().to_string()).unwrap();
+    let messaging_source = serde_json::to_string(&messaging_skill.display().to_string()).unwrap();
     let code = format!(
         r#"
 import sys, asyncio, pathlib
+sys.path.insert(0, {messaging_source})
 sys.path.insert(0, {source})
 import decision_api
 assert pathlib.Path(decision_api.__file__).resolve().is_relative_to(pathlib.Path({source}).resolve())

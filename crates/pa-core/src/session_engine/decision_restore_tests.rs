@@ -39,6 +39,7 @@ async fn build_session(root: &Path, manager: SessionManager) -> SessionEngine {
         cost: pa_agent::types::UsageCost::default(),
         context_window: 1_000,
         max_tokens: 100,
+        max_tokens_explicit: false,
     };
     let provider = std::sync::Arc::new(pa_agent::scripted::ScriptedProvider::new(model.clone()));
     let conversation_log_path = manager.get_session_file().map(Path::to_path_buf);

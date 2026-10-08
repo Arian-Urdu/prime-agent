@@ -1,12 +1,6 @@
-//! The builtin slash-command vocabulary. Port of `core/slash-commands.ts`:
-//! the command table every surface shares (the interactive TUI, the session
-//! engine's command admission, and CLI suggestion help), plus the parse and
-//! suggestion helpers over it.
-//!
-//! Pure data and pure functions only. This is the shared-vocabulary crate:
-//! the TUI cannot import the session engine, and one table must serve both
-//! sides, so the data lives here (the TS product keeps the same single
-//! table in core and imports it from its TUI).
+//! The builtin slash-command vocabulary (TS `slash-commands.ts`): the one command table every
+//! surface shares (TUI, session-engine admission, CLI suggestion help), plus parse/suggestion
+//! helpers. Lives here because the TUI cannot import the session engine.
 
 use std::collections::HashMap;
 
@@ -14,8 +8,8 @@ use std::collections::HashMap;
 pub const SESSION_SLASH_COMMAND_NAMES: [&str; 5] =
     ["compact", "refine", "goal", "autonomous", "decision-api"];
 
-/// Durable row custom types (TS core/messages.ts): the command echo and its
-/// result, as persisted in sessions and rendered by every surface.
+/// Durable row custom types (TS `messages.ts`): the command echo and its
+/// result, persisted in sessions and rendered by every surface.
 pub const SESSION_SLASH_COMMAND_CUSTOM_TYPE: &str = "session_slash_command";
 pub const SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE: &str = "session_slash_command_result";
 /// The durable `/decision-api` state row (`details.provider`): the newest
@@ -100,7 +94,6 @@ impl DecisionApiProvider {
     }
 }
 
-/// True when `value` names a session-executed command.
 #[must_use]
 pub fn is_session_slash_command_name(value: &str) -> bool {
     SESSION_SLASH_COMMAND_NAMES.contains(&value)
@@ -115,10 +108,9 @@ pub enum SlashCommandExecution {
     Session,
 }
 
-/// One builtin slash command. Descriptions and argument hints are
-/// user-facing: keep them byte-identical to the TS table. `update` is the
-/// one sanctioned divergence (the 2026-09-27 operator directive): it is
-/// the TS->Rust migration path, not the TS update surface.
+/// One builtin slash command. Descriptions and argument hints are user-facing: byte-identical to
+/// the TS table. `update` is the one sanctioned divergence (2026-09-27 operator directive): it is
+/// the TS->Rust migration path.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BuiltinSlashCommand {
     pub name: &'static str,
@@ -258,9 +250,8 @@ impl SlashCommandRegistry {
         })
     }
 
-    /// The suggestion candidates for a mistyped command: every canonical
-    /// name and alias, in registry order (`findSlashCommandSuggestion` in
-    /// core/slash-commands.ts searches this list).
+    /// The suggestion candidates: every canonical name and alias, in
+    /// registry order (TS `findSlashCommandSuggestion` searches this list).
     #[must_use]
     pub fn suggestion_candidates(&self) -> Vec<&'static str> {
         let mut candidates = Vec::new();
@@ -282,9 +273,8 @@ pub struct ResolvedSlashCommand {
     pub args: String,
 }
 
-/// Parse a `/name args` line. A leading `/` is required; the name is the
-/// token up to the first whitespace separator, the rest (trimmed) is the
-/// argument string.
+/// Parse a `/name args` line: leading `/` required, name up to the first
+/// whitespace, the trimmed rest is the argument string.
 pub fn parse_slash_command(text: &str) -> Option<(String, String)> {
     if !text.starts_with('/') {
         return None;
@@ -296,9 +286,7 @@ pub fn parse_slash_command(text: &str) -> Option<(String, String)> {
     }
 }
 
-/// Suggest the closest candidate command name, mirroring
-/// `findSlashCommandSuggestion` in core/slash-commands.ts.
-///
+/// Suggest the closest candidate command name, mirroring `findSlashCommandSuggestion`.
 /// # Panics
 ///
 /// Cannot panic: the `unwrap` below only runs when `closest` already holds

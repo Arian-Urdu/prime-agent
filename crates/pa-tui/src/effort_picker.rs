@@ -3,8 +3,7 @@
 
 use crate::choice_picker::ChoicePicker;
 
-/// The reasoning-level descriptions the TS selector lists under each level
-/// (TS `LEVEL_DESCRIPTIONS`).
+/// The reasoning-level descriptions the TS selector lists under each level.
 #[must_use]
 pub fn level_description(level: &str) -> &'static str {
     match level {
@@ -19,7 +18,7 @@ pub fn level_description(level: &str) -> &'static str {
     }
 }
 
-/// The outcome of dispatching `/effort [level]` (TS `handleEffortCommand`).
+/// The outcome of dispatching `/effort [level]`.
 #[derive(Debug)]
 pub(crate) enum EffortCommandOutcome {
     /// Open the picker over the session's levels.

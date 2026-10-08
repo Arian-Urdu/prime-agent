@@ -9,22 +9,31 @@ use super::{
     ParentIdentity, PromptRequest, ProviderTarget, SessionEngine, SideQuestionOutcome,
     SideQuestionRequest, StartupScope, TurnPrompt, Value, DEFAULT_RLM_MAX_DEPTH,
 };
+use pa_core::session_engine::agent_messaging::AgentFamilyRelationship;
 
 impl SessionEngine for AgentSessionEngine {
-    fn route_decision_api_goal(&self, sender_name: &str, message: &str) -> bool {
-        let Ok(goal) = serde_json::from_str::<Value>(message) else {
+    fn route_decision_api_event(
+        &self,
+        relationship: Option<AgentFamilyRelationship>,
+        sender_name: &str,
+        message: &str,
+    ) -> bool {
+        if relationship != Some(AgentFamilyRelationship::Child) {
+            return false;
+        }
+        let Ok(decision) = serde_json::from_str::<Value>(message) else {
             return false;
         };
-        if goal["type"] != "decision_api.goal" {
+        if decision["type"] != "decision_api.decision" {
             return false;
         }
         if let Some(slot) = self
-            .decision_goals
+            .decision_replies
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get_mut(sender_name)
         {
-            *slot = Some(goal);
+            *slot = Some(decision);
         }
         true
     }

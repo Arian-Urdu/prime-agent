@@ -26,6 +26,14 @@ pre-import of the `decision_api` module are gated at session and kernel
 start; an existing kernel pre-imports it only after a restart). Stopping an
 active control loop before changing the setting avoids half-learned state.
 
+The loop runs System 1 as a spawned decision child
+(`rlm.spawn(..., kind="decision")`): the child's model is the setting's
+reference, its every message is one decision request served by one model
+call, and it lives exactly as long as the loop. Goals flow to it as tagged
+`decision_api.goal` agent messages (an older goal never overwrites a newer
+one), and its answers return to the loop as tagged `decision_api.decision`
+messages.
+
 ## Opt-in live smoke checks
 
 These checks make billed provider requests. Run them only when intentionally

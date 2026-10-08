@@ -101,8 +101,9 @@ pub(crate) type SettledKernelRelease =
 
 /// A [`SessionEngine`] running real agent turns.
 pub struct AgentSessionEngine {
-    /// Latest System 2 reply per live loop child; shared with its kernel host handler.
-    pub(crate) decision_goals:
+    /// Latest decision reply per live decision child; shared with its kernel
+    /// host handler (`decision_api.decision`).
+    pub(crate) decision_replies:
         Arc<std::sync::Mutex<std::collections::HashMap<String, Option<Value>>>>,
     pub(crate) runtime: crate::async_safe_runtime::AsyncSafeRuntime,
     pub(crate) config: AgentEngineConfig,

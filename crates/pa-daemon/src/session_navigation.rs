@@ -434,6 +434,7 @@ mod tests {
             recovery_journal_path: dir.join("recovery.jsonl"),
             telemetry_disabled: None,
             script: Some(json!({ "responses": ["ack"] })),
+            decision_child: false,
         };
         let worker = Arc::new(Worker::new(config, None));
         let created = worker
@@ -507,6 +508,7 @@ mod tests {
                 "engine": "faux",
                 "responses": [{ "text": "one" }, { "text": "two" }],
             })),
+            decision_child: false,
         };
         let worker = Arc::new(Worker::new(config, None));
         let created = worker
@@ -712,6 +714,7 @@ mod tests {
             recovery_journal_path: dir.path().join("recovery.jsonl"),
             telemetry_disabled: None,
             script: Some(json!({ "responses": ["ack"] })),
+            decision_child: false,
         };
         let worker = Arc::new(Worker::new(config, None));
         let created = worker
@@ -828,6 +831,7 @@ mod tests {
             recovery_journal_path: dir.join("recovery.jsonl"),
             telemetry_disabled: None,
             script: Some(json!({ "responses": ["ack"] })),
+            decision_child: false,
         };
         let worker = Arc::new(crate::worker::Worker::new(config, None));
         let created = worker

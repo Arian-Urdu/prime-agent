@@ -125,7 +125,7 @@ impl AgentSessionEngine {
         // unseeded (None keeps the TS default "one-at-a-time").
         let queue_modes = std::sync::Mutex::new((None, None));
         Ok(Self {
-            decision_goals: Arc::default(),
+            decision_replies: Arc::default(),
             runtime,
             config,
             mcp,
@@ -780,23 +780,23 @@ impl AgentSessionEngine {
             self.children.clone(),
         ));
         let mut handlers = HostRequestHandlers::default();
-        let goals = Arc::clone(&self.decision_goals);
+        let replies = Arc::clone(&self.decision_replies);
         handlers.register(
-            "decision_api.goal",
+            "decision_api.decision",
             pa_core::kernel::shared::host_handler(move |payload| {
-                let goals = Arc::clone(&goals);
+                let replies = Arc::clone(&replies);
                 Box::pin(async move {
                     let name = payload.data["name"].as_str().ok_or_else(|| {
-                        anyhow::anyhow!("decision_api.goal requires a child name")
+                        anyhow::anyhow!("decision_api.decision requires a child name")
                     })?;
-                    let mut goals = goals
+                    let mut replies = replies
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if payload.data["close"] == true {
-                        goals.remove(name);
+                        replies.remove(name);
                         Ok(Value::Null)
                     } else {
-                        Ok(goals
+                        Ok(replies
                             .entry(name.to_string())
                             .or_default()
                             .take()
@@ -1032,14 +1032,14 @@ impl AgentSessionEngine {
 }
 
 #[cfg(test)]
-mod decision_goal_tests {
+mod decision_reply_tests {
     use super::*;
     use crate::worker::{Worker, WorkerConfig};
     use pa_core::kernel::shared::HostRequestPayload;
     use serde_json::json;
 
     #[tokio::test]
-    async fn child_goals_reach_the_loop_without_queuing_a_parent_turn() {
+    async fn child_decision_replies_reach_the_loop_without_queuing_a_parent_turn() {
         let dir = tempfile::tempdir().unwrap();
         let worker = Worker::new(
             WorkerConfig {
@@ -1052,6 +1052,7 @@ mod decision_goal_tests {
                 recovery_journal_path: dir.path().join("recovery.jsonl"),
                 telemetry_disabled: Some(true),
                 script: None,
+                decision_child: false,
             },
             /*registration*/ None,
         );
@@ -1065,41 +1066,47 @@ mod decision_goal_tests {
             .unwrap()
             .extra_host_handlers()
             .unwrap();
-        let receive = handlers
-            .get("decision_api.goal")
-            .expect("goal route registered");
-        let poll = |data| {
-            receive(HostRequestPayload {
+        let poll = handlers
+            .get("decision_api.decision")
+            .expect("decision route registered");
+        let call = |data| {
+            poll(HostRequestPayload {
                 data,
                 cell_source_code: None,
             })
         };
         assert_eq!(
-            poll(json!({"name":"system-2-test"})).await.unwrap(),
+            call(json!({"name":"system-1-test"})).await.unwrap(),
             Value::Null
         );
-        let goal = json!({"type":"decision_api.goal","seq":0,"goal":"follow the target"});
-        let mut delivery = json!({"message":goal.to_string(),"sender":{
-            "activeSessionId":"child","sessionName":"system-2-test",
+        let decision = json!({
+            "type":"decision_api.decision","seq":0,
+            "decision":{"action":"left","confidence":0.9}
+        });
+        let mut delivery = json!({"message":decision.to_string(),"sender":{
+            "activeSessionId":"child","sessionName":"system-1-test",
             "parentActiveSessionId":"parent","runtimeKind":"subagent"
         }});
         worker.core.lock().unwrap().busy = true;
         assert!(worker.handle_worker_deliver_message(&delivery).success);
-        assert_eq!(poll(json!({"name":"system-2-test"})).await.unwrap(), goal);
         assert_eq!(
-            poll(json!({"name":"system-2-test"})).await.unwrap(),
+            call(json!({"name":"system-1-test"})).await.unwrap(),
+            decision
+        );
+        assert_eq!(
+            call(json!({"name":"system-1-test"})).await.unwrap(),
             Value::Null
         );
         assert!(worker.core.lock().unwrap().steering.is_empty());
         assert!(worker.core.lock().unwrap().follow_up.is_empty());
         worker.core.lock().unwrap().busy = false;
-        poll(json!({"name":"system-2-test","close":true}))
+        call(json!({"name":"system-1-test","close":true}))
             .await
             .unwrap();
         assert!(worker.handle_worker_deliver_message(&delivery).success);
         assert!(
             worker.core.lock().unwrap().steering.is_empty(),
-            "retired child must not wake the parent"
+            "a closed decision child must not wake the parent"
         );
         delivery["sender"]["parentActiveSessionId"] = json!("another-parent");
         assert!(worker.handle_worker_deliver_message(&delivery).success);

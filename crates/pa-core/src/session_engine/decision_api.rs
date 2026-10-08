@@ -421,6 +421,47 @@ async fn serve_decision(
     }))
 }
 
+/// The settings decision model's resolved selector (`"provider/id"`):
+/// the spawn seam uses this for the decision child's model, refusing with
+/// the same actionable messages as `decide()` when the setting is unset or
+/// unresolvable.
+///
+/// # Errors
+///
+/// Returns the unset/unresolvable-setting refusal.
+pub fn decision_model_selector(cwd: &Path, agent_dir: &Path) -> Result<String, String> {
+    resolve_decision_model(cwd, agent_dir).map(|resolved| resolved.label())
+}
+
+/// Serve one decision request: validate the kernel's request body, resolve
+/// the settings model through the registry, and run one provider
+/// completion. The session host handler and the daemon's decision child
+/// share this path.
+///
+/// # Errors
+///
+/// Returns the request, setting, resolution, or provider failure as an
+/// actionable message.
+pub async fn serve_decision_request(
+    request: Value,
+    cwd: &Path,
+    agent_dir: &Path,
+) -> anyhow::Result<Value> {
+    let Value::Object(request) = request else {
+        bail!("decision_api.decide needs a request object");
+    };
+    let request = parse_decision_request(request)?;
+    let resolved = resolve_decision_model(cwd, agent_dir).map_err(anyhow::Error::msg)?;
+    if !request.images.is_empty() && !resolved.model.input.contains(&ModelInput::Image) {
+        bail!(
+            "{} does not accept image input, so decisions cannot carry images. Drop \
+             the images, or set decisionApi.systemOneModel to a vision-capable model.",
+            resolved.label()
+        );
+    }
+    serve_decision(&resolved, &request).await
+}
+
 /// Register `decision_api.decide`, resolving the decision model from the
 /// settings under `agent_dir` on every call.
 pub(crate) fn register_decision_api_handler(
@@ -434,21 +475,10 @@ pub(crate) fn register_decision_api_handler(
             let cwd = cwd.clone();
             let agent_dir = agent_dir.clone();
             Box::pin(async move {
-                let Some(Value::Object(request)) = payload.data.get("request").cloned() else {
+                let Some(request) = payload.data.get("request").cloned() else {
                     bail!("decision_api.decide needs a request object");
                 };
-                let request = parse_decision_request(request)?;
-                let resolved =
-                    resolve_decision_model(&cwd, &agent_dir).map_err(anyhow::Error::msg)?;
-                if !request.images.is_empty() && !resolved.model.input.contains(&ModelInput::Image)
-                {
-                    bail!(
-                        "{} does not accept image input, so decisions cannot carry images. Drop \
-                         the images, or set decisionApi.systemOneModel to a vision-capable model.",
-                        resolved.label()
-                    );
-                }
-                serve_decision(&resolved, &request).await
+                serve_decision_request(request, &cwd, &agent_dir).await
             })
         }),
     );

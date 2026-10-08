@@ -108,6 +108,7 @@ mod resume_settings_tests {
                     recovery_journal_path: dir.path().join("recovery.jsonl"),
                     telemetry_disabled: Some(true),
                     script: Some(json!({"responses":[]})),
+                    decision_child: false,
                 },
                 None,
             );

@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::engine::{create_session, SessionEngine, SessionEngineConfig};
 
@@ -145,12 +145,10 @@ async fn decision_api_real_runtime_loop_routes_decisions_and_child_delivery_then
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum FixtureRequest {
-        Decide,
         Spawn,
         Send,
-        Goal,
+        Decision,
         Delete,
-        AwaitChild,
     }
     if run_runtime_fixture_in_child(
         "decision_api_real_runtime_loop_routes_decisions_and_child_delivery_then_cleans_up",
@@ -159,7 +157,7 @@ async fn decision_api_real_runtime_loop_routes_decisions_and_child_delivery_then
     {
         return;
     }
-    // This is a real REPL/skill bridge with synthetic provider and child
+    // This is a real REPL/skill bridge with synthetic child and reply
     // handlers. It never invokes a paid provider or starts a daemon child.
     let python = std::env::var_os("PRIME_AGENT_KERNEL_PYTHON")
         .map(std::path::PathBuf::from)
@@ -173,51 +171,65 @@ async fn decision_api_real_runtime_loop_routes_decisions_and_child_delivery_then
         return;
     };
     let events = Arc::new(Mutex::new(Vec::new()));
-    let goal_message = Arc::new(Mutex::new(serde_json::Value::Null));
-    let child_ready = Arc::new(tokio::sync::Notify::new());
+    let replies = Arc::new(Mutex::new(std::collections::HashMap::<String, Value>::new()));
     let mut handlers = HostRequestHandlers::new();
     for (name, kind) in [
-        ("decision_api.decide", FixtureRequest::Decide),
         ("rlm.run", FixtureRequest::Spawn),
         ("agent_message.send", FixtureRequest::Send),
-        ("decision_api.goal", FixtureRequest::Goal),
+        ("decision_api.decision", FixtureRequest::Decision),
         ("rlm.delete_subagent", FixtureRequest::Delete),
-        ("fixture.child_ready", FixtureRequest::AwaitChild),
     ] {
         let events = Arc::clone(&events);
-        let goal_message = Arc::clone(&goal_message);
-        let child_ready = Arc::clone(&child_ready);
+        let replies = Arc::clone(&replies);
         handlers.register(name, host_handler(move |payload| {
             let events = Arc::clone(&events);
-            let goal_message = Arc::clone(&goal_message);
-            let child_ready = Arc::clone(&child_ready);
+            let replies = Arc::clone(&replies);
             Box::pin(async move {
                 events.lock().unwrap().push((kind, payload.data.clone()));
                 match kind {
-                    FixtureRequest::Decide => Ok(json!({
-                        "model":"synthetic-decision",
-                        "answers":{"action":{"choice":"left","confidence":0.9,"probabilities":{"left":0.9,"right":0.1}}}
-                    })),
                     FixtureRequest::Spawn => {
-                        Ok(json!({"rlm_child_id":"fixture-child","name":payload.data["kwargs"]["name"],"session_dir":"/tmp/fixture-child","model":"synthetic/child"}))
+                        let name = payload.data["kwargs"]["name"].clone();
+                        Ok(json!({"rlm_child_id":"fixture-child","name":name,"session_dir":"/tmp/fixture-child","model":"synthetic/child"}))
                     }
                     FixtureRequest::Send => {
                         let text = payload.data["message"].as_str().unwrap();
-                        let observation: serde_json::Value = serde_json::from_str(text.split_once("First message:\n").unwrap().1)?;
-                        assert_eq!(observation["seq"], 0);
-                        *goal_message.lock().unwrap() = json!({"seq":0,"goal":"follow fixture strategy"});
-                        child_ready.notify_one();
+                        let message: serde_json::Value = serde_json::from_str(text)?;
+                        let name = payload.data["receiver_name"].as_str().unwrap_or("system-1");
+                        // The decision child's answer routes back through
+                        // the parent's per-child slot (the child records the
+                        // latest message-sourced goal and serves one decide).
+                        let state = message["state"].clone();
+                        let mut decision_state = state;
+                        if decision_state.get("goal").is_none() {
+                            decision_state["goal"] = json!("follow fixture strategy");
+                        }
+                        replies.lock().unwrap().insert(
+                            name.to_string(),
+                            json!({
+                                "type":"decision_api.decision","seq":message["seq"],
+                                "model":"synthetic/child",
+                                "decision":{"choice":"left","confidence":0.9,"probabilities":{"left":0.9,"right":0.1}}
+                            }),
+                        );
                         Ok(json!({"deliveryStatus":"sent"}))
+                    }
+                    FixtureRequest::Decision => {
+                        let name = payload.data["name"].as_str().unwrap_or_default().to_string();
+                        if payload.data["close"] == true {
+                            replies.lock().unwrap().remove(&name);
+                            return Ok(Value::Null);
+                        }
+                        Ok(replies
+                            .lock()
+                            .unwrap()
+                            .get(&name)
+                            .cloned()
+                            .unwrap_or(Value::Null))
                     }
                     FixtureRequest::Delete => Ok(json!({"subagent":{
                         "rlm_child_id":"fixture-child","session_name":payload.data["target"],
                         "session_dir":"/tmp/fixture-child","status":"completed"
                     },"outcome":"deleted"})),
-                    FixtureRequest::Goal => Ok(goal_message.lock().unwrap().take()),
-                    FixtureRequest::AwaitChild => {
-                        child_ready.notified().await;
-                        Ok(json!({"ready":true}))
-                    }
                 }
             })
         }));
@@ -251,26 +263,21 @@ observations_seen = 0
 async def observe_fixture():
     global observations_seen
     observations_seen += 1
-    if observations_seen == 2:
-        await decision_api.rlm.host_request("fixture.child_ready")
-        loop._system2_ready.set()
-        while not loop.goal_updates:
-            await asyncio.sleep(0)
     if observations_seen > 2:
         return None
     return {{"frame": observations_seen}}
 loop = decision_api.Loop(observe_fixture, actions_taken.append, {{"left":"go left", "right":"go right"}},
-    objective="fixture objective", system2=decision_api.System2(interval=3600))
-status = await asyncio.wait_for(loop.run(), 10)
+    objective="fixture objective", decide_timeout=15)
+status = await asyncio.wait_for(loop.run(), 60)
 assert actions_taken == ["left", "left"], actions_taken
-assert loop.goal == "follow fixture strategy", loop.status()
+assert loop.goal == "fixture objective", loop.status()
 assert loop.errors == [], loop.errors
 assert not status["running"]
 print("fixture passed")
 "#
     );
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(120),
         manager.execute(&code, ExecuteOptions::default()),
     )
     .await
@@ -290,48 +297,45 @@ print("fixture passed")
     );
     assert_eq!(result.stdout, "fixture passed\n");
     let events = events.lock().unwrap();
-    let mut decisions: Vec<_> = events
-        .iter()
-        .filter(|(kind, _)| *kind == FixtureRequest::Decide)
-        .map(|(_, payload)| payload["request"]["state"].clone())
-        .collect();
-    assert_eq!(decisions.len(), 2);
-    // Latency depends on scheduler timing; the request state is deterministic.
-    decisions[1]["recent_actions"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("latency_ms");
-    assert_eq!(
-        decisions,
-        vec![
-            json!({"observation":{"frame":1},"goal":"fixture objective"}),
-            json!({"observation":{"frame":2},"goal":"follow fixture strategy","recent_actions":[{"step":0,"action":"left","confidence":0.9}]}),
-        ]
-    );
+    // The spawn carries the decision kind; the requests carry the step seqs.
     let spawned = events
         .iter()
         .find(|(kind, _)| *kind == FixtureRequest::Spawn)
         .unwrap();
-    let sent = events
+    assert_eq!(spawned.1["kwargs"]["kind"], json!("decision"));
+    assert!(
+        spawned.1["prompt"]
+            .as_str()
+            .is_some_and(|prompt| prompt.contains("You are System 1")),
+        "the child's protocol prompt composes from the skill material"
+    );
+    let sends: Vec<&Value> = events
         .iter()
-        .find(|(kind, _)| *kind == FixtureRequest::Send)
-        .unwrap();
+        .filter(|(kind, _)| *kind == FixtureRequest::Send)
+        .map(|(_, data)| data)
+        .collect();
+    assert_eq!(sends.len(), 2);
+    let seqs: Vec<i64> = sends
+        .iter()
+        .filter_map(|send| {
+            let message: Value = serde_json::from_str(send["message"].as_str()?).ok()?;
+            message["seq"].as_i64()
+        })
+        .collect();
+    assert_eq!(seqs, vec![0, 1]);
+    assert!(
+        sends
+            .iter()
+            .all(|send| send["receiver_role"] == json!("child")),
+        "the requests address the decision child"
+    );
     let deleted = events
         .iter()
         .find(|(kind, _)| *kind == FixtureRequest::Delete)
         .unwrap();
     assert_eq!(
-        (
-            sent.1["receiver_role"].clone(),
-            sent.1["receiver_name"].clone(),
-            deleted.1["target"].clone()
-        ),
-        (
-            json!("child"),
-            spawned.1["kwargs"]["name"].clone(),
-            spawned.1["kwargs"]["name"].clone()
-        )
+        deleted.1["target"], spawned.1["kwargs"]["name"],
+        "the loop's teardown deletes its decision child"
     );
-    assert_eq!(*goal_message.lock().unwrap(), serde_json::Value::Null);
     println!("DECISION_API_REAL_FIXTURE_EXECUTED: decision_api_real_runtime_loop_routes_decisions_and_child_delivery_then_cleans_up");
 }

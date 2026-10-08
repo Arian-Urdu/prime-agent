@@ -303,8 +303,10 @@ impl Worker {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             sender_is_child_of(&sender, &core).then_some(AgentFamilyRelationship::Child)
         };
-        if from_relationship == Some(AgentFamilyRelationship::Child)
-            && self.engine.route_decision_api_goal(&sender_name, message)
+        if from_relationship != Some(AgentFamilyRelationship::Sibling)
+            && self
+                .engine
+                .route_decision_api_event(from_relationship, &sender_name, message)
         {
             let (core, inputs) = self.summary_inputs();
             let summary = self.summary_locked(&core, inputs);

@@ -1,7 +1,8 @@
 """The decision-api loop against a stand-in host.
 
-Covers image strings, step control, a live settings change, and System 2's
-action gate. `rlm` and `agent_message` are installed before the skill imports.
+Covers the decision child transport (spawn + request + tagged reply), goal
+routing, step control, and the direct `decide` path. `rlm` and
+`agent_message` are installed before the skill imports.
 """
 
 import asyncio
@@ -11,38 +12,44 @@ import types
 import unittest
 
 host_calls = []
-spawned = []
+sent = []
 
 
 async def host_request(kind, payload):
     host_calls.append((kind, payload))
-    return {
-        "answers": {
-            "action": {
-                "choice": "left",
-                "confidence": 0.9,
-                "probabilities": {"left": 0.9},
-            }
-        },
-        "model": "fixture/model",
-    }
+    if kind == "decision_api.decide":
+        return {
+            "answers": {
+                "action": {
+                    "choice": "left",
+                    "confidence": 0.9,
+                    "probabilities": {"left": 0.9},
+                }
+            },
+            "model": "fixture/model",
+        }
+    return None
 
 
 class _Handle:
-    model = "sub"
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.model = "fixture/system-1"
 
 
-async def spawn(prompt, *, name, model):
-    spawned.append({"prompt": prompt, "name": name, "model": model})
-    return _Handle()
+async def spawn(prompt, *, name, kind=None, model=None, thinking=None):
+    if kind != "decision":
+        raise TypeError("the loop spawns a decision child")
+    assert "You are System 1" in prompt
+    return _Handle(name)
 
 
 async def send(text, *, receiver_role, receiver_name):
-    spawned.append({"sent": text, "role": receiver_role, "name": receiver_name})
+    sent.append({"text": text, "role": receiver_role, "name": receiver_name})
 
 
 async def delete_subagent(name):
-    spawned.append({"deleted": name})
+    sent.append({"deleted": name})
 
 
 def _install_stubs():
@@ -58,7 +65,7 @@ def _install_stubs():
 
 _install_stubs()
 
-from decision_api import DEFAULT_INSTRUCTIONS, Loop, System2, decide  # noqa: E402
+from decision_api import DEFAULT_INSTRUCTIONS, Loop, decide  # noqa: E402
 
 
 class DecideTests(unittest.TestCase):
@@ -84,7 +91,6 @@ class DecideTests(unittest.TestCase):
             )
             self.assertEqual(result["action"], "left")
             self.assertEqual(result["confidence"], 0.9)
-            self.assertEqual(result["probabilities"], {"left": 0.9})
             self.assertEqual(result["model"], "fixture/model")
             self.assertIsInstance(result["latency_ms"], float)
 
@@ -109,7 +115,7 @@ class DecideTests(unittest.TestCase):
 class LoopTests(unittest.TestCase):
     def setUp(self):
         host_calls.clear()
-        spawned.clear()
+        sent.clear()
 
     def test_steps_skip_a_system1_error_and_stop_when_observe_ends(self):
         seen = []
@@ -134,7 +140,6 @@ class LoopTests(unittest.TestCase):
                 {"left": "go left"},
                 objective="stay under it",
                 system1=system1,
-                system2=None,
                 on_error="skip",
             )
             status = await loop.run()
@@ -142,7 +147,6 @@ class LoopTests(unittest.TestCase):
             self.assertEqual(loop.step, 3)
             self.assertEqual(len(loop.errors), 1)
             self.assertIn("blip", loop.errors[0]["error"])
-            self.assertEqual(host_calls, [])
             self.assertEqual(
                 {
                     key: status[key]
@@ -169,71 +173,204 @@ class LoopTests(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_images_reach_the_host_and_a_bad_image_stops_the_next_step(self):
+    def test_the_loop_spawns_one_child_and_awaits_its_replies(self):
         taken = []
+        replies = {}
+        spawns = []
 
-        def observe():
-            return {}
+        async def stub_spawn(prompt, *, name, kind=None, model=None, thinking=None):
+            spawns.append(name)
+            return _Handle(name)
 
-        async def run():
-            loop = Loop(
-                observe,
-                taken.append,
-                {"left": "go left"},
-                objective="catch",
-                system2=None,
-                images=lambda _observation: ["data:image/png;base64,AA=="],
-            )
+        async def stub_send(text, *, receiver_role, receiver_name):
+            message = json.loads(text)
+            sent.append({"message": message, "role": receiver_role, "name": receiver_name})
+            # The child's answer routes back through the decision slot.
+            replies[receiver_name] = {
+                "type": "decision_api.decision",
+                "seq": message["seq"],
+                "model": "fixture/model",
+                "decision": {"choice": "left", "confidence": 0.9},
+            }
 
-            async def on_step(record, _observation):
-                if record["step"] == 0:
-                    loop.images = lambda _observation: ["not-a-data-url"]
-
-            loop.on_step = on_step
-            status = await loop.run()
-            self.assertEqual(taken, ["left"])
-            self.assertTrue(status["error"].startswith("TypeError:"))
-            self.assertEqual(len(host_calls), 1)
-            self.assertEqual(
-                host_calls[0][1]["request"]["images"],
-                ["data:image/png;base64,AA=="],
-            )
-
-        asyncio.run(run())
-
-    def test_the_next_step_reads_actions_assigned_on_a_running_loop(self):
-        taken = []
+        async def stub_host_request(kind, payload):
+            host_calls.append((kind, payload))
+            if kind == "decision_api.decision":
+                if payload.get("close"):
+                    replies.pop(payload["name"], None)
+                    return None
+                return replies.get(payload["name"])
 
         def observe():
             observe.n += 1
-            return {} if observe.n <= 2 else None
+            if observe.n > 2:
+                return None
+            return {"frame": observe.n}
 
         observe.n = 0
 
-        def system1(_observation, actions, _goal, _history):
-            return next(iter(actions))
+        import decision_api
+
+        decision_api.rlm.spawn = stub_spawn
+        decision_api.rlm.host_request = stub_host_request
+        decision_api.agent_message.send = stub_send
 
         async def run():
-            loop = Loop(
+            loop = decision_api.Loop(
                 observe,
                 taken.append,
-                {"left": "go left"},
-                objective="catch",
-                system1=system1,
-                system2=None,
+                {"left": "go left", "right": "go right"},
+                objective="fixture objective",
+                decide_timeout=5.0,
             )
-
-            def on_step(record, _observation):
-                if record["step"] == 0:
-                    loop.actions = {"up": "go up"}
-
-            loop.on_step = on_step
-            await loop.run()
-            self.assertEqual(taken, ["left", "up"])
-            self.assertEqual(host_calls, [])
+            status = await loop.run()
+            self.assertEqual(taken, ["left", "left"])
+            self.assertEqual(len(spawns), 1, "one child for the loop's lifetime")
+            self.assertEqual(loop._child_model, "fixture/model")
+            self.assertEqual(spawns[0].split("-")[2], loop._loop_id)
+            self.assertEqual(loop.status()["system1_model"], "fixture/model")
+            self.assertEqual(loop.errors, [], loop.errors)
+            self.assertFalse(status["running"])
+            # The requests carry the step seq and the decision instructions.
+            requests = [
+                entry["message"] for entry in sent if entry.get("role") == "child"
+            ]
+            self.assertEqual([request["seq"] for request in requests], [0, 1])
+            for request in requests:
+                self.assertEqual(request["questions"]["action"]["type"], "choice")
+                self.assertEqual(
+                    request["questions"]["action"]["criteria"],
+                    {"left": "go left", "right": "go right"},
+                )
+                self.assertNotIn("goal", request["state"], "the goal rides tagged messages, not the state")
 
         asyncio.run(run())
 
+    def test_goal_updates_route_to_the_child(self):
+        taken = []
+        goals = []
+        replies = {}
+        decided = []
+
+        async def stub_spawn(prompt, *, name, kind=None, model=None, thinking=None):
+            return _Handle(name)
+
+        async def stub_send(text, *, receiver_role, receiver_name):
+            message = json.loads(text)
+            sent.append(message)
+            if message.get("type") == "decision_api.goal":
+                goals.append(message)
+            else:
+                # The child injects the latest goal into the state it serves.
+                decided.append(message["seq"])
+                replies[receiver_name] = {
+                    "type": "decision_api.decision",
+                    "seq": message["seq"],
+                    "model": "fixture/model",
+                    "decision": {"choice": "left", "confidence": 0.9},
+                }
+
+        async def stub_host_request(kind, payload):
+            if kind == "decision_api.decision":
+                if payload.get("close"):
+                    return None
+                return replies.get(payload["name"])
+
+        def observe():
+            observe.n += 1
+            if observe.n > 2:
+                return None
+            return {}
+
+        observe.n = 0
+
+        import decision_api
+
+        decision_api.rlm.spawn = stub_spawn
+        decision_api.rlm.host_request = stub_host_request
+        decision_api.agent_message.send = stub_send
+
+        async def run():
+            loop = decision_api.Loop(
+                observe,
+                taken.append,
+                {"left": "go left"},
+                objective="fixture objective",
+                on_step=lambda record, observation: (
+                    loop.set_goal("follow the target") if record["step"] == 0 else None
+                ),
+                decide_timeout=5.0,
+            )
+            await loop.run()
+            self.assertEqual(taken, ["left", "left"])
+            self.assertEqual(loop.goal, "follow the target")
+            self.assertEqual(loop.goal_updates[-1]["goal"], "follow the target")
+            # The goal message is tagged and routed to the child.
+            self.assertEqual(
+                [entry["type"] for entry in goals],
+                ["decision_api.goal"],
+                goals,
+            )
+            self.assertEqual(goals[0]["goal"], "follow the target")
+            # set_goal of an empty goal is a contract error.
+            with self.assertRaises(TypeError):
+                loop.set_goal("")
+
+        asyncio.run(run())
+
+    def test_a_child_error_reply_fails_the_step_and_the_removal_closes_the_slot(self):
+        taken = []
+        replies = {}
+        closed = []
+
+        async def stub_spawn(prompt, *, name, kind=None, model=None, thinking=None):
+            return _Handle(name)
+
+        async def stub_send(text, *, receiver_role, receiver_name):
+            message = json.loads(text)
+            replies[receiver_name] = {
+                "type": "decision_api.decision",
+                "seq": message["seq"],
+                "error": "the decision model refused",
+            }
+
+        async def stub_host_request(kind, payload):
+            if kind == "decision_api.decision":
+                if payload.get("close"):
+                    closed.append(payload["name"])
+                    return None
+                return replies.get(payload["name"])
+
+        def observe():
+            observe.n += 1
+            if observe.n > 1:
+                return None
+            return {}
+
+        observe.n = 0
+
+        import decision_api
+
+        decision_api.rlm.spawn = stub_spawn
+        decision_api.rlm.host_request = stub_host_request
+        decision_api.agent_message.send = stub_send
+
+        async def run():
+            loop = decision_api.Loop(
+                observe,
+                taken.append,
+                {"left": "go left"},
+                objective="fixture objective",
+                decide_timeout=5.0,
+                on_error="skip",
+            )
+            await loop.run()
+            self.assertEqual(taken, [])
+            self.assertEqual(len(loop.errors), 1)
+            self.assertIn("the decision model refused", loop.errors[0]["error"])
+            self.assertEqual(closed, ["system-1-" + loop._loop_id])
+
+        asyncio.run(run())
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 //! The System One structured-decision protocol (Prime Inference's
-//! `/api/v1/systemone` endpoint, the hosted port of the old TypeSafe
+//! `/api/v1/systemone` endpoint, the hosted port of the old `TypeSafe`
 //! endpoint): the decision request body POSTs to the model's `baseUrl` +
 //! `/systemone` with the merged request auth, and the reply envelope
 //! (`model` + `answers`) becomes the assistant text. The host (pa-core)
@@ -29,7 +29,7 @@ const ERROR_BODY_CHARS: usize = 500;
 pub struct SystemOneProvider;
 
 impl Provider for SystemOneProvider {
-    fn api(&self) -> &str {
+    fn api(&self) -> &'static str {
         "systemone"
     }
 
@@ -161,9 +161,9 @@ fn error_message(model: &Model, error: &str) -> AssistantMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event_stream::AssistantMessageEvent;
     use pa_types::ai::{Message, UserContent, UserMessage};
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// One request the loopback server received.
     #[derive(Debug, Clone)]
@@ -205,9 +205,14 @@ mod tests {
                         break (head.to_string(), body.to_string());
                     }
                 };
-                let mut request_line = head.lines().next().unwrap_or_default().split(' ');
-                let method = request_line.next().unwrap_or_default().to_string();
-                let path = request_line.next().unwrap_or_default().to_string();
+                let path = head
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .split(' ')
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
                 let authorization = head.lines().find_map(|line| {
                     let line = line.to_ascii_lowercase();
                     line.strip_prefix("authorization:")
@@ -230,7 +235,6 @@ mod tests {
                      content-length: {}\r\nconnection: close\r\n\r\n{reply}",
                     reply.len()
                 );
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 socket.write_all(response.as_bytes()).await.unwrap();
             }
         });
@@ -243,12 +247,12 @@ mod tests {
             "provider": "prime-inference", "baseUrl": base_url, "reasoning": false,
             "input": ["text", "image"],
             "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-            "contextWindow": 100000, "maxTokens": 8192,
+            "contextWindow": 100_000, "maxTokens": 8192,
         }))
         .unwrap()
     }
 
-    fn decision_context(request: Value) -> Context {
+    fn decision_context(request: &Value) -> Context {
         Context {
             system_prompt: None,
             messages: vec![Message::User(UserMessage {
@@ -276,7 +280,7 @@ mod tests {
         });
         let stream = SystemOneProvider.stream(
             &model,
-            &decision_context(request.clone()),
+            &decision_context(&request),
             Some(&StreamOptions {
                 api_key: Some("test-key".to_string()),
                 headers: Some(
@@ -342,7 +346,7 @@ mod tests {
             },
             "model": "cloudflare/clef"
         });
-        let stream = SystemOneProvider.stream(&model, &decision_context(request.clone()), None);
+        let stream = SystemOneProvider.stream(&model, &decision_context(&request), None);
         let message = stream.result().await;
         assert_eq!(message.stop_reason, StopReason::Stop);
         let requests = seen.lock().unwrap();
@@ -365,7 +369,7 @@ mod tests {
         let base = serve(404, json!({"error": "no such model"}), seen).await;
         let model = fixture_model(&base);
         let stream =
-            SystemOneProvider.stream(&model, &decision_context(json!({"state": {}})), None);
+            SystemOneProvider.stream(&model, &decision_context(&json!({"state": {}})), None);
         let message = stream.result().await;
         assert_eq!(message.stop_reason, StopReason::Error);
         let error = message.error_message.unwrap();

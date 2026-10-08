@@ -3,7 +3,7 @@
 //! The offline pins always run: the registry recipe (baseUrl, the key from an
 //! env-var name, the team header from the stored login, the vision-capable
 //! `clef` model) resolves through the spawn seam, and the unset setting
-//! refuses with decide()'s actionable message. The billed `decide()` round
+//! refuses with `decide()`'s actionable message. The billed `decide()` round
 //! trip is opt-in: `PA_DECISION_LIVE=1` with `PA_DECISION_LIVE_API_KEY`
 //! (and `PA_DECISION_LIVE_TEAM_ID`) set, and the endpoint reachable.
 
@@ -142,16 +142,15 @@ async fn endpoint_reachable() -> bool {
         tokio::net::TcpStream::connect((ENDPOINT_HOST, ENDPOINT_PORT)),
     )
     .await;
-    match probe {
-        Ok(Ok(_)) => true,
-        _ => {
-            eprintln!("{ENDPOINT_HOST} unreachable; skipping the live clef decide round trip");
-            false
-        }
+    if let Ok(Ok(_)) = probe {
+        true
+    } else {
+        eprintln!("{ENDPOINT_HOST} unreachable; skipping the live clef decide round trip");
+        false
     }
 }
 
-/// One end-to-end decide() round trip over the clef endpoint: the text
+/// One end-to-end `decide()` round trip over the clef endpoint: the text
 /// decision and the vision (image) decision, through the same host path the
 /// decision child serves.
 #[tokio::test]

@@ -372,6 +372,13 @@ impl Worker {
             Arc::clone(&events),
             Arc::clone(&recovery),
         ));
+        // The turn runner's passivation context: shared by both engine
+        // branches below (each moves the worker token into its engine).
+        let passivation = crate::worker::turn::PassivationContext {
+            agent_dir: config.agent_dir.clone(),
+            link: Arc::clone(&roster_link),
+            worker_token: worker_token.clone(),
+        };
         let (engine, agent_engine, roster_pushes): (
             std::sync::Arc<dyn SessionEngine>,
             Option<std::sync::Arc<crate::agent_engine::AgentSessionEngine>>,
@@ -666,7 +673,7 @@ impl Worker {
                         engine: std::sync::Arc::clone(&engine),
                         user_bash: std::sync::Arc::clone(&user_bash),
                         roster_link: Arc::clone(&roster_link),
-                        worker_token: worker_token.clone(),
+                        worker_token,
                         worker_instance_id: config.worker_instance_id.clone(),
                         roster_delta_sequence: std::sync::Arc::clone(&roster_delta_sequence),
                     },
@@ -681,31 +688,30 @@ impl Worker {
                         roster_pushes.clone(),
                     );
                 }
-                let runner = TurnRunner {
-                    recovery: Arc::clone(&recovery),
-                    core: Arc::clone(&core),
-                    input_pauses: input_pauses.clone(),
-                    prompt_admissions: prompt_admissions.clone(),
-                    work_notify: Arc::clone(&work_notify),
-                    idle_notify: Arc::clone(&idle_notify),
-                    events: events.clone(),
-                    engine: std::sync::Arc::clone(&engine),
-                    active_session_id,
-                    roster_pushes: roster_pushes.clone(),
-                    user_bash: std::sync::Arc::clone(&user_bash),
-                    passivation: crate::worker::turn::PassivationContext {
-                        agent_dir: config.agent_dir.clone(),
-                        link: Arc::clone(&roster_link),
-                        worker_token,
-                    },
-                    herdr: std::sync::Arc::clone(&herdr_slot),
-                };
-                tokio::spawn(async move {
-                    runner.run().await;
-                });
                 (engine, agent_engine, roster_pushes)
             }
         };
+        // The turn runner drives the engine's queued prompts; every engine
+        // needs it — a decision child without a runner never dequeues its
+        // first prompt.
+        let runner = TurnRunner {
+            recovery: Arc::clone(&recovery),
+            core: Arc::clone(&core),
+            input_pauses: input_pauses.clone(),
+            prompt_admissions: prompt_admissions.clone(),
+            work_notify: Arc::clone(&work_notify),
+            idle_notify: Arc::clone(&idle_notify),
+            events: events.clone(),
+            engine: std::sync::Arc::clone(&engine),
+            active_session_id,
+            roster_pushes: roster_pushes.clone(),
+            user_bash: std::sync::Arc::clone(&user_bash),
+            passivation,
+            herdr: std::sync::Arc::clone(&herdr_slot),
+        };
+        tokio::spawn(async move {
+            runner.run().await;
+        });
         let side_questions = crate::side_question::SideQuestionManager::new(
             std::sync::Arc::clone(&engine),
             events.clone(),

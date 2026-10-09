@@ -78,7 +78,10 @@ def _default_message(
     """What System 2 receives by default (the loop adds `seq`)."""
     return {
         "objective": objective,
-        "observation": json.dumps(observation, default=str)[:_OBSERVATION_CHARS],
+        # Text goes as is: encoding it here and again with the whole message would escape it twice.
+        "observation": (observation if isinstance(observation, str) else json.dumps(observation, default=str))[
+            :_OBSERVATION_CHARS
+        ],
         "actions": list(actions),
         "recent_actions": history,
         "current_goal": goal,
@@ -148,13 +151,15 @@ async def _call(fn: Callable[..., Any], *args: Any) -> Any:
 
 @dataclass
 class System2:
-    """How System 2 operates. Changing `prompt` or `model` on a running loop
+    """How System 2 operates. Changing `prompt`, `model` or `thinking` on a running loop
     schedules a replacement System 2; `interval` and `message` apply at once.
     Transport runs in the background with one newest pending observation.
 
     - `prompt`: System 2's instructions, sent with the first message.
       Replies use tagged JSON parent messages as in DEFAULT_SYSTEM2_PROMPT.
     - `model`: subagent model (None inherits the calling agent's model).
+    - `thinking`: subagent reasoning level such as "low" (None inherits the
+      calling agent's level).
     - `interval`: None sends the newest observation once System 2 answered its
       previous message; a number of seconds sends on that fixed interval instead.
     - `message`: `(observation, history, goal, objective, actions) -> dict`.
@@ -168,6 +173,7 @@ class System2:
 
     prompt: str = DEFAULT_SYSTEM2_PROMPT
     model: str | None = None
+    thinking: str | None = None
     interval: float | None = None
     message: Callable[..., dict[str, Any]] = _default_message
     can_act: bool = False
@@ -410,7 +416,8 @@ class Loop:
     def _read_goal(self, data: dict[str, Any], actions: dict[str, str]) -> None:
         if self._live is None or self.system2 is not self._live[0]:
             return
-        if (self.system2.prompt, self.system2.model, self.system2.can_act) != self._live[2]:
+        wanted = self.system2
+        if (wanted.prompt, wanted.model, wanted.thinking, wanted.can_act) != self._live[2]:
             return
         try:
             seq = data["seq"]
@@ -446,7 +453,7 @@ class Loop:
                 await self._system2_ready.wait()
                 self._system2_ready.clear()
                 wanted = self.system2
-                config = None if wanted is None else (wanted.prompt, wanted.model, wanted.can_act)
+                config = None if wanted is None else (wanted.prompt, wanted.model, wanted.thinking, wanted.can_act)
                 if self._live is not None and (self._live[0] is not wanted or self._live[2] != config):
                     await self._retire_system2()
                     failures = 0
@@ -483,7 +490,8 @@ class Loop:
                         self._spawning_name = name
                         await asyncio.wait_for(rlm.host_request("decision_api.goal", {"name": name}), wanted.timeout)
                         handle = await asyncio.wait_for(
-                            rlm.spawn(self._instructions, name=name, model=wanted.model), wanted.timeout
+                            rlm.spawn(self._instructions, name=name, model=wanted.model, thinking=wanted.thinking),
+                            wanted.timeout,
                         )
                         self._live = (wanted, name, config)
                         self._spawning_name = None

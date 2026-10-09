@@ -104,6 +104,7 @@ loop.on_step = lambda record, observation: ...                  # log or render;
 loop.objective = "..."            # System 2 sees it in its next message
 loop.system2.prompt = "..."       # schedules replacement; keep the tagged parent-message reply format
 loop.system2.model = "..."        # respawns too
+loop.system2.thinking = "low"     # subagent reasoning level (None inherits yours); respawns too
 loop.system2.interval = 2.0       # send every 2 s instead of once System 2 answered
 loop.system2.timeout = 30.0       # bound spawn/message transport; failures retry in the background
 loop.system2.can_act = True       # only if the user asks: lets System 2 override one action (respawns)

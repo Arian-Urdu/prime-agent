@@ -27,6 +27,7 @@ class System2Tests(unittest.IsolatedAsyncioTestCase):
         self.completed = asyncio.Queue()
         self.sent = []
         self.children = []
+        self.thinking = []
         self.deleted = []
         self.goals = {}
         self.loop = decision_api.Loop(
@@ -38,8 +39,9 @@ class System2Tests(unittest.IsolatedAsyncioTestCase):
             on_step=lambda record, _observation: self.completed.put_nowait(record),
         )
 
-        async def spawn(_prompt, *, name, model):
+        async def spawn(_prompt, *, name, model, thinking=None):
             self.children.append(name)
+            self.thinking.append(thinking)
             return _Handle()
 
         async def send(text, **_kwargs):
@@ -81,6 +83,16 @@ class System2Tests(unittest.IsolatedAsyncioTestCase):
         self.goals[self.children[-1]] = data
         self.loop._system2_ready.set()
         await until(lambda: self.goals.get(self.children[-1]) is None)
+
+    async def test_thinking_reaches_the_child_and_a_change_respawns_it(self):
+        self.loop.system2.thinking = "low"
+        await self.step()
+        await until(lambda: self.children)
+        self.loop.system2.thinking = "high"
+        await self.step()
+        await until(lambda: len(self.children) == 2)
+        self.assertEqual(self.thinking, ["low", "high"])
+        self.assertEqual(self.deleted, self.children[:1])
 
     async def test_hanging_send_does_not_block_actions_and_is_cancelled_on_stop(self):
         entered = asyncio.Event()
@@ -127,7 +139,7 @@ class System2Tests(unittest.IsolatedAsyncioTestCase):
     async def test_hanging_spawn_is_cancelled_and_its_named_child_is_cleaned(self):
         entered = asyncio.Event()
 
-        async def spawn(_prompt, *, name, model):
+        async def spawn(_prompt, *, name, model, thinking=None):
             self.children.append(name)
             entered.set()
             await asyncio.Event().wait()
@@ -143,7 +155,7 @@ class System2Tests(unittest.IsolatedAsyncioTestCase):
     async def test_transient_spawn_failure_retries_without_a_new_observation(self):
         attempts = 0
 
-        async def spawn(_prompt, *, name, model):
+        async def spawn(_prompt, *, name, model, thinking=None):
             nonlocal attempts
             attempts += 1
             self.children.append(name)
@@ -267,6 +279,13 @@ class System2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["running"])
         self.assertTrue(any("TimeoutError" in error["error"] for error in self.loop.errors))
 
+
+class DefaultMessageTests(unittest.TestCase):
+    def test_text_observation_is_encoded_once_with_the_message(self):
+        text = "HUD\n#@#"
+        message = decision_api._default_message(text, [], "", "objective", {"move": "keys"})
+        self.assertEqual(json.loads(json.dumps(message))["observation"], text)
+        self.assertEqual(decision_api._default_message({"x": 1}, [], "", "", {})["observation"], '{"x": 1}')
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,10 @@
-"""Catch startup owns its subprocess, including failed and cancelled startup."""
+"""Catch startup owns its subprocess, including failed and cancelled startup.
+The observation helpers split the rendered frame from the text state."""
 
 import asyncio
+import base64
+import shutil
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -76,6 +80,85 @@ class CatchTests(unittest.IsolatedAsyncioTestCase):
                 await env.CatchEnv.make(record=False)
         self.assertEqual(process.returncode, -15)
         self.assertTrue(process.reaped)
+
+
+class ObservationHelperTests(unittest.TestCase):
+    def observation(self, image="data:image/png;base64,aGVsbG8="):
+        return {
+            "picture": [".....", "..U.."],
+            "bowl": "middle",
+            "caught": 3,
+            "missed": 4,
+            "done": False,
+            "image": image,
+        }
+
+    def test_state_keeps_the_text_and_drops_the_frame(self):
+        state = env.observation_state(self.observation())
+        self.assertEqual(
+            state["observation"],
+            {"picture": [".....", "..U.."], "bowl": "middle", "caught": 3, "missed": 4, "done": False},
+        )
+
+    def test_state_keeps_the_text_when_there_is_no_frame(self):
+        observation = self.observation(image=None)
+        state = env.observation_state(observation)
+        self.assertNotIn("image", state["observation"])
+        self.assertEqual(state["observation"]["caught"], 3)
+
+    def test_state_carries_recent_actions(self):
+        history = [{"step": 0, "action": "wait", "confidence": 0.5, "latency_ms": 1.0}]
+        state = env.observation_state(self.observation(), history=history)
+        self.assertEqual(state["recent_actions"], history)
+
+    def test_images_pass_the_frame_through_as_a_data_url(self):
+        self.assertEqual(env.observation_images(self.observation()), ["data:image/png;base64,aGVsbG8="])
+        self.assertIsNone(env.observation_images(self.observation(image=None)))
+        self.assertIsNone(env.observation_images(self.observation(image="not-a-data-url")))
+
+
+class LiveObservationFrameTests(unittest.IsolatedAsyncioTestCase):
+    """The game serves a real rendered frame: a decodable PNG of the play
+    area. Skipped when `uv` cannot run the game (its declared pygame
+    dependency resolves through uv)."""
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("uv") is None:
+            raise unittest.SkipTest("uv is not on PATH; the game cannot start")
+
+    async def asyncSetUp(self):
+        self.environment = await env.CatchEnv.make(seconds=5, seed=1, record=False, headless=True)
+
+    def assert_play_area_png(self, url):
+        prefix, _, data = url.partition(",")
+        self.assertEqual(prefix, "data:image/png;base64")
+        png = base64.b64decode(data, validate=True)
+        self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+        width, height = struct.unpack(">II", png[16:24])
+        self.assertEqual((width, height), (360, 360))
+
+    async def test_the_observation_carries_a_play_area_png(self):
+        observation, _ = await self.environment.reset()
+        self.assertIn("picture", observation)
+        self.assertIn("bowl", observation)
+        self.assert_play_area_png(observation["image"])
+
+    async def test_the_frame_tracks_the_game(self):
+        observation, _ = await self.environment.reset()
+        first = observation["image"]
+        # The seeded first circle spawns at 0.6 s and is mid-fall here, so
+        # the frame must move with the game, not stay the opening render.
+        await asyncio.sleep(0.8)
+        observation, _, terminated, truncated, _ = await self.environment.step("wait")
+        self.assertFalse(terminated or truncated)
+        second = observation["image"]
+        self.assert_play_area_png(second)
+        self.assertNotEqual(first, second)
+
+    async def asyncTearDown(self):
+        await self.environment.close()
+        shutil.rmtree(self.environment.summary_path.parent, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,12 @@
     observation, info = await catch.reset()
     observation, reward, terminated, truncated, info = await catch.step("wait")
     result = await catch.close()
+
+Each observation carries the text state (`picture`, `bowl`, `caught`,
+`missed`, `done`) and the rendered frame as a PNG data URL (`image`).
+`observation_state` and `observation_images` split it for the decision-api
+loop: System 1 reads the compact text state and sees the frame as an image
+block (vision-capable models only).
 """
 
 from __future__ import annotations
@@ -26,6 +32,30 @@ ACTIONS = {
     "goto_right": "Move the bowl to the right column",
     "goto_far_right": "Move the bowl to the far right column",
 }
+
+
+def observation_state(
+    observation: dict[str, Any], goal: str = "", history: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    """The compact text half of an observation for the loop's `state`
+    callback: every field but the rendered frame. `observation_images`
+    sends the frame as an image block, so the data URL never rides the
+    text state too."""
+    state: dict[str, Any] = {
+        "observation": {key: value for key, value in observation.items() if key != "image"}
+    }
+    if history:
+        state["recent_actions"] = history
+    return state
+
+
+def observation_images(observation: dict[str, Any]) -> list[str] | None:
+    """The observation's rendered frame as decision images for the loop's
+    `images` callback: one PNG data URL, or None when there is no frame."""
+    image = observation.get("image")
+    if isinstance(image, str) and image.startswith("data:image/"):
+        return [image]
+    return None
 
 
 class CatchEnv:

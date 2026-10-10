@@ -32,6 +32,10 @@ try:
             observation = {**observation, "done": True}
 
     loop = decision_api.Loop(observe, act, catch.actions, objective="Catch the falling circles", tick=0.1)
+    # A vision-capable System 1 reads the compact text state and sees the
+    # rendered frame; drop these two lines for a text-only model.
+    loop.state = env.observation_state
+    loop.images = env.observation_images
     loop.start()
     while (await loop.wait(timeout=10))["running"]:
         print(loop.status(), loop.errors[-3:])
@@ -47,6 +51,13 @@ The first `reset()` starts the episode clock. `step(action)` returns
 drops since the previous step. `close()` returns the final score and optional
 recording path and is safe to call again. The session agent designs the loop;
 the environment supplies observations and applies actions.
+
+Each observation is the text state (`picture`, `bowl`, `caught`, `missed`,
+`done`) plus the rendered frame as a 360x360 PNG data URL (`image`). For a
+vision-capable System 1, wire the split into the loop: `loop.state =
+env.observation_state` keeps the data URL out of the text, and `loop.images =
+env.observation_images` rides the frame as the decision request's image
+block. Both helpers accept the observation as the loop passes it.
 
 Run startup/artifact regression tests with
 `python3 -m unittest discover -s examples/catch -p 'test_*.py' -v`.

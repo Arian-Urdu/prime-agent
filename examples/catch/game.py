@@ -5,7 +5,7 @@
 """Catch: white circles fall in five columns; the bowl at the bottom catches them.
 
 The game serves JSON lines on localhost for the decision-api loop:
-  {"op": "observe"}                         -> game state as text (System 1's input)
+  {"op": "observe"}                         -> game state as text plus the rendered frame (System 1's input)
   {"op": "act", "action": "wait" | "goto_far_left" | "goto_left" | "goto_middle" | "goto_right" | "goto_far_right"}
   {"op": "overlay", "system1": {...}, "system2": {...}}
 It prints "PORT <n>" once listening. The clock starts on the first observe.
@@ -14,6 +14,8 @@ It prints "PORT <n>" once listening. The clock starts on the first observe.
 from __future__ import annotations
 
 import argparse
+import base64
+import io
 import json
 import math
 import os
@@ -39,6 +41,7 @@ FALL_SPEED = 300  # px/s for every circle: about 2 s from the top to the line
 MOVE_SPEED = 4 * COL_W / 0.01  # px/s: column 1 to 5 within 10 ms, so a single frame
 TRAIL_S = 0.12  # how long the afterimage of a move lingers
 PICTURE_ROWS = 8
+FRAME_SIDE = 360  # the rendered frame's width and height in the observation
 FPS, VIDEO_FPS = 60, 30
 MIN_GAP_S = 0.3
 RATE_MIN, RATE_MAX = 0.3, 1 / MIN_GAP_S
@@ -95,6 +98,7 @@ class Game:
         self.next_spawn = 0.6
         self.system1: dict = {}
         self.system2: dict = {}
+        self.frame: str | None = None
         self.latencies: list[float] = []
         self.goal_changed_at: float | None = None
 
@@ -137,6 +141,7 @@ class Game:
             "caught": self.caught,
             "missed": self.missed,
             "done": self.finished,
+            "image": self.frame,
         }
 
     def update(self, dt: float) -> None:
@@ -229,6 +234,15 @@ class Renderer:
         self.f_value = font(mono, 15)
         self.f_goal = font(sans, 17)
         self.f_brand = font(sans, 22)
+
+    def frame_data_url(self) -> str:
+        """The play area (never the side panel) as one downscaled PNG data
+        URL: the observation's image for vision-capable decision models."""
+        play = self.screen.subsurface(self.pg.Rect(0, 0, GAME_W, H))
+        small = self.pg.transform.smoothscale(play, (FRAME_SIDE, FRAME_SIDE))
+        buffer = io.BytesIO()
+        self.pg.image.save(small, buffer, ".png")
+        return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
 
     def text(self, font, value: str, color, pos, anchor: str = "topleft") -> None:
         surface = font.render(value, True, color)
@@ -386,6 +400,8 @@ def main() -> None:
     pygame.init()
     game = Game(args.seconds, args.seed)
     renderer = Renderer(pygame)
+    renderer.draw(game)
+    game.frame = renderer.frame_data_url()
     print(f"PORT {serve(game)}", flush=True)
 
     video = None
@@ -410,6 +426,7 @@ def main() -> None:
         with game.lock:
             game.update(min(0.05, now - last))
             renderer.draw(game)
+            game.frame = renderer.frame_data_url()
             started, finished = game.started, game.finished
         last = now
         pygame.display.flip()

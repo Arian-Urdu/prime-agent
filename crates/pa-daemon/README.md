@@ -242,7 +242,12 @@ boot), re-arms scheduled work (a boot scan of `scheduled-jobs.json`;
 due active jobs of sessionless files are woken once, never archived), and
 reports the pass over `update_restore_status` while `hello.update_resume`
 carries the settle state; client attaches to a not-yet-restored roster row
-queue behind the pass instead of failing. The heartbeat-catalog change
+queue behind the pass instead of failing.
+For historical TypeScript update manifests, the restore pass recreates parents
+before their children, remaps active parent IDs, and restores pending context
+and action queues explicitly because those manifests predate Rust's journals.
+Attaches remain gated until that replay completes.
+The heartbeat-catalog change
 broadcast owns its surface here too (the worker's cron-store
 `on_heartbeat_change` listener emits a `heartbeats_changed` outbound frame
 — TS daemon-mode's `broadcastGlobal` — and the supervisor re-broadcasts it
@@ -274,3 +279,9 @@ branch, including the window's pre-compaction metadata. This private store gette
 runs before the lazy session engine builds and never resolves auth, models, or the
 kernel. Branch replacement changes the next snapshot immediately; explicit off
 and malformed status rows clear earlier state.
+
+The composition root initializes the packaged product version with
+`protocol::configure_app_version` before entering daemon or worker mode.
+`protocol::app_version` supplies that identity to both hello frames and update
+checkpoints; library embedders fall back to the compiled version. Release
+manifest restamping therefore remains consistent with CLI `--version`.

@@ -89,6 +89,8 @@ fn main_impl(args: &[String], runtime: &dyn mode::Runtime) -> Result<i32, String
     // Telemetry reports the version `--version` prints: the beta channel
     // restamps only the packaged manifest, never the compiled-in version.
     pa_telemetry::set_version(crate::config::version());
+    pa_daemon::protocol::configure_app_version(crate::config::version())
+        .map_err(|error| error.to_string())?;
 
     let offline_mode = args.iter().any(|arg| arg == "--offline")
         || crate::config::is_truthy_env_flag(
@@ -132,6 +134,9 @@ fn main_impl(args: &[String], runtime: &dyn mode::Runtime) -> Result<i32, String
     }
 
     let app_mode = mode::AppMode::resolve(&parsed, std::io::stdin().is_terminal());
+
+    // Enable Windows VT processing before raw ANSI mode writes.
+    pa_types::platform::console_init();
 
     if public_command.attach_agent.is_some() && app_mode != mode::AppMode::Interactive {
         return Err("attach requires an interactive terminal".to_string());

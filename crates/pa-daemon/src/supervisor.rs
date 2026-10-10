@@ -86,10 +86,10 @@ use crate::framing::{write_frame, PrivateFrameReader, DEFAULT_PRIVATE_FRAME_LIMI
 use crate::paths;
 use crate::prompt_admission::input_admission_id;
 use crate::protocol::{
-    command_active_session_id, command_type_name, current_protocol_info,
+    app_version, command_active_session_id, command_type_name, current_protocol_info,
     parse_supervisor_command_line, response_failure, response_line, response_success,
     DaemonResponse, DaemonRuntimeIdentity, EnvelopeParseError, TypedCreateRejection,
-    DAEMON_APP_VERSION, DAEMON_SCHEMA_ID, DAEMON_SCHEMA_REVISION,
+    DAEMON_SCHEMA_ID, DAEMON_SCHEMA_REVISION,
 };
 use crate::registry::{
     ResidentWorker, SessionRegistry, WorkerRegistration, WorkerReply, WorkerRequest,
@@ -458,6 +458,27 @@ impl Supervisor {
             let supervisor = Arc::clone(&self);
             tokio::spawn(async move {
                 crate::session_archive::archive_sweep_loop(&supervisor).await;
+            });
+        }
+
+        // Journals without verifiable ownership and flat TS update status
+        // records stay intact: a missing descriptor or a dead coordinator
+        // does not prove that no worker or waiting caller still needs them.
+        {
+            let supervisor = Arc::clone(&self);
+            tokio::task::spawn_blocking(move || {
+                let leases = crate::lease::reclaim_dead_owner_leases(&supervisor.options.agent_dir);
+                let logs = crate::worker_stderr::prune_socket_logs(
+                    &supervisor.options.agent_dir,
+                    &supervisor.options.socket_path,
+                );
+                let leftovers =
+                    crate::ts_era::sweep_ts_era_leftovers(&supervisor.options.agent_dir);
+                if leases + logs + leftovers > 0 {
+                    supervisor.log_line(&format!(
+                        "boot cleanup: removed {leases} dead-owner lease dir(s), {logs} old socket log(s), {leftovers} TS-era leftover(s)"
+                    ));
+                }
             });
         }
 
